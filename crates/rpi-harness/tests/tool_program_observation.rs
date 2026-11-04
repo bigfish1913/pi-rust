@@ -57,7 +57,7 @@ impl AgentTool for NativeTool {
         &self.schema.name
     }
     fn execution_mode(&self) -> ToolExecutionMode {
-        if self.schema.name == "program" {
+        if matches!(self.schema.name.as_str(), "program" | "wrapper") {
             ToolExecutionMode::Sequential
         } else {
             ToolExecutionMode::Parallel
@@ -499,7 +499,7 @@ async fn native_checkpoint_identity_partials_and_post_hook_final_are_observed() 
     assert_eq!(child.0.root_name, "program");
     assert_eq!(child.0.ordinal, 1);
     assert_eq!(child.1, json!({"caller":"original"}));
-    assert_no_child_messages(&session, &[child.0.request_id.clone()]).await;
+    assert_no_child_messages(&session, std::slice::from_ref(&child.0.request_id)).await;
     assert!(!events.lock().unwrap().iter().any(|e| matches!(e,
         AgentEvent::ToolExecutionStart { tool_call_id, .. } | AgentEvent::ToolExecutionEnd { tool_call_id, .. }
             if tool_call_id == &child.0.request_id)), "child observations are not transcript lifecycle events");
@@ -785,7 +785,7 @@ async fn cancelled_child_drains_native_execution_then_writer_before_root_finaliz
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn observer_none_preserves_legacy_checkpoint_and_root_only_transcript() {
+async fn default_journal_preserves_legacy_checkpoint_and_root_only_transcript() {
     let mut options = AgentHarnessOptions::default();
     let session = options.session.clone();
     let effect_session = session.clone();
@@ -809,7 +809,7 @@ async fn observer_none_preserves_legacy_checkpoint_and_root_only_transcript() {
                 let session = effect_session.clone();
                 let effects = actual.clone();
                 Box::pin(async move {
-                    assert!(current_observation().is_none());
+                    assert!(current_observation().unwrap().id().starts_with("tpchild-"));
                     assert!(session.find_entries(&EntryQuery::default()).await.unwrap().iter().any(|e| matches!(e,
                     Entry::Custom(e) if e.custom_type == "rpi.tool_program.intent.v1" && e.data.as_ref().unwrap()["requestId"] == id)));
                     effects.fetch_add(1, Ordering::SeqCst);
@@ -828,4 +828,364 @@ async fn observer_none_preserves_legacy_checkpoint_and_root_only_transcript() {
     ));
     assert_eq!(effects.load(Ordering::SeqCst), 1);
     assert_no_child_messages(&session, &[]).await;
+    let entries = session.find_entries(&EntryQuery::default()).await.unwrap();
+    let begin = entries
+        .iter()
+        .find_map(|entry| match entry {
+            Entry::Custom(entry) if entry.custom_type == "rpi.tool_program.child_begin.v1" => {
+                entry.data.as_ref()
+            }
+            _ => None,
+        })
+        .expect("default native child begin was committed");
+    assert_eq!(begin["toolName"], "effect");
+    assert!(begin["childId"].as_str().unwrap().starts_with("tpchild-"));
+    assert!(entries.iter().any(|entry| matches!(entry,
+        Entry::Custom(entry) if entry.custom_type == "rpi.tool_program.child_phase.v1"
+            && entry.data.as_ref().unwrap()["phase"] == "final")));
+}
+
+async fn journal(session: &Session) -> (Vec<Value>, Vec<Value>) {
+    let entries = session
+        .find_entries(&EntryQuery {
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut begins = vec![];
+    let mut phases = vec![];
+    for entry in entries {
+        if let Entry::Custom(entry) = entry {
+            match entry.custom_type.as_str() {
+                "rpi.tool_program.child_begin.v1" => begins.push(entry.data.unwrap()),
+                "rpi.tool_program.child_phase.v1" => phases.push(entry.data.unwrap()),
+                _ => {}
+            }
+        }
+    }
+    (begins, phases)
+}
+async fn journal_body(session: &Session, descriptor: &Value) -> Value {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use rpi_harness::tool_program_body::{read_body_page, BodyPageQuery, MAX_PAGE_BYTES};
+    use sha2::{Digest, Sha256};
+    let mut query = BodyPageQuery {
+        descriptor_id: descriptor["descriptorId"].as_str().unwrap().into(),
+        leaf_id: None,
+        cursor: None,
+        limit: 8,
+        max_bytes: MAX_PAGE_BYTES,
+    };
+    let mut bytes = vec![];
+    loop {
+        let page = read_body_page(session, "main", &query).await.unwrap();
+        for chunk in page.chunks {
+            bytes.extend(STANDARD.decode(chunk.data).unwrap());
+        }
+        query.cursor = page.next_cursor;
+        if query.cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        bytes.len() as u64,
+        descriptor["byteLength"].as_u64().unwrap()
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        descriptor["sha256"]
+    );
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_journal_parallel_cold_reopen_signed_partials_and_final_no_replay() {
+    use rpi_harness::session::{
+        jsonl::{JsonlSessionStorage, JsonlV4Header},
+        DefaultIdGenerator, SystemClock,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("journal.jsonl")
+        .to_string_lossy()
+        .replace(char::from(92), "/");
+    let fs: Arc<dyn rpi_tools::FileSystem> =
+        Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().into()));
+    let clock = Arc::new(SystemClock);
+    let ids = Arc::new(DefaultIdGenerator::new());
+    let storage = JsonlSessionStorage::create(
+        fs.clone(),
+        &path,
+        JsonlV4Header::new("journal-cold".into(), 1, "/".into(), None, None, None),
+        clock.clone(),
+        ids.clone(),
+    )
+    .await
+    .unwrap();
+    let session = Session::new(Arc::new(storage), None);
+    let effects = Arc::new(AtomicUsize::new(0));
+    let count = effects.clone();
+    let mut options = AgentHarnessOptions {
+        session: session.clone(),
+        ..Default::default()
+    };
+    options.tools = vec![
+        tool(
+            "program",
+            Arc::new(|_, _, _, _| {
+                Box::pin(async {
+                    let program = current().unwrap();
+                    let mut calls = vec![];
+                    for n in 0..8 {
+                        calls.push(start(&program, "effect", json!({"n":n})).await);
+                    }
+                    for call in calls {
+                        assert_eq!(poll(&program, &call).await["status"], "done");
+                    }
+                    Ok(AgentToolResult::text("root"))
+                })
+            }),
+        ),
+        tool(
+            "effect",
+            Arc::new(move |_, args, _, update| {
+                let count = count.clone();
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    for n in 0..4 {
+                        let mut partial = signed_partial();
+                        partial.details =
+                            json!({"n":args["n"], "update":n, "padding":"中".repeat(12_000)});
+                        update(partial);
+                    }
+                    // Deliberately no await/flush between partials and native finished.
+                    Ok(AgentToolResult::text("pre-hook"))
+                })
+            }),
+        ),
+    ];
+    options.after_tool_call = Some(Arc::new(|ctx, _| {
+        let result = (ctx.tool_call.name == "effect").then(|| AfterToolCallResult {
+            content: Some(signed_partial().content),
+            details: Some(json!({"authoritative":true})),
+            is_error: Some(true),
+            usage: Some(patched_usage()),
+            ..Default::default()
+        });
+        Box::pin(async move { result })
+    }));
+    let (harness, _) = build(options, None).await;
+    assert!(matches!(
+        bounded(harness.prompt_text("run", vec![]))
+            .await
+            .unwrap()
+            .outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+    assert_eq!(effects.load(Ordering::SeqCst), 8);
+    drop(harness);
+    session.storage().drain().await;
+    drop(session);
+    let reopened = Session::new(
+        Arc::new(
+            JsonlSessionStorage::load(fs, &path, clock, ids)
+                .await
+                .unwrap(),
+        ),
+        None,
+    );
+    let (begins, phases) = journal(&reopened).await;
+    assert_eq!(begins.len(), 8);
+    assert_eq!(phases.len(), 8 * 8);
+    for begin in begins {
+        let child = begin["childId"].as_str().unwrap();
+        assert_eq!(begin["toolName"], "effect");
+        assert!(begin["parentChildId"].is_null());
+        assert!(!begin.to_string().contains("tp-"));
+        let child_phases: Vec<_> = phases.iter().filter(|p| p["childId"] == child).collect();
+        assert_eq!(
+            child_phases
+                .iter()
+                .map(|p| p["phase"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "requested",
+                "prepared",
+                "update",
+                "update",
+                "update",
+                "update",
+                "final",
+                "closed"
+            ]
+        );
+        for (index, phase) in child_phases.iter().enumerate() {
+            assert_eq!(phase["index"], index as u64);
+        }
+        let requested = journal_body(&reopened, &child_phases[0]["descriptor"]).await;
+        assert_eq!(
+            journal_body(&reopened, &child_phases[1]["descriptor"]).await,
+            requested
+        );
+        for n in 0..4 {
+            let partial = journal_body(&reopened, &child_phases[n + 2]["descriptor"]).await;
+            assert_eq!(partial["content"][0]["textSignature"], "native-signature");
+            assert_eq!(partial["details"]["update"], n as u64);
+            assert_eq!(partial["details"]["n"], requested["n"]);
+        }
+        let final_result = journal_body(&reopened, &child_phases[6]["descriptor"]).await;
+        assert_eq!(
+            final_result["content"],
+            serde_json::to_value(signed_partial().content).unwrap()
+        );
+        assert_eq!(final_result["details"], json!({"authoritative":true}));
+        assert_eq!(
+            final_result["usage"],
+            serde_json::to_value(patched_usage()).unwrap()
+        );
+        assert_eq!(child_phases[6]["isError"], true);
+        assert_eq!(child_phases[7]["failed"], false);
+        assert_eq!(child_phases[7]["interrupted"], false);
+    }
+    assert_no_child_messages(&reopened, &[]).await;
+    // Loading the owning native log is read-only: no uncertain execution replay.
+    assert_eq!(effects.load(Ordering::SeqCst), 8);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_journal_nested_public_parent_is_real_child_not_private_request() {
+    let mut options = AgentHarnessOptions::default();
+    let session = options.session.clone();
+    options.tools = vec![
+        tool(
+            "program",
+            Arc::new(|_, _, _, _| {
+                Box::pin(async {
+                    let program = current().unwrap();
+                    let id = start(&program, "wrapper", json!({})).await;
+                    assert_eq!(poll(&program, &id).await["status"], "done");
+                    Ok(AgentToolResult::text("root"))
+                })
+            }),
+        ),
+        tool(
+            "wrapper",
+            Arc::new(|_, _, _, _| {
+                Box::pin(async {
+                    let program = current().unwrap();
+                    let id = start(&program, "effect", json!({})).await;
+                    assert_eq!(poll(&program, &id).await["status"], "done");
+                    Ok(AgentToolResult::text("wrapper"))
+                })
+            }),
+        ),
+        tool(
+            "effect",
+            Arc::new(|_, _, _, _| Box::pin(async { Ok(signed_partial()) })),
+        ),
+    ];
+    let (harness, _) = build(options, None).await;
+    bounded(harness.prompt_text("run", vec![])).await.unwrap();
+    let (begins, phases) = journal(&session).await;
+    assert_eq!(begins.len(), 2);
+    assert_eq!(begins[0]["toolName"], "wrapper");
+    assert!(begins[0]["parentChildId"].is_null());
+    assert_eq!(begins[1]["parentChildId"], begins[0]["childId"]);
+    assert_eq!(begins[1]["origin"], begins[0]["origin"]);
+    assert_eq!(begins[1]["rootCallId"], begins[0]["rootCallId"]);
+    assert_eq!(phases.iter().filter(|p| p["phase"] == "final").count(), 2);
+    assert_no_child_messages(&session, &[]).await;
+}
+
+#[tokio::test]
+async fn public_append_cannot_fabricate_native_child_namespace() {
+    use rpi_harness::agent_harness::{BranchWriteGuard, ScopedEntry};
+    let session = AgentHarnessOptions::default().session;
+    session.create_lane("side", None).await.unwrap();
+    let harness = AgentHarness::create(AgentHarnessOptions {
+        session: session.clone(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    for custom_type in [
+        "rpi.tool_program.child_begin.v1",
+        "rpi.tool_program.child_phase.v1",
+    ] {
+        for lane in ["main"] {
+            let revision = session.storage().history_revision().await.unwrap();
+            let guard = BranchWriteGuard {
+                session_id: session.storage().metadata().id,
+                leaf_id: session.view(lane).get_leaf_id().await.unwrap(),
+                custom_type: custom_type.into(),
+                entry_id: None,
+            };
+            let error = harness
+                .append_scoped_entry(
+                    &guard,
+                    ScopedEntry::Custom {
+                        custom_type: custom_type.into(),
+                        data: Some(json!({"version":1,"childId":"forged"})),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("reserved native child journal"));
+            assert_eq!(
+                session.storage().history_revision().await.unwrap(),
+                revision
+            );
+        }
+        assert!(session
+            .append_custom_entry(custom_type, Some(json!({})))
+            .await
+            .is_err());
+        assert!(session
+            .view("side")
+            .append_custom_entry(custom_type, Some(json!({})))
+            .await
+            .is_err());
+        assert!(session
+            .append_entry(
+                ProvisionedEntry {
+                    id: "forged".into(),
+                    kind: ProvisionedKind::Custom {
+                        custom_type: custom_type.into(),
+                        data: Some(json!({}))
+                    }
+                },
+                "main"
+            )
+            .await
+            .is_err());
+    }
+    for lane in ["main"] {
+        let custom_type = "rpi.tool_program.child_begin.v1.other";
+        let guard = BranchWriteGuard {
+            session_id: session.storage().metadata().id,
+            leaf_id: session.view(lane).get_leaf_id().await.unwrap(),
+            custom_type: custom_type.into(),
+            entry_id: None,
+        };
+        harness
+            .append_scoped_entry(
+                &guard,
+                ScopedEntry::Custom {
+                    custom_type: custom_type.into(),
+                    data: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session
+            .find_entries(&EntryQuery::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }

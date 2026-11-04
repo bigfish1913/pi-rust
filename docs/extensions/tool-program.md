@@ -19,7 +19,105 @@ and logs. A numeric handle alone is not a credential or authorization. A registr
 a tool invocation. Synchronous callbacks inherit their actual driver identity;
 foreign workers authenticate the captured invocation, including child subsets.
 
-## Latest native archival-body primitive (not installed child history)
+## Latest installed native child journal (queries and UI still pending)
+
+The harness now installs a native ToolProgram journal by default, using the
+existing primary-session body primitive. This is **real persisted child history**,
+not fabricated assistant/tool messages or data reconstructed from parent details.
+It does **not yet** expose child RPC capabilities/commands/live events, a complete
+child-summary/recovery query, extcore/HTTP/ACP projections, or Web cards/reload/HMR.
+The six Code Mode capabilities, SDK pin, ABI and protected recursion policy stay
+unchanged. Ordinary tool-only runs do not create child observations or workers.
+
+Before a child can execute, native correlation verifies its checkpointed
+Never-replay root against the committed assistant's actual tool-call-only slot,
+ID and name. The journal generates a distinct `tpchild-<UUIDv4>` entry ID; real
+nested parents resolve through active native mappings, not guest JSON. New public
+metadata does not serialize private `tp-*` request IDs. Existing intent/finished
+records retain their prior private-ID fields; arbitrary original arguments and
+results are archived exactly, including sensitive values they may contain.
+
+Primary custom entries are `rpi.tool_program.child_begin.v1` and
+`rpi.tool_program.child_phase.v1`. Requested arguments ACK before publishing the
+observation; prepared arguments ACK after the existing native execution-intent
+checkpoint and before effects. Genuine ordered signed partials, the authoritative
+**post-after-hook final result**, and a closed phase reference canonical durable
+bodies. A prepared record is not proof effects ran; a missing final is not a
+successful result. Partial bodies and uncertain ACKs are never repaired, retried,
+or used to replay execution. No new fsync or power-loss guarantee is made.
+
+Per-child partial admission is **8 queued/in-flight updates and 8 MiB of exact
+encoded values**, with bounded metadata and separate borrowed final capacity
+(up to the body primitive's 32 MiB). A single writer owns each child's channel;
+a shared journal transaction gate orders writers. Quota/storage failures are
+sticky run failures, cancel admission and drain ownership rather than silently
+truncating/dropping a successful stream. Known native usage/termination accounting
+is retained before fallible archival final encoding. Closed mappings retire;
+there is no new run-wide 128-start budget across independent programs. Normal
+close stops admission and joins/drains accepted work even on errors; abrupt Drop
+only aborts and cannot promise an asynchronous join or a closed record.
+
+Native facade mutations share a per-binding reader/writer gate. Ordinary
+checkpoints remain concurrent under shared admission; journal metadata and whole
+body revision/ancestry/CAS/ACK sections take exclusive admission. The gate is
+never held while running tools or awaiting callback/queue drains. Clones/pins
+share it, queued writes pin the old binding before waiting, and task-local
+reentrancy does not propagate to spawned tasks. CAS still fails closed without
+retry for raw-storage/independent-facade/external mutations. This is **not global
+or cross-process serialization**, a storage-latency bound, or an RSS guarantee.
+
+An explicit host observation sink is composed with, not substituted for, the
+native journal; failures propagate and both normal close paths are awaited.
+Generic Session/custom/provisioned appends **and guarded public scoped appends**
+reject the exact begin/phase namespace before conditional writes. Ordinary and
+similarly prefixed custom entries remain supported. Direct trusted storage
+handles are not an extension sandbox; only body chunk/commit types are excluded
+from semantic hooks. Begin/phase metadata remains visible as bounded custom data.
+
+**Custom storage migration:** installed journaling requires real
+`history_revision()` and atomic `append_entry_if_revision()` support. Existing
+trait defaults fail closed; wrappers must forward to the same backing store or
+implement atomic CAS. Do not emulate it with read-then-unconditional-append or
+silently omit journaling. The prior `EntryQuery` field migration and metadata
+ancestry fallback caveats below still apply.
+
+Qualification: **1,189 passed / 0 failed / 6 ignored, twice**, native
+agent/extensions/harness/SDK, 73 result summaries in
+`target/codemode-journal-full-final{,-repeat}.log`. Includes **25 new tests**:
+14 writer tests, 7 facade-coordination tests, 3 additional observation integration
+tests and 1 guarded-namespace test. Existing observation/recovery tests were
+retained and adapted for default installation, not counted again. A separate
+all-features journal focus passed 14 tests. Coverage includes exact signed
+partials/post-hook finals, eight concurrent children on real asynchronous JSONL,
+immediate native finished writes, cold reopen, nested parent IDs, namespace
+reservation on main/side, callback quotas, cancellation/join ownership, facade
+switches, raw-CAS conflict/no replay and independent checkpoint concurrency.
+
+Fresh rebuilt Windows host + unchanged DLL/fixture/gate smoke **59/59**:
+`pi-rust-codemode/target/codemode-native-journal-smoke-2/`. The read-only local
+`target/audit-codemode-journal.py` checked 26 real primary session logs: **70 child
+begins, 266 complete bodies / 101,830,803 decoded bytes**, requested70/prepared68/
+update58/final70/closed70. It verified native assistant slots, parent IDs,
+monotonic phases, per-chunk and aggregate hashes, descriptors and artifact hashes.
+This audit is evidence, **not a new runtime query API**. Current host SHA-256:
+`3a623f1c1fd7557ea07bc1add026310005c4ce38ca0020074ab45a65505695f0`.
+
+Fmt and CLI build pass. Diagnostic Clippy without `-D warnings` passes but strict
+native Clippy remains blocked by 48 existing harness lib-test diagnostics, not
+strict-green. Initial qualification caught the overly exclusive facade gate's
+parallel-checkpoint regression; shared ordinary mutation admission fixed it and
+the original regression test passes unchanged. Earlier reviews also caught
+uncoordinated CAS and scoped-namespace bypasses; both were fixed and covered.
+Earlier failing attempts/smoke artifacts are not final evidence. No installed
+binary replacement, deployment, production restart, merge, live-provider,
+Linux/macOS, full-workspace-all-features, performance/RSS or full-parity claim.
+
+**Next:** capability-gated bounded child summary/body queries, branch/cursor and
+snapshot/live reconciliation with explicit uncertain recovery states; native
+child events; then neutral extcore, thin HTTP/ACP and approved dev frontend work.
+The overall goal remains incomplete.
+
+## Historical native archival-body primitive checkpoint
 
 Native `rpi-harness::tool_program_body` now offers `append_body()` and
 `read_body_page()`. This is a **standalone primary-session storage primitive**:

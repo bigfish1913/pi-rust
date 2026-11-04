@@ -12,6 +12,7 @@
 //! that lane. Lane resolution goes through `get_leaf_id_for_lane`, which throws
 //! `invalid_lane` when the lane does not exist — matching TS.
 
+use std::future::Future;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -31,6 +32,18 @@ use crate::session::types::{
 };
 
 static AGENT_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+
+tokio::task_local! {
+    // Scoped to this future, never inherited by spawned tasks. Retain outer
+    // gates too, so nesting a different binding cannot hide an already-held gate.
+    static HELD_MUTATION_GATES: Vec<(Arc<tokio::sync::RwLock<()>>, MutationPermit)>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MutationPermit {
+    Shared,
+    Exclusive,
+}
 
 fn agent_diagnostics_enabled() -> bool {
     *AGENT_DIAGNOSTICS
@@ -166,6 +179,7 @@ pub struct Session {
 #[derive(Clone)]
 struct SessionBinding {
     storage: Arc<dyn SessionStorage>,
+    mutation_gate: Arc<tokio::sync::RwLock<()>>,
     volatile_progress: Option<crate::frame_progress::SharedVolatileProgress>,
     entry_commit_publisher: Option<broadcast::Sender<SessionEntryCommit>>,
 }
@@ -189,6 +203,7 @@ impl Session {
         Self {
             binding: Arc::new(RwLock::new(SessionBinding {
                 storage,
+                mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
                 volatile_progress: None,
                 entry_commit_publisher: None,
             })),
@@ -235,6 +250,7 @@ impl Session {
         let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
         *self.binding.write().unwrap() = SessionBinding {
             storage,
+            mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             volatile_progress: None,
             entry_commit_publisher: publisher,
         };
@@ -257,6 +273,59 @@ impl Session {
             binding: Arc::new(RwLock::new(binding)),
             id_generator,
         }
+    }
+
+    /// Exclusively coordinate a journal revision/ancestry/conditional-append
+    /// transaction on a single captured binding.
+    ///
+    /// Capture before waiting: a facade switch must not redirect a queued write.
+    /// Nested facade mutations on the same gate are reentrant in this task only.
+    /// Journal callers must enter outside ordinary shared mutations: attempting
+    /// to upgrade a shared permit is an internal error, never an implicit wait.
+    /// This does not coordinate raw storage handles or other processes; callers
+    /// must retain storage CAS checks and must not await tools or queue drains here.
+    pub(crate) async fn with_mutation<F, Fut, T>(&self, operation: F) -> T
+    where
+        F: FnOnce(Session) -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let session = self.pin(Arc::clone(&self.id_generator));
+        let gate = Arc::clone(&session.binding.read().unwrap().mutation_gate);
+        let mut held = HELD_MUTATION_GATES
+            .try_with(Clone::clone)
+            .unwrap_or_default();
+        if let Some((_, permit)) = held.iter().find(|(held, _)| Arc::ptr_eq(held, &gate)) {
+            assert!(
+                *permit == MutationPermit::Exclusive,
+                "cannot upgrade a shared session mutation permit to exclusive"
+            );
+            return operation(session).await;
+        }
+        let _guard = gate.write().await;
+        held.push((Arc::clone(&gate), MutationPermit::Exclusive));
+        HELD_MUTATION_GATES.scope(held, operation(session)).await
+    }
+
+    /// Ordinary mutations share a permit, preserving independent checkpoint ACK
+    /// concurrency while excluding journal transactions. Pin before waiting so
+    /// facade switches cannot redirect queued writes. Reuse either same-task
+    /// permit on this gate: reacquiring a read can deadlock behind a queued writer.
+    async fn with_shared_mutation<F, Fut, T>(&self, operation: F) -> T
+    where
+        F: FnOnce(Session) -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let session = self.pin(Arc::clone(&self.id_generator));
+        let gate = Arc::clone(&session.binding.read().unwrap().mutation_gate);
+        let mut held = HELD_MUTATION_GATES
+            .try_with(Clone::clone)
+            .unwrap_or_default();
+        if held.iter().any(|(held, _)| Arc::ptr_eq(held, &gate)) {
+            return operation(session).await;
+        }
+        let _guard = gate.read().await;
+        held.push((Arc::clone(&gate), MutationPermit::Shared));
+        HELD_MUTATION_GATES.scope(held, operation(session)).await
     }
 
     /// Publish the prepared target without changing the shared facade handles.
@@ -358,7 +427,10 @@ impl Session {
 
     /// `setName(name)`. Mirrors TS `Session.setName`.
     pub async fn set_name(&self, name: Option<&str>) -> SessionResult<()> {
-        self.storage_arc().set_name(name).await
+        self.with_shared_mutation(
+            |session| async move { session.storage_arc().set_name(name).await },
+        )
+        .await
     }
 
     /// `getLabel(targetId)`. Mirrors TS `Session.getLabel`.
@@ -368,7 +440,10 @@ impl Session {
 
     /// `setLabel(targetId, label)`. Mirrors TS `Session.setLabel`.
     pub async fn set_label(&self, target_id: &str, label: Option<&str>) -> SessionResult<()> {
-        self.storage_arc().set_label(target_id, label).await
+        self.with_shared_mutation(|session| async move {
+            session.storage_arc().set_label(target_id, label).await
+        })
+        .await
     }
 
     // -- Entry queries (session-wide, sequence order) ------------------------
@@ -503,12 +578,18 @@ impl Session {
 
     /// `createLane(lane, at)`. Mirrors TS `Session.createLane`.
     pub async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
-        self.storage_arc().create_lane(lane, at).await
+        self.with_shared_mutation(|session| async move {
+            session.storage_arc().create_lane(lane, at).await
+        })
+        .await
     }
 
     /// `moveLane(lane, to)`. Mirrors TS `Session.moveLane`.
     pub async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()> {
-        self.storage_arc().move_lane(lane, to).await
+        self.with_shared_mutation(|session| async move {
+            session.storage_arc().move_lane(lane, to).await
+        })
+        .await
     }
 
     // -- Raw append (provisioned entry / record) -----------------------------
@@ -536,6 +617,16 @@ impl Session {
         &self,
         records: Vec<super::types::AssistantFrameRecord>,
     ) -> SessionResult<Vec<super::types::AssistantFrameRecord>> {
+        self.with_shared_mutation(|session| async move {
+            session.append_progress_unlocked(records).await
+        })
+        .await
+    }
+
+    async fn append_progress_unlocked(
+        &self,
+        records: Vec<super::types::AssistantFrameRecord>,
+    ) -> SessionResult<Vec<super::types::AssistantFrameRecord>> {
         for record in &records {
             assert_json_serializable(
                 &serde_json::to_value(record)
@@ -554,11 +645,28 @@ impl Session {
 
     /// Retry physical retirement using durable terminal records only.
     pub async fn prune_completed_progress(&self) -> SessionResult<usize> {
-        self.storage_arc().prune_completed_progress().await
+        self.with_shared_mutation(|session| async move {
+            session.storage_arc().prune_completed_progress().await
+        })
+        .await
     }
 
     /// Append a durable record followed immediately by an entry.
     pub(crate) async fn append_record_and_entry(
+        &self,
+        record: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+    ) -> SessionResult<(LaneRecord, Entry)> {
+        self.with_shared_mutation(|session| async move {
+            session
+                .append_record_and_entry_unlocked(record, entry, lane)
+                .await
+        })
+        .await
+    }
+
+    async fn append_record_and_entry_unlocked(
         &self,
         record: LaneRecord,
         entry: ProvisionedEntry,
@@ -589,6 +697,21 @@ impl Session {
 
     /// Append a record, an entry, and a following record in that exact order.
     pub(crate) async fn append_record_entry_and_record(
+        &self,
+        before: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+        after: LaneRecord,
+    ) -> SessionResult<(LaneRecord, Entry, LaneRecord)> {
+        self.with_shared_mutation(|session| async move {
+            session
+                .append_record_entry_and_record_unlocked(before, entry, lane, after)
+                .await
+        })
+        .await
+    }
+
+    async fn append_record_entry_and_record_unlocked(
         &self,
         before: LaneRecord,
         entry: ProvisionedEntry,
@@ -628,6 +751,16 @@ impl Session {
 
     /// Validate payloads before accepting a whole queue cancellation batch.
     pub async fn append_queue_cancellations(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        self.with_shared_mutation(|session| async move {
+            session.append_queue_cancellations_unlocked(records).await
+        })
+        .await
+    }
+
+    async fn append_queue_cancellations_unlocked(
         &self,
         records: Vec<LaneRecord>,
     ) -> SessionResult<Vec<LaneRecord>> {
@@ -846,10 +979,33 @@ impl Session {
     /// `commitEntry(entry, lane)` — `assertJsonSerializable` then
     /// `storage.appendEntry`. Mirrors TS private `Session.commitEntry`.
     async fn commit_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
+        // Generic extension/runtime append APIs cannot mint journal authority.
+        // The native writer uses the crate-private conditional append path.
+        if matches!(&entry.kind, ProvisionedKind::Custom { custom_type, .. }
+            if crate::tool_program_journal::is_reserved_custom_type(custom_type))
+        {
+            return Err(SessionError::invalid_payload(
+                "reserved native child journal type",
+            ));
+        }
         self.commit_entry_checked(entry, lane, None).await
     }
 
     async fn commit_entry_checked(
+        &self,
+        entry: ProvisionedEntry,
+        lane: &str,
+        expected: Option<u64>,
+    ) -> SessionResult<Entry> {
+        self.with_shared_mutation(|session| async move {
+            session
+                .commit_entry_checked_unlocked(entry, lane, expected)
+                .await
+        })
+        .await
+    }
+
+    async fn commit_entry_checked_unlocked(
         &self,
         entry: ProvisionedEntry,
         lane: &str,
@@ -944,6 +1100,19 @@ impl Session {
     }
 
     async fn commit_record_checked(
+        &self,
+        record: LaneRecord,
+        expected: Option<u64>,
+    ) -> SessionResult<LaneRecord> {
+        self.with_shared_mutation(|session| async move {
+            session
+                .commit_record_checked_unlocked(record, expected)
+                .await
+        })
+        .await
+    }
+
+    async fn commit_record_checked_unlocked(
         &self,
         record: LaneRecord,
         expected: Option<u64>,
@@ -1242,6 +1411,348 @@ mod tests {
         AgentMessage::User(UserMessage::new(text, 1))
     }
 
+    fn mutation_entry(id: &str) -> ProvisionedEntry {
+        ProvisionedEntry {
+            id: id.into(),
+            kind: ProvisionedKind::Message {
+                message: user(id),
+                terminate: None,
+            },
+        }
+    }
+
+    async fn competing_native_mutation(session: Session, kind: usize) -> SessionResult<()> {
+        match kind {
+            0 => {
+                session.append_message(user("native finished")).await?;
+            }
+            1 => {
+                session
+                    .append_record(notification_record("native intent"))
+                    .await?;
+            }
+            2 => {
+                use crate::session::types::{AssistantFrameOp, AssistantFrameRecord, RecordBase};
+                session
+                    .append_progress(vec![AssistantFrameRecord {
+                        base: RecordBase {
+                            id: "frame".into(),
+                            seq: 0,
+                            lane: "main".into(),
+                            timestamp: 0,
+                        },
+                        run_id: "run".into(),
+                        stream_index: 0,
+                        op: AssistantFrameOp::Append,
+                        frame: Some(serde_json::json!({"type": "text_delta", "delta": "progress"})),
+                    }])
+                    .await?;
+            }
+            3 => {
+                session.prune_completed_progress().await?;
+            }
+            4 => {
+                session
+                    .append_record_and_entry(
+                        notification_record("intent"),
+                        mutation_entry("checkpoint"),
+                        "main",
+                    )
+                    .await?;
+            }
+            5 => {
+                session
+                    .append_record_entry_and_record(
+                        notification_record("notification-op"),
+                        mutation_entry("checkpoint"),
+                        "main",
+                        notification_finish(),
+                    )
+                    .await?;
+            }
+            6 => {
+                session.append_queue_cancellations(vec![]).await?;
+            }
+            7 => {
+                session.create_lane("side", None).await?;
+            }
+            8 => {
+                session.move_lane("main", None).await?;
+            }
+            9 => {
+                session.set_name(Some("native name")).await?;
+            }
+            10 => {
+                session.set_label("root", Some("native label")).await?;
+            }
+            11 => {
+                session
+                    .with_mutation(|pinned| async move {
+                        let revision = pinned.storage().history_revision().await?;
+                        pinned
+                            .append_record_if_revision(notification_record("conditional"), revision)
+                            .await
+                    })
+                    .await?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_mutators_wait_for_journal_revision_validate_append_ack() {
+        for kind in 0..12 {
+            let session = fixture_session();
+            session
+                .append_entry(mutation_entry("root"), "main")
+                .await
+                .unwrap();
+            // Pin and clone must retain the gate, not allocate another one.
+            let peer = session.pin(session.id_generator().clone()).clone();
+            let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (peer,) = session
+                    .with_mutation(|pinned| async move {
+                        let revision = pinned.storage().history_revision().await.unwrap();
+                        let peer = tokio::spawn(async move {
+                            // A spawned task must NOT inherit the transaction's
+                            // reentrancy token. Poll once to prove it actually waits.
+                            let mutation = competing_native_mutation(peer, kind);
+                            tokio::pin!(mutation);
+                            assert!(
+                                futures::poll!(&mut mutation).is_pending(),
+                                "native mutator {kind} bypassed the gate"
+                            );
+                            blocked_tx.send(()).unwrap();
+                            mutation.await.unwrap();
+                        });
+                        blocked_rx.await.unwrap();
+                        pinned
+                            .branch_ancestry(&BranchBounds::default())
+                            .await
+                            .unwrap();
+                        assert_eq!(pinned.storage().history_revision().await.unwrap(), revision);
+                        pinned
+                            .append_entry_if_revision(mutation_entry("journal"), "main", revision)
+                            .await
+                            .unwrap();
+                        // ACK occurs while the native peer is still excluded.
+                        assert_eq!(
+                            pinned.storage().history_revision().await.unwrap(),
+                            revision + 1
+                        );
+                        (peer,)
+                    })
+                    .await;
+                peer.await.unwrap();
+                assert!(session.get_entry("journal").await.unwrap().is_some());
+            })
+            .await
+            .expect("native transaction and peer must both complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_checkpoint_ack_does_not_block_independent_native_append() {
+        let ack = Arc::new(tokio::sync::Notify::new());
+        let inner = fixture_session();
+        let session = Session::new(
+            Arc::new(RebindingStorage {
+                inner: inner.storage(),
+                callback: Arc::new(Mutex::new(None)),
+                checkpoint_ack: Some(ack.clone()),
+            }),
+            None,
+        );
+        let checkpoint = session.append_record_and_entry(
+            notification_record("intent"),
+            mutation_entry("checkpoint"),
+            "main",
+        );
+        tokio::pin!(checkpoint);
+        assert!(futures::poll!(&mut checkpoint).is_pending());
+        // The checkpoint is durably written but its storage ACK is withheld.
+        assert!(inner.get_entry("checkpoint").await.unwrap().is_some());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.append_entry(mutation_entry("independent"), "main"),
+        )
+        .await
+        .expect("ordinary readers must remain concurrent during a checkpoint ACK")
+        .unwrap();
+        assert!(futures::poll!(&mut checkpoint).is_pending());
+        ack.notify_one();
+        checkpoint.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nested_shared_mutation_bypasses_queued_exclusive_writer() {
+        let session = fixture_session();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (writer,) = session
+                .with_shared_mutation(|pinned| async move {
+                    let peer = pinned.clone();
+                    let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+                    let writer = tokio::spawn(async move {
+                        let exclusive = peer.with_mutation(|_| async {});
+                        tokio::pin!(exclusive);
+                        assert!(futures::poll!(&mut exclusive).is_pending());
+                        queued_tx.send(()).unwrap();
+                        exclusive.await;
+                    });
+                    queued_rx.await.unwrap();
+                    pinned
+                        .append_entry(mutation_entry("nested-reader"), "main")
+                        .await
+                        .unwrap();
+                    (writer,)
+                })
+                .await;
+            writer.await.unwrap();
+        })
+        .await
+        .expect("nested shared acquisition must not wait behind a writer");
+        assert!(HELD_MUTATION_GATES.try_with(|_| ()).is_err());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "cannot upgrade a shared session mutation permit to exclusive")]
+    async fn shared_mutation_cannot_upgrade_to_exclusive() {
+        fixture_session()
+            .with_shared_mutation(|pinned| async move {
+                pinned.with_mutation(|_| async {}).await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn same_gate_nested_facade_appends_are_reentrant() {
+        let session = fixture_session().with_volatile_progress();
+        let gate = session.binding.read().unwrap().mutation_gate.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.with_mutation(|pinned| async move {
+                assert!(Arc::ptr_eq(
+                    &gate,
+                    &pinned.binding.read().unwrap().mutation_gate
+                ));
+                let nested = pinned.pin(pinned.id_generator().clone());
+                nested
+                    .append_entry(mutation_entry("nested"), "main")
+                    .await
+                    .unwrap();
+                nested
+                    .with_mutation(|again| async move {
+                        again
+                            .append_record(notification_record("nested-intent"))
+                            .await
+                            .unwrap();
+                        again.set_name(Some("nested name")).await.unwrap();
+                    })
+                    .await;
+            }),
+        )
+        .await
+        .expect("same-gate native appends must not deadlock");
+        assert!(session.get_entry("nested").await.unwrap().is_some());
+        assert_eq!(
+            session.get_name().await.unwrap().as_deref(),
+            Some("nested name")
+        );
+        // The scope must be gone after completion, not a persistent bypass.
+        assert!(HELD_MUTATION_GATES.try_with(|_| ()).is_err());
+    }
+
+    #[tokio::test]
+    async fn waiting_mutation_keeps_original_binding_across_facade_switch() {
+        for use_rebind in [false, true] {
+            let facade = fixture_session();
+            let old = facade.pin(facade.id_generator().clone());
+            let target = fixture_session();
+            let old_gate = old.binding.read().unwrap().mutation_gate.clone();
+            let held = old_gate.write().await;
+            let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+            let peer_facade = facade.clone();
+            let peer = tokio::spawn(async move {
+                let mutation = peer_facade.append_entry(mutation_entry("queued-old"), "main");
+                tokio::pin!(mutation);
+                assert!(futures::poll!(&mut mutation).is_pending());
+                blocked_tx.send(()).unwrap();
+                mutation.await.unwrap();
+            });
+            blocked_rx.await.unwrap();
+            if use_rebind {
+                facade.rebind_to(&target);
+                assert!(Arc::ptr_eq(
+                    &facade.binding.read().unwrap().mutation_gate,
+                    &target.binding.read().unwrap().mutation_gate
+                ));
+            } else {
+                facade.set_storage(target.storage());
+            }
+            assert!(!Arc::ptr_eq(
+                &old_gate,
+                &facade.binding.read().unwrap().mutation_gate
+            ));
+            // The target binding is independent of the blocked old mutation.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                facade.append_entry(mutation_entry("new"), "main"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(old.get_entry("queued-old").await.unwrap().is_none());
+            drop(held);
+            tokio::time::timeout(std::time::Duration::from_secs(5), peer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(old.get_entry("queued-old").await.unwrap().is_some());
+            assert!(target.get_entry("queued-old").await.unwrap().is_none());
+            assert!(target.get_entry("new").await.unwrap().is_some());
+            assert!(old.get_entry("new").await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_storage_intervening_write_still_rejects_cas_without_retry() {
+        let session = fixture_session();
+        session
+            .with_mutation(|pinned| async move {
+                let storage = pinned.storage();
+                let revision = storage.history_revision().await.unwrap();
+                storage
+                    .append_entry(mutation_entry("external"), "main")
+                    .await
+                    .unwrap();
+                let entry_error = pinned
+                    .append_entry_if_revision(mutation_entry("must-not-retry"), "main", revision)
+                    .await
+                    .unwrap_err();
+                let record_error = pinned
+                    .append_record_if_revision(
+                        notification_record("must-not-retry-record"),
+                        revision,
+                    )
+                    .await
+                    .unwrap_err();
+                for error in [entry_error, record_error] {
+                    assert_eq!(error.code, SessionErrorCode::Storage);
+                    assert!(error.message.contains("branch write conflict"));
+                }
+                assert_eq!(storage.history_revision().await.unwrap(), revision + 1);
+                assert!(pinned.get_entry("must-not-retry").await.unwrap().is_none());
+                assert!(pinned
+                    .find_records(&RecordQuery::default())
+                    .await
+                    .unwrap()
+                    .is_empty());
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn atomic_prompt_commit_also_publishes_invalidation() {
         use crate::session::types::{OperationIntent, OperationStartedRecord, RecordBase};
@@ -1535,6 +2046,7 @@ mod tests {
         inner: Arc<dyn SessionStorage>,
         callback: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
         fail_branch: bool,
+        checkpoint_ack: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[async_trait::async_trait]
@@ -1575,6 +2087,21 @@ mod tests {
         }
         async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
             self.inner.append_record(record).await
+        }
+        async fn append_record_and_entry(
+            &self,
+            record: LaneRecord,
+            entry: ProvisionedEntry,
+            lane: &str,
+        ) -> SessionResult<(LaneRecord, Entry)> {
+            let result = self
+                .inner
+                .append_record_and_entry(record, entry, lane)
+                .await;
+            if let Some(ack) = &self.checkpoint_ack {
+                ack.notified().await;
+            }
+            result
         }
         async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
             self.inner.get_entry(id).await
@@ -1774,6 +2301,7 @@ mod tests {
             inner: old_storage,
             callback: callback.clone(),
             fail_branch: false,
+            checkpoint_ack: None,
         });
         let facade = Session::new(wrapper, None);
         let replacement = new.storage();
@@ -1821,6 +2349,7 @@ mod tests {
             Arc::new(RebindingStorage {
                 inner: old.storage(),
                 callback: callback.clone(),
+                checkpoint_ack: None,
             }),
             None,
         );

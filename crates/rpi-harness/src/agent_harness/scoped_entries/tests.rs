@@ -727,3 +727,57 @@ mod scoped_drop_probe {
         );
     }
 }
+
+#[tokio::test]
+async fn guarded_custom_appends_cannot_mint_native_journal_on_main_or_side() {
+    for lane in ["main", "side"] {
+        let mut h = harness().await;
+        if lane != "main" {
+            h.session.create_lane(lane, None).await.unwrap();
+            h.lane = lane.into();
+        }
+        for typ in [
+            "rpi.tool_program.child_begin.v1",
+            "rpi.tool_program.child_phase.v1",
+        ] {
+            let before = h.session.storage().history_revision().await.unwrap();
+            let guard = BranchWriteGuard {
+                session_id: h.session.storage().metadata().id,
+                leaf_id: h.view().get_leaf_id().await.unwrap(),
+                custom_type: typ.into(),
+                entry_id: None,
+            };
+            let error = h
+                .append_scoped_entry(
+                    &guard,
+                    ScopedEntry::Custom {
+                        custom_type: typ.into(),
+                        data: Some(serde_json::json!({"childId":"forged"})),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("reserved native child journal"));
+            assert_eq!(
+                h.session.storage().history_revision().await.unwrap(),
+                before
+            );
+        }
+        let typ = "rpi.tool_program.child_begin.v1.other";
+        let guard = BranchWriteGuard {
+            session_id: h.session.storage().metadata().id,
+            leaf_id: h.view().get_leaf_id().await.unwrap(),
+            custom_type: typ.into(),
+            entry_id: None,
+        };
+        h.append_scoped_entry(
+            &guard,
+            ScopedEntry::Custom {
+                custom_type: typ.into(),
+                data: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+}

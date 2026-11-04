@@ -110,6 +110,14 @@ impl AgentHarness {
         guard: &BranchWriteGuard,
         entry: ScopedEntry,
     ) -> HarnessResult<String> {
+        // A valid extension branch guard is not native journal authority. This
+        // public route uses conditional append, so enforce the same reservation
+        // as ordinary Session appends before any branch payload lookup.
+        if matches!(&entry, ScopedEntry::Custom { custom_type, .. }
+            if crate::tool_program_journal::is_reserved_custom_type(custom_type))
+        {
+            return Err(HarnessError::io("reserved native child journal type"));
+        }
         let gate = self.message_writes.lock().await;
         // Pin the revision before every preflight read, including outbox
         // deduplication. The backend compares it inside its write boundary.

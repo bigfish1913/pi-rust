@@ -291,13 +291,29 @@ pub async fn append_body<T: Serialize + Sync>(
     value: &T,
     max_bytes: usize,
 ) -> SessionResult<BodyDescriptor> {
-    let session = session.pin(session.id_generator().clone());
+    // Coordinate native facade writes for the complete preflight/chunk/commit
+    // transaction. CAS still detects uncoordinated storage/process mutations;
+    // no uncertain append is retried. Never await tool execution under this gate.
+    session
+        .with_mutation(|session| async move {
+            append_body_locked(&session, lane, child_id, kind, value, max_bytes).await
+        })
+        .await
+}
+async fn append_body_locked<T: Serialize + Sync>(
+    session: &Session,
+    lane: &str,
+    child_id: &str,
+    kind: BodyKind,
+    value: &T,
+    max_bytes: usize,
+) -> SessionResult<BodyDescriptor> {
     if !(1..=MAX_BODY_BYTES).contains(&max_bytes) {
         return Err(invalid("body quota must be 1..=32 MiB"));
     }
     id(child_id)?;
-    let anchor = leaf(&session, lane).await?;
-    child(&member(&session, &anchor, child_id).await?)?;
+    let anchor = leaf(session, lane).await?;
+    child(&member(session, &anchor, child_id).await?)?;
     let mut sink = ChunkSink {
         chunks: vec![],
         bytes: 0,
@@ -339,10 +355,10 @@ pub async fn append_body<T: Serialize + Sync>(
             CHUNK_CUSTOM_TYPE,
             &chunk(&descriptor, index, &bytes),
         )?;
-        append_checked(&session, lane, &previous, entry).await?;
+        append_checked(session, lane, &previous, entry).await?;
         previous = chunk_id(&descriptor.body_id, index);
     }
-    append_checked(&session, lane, &previous, commit).await?;
+    append_checked(session, lane, &previous, commit).await?;
     Ok(descriptor)
 }
 async fn append_checked(

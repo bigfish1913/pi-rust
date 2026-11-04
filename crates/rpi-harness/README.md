@@ -155,12 +155,13 @@ including one test per crash point.
 MIT. See [LICENSE](https://github.com/bigfish1913/pi-rust/blob/main/LICENSE)
 and [NOTICE](https://github.com/bigfish1913/pi-rust/blob/main/NOTICE).
 
-## Native archival-body API (not installed observation)
+## Native child journal and archival-body API
 
 `tool_program_body::{append_body, read_body_page}` stores bounded canonical JSON
-chunks and a descriptor-last commit in native primary custom entries; it does not
-install a child observer or advertise RPC support. See the
-[host contract](../../docs/extensions/tool-program.md#latest-native-archival-body-primitive-not-installed-child-history)
+chunks and a descriptor-last commit in native primary custom entries. The harness
+now installs a native child journal using it, composed with an optional host sink;
+child RPC capabilities/events and adapter/UI projection are still pending. See the
+[host contract](../../docs/extensions/tool-program.md#latest-installed-native-child-journal-queries-and-ui-still-pending)
 for limits, ownership, consumer integrity checks and qualification boundaries.
 
 `EntryQuery` adds `exclude_tool_program_bodies: bool` (default false). Downstream
@@ -172,4 +173,11 @@ remain visible. Explicit generic history/export reads still include archives.
 `EntryAncestry` identities; existing implementers compile, but their fallback can
 hydrate full entries until a metadata-only override is provided. Native metadata
 walks are O(history), ordinary SQLite/memory remain eager, and no RSS guarantee is
-made. Production child history, native commands/events and Web/ACP remain pending.
+made. Default journaling additionally requires real `history_revision()` and
+atomic conditional-entry appends from custom storage implementations/wrappers.
+Ordinary native facade mutations share per-binding admission; journal CAS/body
+transactions take exclusive admission without retry. Exact native child begin/phase
+custom types are reserved on generic and guarded public append APIs. Closed
+private mappings retire, and normal close joins the writer; abrupt Drop is abort-
+only. Bounded child queries/recovery projection, native events and Web/ACP remain
+pending.

@@ -239,6 +239,27 @@ impl SessionStorage for FaultStorage {
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
         self.inner.get_lanes().await
     }
+    async fn history_revision(&self) -> SessionResult<u64> {
+        self.inner.history_revision().await
+    }
+    async fn append_entry_if_revision(
+        &self,
+        entry: ProvisionedEntry,
+        lane: &str,
+        expected: u64,
+    ) -> SessionResult<Entry> {
+        if matches!(&entry.kind, ProvisionedKind::Custom { custom_type, .. }
+            if custom_type == self.marker)
+        {
+            return Err(SessionError::storage(format!(
+                "controlled {} failure",
+                self.marker
+            )));
+        }
+        self.inner
+            .append_entry_if_revision(entry, lane, expected)
+            .await
+    }
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
         self.inner.create_lane(lane, at).await
     }
