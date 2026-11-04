@@ -1596,6 +1596,7 @@ mod tests {
             Arc::new(RebindingStorage {
                 inner: inner.storage(),
                 callback: Arc::new(Mutex::new(None)),
+                fail_branch: false,
                 checkpoint_ack: Some(ack.clone()),
             }),
             None,
@@ -2297,6 +2298,7 @@ mod tests {
                 inner: original.storage(),
                 callback: Arc::new(Mutex::new(None)),
                 fail_branch: true,
+                checkpoint_ack: None,
             }),
             None,
         );
@@ -2384,6 +2386,7 @@ mod tests {
             Arc::new(RebindingStorage {
                 inner: old.storage(),
                 callback: callback.clone(),
+                fail_branch: false,
                 checkpoint_ack: None,
             }),
             None,
