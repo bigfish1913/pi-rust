@@ -11,6 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/bigfish1913/pi-rust/compare/v0.17.2...v0.18.0) - 2026-11-04
+
+### Fixed
+
+- *(cli)* make context dismissible and align skill commands with pi ([#251](https://github.com/bigfish1913/pi-rust/pull/251))
+
 ## [0.17.2](https://github.com/bigfish1913/pi-rust/compare/v0.17.1...v0.17.2) - 2026-11-04
 
 ### Fixed
