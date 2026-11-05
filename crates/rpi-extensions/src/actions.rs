@@ -651,6 +651,19 @@ pub trait RuntimeActionHost: Send + Sync {
     /// B5d — until then this returns an "unsupported" error string).
     async fn reload(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
 
+    /// `ReloadModels` — re-read the model/provider catalog from disk **without**
+    /// reloading extensions.
+    ///
+    /// The cheap counterpart of [`Self::reload`]: it swaps the model catalog
+    /// and the provider runtime bindings, but leaves the extension registry,
+    /// the emitter and the event snapshot untouched — so an in-flight run keeps
+    /// receiving plugin events.
+    ///
+    /// Defaults to "not supported" so hosts that never wired it keep working.
+    async fn reload_models(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("reload_models is not supported by this host".to_string())
+    }
+
     /// `GetCliFlag` — read a parsed extension CLI flag. Args are
     /// `{"name":"flag"}` and the result is `{"value": <bool|string|null>}`.
     async fn get_cli_flag(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -1195,6 +1208,74 @@ impl ReloadMailbox {
     }
 }
 
+/// A request/reply mailbox for `runtime_action(ReloadModels)`.
+///
+/// Unlike [`ReloadMailbox`] (fire-and-forget: the plugin does not care whether
+/// the reload succeeded), this one **waits for the result**: the caller wants
+/// to know how many models the refreshed catalog holds, and whether the
+/// re-read failed at all.
+///
+/// The TUI owns the receiver and performs the actual work (it owns the
+/// harness); the plugin-facing side only enqueues a request and awaits the
+/// reply.
+pub struct ReloadModelsMailbox {
+    tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReloadModelsRequest>>>>,
+}
+
+impl Default for ReloadModelsMailbox {
+    fn default() -> Self {
+        Self {
+            tx: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+/// One pending `ReloadModels` request plus the channel to answer on.
+pub struct ReloadModelsRequest {
+    /// Answer channel: `Ok(model_count)` or `Err(reason)`.
+    pub reply: tokio::sync::oneshot::Sender<Result<usize, String>>,
+}
+
+impl Clone for ReloadModelsMailbox {
+    fn clone(&self) -> Self {
+        Self {
+            tx: Arc::clone(&self.tx),
+        }
+    }
+}
+
+impl ReloadModelsMailbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install the TUI's request sender. Replaces any prior sender.
+    pub fn install(&self, tx: tokio::sync::mpsc::UnboundedSender<ReloadModelsRequest>) {
+        *self.tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Enqueue a request and await the TUI's answer.
+    ///
+    /// `Err` when no TUI is installed (the host surfaces "not available") or
+    /// when the TUI went away before answering.
+    pub async fn request(&self) -> Result<usize, String> {
+        let (reply, wait) = tokio::sync::oneshot::channel();
+        let tx = self.tx.lock().unwrap().clone();
+        let Some(tx) = tx else {
+            return Err("reload_models is not available (no TUI attached)".to_string());
+        };
+        tx.send(ReloadModelsRequest { reply })
+            .map_err(|_| "reload_models request dropped (TUI gone)".to_string())?;
+        wait.await
+            .map_err(|_| "reload_models request dropped (TUI gone)".to_string())?
+    }
+
+    /// Drop the installed sender (TUI shutdown). Idempotent.
+    pub fn clear(&self) {
+        *self.tx.lock().unwrap() = None;
+    }
+}
+
 /// Build the reload callback the bridge carries, backed by a [`ReloadMailbox`].
 /// When a plugin calls `runtime_action(Reload)`, the bridge's spawn site awaits
 /// this callback, which signals the TUI (if installed) and returns; the plugin
@@ -1290,6 +1371,7 @@ async fn dispatch(
         RuntimeActionId::NavigateTree => host.navigate_tree(args).await,
         RuntimeActionId::SwitchSession => host.switch_session(args).await,
         RuntimeActionId::Reload => host.reload(args).await,
+        RuntimeActionId::ReloadModels => host.reload_models(args).await,
         RuntimeActionId::GetCliFlag => host.get_cli_flag(args).await,
         RuntimeActionId::UiDialog => ui_dialog.handle(args),
         // UI-only action: handled by the bridge (no harness call), exactly like

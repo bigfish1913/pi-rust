@@ -404,6 +404,8 @@ pub struct PreparedExtensions {
     action_host: Arc<crate::extensions_actions::HarnessActionHost>,
     harness_cell: Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>,
     reload_mailbox: rpi_extensions::ReloadMailbox,
+    /// Request channel for `runtime_action(ReloadModels)` (action id 31).
+    reload_models_mailbox: rpi_extensions::ReloadModelsMailbox,
     ui_dialog_mailbox: rpi_extensions::UiDialogMailbox,
     ext_status_mailbox: rpi_extensions::ExtensionStatusMailbox,
     editor_text_mailbox: rpi_extensions::EditorTextMailbox,
@@ -574,6 +576,10 @@ pub fn prepare_extensions(
         BuildError::HarnessCreate(format!("no tokio runtime for action bridge: {e}"))
     })?;
     let catalog = Vec::new();
+    // Request channel for `runtime_action(ReloadModels)` (action id 31).
+    // Created before the host so the host can carry it; the TUI installs its
+    // sender once it starts.
+    let reload_models_mailbox = rpi_extensions::ReloadModelsMailbox::new();
     let (action_host, harness_cell) = crate::extensions_actions::HarnessActionHost::new_empty(
         catalog.clone(),
         cwd.to_path_buf(),
@@ -584,7 +590,8 @@ pub fn prepare_extensions(
     let action_host = Arc::new(
         action_host
             .with_session_dir(session_dir.clone())
-            .with_fresh_session_only(native_store.is_some()),
+            .with_fresh_session_only(native_store.is_some())
+            .with_reload_models_mailbox(reload_models_mailbox.clone()),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = action_host.clone();
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
@@ -672,6 +679,7 @@ pub fn prepare_extensions(
         action_host,
         harness_cell,
         reload_mailbox,
+        reload_models_mailbox,
         ui_dialog_mailbox,
         ext_status_mailbox,
         editor_text_mailbox,
@@ -758,6 +766,7 @@ pub async fn build_prepared(
         action_host,
         harness_cell,
         reload_mailbox,
+        reload_models_mailbox,
         ui_dialog_mailbox,
         ext_status_mailbox,
         editor_text_mailbox,
@@ -1441,6 +1450,9 @@ pub async fn build_prepared(
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
+        // Request channel for `runtime_action(ReloadModels)` — the TUI installs
+        // its sender and answers on the request's reply channel.
+        reload_models_mailbox,
         ui_dialog: ui_dialog_mailbox,
         ext_status: ext_status_mailbox,
         editor_text: editor_text_mailbox,
@@ -1584,6 +1596,11 @@ pub struct ReloadContext {
     pub tool_context: rpi_extensions::ToolCallContext,
     /// The live action-bridge cell (swapped + old invalidated on reload).
     pub action_bridge: ActionBridgeCell,
+    /// Request channel for `runtime_action(ReloadModels)` (action id 31).
+    ///
+    /// The TUI installs its sender here and performs the (cheap) catalog
+    /// refresh on its main loop, then answers on the request's reply channel.
+    pub reload_models_mailbox: rpi_extensions::ReloadModelsMailbox,
     /// The extension status registry the TUI renders in its footer (`SetStatus`).
     /// Lives in the context (not the cell) so it survives a bridge swap.
     pub ext_status: rpi_extensions::ExtensionStatusMailbox,
@@ -1783,6 +1800,131 @@ pub async fn reload_extension_resources(
     ctx: &ReloadContext,
 ) -> ReloadOutcome {
     reload_extension_resources_inner(harness, ctx, || {}).await
+}
+
+/// Re-read the model/provider catalog from disk and swap it into the live
+/// harness — **without** reloading extensions.
+///
+/// This is the cheap counterpart of [`reload_extension_resources`]. That
+/// routine rebuilds the whole `ExtensionSession`, which invalidates the old
+/// `RegistrySnapshot`; the **in-flight run** captured its emitter at run start
+/// (`agent_harness.rs`, `snap.agent_emitter.clone()`), so from that moment
+/// every plugin event is dropped by the staleness guard in
+/// `dispatch_to_handlers`. The TUI keeps rendering (it uses the broadcast
+/// emitter), so the session *looks* alive while its plugin event stream is
+/// dead until the next run.
+///
+/// This routine therefore touches only:
+///
+/// 1. the model catalog (`ctx.catalog` + the action host's copy), and
+/// 2. the provider runtime bindings (`harness.set_models`).
+///
+/// The extension registry, the emitter and the event snapshot are **not**
+/// touched, so a running turn keeps receiving plugin events.
+///
+/// `models.json` is re-read from disk by the resolver
+/// (`resolve_with_extensions` → `load_models_config`), so a catalog edited
+/// out-of-band is picked up here.
+pub async fn reload_model_catalog_only(
+    harness: &AgentHarness,
+    ctx: &ReloadContext,
+) -> Result<usize, String> {
+    let project_trusted = resolve_project_trust(&ctx.args, &ctx.cwd);
+
+    // The **current** extension session is reused (not reloaded): its provider
+    // packages are still registered, so their models stay in the catalog.
+    let session_guard = ctx.extension_session.lock().unwrap();
+    let extension_session = session_guard.clone();
+    drop(session_guard);
+
+    // Re-resolve from disk: `resolve_with_extensions` re-reads `models.json`
+    // and re-reads credentials. Keep the currently selected provider/model so
+    // a catalog refresh does not silently switch the user to another model.
+    let mut args = ctx.args.clone();
+    let current = harness.lane("main").get_model().await.ok();
+    if let Some(model) = current.as_ref() {
+        args.provider = Some(model.provider.clone());
+        args.model = Some(model.id.clone());
+        // ⚠️ 只在 **provider 变了** 时清掉 CLI 覆盖的密钥 / endpoint。
+        //
+        // `api_key` / `base_url` 是 CLI 级的覆盖，resolver 只在 provider/model
+        // 身份选定**之后**才应用它们（见 `rpi-runtime/src/provider.rs`）。
+        // 无条件清掉会让「用 `--api-key` 起的会话」在刷新后回落到
+        // `models.json` / 环境变量 —— 凭据来源静默变了。
+        //
+        // 上游的 `reload_extension_resources` 用的是同一条判据
+        // （`current.provider != ctx.resolved_model.provider`）：换了 provider
+        // 才说明原来的 CLI 覆盖不再适用。
+        if ctx.resolved_model.provider != model.provider {
+            args.api_key = None;
+            args.base_url = None;
+        }
+    }
+    // Keep the lane's current thinking level: the catalog refresh is about
+    // *which models exist*, not about changing how the current one thinks.
+    args.thinking = harness.lane("main").get_thinking_level().await.ok();
+
+    let resolved = crate::provider::resolve_with_extensions(
+        &args,
+        &ctx.cwd,
+        project_trusted,
+        &extension_session,
+    )
+    .map_err(|error| format!("重读模型清单失败：{error}"))?;
+
+    let catalog = crate::provider::authenticated_catalog(&resolved);
+
+    // Swap the runtime bindings FIRST: the harness must be able to route to a
+    // provider that only exists in the new catalog before anything tries to
+    // use it.
+    let providers = build_models_with_extensions_for_reload(
+        &resolved.providers,
+        &extension_session,
+        ctx.runtime.clone(),
+    );
+    harness
+        .set_models(providers)
+        .await
+        .map_err(|error| format!("换模型运行时失败：{error}"))?;
+
+    // Publish the catalog to every reader: the action host (what `set_model`
+    // resolves against) and the reload context (what the TUI renders).
+    if let Some(bridge) = ctx.action_bridge.lock().unwrap().as_ref() {
+        bridge.clone_host().replace_model_catalog(catalog.clone());
+    }
+    *ctx.catalog
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = catalog.clone();
+    *ctx.providers
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = resolved.providers.clone();
+
+    // Keep the lane on its current model identity, but take the entry from the
+    // NEW catalog: cloning the old object would leave the lane running on
+    // stale metadata (endpoint, context window, sampling) that the catalog no
+    // longer serves. Fall back to the freshly resolved model when the current
+    // one is gone.
+    let lane_model = current
+        .as_ref()
+        .and_then(|model| {
+            catalog
+                .iter()
+                .find(|m| m.id == model.id && m.provider == model.provider)
+        })
+        .cloned()
+        .unwrap_or_else(|| resolved.model.clone());
+    harness
+        .lane("main")
+        .set_model(lane_model)
+        .await
+        .map_err(|error| format!("设置当前模型失败：{error}"))?;
+
+    tracing::info!(
+        models = catalog.len(),
+        provider = %resolved.model.provider,
+        "模型清单已重读（未重载扩展）"
+    );
+    Ok(catalog.len())
 }
 
 async fn reload_extension_resources_inner<F>(
@@ -3984,6 +4126,44 @@ mod tests {
             ["legacy"]
         );
     }
+
+    // A catalog refresh must hand the lane the NEW entry, not the old object:
+    // a successful reload that leaves the lane on stale metadata (endpoint,
+    // context window) is silently wrong -- requests keep using it.
+    #[test]
+    fn catalog_refresh_keeps_model_identity_but_takes_new_metadata() {
+        let stale = rpi_ai::Model {
+            base_url: "http://localhost/old".into(),
+            context_window: 8192,
+            ..rpi_ai::Model::new(
+                "model",
+                "Model",
+                rpi_ai::Api::OpenaiCompletions,
+                "probe",
+                "http://localhost",
+            )
+        };
+        let catalog = vec![rpi_ai::Model {
+            base_url: "http://localhost/new".into(),
+            context_window: 32768,
+            ..stale.clone()
+        }];
+        let current = Some(stale);
+
+        let lane_model = current
+            .as_ref()
+            .and_then(|model| {
+                catalog
+                    .iter()
+                    .find(|m| m.id == model.id && m.provider == model.provider)
+            })
+            .cloned()
+            .unwrap_or_else(|| catalog[0].clone());
+
+        assert_eq!(lane_model.base_url, "http://localhost/new");
+        assert_eq!(lane_model.context_window, 32768);
+    }
+
     use crate::args::Args;
 
     #[test]
