@@ -994,6 +994,8 @@ where
             "navigate" => rpc_navigate(&lane, &msg).await,
             "get_available_models" => Ok(rpc_get_available_models(&model_catalog)),
             "get_auth_status" => Ok(rpc_get_auth_status(&model_catalog, oauth_snapshot.as_ref())),
+            "get_provider_models" => rpc_get_provider_models(&msg).await,
+            "test_provider_config" => rpc_test_provider_config(&msg).await,
             "oauth" => rpc_oauth(&oauth_snapshot, &msg),
             "set_api_key" => rpc_set_api_key(&msg).await,
             "set_provider_config" => rpc_set_provider_config(&msg),
@@ -2449,6 +2451,38 @@ fn oauth_display(payload: &serde_json::Value) -> serde_json::Value {
         }
     }
     serde_json::Value::Object(safe)
+}
+
+async fn rpc_get_provider_models(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let required = |name: &str| {
+        msg.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("get_provider_models requires {name}"))
+    };
+    let api = required("api")?;
+    let base_url = required("baseUrl")?;
+    let api_key = required("apiKey")?;
+    let models = crate::provider_probe::get_models(api, base_url, api_key).await?;
+    Ok(serde_json::json!({"models": models}))
+}
+
+async fn rpc_test_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let required = |name: &str| {
+        msg.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("test_provider_config requires {name}"))
+    };
+    let result = crate::provider_probe::test_connection(
+        required("api")?,
+        required("baseUrl")?,
+        required("apiKey")?,
+    )
+    .await?;
+    Ok(serde_json::to_value(result).map_err(|error| error.to_string())?)
 }
 
 fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {

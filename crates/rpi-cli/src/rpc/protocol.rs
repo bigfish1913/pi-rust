@@ -237,6 +237,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "abort",
     "get_available_models",
     "get_auth_status",
+    "get_provider_models",
+    "test_provider_config",
     "oauth",
     "set_api_key",
     "set_provider_config",
