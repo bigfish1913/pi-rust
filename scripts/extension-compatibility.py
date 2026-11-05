@@ -122,6 +122,26 @@ def read_json_lines(process: subprocess.Popen[str], output: queue.Queue, errors:
     threading.Thread(target=stderr_reader, daemon=True).start()
 
 
+def native_request(
+    process: subprocess.Popen[str], output: queue.Queue, request_id: str, command: str, fields: dict
+) -> dict:
+    assert process.stdin is not None
+    payload = {"type": command, "id": request_id, **fields}
+    process.stdin.write(json.dumps(payload) + "\n")
+    process.stdin.flush()
+    deadline = time.monotonic() + 35
+    while time.monotonic() < deadline:
+        try:
+            value = output.get(timeout=1)
+        except queue.Empty:
+            if process.poll() is not None:
+                raise AssertionError(f"process exited with {process.returncode} during {command}")
+            continue
+        if value.get("id") == request_id:
+            return value
+    raise AssertionError(f"timed out waiting for {command}")
+
+
 def request(
     process: subprocess.Popen[str], output: queue.Queue, request_id: str, method: str, params: dict
 ) -> dict:
@@ -199,10 +219,10 @@ def native_rpc(rpi: Path, extensions: Path, root: Path, env: dict[str, str]) -> 
         assert ready.get("type") == "ready", ready
         supported = set(ready.get("supportedCommands", []))
         assert {"get_commands", "get_session_branch"} <= supported, ready
-        commands = request(process, output, "commands", "get_commands", {})
+        commands = native_request(process, output, "commands", "get_commands", {})
         assert commands.get("success") is True, commands
         assert isinstance(commands.get("data", {}).get("commands"), list), commands
-        branch = request(
+        branch = native_request(
             process,
             output,
             "branch",
