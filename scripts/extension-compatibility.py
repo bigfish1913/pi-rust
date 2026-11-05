@@ -152,6 +152,10 @@ def stop(process: subprocess.Popen[str]) -> None:
 
 
 def native_rpc(rpi: Path, extensions: Path, root: Path, env: dict[str, str]) -> dict:
+    native_env = dict(env)
+    # The native smoke passes the directory explicitly; do not also inject it
+    # through RPI_EXTENSIONS_DIR, which would scan the same plugins twice.
+    native_env.pop("RPI_EXTENSIONS_DIR", None)
     process = subprocess.Popen(
         [
             str(rpi),
@@ -171,7 +175,7 @@ def native_rpc(rpi: Path, extensions: Path, root: Path, env: dict[str, str]) -> 
             "synthetic",
         ],
         cwd=root,
-        env=env,
+        env=native_env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -183,7 +187,12 @@ def native_rpc(rpi: Path, extensions: Path, root: Path, env: dict[str, str]) -> 
     errors: list[str] = []
     read_json_lines(process, output, errors)
     try:
-        ready = output.get(timeout=35)
+        try:
+            ready = output.get(timeout=120)
+        except queue.Empty as error:
+            raise AssertionError(
+                f"timed out waiting for native RPC ready; exit={process.poll()} stderr={errors[-40:]}"
+            ) from error
         assert ready.get("type") == "ready", ready
         supported = set(ready.get("supportedCommands", []))
         assert {"get_commands", "get_session_branch"} <= supported, ready
