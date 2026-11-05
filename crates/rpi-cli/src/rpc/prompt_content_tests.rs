@@ -238,7 +238,9 @@ fn exact_decoded_image_budgets_not_base64_estimates() {
         image_with_size(Some(max - 100)),
         image_with_size(Some(101)),
     ]);
-    assert!(parse_prompt_content(&input).unwrap_err().contains("524288"));
+    assert!(parse_prompt_content(&input)
+        .unwrap_err()
+        .contains("2097152"));
     assert!(parse_prompt_content(&command(vec![
         image_with_size(Some(max)),
         image_with_size(Some(max / 2)),
@@ -267,7 +269,9 @@ fn exact_serialized_command_boundary_includes_id_extensions_escaping_and_lf() {
         serde_json::to_vec(&input).unwrap().len() + 1,
         MAX_PROMPT_BYTES + 1
     );
-    assert!(parse_prompt_content(&input).unwrap_err().contains("786432"));
+    assert!(parse_prompt_content(&input)
+        .unwrap_err()
+        .contains("3145728"));
 }
 
 #[test]
@@ -277,11 +281,11 @@ fn capability_profile_contains_all_bounds_for_later_integration() {
         json!({
             "contentBlocksVersion":1, "image":true,
             "imageMimeTypes":["image/png", "image/jpeg"],
-            "maxImages":4, "maxImageBytes":262144, "maxTotalImageBytes":524288,
-            "maxImageBase64Bytes":349528, "maxPromptBytes":786432,
+            "maxImages":4, "maxImageBytes":1048576, "maxTotalImageBytes":2097152,
+            "maxImageBase64Bytes":1398104, "maxPromptBytes":3145728,
             "maxTextBytes":32768, "maxContentBlocks":64, "maxImageSide":2000,
-            "maxImagePixels":4000000, "imageDecodeAllocBudgetBytes":33554432,
-            "frameBytes":1048576
+            "maxImagePixels":4000000, "imageDecodeAllocBudgetBytes":67108864,
+            "frameBytes":4194304
         })
     );
 }

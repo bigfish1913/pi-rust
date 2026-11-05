@@ -5,9 +5,9 @@ use std::io::{self, Write};
 
 pub const MAX_CONTENT_BLOCKS: usize = 64;
 pub const MAX_IMAGES: usize = 4;
-pub const MAX_TOTAL_IMAGE_BYTES: usize = 512 * 1024;
+pub const MAX_TOTAL_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 32 * 1024;
-pub const MAX_PROMPT_BYTES: usize = 768 * 1024;
+pub const MAX_PROMPT_BYTES: usize = 3 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedPrompt {
@@ -155,13 +155,19 @@ pub fn parse_prompt_content(command: &Value) -> Result<ParsedPrompt, String> {
                         RPC_IMAGE_MAX_BASE64_BYTES, RPC_IMAGE_MAX_BYTES,
                     };
                     if data.is_empty() || data.len() > RPC_IMAGE_MAX_BASE64_BYTES {
-                        return Err("image data must contain 1..262144 decoded bytes".into());
+                        return Err(format!(
+                            "image data must contain 1..{} decoded bytes",
+                            RPC_IMAGE_MAX_BYTES
+                        ));
                     }
                     let bytes = STANDARD
                         .decode(data)
                         .map_err(|_| "image data must be canonical standard base64")?;
                     if bytes.is_empty() || bytes.len() > RPC_IMAGE_MAX_BYTES {
-                        return Err("image data must contain 1..262144 decoded bytes".into());
+                        return Err(format!(
+                            "image data must contain 1..{} decoded bytes",
+                            RPC_IMAGE_MAX_BYTES
+                        ));
                     }
                     if STANDARD.encode(&bytes) != data {
                         return Err("image data must be canonical standard base64".into());
@@ -170,7 +176,10 @@ pub fn parse_prompt_content(command: &Value) -> Result<ParsedPrompt, String> {
                         .checked_add(bytes.len())
                         .ok_or("image budget overflow")?;
                     if image_bytes > MAX_TOTAL_IMAGE_BYTES {
-                        return Err("aggregate image data exceeds 524288 decoded bytes".into());
+                        return Err(format!(
+                            "aggregate image data exceeds {} decoded bytes",
+                            MAX_TOTAL_IMAGE_BYTES
+                        ));
                     }
                 }
                 _ => return Err("block type must be text or image".into()),
@@ -215,8 +224,13 @@ fn validate_command_size(command: &Value) -> Result<(), String> {
             Ok(())
         }
     }
-    serde_json::to_writer(Budget(0), command)
-        .map_err(|_| "serialized contentBlocks command plus LF exceeds 786432 bytes".into())
+    serde_json::to_writer(Budget(0), command).map_err(|_| {
+        format!(
+            "serialized contentBlocks command plus LF exceeds {} bytes",
+            MAX_PROMPT_BYTES
+        )
+        .into()
+    })
 }
 
 /// The versioned profile describes preflight limits, not a hard heap limit.
