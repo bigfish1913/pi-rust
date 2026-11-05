@@ -600,6 +600,75 @@ async fn a_two_turn_conversation_keeps_its_first_user_question() {
     let _ = &mut tui;
 }
 
+/// Regression: a live notice must keep transcript order.
+///
+/// `chat_container` is the assembled document — header, notices, the visible
+/// history page, then the live slot. Appending a model-switch note to
+/// `chat_container` placed it AFTER the slot that keeps growing, so the note
+/// stayed glued below every line streamed afterwards instead of marking where
+/// the switch actually happened.
+#[test]
+fn live_notices_land_in_the_slot_that_keeps_growing() {
+    let mut state = super::super::tests::test_tui_state();
+    let storage = Arc::new(InMemorySessionStorage::new(
+        SessionMetadata {
+            id: "notice-order".into(),
+            created_at: 0,
+            parent_session_id: None,
+        },
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    ));
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .history_page
+        .resident
+        .lock()
+        .unwrap()
+        .storage = Some(storage);
+    let chat = state.chat_container.clone();
+    state.history_page.mount_active(&chat);
+
+    add_user_message(&state.history_page.active, "first question");
+    state
+        .history_page
+        .active
+        .add_child(Arc::new(rpi_tui::Text::new("first answer", 0, 0)));
+    // A model switch while the session is live.
+    let live = state.history_page.live(&chat);
+    add_note_message(
+        &live,
+        "Model set to faux/faux-1 — applies to the next message.",
+    );
+    // Streaming continues afterwards.
+    state
+        .history_page
+        .active
+        .add_child(Arc::new(rpi_tui::Text::new("second answer", 0, 0)));
+
+    let content = text(&state);
+    let answer_one = content.find("first answer").unwrap();
+    let notice = content.find("Model set to").unwrap();
+    let answer_two = content.find("second answer").unwrap();
+    assert!(
+        answer_one < notice && notice < answer_two,
+        "the switch notice must sit where it happened, not below later output:\n{content}"
+    );
+}
+
+/// The live slot is the target only when a durable history is bound; flat hosts
+/// (unit tests, embedders without a session) keep their single container.
+#[test]
+fn live_slot_falls_back_to_the_chat_container_when_history_is_unbound() {
+    let state = super::super::tests::test_tui_state();
+    let chat = state.chat_container.clone();
+    let live = state.history_page.live(&chat);
+    assert!(
+        Arc::ptr_eq(&live, &chat),
+        "an unbound host has only its chat container"
+    );
+}
+
 /// The budget is a memory guard, not a silent truncation policy: whatever the
 /// window, `latest_page` must never lose the tail, and `has_more_before` must
 /// stay truthful so paging can still reach anything outside it.

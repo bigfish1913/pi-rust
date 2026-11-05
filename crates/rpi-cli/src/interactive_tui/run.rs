@@ -281,7 +281,7 @@ pub(super) async fn run_prompt_streaming(
                         .as_ref()
                         .and_then(|m| m.error_message.clone())
                         .unwrap_or_else(|| format!("{error:?}"));
-                    add_error_message(&state.chat_container, &msg);
+                    add_error_message(&state.history_page.live(&state.chat_container), &msg);
                 }
             }
             HarnessRunOutcome::Suspended { .. } => {
@@ -294,7 +294,10 @@ pub(super) async fn run_prompt_streaming(
                 // Aborted runs render their own partial/final message via the
                 // stream; only add a note on the blocking fallback path.
                 if !streaming {
-                    add_error_message(&state.chat_container, "Request aborted.");
+                    add_error_message(
+                        &state.history_page.live(&state.chat_container),
+                        "Request aborted.",
+                    );
                     let _ = final_message; // (rendered by the stream in streaming mode)
                 }
             }
@@ -316,9 +319,15 @@ pub(super) async fn run_prompt_streaming(
                     .history_page
                     .unsaved
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                add_error_message(&state.chat_container, &tui_session_storage_notice(&e));
+                add_error_message(
+                    &state.history_page.live(&state.chat_container),
+                    &tui_session_storage_notice(&e),
+                );
             } else {
-                add_error_message(&state.chat_container, &e.to_string());
+                add_error_message(
+                    &state.history_page.live(&state.chat_container),
+                    &e.to_string(),
+                );
             }
         }
     }
@@ -377,7 +386,10 @@ pub(super) async fn run_skill_streaming(
             }
             HarnessRunOutcome::Aborted { .. } => {
                 if !streaming {
-                    add_error_message(&state.chat_container, "Skill invocation aborted.");
+                    add_error_message(
+                        &state.history_page.live(&state.chat_container),
+                        "Skill invocation aborted.",
+                    );
                 }
             }
             HarnessRunOutcome::Suspended { .. } => add_error_message(
@@ -394,11 +406,14 @@ pub(super) async fn run_skill_streaming(
                         .as_ref()
                         .and_then(|m| m.error_message.clone())
                         .unwrap_or_else(|| format!("{error:?}"));
-                    add_error_message(&state.chat_container, &message);
+                    add_error_message(&state.history_page.live(&state.chat_container), &message);
                 }
             }
         },
-        Err(error) => add_error_message(&state.chat_container, &error.to_string()),
+        Err(error) => add_error_message(
+            &state.history_page.live(&state.chat_container),
+            &error.to_string(),
+        ),
     }
     if !streaming {
         history::settle(state, tui);
@@ -418,14 +433,20 @@ pub(super) async fn run_compact(
     tui.request_render(false);
     match lane.compact(None).await {
         Ok(_) => {
-            add_note_message(&state.chat_container, "Conversation compacted.");
+            add_note_message(
+                &state.history_page.live(&state.chat_container),
+                "Conversation compacted.",
+            );
             // The last assistant usage describes the pre-compaction context;
             // reset the badge to `?` until the next response reports the new
             // (much smaller) prompt size — mirrors pi's `percent: null`.
             state.footer.set_context_tokens(None);
         }
         Err(e) => {
-            add_error_message(&state.chat_container, &format!("Compact failed: {e}"));
+            add_error_message(
+                &state.history_page.live(&state.chat_container),
+                &format!("Compact failed: {e}"),
+            );
         }
     }
     state.set_status(RunStatus::Idle);

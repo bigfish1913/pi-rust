@@ -116,7 +116,10 @@ pub(super) async fn handle_dequeue(
     let restored =
         restore_queued_messages_to_editor(lane, editor, state.clone(), tui.clone()).await;
     if restored == 0 {
-        add_note_message(&state.chat_container, "No queued messages to restore");
+        add_note_message(
+            &state.history_page.live(&state.chat_container),
+            "No queued messages to restore",
+        );
     } else {
         let plural = if restored > 1 { "s" } else { "" };
         add_note_message(

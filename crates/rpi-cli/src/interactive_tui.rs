@@ -284,6 +284,20 @@ struct CommandContext {
     streaming: bool,
 }
 
+impl CommandContext {
+    /// Where LIVE transcript output belongs (streaming text, notices, errors).
+    ///
+    /// `chat` is the assembled document (header, notices, visible history page,
+    /// live slot, panels). Appending a live notice to it put the note after the
+    /// live slot, so a model-switch or retry note stayed pinned below every line
+    /// streamed afterwards. `HistoryUi::live` resolves the slot that keeps
+    /// growing, keeping such notes in transcript order; hosts without a bound
+    /// history keep using `chat`.
+    fn live_chat(&self) -> Arc<Container> {
+        self.state.history_page.live(&self.chat)
+    }
+}
+
 /// One slash command.
 trait SlashCommand: Send + Sync {
     /// Canonical name, with the leading `/` (e.g. "/model").
@@ -2565,7 +2579,10 @@ pub async fn interactive_tui(
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            add_error_message(&state.chat_container, &error);
+                            add_error_message(
+                                &state.history_page.live(&state.chat_container),
+                                &error,
+                            );
                             tui.request_render(false);
                         }
                     }
@@ -3153,12 +3170,14 @@ pub async fn interactive_tui(
                     .read()
                     .unwrap_or_else(|error| error.into_inner())
                     .clone();
+                // Live notice → live slot (see `HistoryUi::live`).
+                let live = state.history_page.live(&chat_container);
                 match switch_provider(&input, &manifests, &available, &lane).await {
                     Ok((model, note)) => {
                         state.set_current_model(&model);
-                        add_note_message(&chat_container, &note);
+                        add_note_message(&live, &note);
                     }
-                    Err(error) => add_error_message(&chat_container, &error),
+                    Err(error) => add_error_message(&live, &error),
                 }
                 tui.request_render(false);
             }

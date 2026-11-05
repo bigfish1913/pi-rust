@@ -286,9 +286,12 @@ pub(super) async fn report_model_selection(
     model: rpi_ai::Model,
     save_default: bool,
 ) {
+    // Live notice: it belongs in the transcript's live slot, not after it, or
+    // it would stay pinned below everything streamed afterwards.
+    let live = state.history_page.live(&state.chat_container);
     match apply_model_selection(lane, state, model, save_default).await {
-        Ok(note) => add_note_message(&state.chat_container, &note),
-        Err(error) => add_error_message(&state.chat_container, &error),
+        Ok(note) => add_note_message(&live, &note),
+        Err(error) => add_error_message(&live, &error),
     }
     tui.request_render(false);
 }

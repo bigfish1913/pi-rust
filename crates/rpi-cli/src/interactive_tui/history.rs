@@ -113,6 +113,25 @@ impl HistoryUi {
     pub(super) fn is_bound(&self) -> bool {
         self.resident.lock().unwrap().storage.is_some()
     }
+    /// The container every LIVE transcript write must target.
+    ///
+    /// `chat_container` is the assembled document: header, startup notices, the
+    /// visible history page, then `active`. Streaming output belongs to
+    /// `active`, so appending a live notice to `chat_container` put it AFTER the
+    /// slot that keeps growing — a model-switch note then stayed glued to the
+    /// bottom of the output, below everything streamed after it.
+    ///
+    /// Routing all live writes through `active` keeps them in transcript order:
+    /// the note lands where the conversation actually was when it was produced.
+    /// Hosts without a bound history (unit tests, flat embedders) keep appending
+    /// to `chat_container`, which is their only container.
+    pub(super) fn live(&self, chat: &Arc<Container>) -> Arc<Container> {
+        if self.is_bound() {
+            self.active.clone()
+        } else {
+            chat.clone()
+        }
+    }
     pub(super) fn is_latest(&self) -> bool {
         self.resident
             .lock()

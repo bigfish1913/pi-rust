@@ -1014,7 +1014,7 @@ pub(super) fn handle_provider_oauth_result(
         Ok(response) => response,
         Err(message) => {
             restore_provider_editor(state, editor_container, editor, tui);
-            add_error_message(&state.chat_container, &message);
+            add_error_message(&state.history_page.live(&state.chat_container), &message);
             tui.request_render(false);
             return;
         }
@@ -1712,8 +1712,12 @@ fn handle_provider_form_input(
         ProviderFormStep::ModelName => {
             form.model_name = text.to_string();
             match save_provider_from_form(&form) {
-                Ok(note) => add_note_message(&state.chat_container, &note),
-                Err(error) => add_error_message(&state.chat_container, &error),
+                Ok(note) => {
+                    add_note_message(&state.history_page.live(&state.chat_container), &note)
+                }
+                Err(error) => {
+                    add_error_message(&state.history_page.live(&state.chat_container), &error)
+                }
             }
             finish_provider_form(state, editor_container, editor, tui);
             return;
@@ -1749,7 +1753,10 @@ fn cancel_provider_form(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
 ) {
-    add_note_message(&state.chat_container, "Provider add cancelled.");
+    add_note_message(
+        &state.history_page.live(&state.chat_container),
+        "Provider add cancelled.",
+    );
     finish_provider_form(state, editor_container, editor, tui);
 }
 
