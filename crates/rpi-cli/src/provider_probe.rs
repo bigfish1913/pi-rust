@@ -20,6 +20,7 @@ pub struct ProviderModel {
     pub owned_by: Option<String>,
     pub context_window: Option<u64>,
     pub max_tokens: Option<u64>,
+    pub supports_images: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +217,7 @@ fn parse_models(body: &str) -> Result<Vec<ProviderModel>, String> {
                     .map(str::to_string),
                 context_window: model_context_window(entry),
                 max_tokens: model_max_tokens(entry),
+                supports_images: model_supports_images(entry),
             })
         })
         .collect::<Vec<_>>();
@@ -260,6 +262,27 @@ fn model_max_tokens(entry: &Value) -> Option<u64> {
     })
 }
 
+fn model_supports_images(entry: &Value) -> Option<bool> {
+    for key in ["supportsImages", "supports_images", "vision"] {
+        if let Some(value) = entry.get(key).and_then(Value::as_bool) {
+            return Some(value);
+        }
+    }
+    for key in ["input", "modalities", "input_modalities"] {
+        if let Some(values) = entry.get(key).and_then(Value::as_array) {
+            return Some(values.iter().any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|text| matches!(text, "image" | "images" | "vision"))
+            }));
+        }
+    }
+    entry
+        .get("capabilities")
+        .and_then(|value| value.get("image").or_else(|| value.get("vision")))
+        .and_then(Value::as_bool)
+}
+
 fn request_error(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "provider request timed out".into()
@@ -292,12 +315,13 @@ mod tests {
     #[test]
     fn parse_openai_and_anthropic_model_shapes() {
         let models = parse_models(
-            r#"{"data":[{"id":"b"},{"id":"a","owned_by":"x","contextWindow":128000,"max_tokens":4096}]}"#,
+            r#"{"data":[{"id":"b"},{"id":"a","owned_by":"x","contextWindow":128000,"max_tokens":4096,"input":["text","image"]}]}"#,
         )
         .unwrap();
         assert_eq!(models[0].id, "a");
         assert_eq!(models[0].context_window, Some(128000));
         assert_eq!(models[0].max_tokens, Some(4096));
+        assert_eq!(models[0].supports_images, Some(true));
         assert_eq!(models[1].id, "b");
         let models =
             parse_models(r#"{"models":[{"slug":"models/gemini","limit":{"context":"1000"}}]}"#)

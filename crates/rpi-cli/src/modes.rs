@@ -2509,6 +2509,9 @@ fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value,
     };
     let context_window = positive_integer("contextWindow")?;
     let max_tokens = positive_integer("maxOutputTokens")?;
+    let supports_images = msg
+        .get("supportsImages")
+        .and_then(serde_json::Value::as_bool);
     crate::config::add_provider(
         provider,
         api,
@@ -2518,6 +2521,7 @@ fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value,
         model_name,
         context_window,
         max_tokens,
+        supports_images,
     )?;
     Ok(serde_json::json!({
         "provider": provider,

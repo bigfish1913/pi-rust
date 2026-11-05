@@ -392,6 +392,7 @@ pub fn add_provider(
     model_name: Option<&str>,
     context_window: Option<u64>,
     max_tokens: Option<u64>,
+    supports_images: Option<bool>,
 ) -> Result<(), String> {
     const MAX_FIELD: usize = 4096;
     let provider_id = provider_id.trim();
@@ -461,7 +462,13 @@ pub fn add_provider(
                 context_window,
                 max_tokens,
                 cost: None,
-                input: None,
+                input: supports_images.map(|supports| {
+                    if supports {
+                        vec!["text".to_string(), "image".to_string()]
+                    } else {
+                        vec!["text".to_string()]
+                    }
+                }),
                 headers: None,
                 compat: None,
             }],
@@ -931,6 +938,7 @@ mod tests {
             Some("Model A"),
             Some(128_000),
             Some(4096),
+            Some(true),
         )
         .unwrap();
         let config = load_models_config().unwrap();
@@ -945,6 +953,10 @@ mod tests {
         assert_eq!(provider.models[0].name.as_deref(), Some("Model A"));
         assert_eq!(provider.models[0].context_window, Some(128_000));
         assert_eq!(provider.models[0].max_tokens, Some(4096));
+        assert_eq!(
+            provider.models[0].input.as_deref(),
+            Some(["text".to_string(), "image".to_string()].as_slice())
+        );
     }
 
     #[test]
@@ -959,6 +971,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let duplicate = add_provider(
@@ -967,6 +980,7 @@ mod tests {
             "https://api.example.test/v1",
             "fixture-key-2",
             "model-b",
+            None,
             None,
             None,
             None,
@@ -982,6 +996,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(unsupported.contains("unsupported"));
@@ -993,6 +1008,7 @@ mod tests {
             "model-a",
             None,
             Some(0),
+            None,
             None,
         )
         .unwrap_err();
