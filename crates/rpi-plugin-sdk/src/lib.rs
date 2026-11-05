@@ -1233,6 +1233,24 @@ pub enum RuntimeActionId {
     StopRound = 29,
     /// Invocation-bound nested tool execution (protocol version 1).
     ToolProgram = 30,
+    /// Re-read the model/provider catalog from disk **without** reloading
+    /// extensions.
+    ///
+    /// Why this exists next to `Reload` (`15`): `Reload` re-runs extension
+    /// discovery and swaps the whole `ExtensionSession`. That swap invalidates
+    /// the old `RegistrySnapshot`, so the **in-flight run** — which captured
+    /// its emitter at run start — silently stops receiving plugin events
+    /// (`dispatch_to_handlers` drops everything from a stale snapshot). The
+    /// TUI keeps rendering (it uses the broadcast emitter), so the session
+    /// looks alive while every plugin event is dead until the next run.
+    ///
+    /// `ReloadModels` is the cheap counterpart: it re-reads `models.json`,
+    /// re-resolves the provider catalog and swaps the runtime bindings, but
+    /// **never touches the extension registry, the emitter, or the event
+    /// snapshot**. A running turn is unaffected.
+    ///
+    /// Args: `{}`; result: `{"models": <count>}`.
+    ReloadModels = 31,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1284,6 +1302,7 @@ impl TryFrom<u32> for RuntimeActionId {
             28 => Ok(Self::RelayUiDialog),
             29 => Ok(Self::StopRound),
             30 => Ok(Self::ToolProgram),
+            31 => Ok(Self::ReloadModels),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1328,6 +1347,7 @@ impl RuntimeActionId {
         Self::RelayUiDialog,
         Self::StopRound,
         Self::ToolProgram,
+        Self::ReloadModels,
     ];
 
     /// The highest defined action id.
@@ -2451,6 +2471,7 @@ mod tests {
             RuntimeActionId::RelayUiDialog,
             RuntimeActionId::StopRound,
             RuntimeActionId::ToolProgram,
+            RuntimeActionId::ReloadModels,
         ];
 
         // Stable wire ids must not depend on which proposal was merged first.
@@ -2463,11 +2484,14 @@ mod tests {
         assert_eq!(u32::from(RuntimeActionId::Abort), 27);
         assert_eq!(u32::from(RuntimeActionId::RelayUiDialog), 28);
         assert_eq!(u32::from(RuntimeActionId::StopRound), 29);
+        assert_eq!(u32::from(RuntimeActionId::ToolProgram), 30);
+        assert_eq!(u32::from(RuntimeActionId::ReloadModels), 31);
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ListCommands));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::Abort));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::RelayUiDialog));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::StopRound));
-        assert_eq!(RuntimeActionId::MAX, 30);
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ReloadModels));
+        assert_eq!(RuntimeActionId::MAX, 31);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         let one_past_last = RuntimeActionId::MAX + 1;

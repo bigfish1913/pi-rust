@@ -165,6 +165,12 @@ pub struct HarnessActionHost {
     /// action then answers with an empty list rather than failing, matching
     /// the "no commands registered" case.
     registry: std::sync::RwLock<Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>>>,
+    /// Request channel for `runtime_action(ReloadModels)` (action id 31).
+    ///
+    /// The refresh itself must run on the TUI's main loop (it owns the
+    /// harness), so the host hands the request over and awaits the answer.
+    /// `None` until the TUI installs its sender.
+    reload_models_mailbox: Option<rpi_extensions::ReloadModelsMailbox>,
 }
 
 impl HarnessActionHost {
@@ -195,9 +201,19 @@ impl HarnessActionHost {
                 side_questions: crate::side_questions::SideQuestions::default(),
                 runtime,
                 registry: std::sync::RwLock::new(None),
+                reload_models_mailbox: None,
             },
             harness,
         )
+    }
+
+    /// Attach the `ReloadModels` request channel (once the TUI starts).
+    pub(crate) fn with_reload_models_mailbox(
+        mut self,
+        mailbox: rpi_extensions::ReloadModelsMailbox,
+    ) -> Self {
+        self.reload_models_mailbox = Some(mailbox);
+        self
     }
 
     pub fn set_catalog(&self, catalog: Vec<rpi_ai::Model>) {
@@ -996,6 +1012,20 @@ impl RuntimeActionHost for HarnessActionHost {
         // B5d wires the reload callback at the bridge layer; this host impl is
         // the "not configured" fallback.
         Err("reload not configured (no /reload callback on this bridge)".to_string())
+    }
+
+    /// `ReloadModels` — re-read the model/provider catalog from disk without
+    /// touching the extension registry.
+    ///
+    /// The work happens on the TUI's main loop (it owns the harness), so the
+    /// request goes through the `ReloadModelsMailbox` and the answer comes
+    /// back over the same request's reply channel.
+    async fn reload_models(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let Some(mailbox) = self.reload_models_mailbox.clone() else {
+            return Err("reload_models is not available (no TUI attached)".to_string());
+        };
+        let count = mailbox.request().await?;
+        Ok(serde_json::json!({ "models": count }))
     }
 }
 

@@ -74,7 +74,8 @@ use thiserror::Error;
 
 pub use actions::{
     reload_callback_from_mailbox, trampoline_runtime_action, ActionBridge, ReloadMailbox,
-    RuntimeActionHost, SideQuestionSink, UiDialogMailbox, UiDialogRequest,
+    ReloadModelsMailbox, ReloadModelsRequest, RuntimeActionHost, SideQuestionSink, UiDialogMailbox,
+    UiDialogRequest,
 };
 pub use editor_text::{EditorTextEdit, EditorTextMailbox, EditorTextMode};
 pub use event_log::{event_log_path, log_handler_invocation, EventLogger};

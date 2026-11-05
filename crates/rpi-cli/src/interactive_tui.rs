@@ -754,6 +754,16 @@ enum TuiMessage {
     /// mailbox) signal the main loop, which awaits
     /// `reload_extension_resources` on the async runtime.
     ReloadExtensions,
+    /// A plugin asked for the model/provider catalog to be re-read from disk
+    /// (`runtime_action(ReloadModels)`, action id 31).
+    ///
+    /// Unlike `ReloadExtensions`, this does **not** rebuild the extension
+    /// session — so an in-flight run keeps receiving plugin events. The main
+    /// loop runs the cheap catalog refresh and answers on the request's reply
+    /// channel.
+    ReloadModels {
+        request: rpi_extensions::ReloadModelsRequest,
+    },
     /// Request an OAuth action. The action itself runs off the main loop because
     /// provider callbacks are synchronous FFI calls and may wait for user
     /// interaction (for example, a browser/device-code exchange).
@@ -1655,6 +1665,28 @@ pub async fn interactive_tui(
     let reload_bridge_handle = tokio::spawn(async move {
         while reload_sig_rx.recv().await.is_some() {
             if reload_tx.send(TuiMessage::ReloadExtensions).is_err() {
+                break; // main loop gone — stop forwarding
+            }
+        }
+    });
+
+    // ---- plugin→TUI model-catalog refresh bridge (action id 31) ----
+    //
+    // `runtime_action(ReloadModels)` must run the refresh on the main loop
+    // (it owns the harness), and the caller wants the answer — so this is a
+    // request/reply channel, not the fire-and-forget `ReloadMailbox` above.
+    let (reload_models_tx, mut reload_models_rx) =
+        tokio::sync::mpsc::unbounded_channel::<rpi_extensions::ReloadModelsRequest>();
+    reload_context
+        .reload_models_mailbox
+        .install(reload_models_tx);
+    let reload_models_tx = tx.clone();
+    let reload_models_bridge_handle = tokio::spawn(async move {
+        while let Some(request) = reload_models_rx.recv().await {
+            if reload_models_tx
+                .send(TuiMessage::ReloadModels { request })
+                .is_err()
+            {
                 break; // main loop gone — stop forwarding
             }
         }
@@ -3569,6 +3601,18 @@ pub async fn interactive_tui(
                     }
                 }
             }
+            Some(TuiMessage::ReloadModels { request }) => {
+                // Re-read the model/provider catalog from disk — **without**
+                // reloading extensions, so a running turn keeps receiving
+                // plugin events (unlike `ReloadExtensions` above, which swaps
+                // the extension session and blinds the in-flight run).
+                let reload_ctx = ctx.reload_context.clone();
+                let result = crate::session::reload_model_catalog_only(harness, &reload_ctx).await;
+                // The caller is blocked on this reply — always answer, even on
+                // failure, or the plugin's action call hangs forever.
+                let _ = request.reply.send(result);
+                tui.request_render(false);
+            }
             Some(TuiMessage::ReloadExtensions) => {
                 // B5d: drive the shared reload routine on the async runtime,
                 // then surface the outcome. `reload_context` was passed into
@@ -3730,6 +3774,10 @@ pub async fn interactive_tui(
     // redundant — the recv terminates — but cheap + makes shutdown explicit.)
     reload_context.mailbox.clear();
     reload_bridge_handle.abort();
+    // Same for the model-catalog refresh bridge: closing the mailbox ends the
+    // request channel, so a pending caller gets "TUI gone" instead of hanging.
+    reload_context.reload_models_mailbox.clear();
+    reload_models_bridge_handle.abort();
     tui.stop(Default::default());
 
     // upstream prints how to resume the session after an interactive exit so
