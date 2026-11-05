@@ -391,6 +391,7 @@ pub fn add_provider(
     model_id: &str,
     model_name: Option<&str>,
     context_window: Option<u64>,
+    max_tokens: Option<u64>,
 ) -> Result<(), String> {
     const MAX_FIELD: usize = 4096;
     let provider_id = provider_id.trim();
@@ -424,6 +425,9 @@ pub fn add_provider(
     if context_window == Some(0) {
         return Err("context window must be greater than zero".into());
     }
+    if max_tokens == Some(0) {
+        return Err("max output tokens must be greater than zero".into());
+    }
     if !matches!(
         api,
         "anthropic-messages" | "openai-completions" | "openai-responses"
@@ -455,7 +459,7 @@ pub fn add_provider(
                 reasoning: None,
                 thinking_level_map: None,
                 context_window,
-                max_tokens: None,
+                max_tokens,
                 cost: None,
                 input: None,
                 headers: None,
@@ -926,6 +930,7 @@ mod tests {
             "model-a",
             Some("Model A"),
             Some(128_000),
+            Some(4096),
         )
         .unwrap();
         let config = load_models_config().unwrap();
@@ -939,6 +944,7 @@ mod tests {
         assert_eq!(provider.models[0].id, "model-a");
         assert_eq!(provider.models[0].name.as_deref(), Some("Model A"));
         assert_eq!(provider.models[0].context_window, Some(128_000));
+        assert_eq!(provider.models[0].max_tokens, Some(4096));
     }
 
     #[test]
@@ -952,6 +958,7 @@ mod tests {
             "model-a",
             None,
             None,
+            None,
         )
         .unwrap();
         let duplicate = add_provider(
@@ -960,6 +967,7 @@ mod tests {
             "https://api.example.test/v1",
             "fixture-key-2",
             "model-b",
+            None,
             None,
             None,
         )
@@ -973,6 +981,7 @@ mod tests {
             "model-a",
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(unsupported.contains("unsupported"));
@@ -984,6 +993,7 @@ mod tests {
             "model-a",
             None,
             Some(0),
+            None,
         )
         .unwrap_err();
         assert!(invalid_context.contains("context window"));

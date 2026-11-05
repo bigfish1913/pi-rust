@@ -19,6 +19,7 @@ pub struct ProviderModel {
     pub id: String,
     pub owned_by: Option<String>,
     pub context_window: Option<u64>,
+    pub max_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -214,6 +215,7 @@ fn parse_models(body: &str) -> Result<Vec<ProviderModel>, String> {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 context_window: model_context_window(entry),
+                max_tokens: model_max_tokens(entry),
             })
         })
         .collect::<Vec<_>>();
@@ -229,6 +231,24 @@ fn model_context_window(entry: &Value) -> Option<u64> {
         entry.get("context_length"),
         entry.get("max_context_size"),
         entry.get("limit").and_then(|limit| limit.get("context")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+            .filter(|value| *value > 0)
+    })
+}
+
+fn model_max_tokens(entry: &Value) -> Option<u64> {
+    [
+        entry.get("maxTokens"),
+        entry.get("max_tokens"),
+        entry.get("max_output_tokens"),
+        entry.get("output"),
+        entry.get("limit").and_then(|limit| limit.get("output")),
     ]
     .into_iter()
     .flatten()
@@ -272,11 +292,12 @@ mod tests {
     #[test]
     fn parse_openai_and_anthropic_model_shapes() {
         let models = parse_models(
-            r#"{"data":[{"id":"b"},{"id":"a","owned_by":"x","contextWindow":128000}]}"#,
+            r#"{"data":[{"id":"b"},{"id":"a","owned_by":"x","contextWindow":128000,"max_tokens":4096}]}"#,
         )
         .unwrap();
         assert_eq!(models[0].id, "a");
         assert_eq!(models[0].context_window, Some(128000));
+        assert_eq!(models[0].max_tokens, Some(4096));
         assert_eq!(models[1].id, "b");
         let models =
             parse_models(r#"{"models":[{"slug":"models/gemini","limit":{"context":"1000"}}]}"#)

@@ -1800,6 +1800,7 @@ pub(super) fn save_provider_from_form(form: &ProviderFormState) -> Result<String
         &form.model_id,
         Some(&form.model_name),
         None,
+        None,
     )?;
     Ok(format!(
         "Added provider \"{}\" ({} · {} model) — restart rpi to use it.",
