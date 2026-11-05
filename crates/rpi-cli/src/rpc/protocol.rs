@@ -1,7 +1,7 @@
 //! Minimal P0 JSONL protocol for the native rpi RPC host.
 use serde_json::{json, Value};
 
-pub const MAX_FRAME_BYTES: usize = 1_048_576;
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const TOOL_PROGRAM_CHILD_EVENT_MAX_BYTES: usize =
     rpi_harness::session::session::NATIVE_JOURNAL_EVENT_MAX_BYTES;
 pub const PI_BASELINE: &str = "1.2.0";
@@ -423,7 +423,7 @@ mod tests {
                 .iter()
                 .any(|advertised| advertised == event));
         }
-        assert_eq!(ready["limits"]["frameBytes"], 1_048_576);
+        assert_eq!(ready["limits"]["frameBytes"], MAX_FRAME_BYTES);
     }
 
     #[test]

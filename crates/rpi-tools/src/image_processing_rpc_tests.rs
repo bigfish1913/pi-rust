@@ -154,7 +154,7 @@ fn rotated_or_mirrored_jpeg_requires_client_normalization() {
 
 #[test]
 fn allocation_budget_is_configured_not_a_claim_of_hard_heap_accounting() {
-    assert_eq!(RPC_IMAGE_MAX_ALLOC, 33_554_432);
+    assert_eq!(RPC_IMAGE_MAX_ALLOC, 67_108_864);
     assert_eq!(RPC_IMAGE_MAX_PIXELS, 4_000_000);
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(RPC_IMAGE_MAX_ALLOC);

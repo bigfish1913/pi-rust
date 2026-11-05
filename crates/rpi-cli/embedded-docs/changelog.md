@@ -11,6 +11,32 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/bigfish1913/pi-rust/compare/v0.18.0...v0.19.0) - 2026-11-05
+
+### Added
+
+- *(harness)* expose bounded ToolProgram child queries and commit events
+- *(runtime)* add scoped native tool programs for Code Mode
+- *(agent)* observe genuine finalized ToolProgram children
+- *(tool-program)* resolve ordered native content attachments
+- *(codemode)* retain native results for bounded attachment
+- *(codemode)* preserve business values and guard invocation outputs
+- *(runtime)* preserve native results accounting and parent progress
+- *(harness)* persist genuine ToolProgram child observations
+- *(harness)* archive bounded native bodies in primary sessions
+
+### Fixed
+
+- *(rpc)* expose stable ToolProgram branch identity
+- *(rpc)* preserve canonical native tool result signatures
+- *(runtime)* drain panicking tool descendants and retain termination
+
+### Other
+
+- *(rpc)* simplify the owned child commit pump
+- add official extension compatibility gate ([#255](https://github.com/bigfish1913/pi-rust/pull/255))
+- *(harness)* initialize rebinding storage fixtures
+
 ## [0.18.0](https://github.com/bigfish1913/pi-rust/compare/v0.17.2...v0.18.0) - 2026-11-04
 
 ### Fixed
