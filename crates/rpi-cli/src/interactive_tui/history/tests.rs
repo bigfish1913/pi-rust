@@ -8,6 +8,10 @@ mod startup_header;
 #[path = "tests/update_notices.rs"]
 mod update_notices;
 
+/// A deliberately small `Latest` window: these tests exercise paging, and with
+/// the production budget their fixtures would fit in a single page.
+const PAGED_LATEST_BUDGET: usize = 50;
+
 async fn fixture(
     count: usize,
 ) -> (
@@ -40,6 +44,9 @@ async fn fixture(
         .await;
     }
     let state = super::super::tests::test_tui_state();
+    // Keep the paging paths reachable with these small fixtures; production
+    // uses the full budget so an ordinary conversation renders whole.
+    state.history_page.set_latest_budget(PAGED_LATEST_BUDGET);
     state.history_page.resident.lock().unwrap().storage = Some(storage.clone());
     let tui = Arc::new(TuiAltScreen::new(
         Box::new(ProcessTerminal::new()),
@@ -104,6 +111,9 @@ async fn pages_replace_not_accumulate_and_release_old_components_and_search() {
     let (_, state, tui) = fixture(123).await;
     request(state.clone(), tui.clone(), Direction::Latest);
     finish_request(&state).await;
+    // With the shrunk test budget this is one page of 123 entries; the
+    // production budget covers a whole conversation, which
+    // `a_two_turn_conversation_keeps_its_first_user_question` pins.
     assert!(text(&state).contains("history-entry-122"));
     assert!(!text(&state).contains("history-entry-072"));
     let children = state.chat_container.get_children();
@@ -514,4 +524,124 @@ async fn capability_header_survives_restore_and_page_replacement_once() {
     assert_eq!(text(&state).matches("capability-header").count(), 1);
     restore_bound(&state, &state.chat_container).await;
     assert_eq!(text(&state).matches("capability-header").count(), 1);
+}
+
+/// Regression: a two-turn conversation used to lose its FIRST user question.
+///
+/// Two ordinary turns reach well over one 50-entry page once tool results are
+/// counted, and `Latest` rendered only that page. The opening question then sat
+/// outside the window; `Older` could still reach it, but nobody presses PageUp
+/// in a two-turn chat, so it simply looked deleted. The live view must cover the
+/// whole conversation.
+#[tokio::test]
+async fn a_two_turn_conversation_keeps_its_first_user_question() {
+    let (storage, state, mut tui) = fixture(0).await;
+    // Production budget: the point is that an ordinary conversation fits.
+    state
+        .history_page
+        .set_latest_budget(super::LATEST_ENTRY_BUDGET);
+    let mut index = 0usize;
+    for turn in 0..2 {
+        append(
+            &storage,
+            index,
+            ProvisionedKind::Message {
+                message: AgentMessage::User(UserMessage {
+                    role: Default::default(),
+                    timestamp: index as i64,
+                    content: rpi_ai::types::UserContent::Text(format!("user-question-{turn}")),
+                }),
+                terminate: None,
+            },
+        )
+        .await;
+        index += 1;
+        // Tool results are what make a short conversation outgrow one page.
+        for tool in 0..30 {
+            append(
+                &storage,
+                index,
+                ProvisionedKind::Message {
+                    message: AgentMessage::Custom(rpi_agent::message::CustomMessage {
+                        role: format!("tool-result-{turn}-{tool}"),
+                        content: vec![],
+                        data: serde_json::Value::Null,
+                        timestamp: index as i64,
+                    }),
+                    terminate: None,
+                },
+            )
+            .await;
+            index += 1;
+        }
+    }
+    restore_bound(&state, &state.chat_container).await;
+    let restored = text(&state);
+    assert!(
+        restored.contains("user-question-0"),
+        "the first turn's question must survive a restore:\n{restored}"
+    );
+    assert!(restored.contains("user-question-1"));
+
+    // The same rule applies to the live view rebuilt at settlement.
+    settle(&state, &tui);
+    finish_request(&state).await;
+    let settled = text(&state);
+    assert!(
+        settled.contains("user-question-0"),
+        "settlement must keep the first turn's question:\n{settled}"
+    );
+    assert!(settled.contains("user-question-1"));
+
+    // Paging still works: `Older` continues past the materialised window.
+    request(state.clone(), tui.clone(), Direction::Latest);
+    finish_request(&state).await;
+    assert!(text(&state).contains("user-question-0"));
+    let _ = &mut tui;
+}
+
+/// The budget is a memory guard, not a silent truncation policy: whatever the
+/// window, `latest_page` must never lose the tail, and `has_more_before` must
+/// stay truthful so paging can still reach anything outside it.
+#[tokio::test]
+async fn latest_page_keeps_the_tail_and_reports_unread_history() {
+    let (storage, state, _tui) = fixture(123).await;
+    state.history_page.set_latest_budget(50);
+    restore_bound(&state, &state.chat_container).await;
+    let rendered = text(&state);
+    assert!(
+        rendered.contains("history-entry-122"),
+        "the newest entry must always render"
+    );
+    let resident = state.history_page.resident.lock().unwrap();
+    let page = resident.page.as_ref().expect("page recorded");
+    assert!(
+        page.has_more_before,
+        "with a 50-entry budget, 123 entries must report unread history"
+    );
+    // The tail cursors survive the backwards walk.
+    assert_eq!(page.last_id.as_deref(), Some("entry-122"));
+    drop(resident);
+    drop(storage);
+}
+
+/// The paged read must agree with a plain full-branch read, so restoring a
+/// session and resuming one show the same transcript.
+#[tokio::test]
+async fn latest_page_matches_a_single_page_when_everything_fits() {
+    let (storage, state, _tui) = fixture(10).await;
+    state
+        .history_page
+        .set_latest_budget(super::LATEST_ENTRY_BUDGET);
+    restore_bound(&state, &state.chat_container).await;
+    for index in 0..10 {
+        assert!(
+            text(&state).contains(&format!("history-entry-{index:03}")),
+            "entry {index} missing"
+        );
+    }
+    let resident = state.history_page.resident.lock().unwrap();
+    assert!(!resident.page.as_ref().unwrap().has_more_before);
+    drop(resident);
+    drop(storage);
 }

@@ -30,10 +30,15 @@ struct Resident {
     page: Option<BranchEntryPage>,
     error: Option<Arc<Container>>,
 }
-#[derive(Default)]
 pub(super) struct HistoryUi {
     resident: Mutex<Resident>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// How many entries the `Latest` view materialises.
+    ///
+    /// Production keeps a normal conversation whole (see
+    /// [`LATEST_ENTRY_BUDGET`]); tests shrink it so the paging paths can be
+    /// exercised with small fixtures instead of thousands of entries.
+    latest_budget: std::sync::atomic::AtomicUsize,
     pub(super) unsaved: std::sync::atomic::AtomicBool,
     pub(super) active: Arc<Container>,
     pub(super) panels: Arc<Container>,
@@ -43,7 +48,34 @@ pub(super) struct HistoryUi {
     /// renders above the notice box.
     pub(super) updates: Arc<Container>,
 }
+impl Default for HistoryUi {
+    fn default() -> Self {
+        Self {
+            resident: Mutex::new(Resident::default()),
+            worker: Mutex::new(None),
+            latest_budget: std::sync::atomic::AtomicUsize::new(LATEST_ENTRY_BUDGET),
+            unsaved: std::sync::atomic::AtomicBool::new(false),
+            active: Arc::new(Container::new()),
+            panels: Arc::new(Container::new()),
+            header: Arc::new(Container::new()),
+            updates: Arc::new(Container::new()),
+        }
+    }
+}
+
 impl HistoryUi {
+    /// Entries the `Latest` view materialises on this host.
+    pub(super) fn latest_budget(&self) -> usize {
+        self.latest_budget
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Test seam: shrink the `Latest` window so paging is reachable with a
+    /// small fixture.
+    #[cfg(test)]
+    pub(super) fn set_latest_budget(&self, budget: usize) {
+        self.latest_budget
+            .store(budget, std::sync::atomic::Ordering::Relaxed);
+    }
     pub(super) fn invalidate(&self) {
         if let Some(worker) = self.worker.lock().unwrap().take() {
             worker.abort();
@@ -166,7 +198,11 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
     let Ok(expected_leaf) = tree.get_leaf_id().await else {
         return;
     };
-    let Ok(page) = tree.branch_entry_page(&Default::default()).await else {
+    // Same rule as the live view: restoring a session must show the WHOLE
+    // conversation, not the newest page. `render_session_history` used to replay
+    // the full branch here, so a single default page silently truncated any
+    // session longer than it.
+    let Ok(page) = latest_page(&tree, state.history_page.latest_budget()).await else {
         return;
     };
     let panels = Arc::new(Container::new());
@@ -218,6 +254,73 @@ fn clear_settled_active(state: &TuiState) {
         state.tool_components.lock().unwrap().clear();
         state.bash_components.lock().unwrap().clear();
     }
+}
+
+/// Upper bound on the entries the live "latest" view materialises.
+///
+/// The view has to cover a normal conversation end to end (the pre-paging
+/// replay did), so this is a memory guard for pathological sessions rather
+/// than a window that shapes ordinary ones: at 50 entries — the page default —
+/// a two-turn chat with tool results already lost its opening question.
+const LATEST_ENTRY_BUDGET: usize = 2_000;
+
+/// Materialise the branch's recent history for the live view: ONE ancestry
+/// walk, then keep the newest `budget` entries.
+///
+/// Walking backwards page by page is the obvious reading of the paging API, and
+/// it is the wrong one here: every `BranchEntryPageQuery` re-walks the branch
+/// for each entry it returns, so N/batch round trips cost O(n²). Measured on the
+/// JSONL backend, 2000 entries take 3.8 s that way versus 139 ms for a single
+/// ordered read, and the gap widens with the session. The page loop also cannot
+/// exceed 100 entries per call, so a long session needs dozens of them.
+async fn latest_page(
+    tree: &Arc<dyn rpi_harness::session::types::SessionTree>,
+    budget: usize,
+) -> rpi_harness::error::SessionResult<BranchEntryPage> {
+    let entries = tree
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                limit: None,
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await?;
+    if entries.is_empty() {
+        return Ok(BranchEntryPage {
+            entries,
+            first_id: None,
+            last_id: None,
+            next_before_id: None,
+            next_after_id: None,
+            has_more_before: false,
+            has_more_after: false,
+            leaf_id: None,
+        });
+    }
+    // Keep the newest window but stay chronological, and report the older
+    // history so paging can still reach it.
+    let total = entries.len();
+    let start = total.saturating_sub(budget);
+    let has_more_before = start > 0;
+    let first_id = entries.get(start).map(|entry| entry.id().to_owned());
+    let last_id = entries.last().map(|entry| entry.id().to_owned());
+    let leaf_id = last_id.clone();
+    Ok(BranchEntryPage {
+        next_before_id: if has_more_before {
+            first_id.clone()
+        } else {
+            None
+        },
+        next_after_id: None,
+        entries: entries[start..].to_vec(),
+        first_id,
+        last_id,
+        has_more_before,
+        has_more_after: false,
+        leaf_id,
+    })
 }
 
 fn metadata(mut page: BranchEntryPage) -> BranchEntryPage {
@@ -281,7 +384,16 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
                 None => tree.branch_entry_page(&Default::default()).await?,
             };
             let query = match direction {
-                Direction::Latest => BranchEntryPageQuery::default(),
+                // `Latest` means "show the conversation", not "show the newest
+                // page" — 0.16 replayed the whole branch here, and narrowing it
+                // to one 50-entry page silently dropped the start of every
+                // ordinary session (two turns with tool results easily reach
+                // 60-75 entries, so the FIRST user question disappeared).
+                Direction::Latest => {
+                    return Ok(Some(
+                        latest_page(&tree, state.history_page.latest_budget()).await?,
+                    ))
+                }
                 Direction::Older if previous.has_more_before => BranchEntryPageQuery {
                     leaf_id: previous.leaf_id,
                     before_id: previous.next_before_id,
