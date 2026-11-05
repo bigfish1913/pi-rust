@@ -999,6 +999,8 @@ where
             "oauth" => rpc_oauth(&oauth_snapshot, &msg),
             "set_api_key" => rpc_set_api_key(&msg).await,
             "set_provider_config" => rpc_set_provider_config(&msg),
+            "update_provider_config" => rpc_update_provider_config(&msg),
+            "delete_provider_config" => rpc_delete_provider_config(&msg),
             "set_model" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
                 Err("cannot set model while a run or prompt validation is active".into())
             }
@@ -2527,6 +2529,60 @@ fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value,
         "provider": provider,
         "modelId": model_id,
         "api": api,
+        "requiresRestart": true,
+    }))
+}
+
+fn rpc_update_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let required = |name: &str| {
+        msg.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("update_provider_config requires {name}"))
+    };
+    let positive_integer = |name: &str| match msg.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+            .ok_or_else(|| format!("{name} must be a positive integer"))
+            .map(Some),
+    };
+    let provider = required("provider")?;
+    let api = required("api")?;
+    let base_url = required("baseUrl")?;
+    let model_id = required("modelId")?;
+    crate::config::update_provider(
+        provider,
+        api,
+        base_url,
+        msg.get("apiKey").and_then(serde_json::Value::as_str),
+        model_id,
+        msg.get("modelName").and_then(serde_json::Value::as_str),
+        positive_integer("contextWindow")?,
+        positive_integer("maxOutputTokens")?,
+        msg.get("supportsImages")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    )?;
+    Ok(serde_json::json!({
+        "provider": provider,
+        "modelId": model_id,
+        "requiresRestart": true,
+    }))
+}
+
+fn rpc_delete_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let provider = msg
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "delete_provider_config requires provider".to_string())?;
+    crate::config::delete_provider(provider)?;
+    Ok(serde_json::json!({
+        "provider": provider,
         "requiresRestart": true,
     }))
 }
