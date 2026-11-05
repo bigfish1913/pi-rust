@@ -437,7 +437,7 @@ jobs:
       RUSTFLAGS: "-D warnings"
       # Update this deliberately when rpi-package compatibility is reviewed.
       # The SHA makes the extension set reproducible and auditable.
-      RPI_PACKAGE_REF: f3936a1a68d0bc9eb4d69dad99d13b0e647b3484
+      RPI_PACKAGE_REF: 15ebfe3924216b716765b2165f3e4eef9b403777
       COMPAT_DIAGNOSTICS_NAME: extension-compat-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out host
