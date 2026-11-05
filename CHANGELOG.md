@@ -11,6 +11,28 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/bigfish1913/pi-rust/compare/v0.19.0...v0.20.0) - 2026-11-05
+
+### Added
+
+- *(plugin-sdk)* add ReloadModels for a catalog-only refresh
+- *(config)* add provider update and delete RPCs
+- *(config)* persist image input support
+- *(config)* persist maximum output tokens
+- *(config)* persist provider context window
+- *(rpc)* probe provider models and connectivity
+- *(rpc)* persist provider configuration
+
+### Fixed
+
+- *(rpc)* raise ACP inline image prompt limit to 1 MiB
+- *(tui)* keep completed plan in transcript order ([#257](https://github.com/bigfish1913/pi-rust/pull/257))
+
+### Other
+
+- Merge branch 'main' into feat/web-provider-config
+- Merge branch 'main' into feat/web-provider-config
+
 ## [0.19.0](https://github.com/bigfish1913/pi-rust/compare/v0.18.0...v0.19.0) - 2026-11-05
 
 ### Added
