@@ -40,6 +40,8 @@ pub enum Command {
         #[serde(default)]
         args: String,
     },
+    /// Read-only identity snapshot for ToolProgram live reconciliation.
+    GetToolProgramBranch,
     /// Read-only snapshot of the current branch's message entries.
     GetMessages {
         limit: Option<u64>,
@@ -213,6 +215,7 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_state",
     "get_commands",
     "execute_command",
+    "get_tool_program_branch",
     "get_messages",
     "get_message_summaries",
     "get_message_window",
@@ -306,6 +309,11 @@ pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
             "sequence": "nativeEntrySeq-v1",
             "delivery": "bestEffortResync",
             "maxEventBytes": TOOL_PROGRAM_CHILD_EVENT_MAX_BYTES
+        },
+        "toolProgramBranch": {
+            "version": 1,
+            "command": "get_tool_program_branch",
+            "identity": "bindingAndLaneGeneration"
         },
         "semantics": {
             "messageUpdates": mode.as_str(),

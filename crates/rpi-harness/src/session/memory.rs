@@ -33,8 +33,8 @@ use crate::session::state::{ApplyOutcome, SessionState};
 use crate::session::types::{
     provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator, LanePointer,
     LaneRecord, LogItem, LogOptions, OperationStartedRecord, ProvisionedEntry, RecordQuery,
-    SessionCreateOptions, SessionMetadata, SessionMutation, SessionRepo, SessionStats,
-    SessionStorage,
+    SessionCreateOptions, SessionLaneBranch, SessionMetadata, SessionMutation, SessionRepo,
+    SessionStats, SessionStorage,
 };
 
 /// A simple shared id-generator producing stringified u64 counters — the
@@ -309,6 +309,10 @@ impl SessionStorage for InMemorySessionStorage {
 
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
         Ok(self.inner.read_state(|state| state.get_lanes()))
+    }
+
+    async fn lane_branch(&self, lane: &str) -> SessionResult<SessionLaneBranch> {
+        self.inner.read_state(|state| state.lane_branch(lane))
     }
 
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {

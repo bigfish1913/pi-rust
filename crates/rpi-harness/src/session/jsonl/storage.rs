@@ -79,8 +79,8 @@ use crate::session::state::ApplyOutcome;
 use crate::session::types::{
     provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator, LanePointer,
     LaneRecord, LogItem, LogOptions, OperationStartedRecord, ProvisionedEntry, RecordQuery,
-    SessionMetadata, SessionMutation, SessionStats, SessionStorage, TranscriptPage,
-    TranscriptPageQuery,
+    SessionLaneBranch, SessionMetadata, SessionMutation, SessionStats, SessionStorage,
+    TranscriptPage, TranscriptPageQuery,
 };
 
 /// Read-only native facts for startup preflight. No storage/file capability is
@@ -1393,6 +1393,16 @@ impl SessionStorage for JsonlSessionStorage {
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
         let state = self.state.lock().await;
         Ok(state.get_lanes())
+    }
+
+    async fn lane_branch(&self, lane: &str) -> SessionResult<SessionLaneBranch> {
+        let state = self.state.lock().await;
+        let (leaf_id, generation) = state.lane_branch(lane)?;
+        Ok(SessionLaneBranch {
+            lane: lane.to_owned(),
+            leaf_id,
+            generation,
+        })
     }
 
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {

@@ -27,8 +27,8 @@ use crate::error::{SessionError, SessionErrorCode, SessionResult};
 use crate::session::types::{
     BranchBounds, BranchEntryPage, BranchEntryPageQuery, BranchOverview, Entry, EntryQuery,
     IdGenerator, JsonValue, LanePointer, LaneRecord, LogItem, LogOptions, OperationStartedRecord,
-    ProvisionedEntry, ProvisionedKind, RecordQuery, SessionMetadata, SessionStats, SessionStorage,
-    SessionTree,
+    ProvisionedEntry, ProvisionedKind, RecordQuery, SessionLaneBranch, SessionMetadata,
+    SessionStats, SessionStorage, SessionTree,
 };
 
 static AGENT_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
@@ -186,6 +186,17 @@ pub struct SessionEntryCommit {
     pub native_journal: Option<NativeJournalCommit>,
 }
 
+/// The exact native identity used by ToolProgram live reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolProgramBranch {
+    pub session_id: String,
+    pub lane: String,
+    pub binding_id: String,
+    pub generation: u64,
+    pub leaf_id: Option<String>,
+}
+
 /// The session facade over a [`SessionStorage`] and [`IdGenerator`]. Mirrors TS
 /// `Session<TMetadata>`. Holds shared handles (`Arc`) so it is cheaply
 /// [`Clone`] — a `view` of any lane shares the same storage + id generator.
@@ -197,6 +208,9 @@ pub struct Session {
 #[derive(Clone)]
 struct SessionBinding {
     storage: Arc<dyn SessionStorage>,
+    /// Identity of this live facade binding, not of the durable session. It is
+    /// copied by clones/pins and replaced on every storage rebind.
+    binding_id: String,
     mutation_gate: Arc<tokio::sync::RwLock<()>>,
     volatile_progress: Option<crate::frame_progress::SharedVolatileProgress>,
     entry_commit_publisher: Option<broadcast::Sender<SessionEntryCommit>>,
@@ -221,12 +235,41 @@ impl Session {
         Self {
             binding: Arc::new(RwLock::new(SessionBinding {
                 storage,
+                binding_id: Uuid::new_v4().to_string(),
                 mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
                 volatile_progress: None,
                 entry_commit_publisher: None,
             })),
             id_generator: id_generator.unwrap_or_else(|| Arc::new(DefaultIdGenerator::new())),
         }
+    }
+
+    /// Read an authoritative lane leaf and explicit lane-mutation generation
+    /// from one pinned storage binding. Unsupported custom storage fails closed.
+    pub async fn tool_program_branch(&self, lane: &str) -> SessionResult<ToolProgramBranch> {
+        let pinned = self.pin(Arc::clone(&self.id_generator));
+        let (storage, binding_id) = {
+            let binding = pinned.binding.read().unwrap();
+            (Arc::clone(&binding.storage), binding.binding_id.clone())
+        };
+        let branch: SessionLaneBranch = storage.lane_branch(lane).await?;
+        let session_id = storage.metadata().id;
+        let valid_id =
+            |id: &str| !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_control);
+        if !valid_id(&session_id)
+            || branch.lane != lane
+            || !valid_id(lane)
+            || branch.leaf_id.as_deref().is_some_and(|id| !valid_id(id))
+        {
+            return Err(SessionError::storage("invalid lane branch identity"));
+        }
+        Ok(ToolProgramBranch {
+            session_id,
+            lane: branch.lane,
+            binding_id,
+            generation: branch.generation,
+            leaf_id: branch.leaf_id,
+        })
     }
 
     /// Read a complete-entry page from one backing-storage binding.
@@ -268,6 +311,7 @@ impl Session {
         let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
         *self.binding.write().unwrap() = SessionBinding {
             storage,
+            binding_id: Uuid::new_v4().to_string(),
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             volatile_progress: None,
             entry_commit_publisher: publisher,
@@ -351,6 +395,9 @@ impl Session {
     pub(crate) fn rebind_to(&self, target: &Self) {
         let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
         let mut binding = target.binding.read().unwrap().clone();
+        // A rebind is a new live binding even when it points back to a storage
+        // previously used by this facade.
+        binding.binding_id = Uuid::new_v4().to_string();
         if binding.entry_commit_publisher.is_none() {
             binding.entry_commit_publisher = publisher;
         }
@@ -1440,6 +1487,76 @@ mod tests {
             Arc::new(DefaultIdGenerator::new()),
         ));
         Session::new(storage, None)
+    }
+
+    #[tokio::test]
+    async fn tool_program_branch_binding_is_shared_by_pins_but_never_reused_on_rebind() {
+        let session = fixture_session();
+        let first = session.tool_program_branch("main").await.unwrap();
+        assert_eq!(first.generation, 0);
+        assert_eq!(
+            first,
+            session.clone().tool_program_branch("main").await.unwrap()
+        );
+        assert_eq!(
+            first,
+            session
+                .pin(session.id_generator.clone())
+                .tool_program_branch("main")
+                .await
+                .unwrap()
+        );
+        session.append_message(user("append")).await.unwrap();
+        let appended = session.tool_program_branch("main").await.unwrap();
+        assert_eq!(first.binding_id, appended.binding_id);
+        assert_eq!(first.generation, appended.generation);
+        assert_ne!(first.leaf_id, appended.leaf_id);
+        let target = fixture_session();
+        session.rebind_to(&target);
+        let rebound = session.tool_program_branch("main").await.unwrap();
+        assert_ne!(rebound.binding_id, first.binding_id);
+        assert_ne!(
+            rebound.binding_id,
+            target.tool_program_branch("main").await.unwrap().binding_id
+        );
+        session.rebind_to(&target);
+        assert_ne!(
+            session
+                .tool_program_branch("main")
+                .await
+                .unwrap()
+                .binding_id,
+            rebound.binding_id
+        );
+        let old = session.tool_program_branch("main").await.unwrap();
+        session.set_storage(session.storage());
+        assert_ne!(
+            session
+                .tool_program_branch("main")
+                .await
+                .unwrap()
+                .binding_id,
+            old.binding_id
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_program_branch_custom_storage_default_is_fail_closed() {
+        let session = Session::new(
+            Arc::new(RebindingStorage {
+                inner: fixture_session().storage(),
+                callback: Arc::new(Mutex::new(None)),
+                fail_branch: false,
+                checkpoint_ack: None,
+            }),
+            None,
+        );
+        assert!(session
+            .tool_program_branch("main")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
     }
 
     fn user(text: &str) -> AgentMessage {

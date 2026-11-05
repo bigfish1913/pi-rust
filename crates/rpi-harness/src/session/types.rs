@@ -1364,6 +1364,15 @@ pub struct LanePointer {
     pub leaf_id: Option<String>,
 }
 
+/// Authoritative live lane identity. `generation` advances only for explicit
+/// lane create/move mutations; ordinary entry/record appends do not change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLaneBranch {
+    pub lane: String,
+    pub leaf_id: Option<String>,
+    pub generation: u64,
+}
+
 /// `LogItem` — the unified mutation log `get_log` returns. Mirrors the TS union
 /// (`entry | record | lane | fact(name) | fact(label)`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1538,6 +1547,14 @@ pub trait SessionStorage: Send + Sync {
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>>;
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()>;
     async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()>;
+
+    /// Atomically read one lane's current leaf and explicit lane-mutation
+    /// generation. Custom storage defaults to fail-closed: callers must not
+    /// substitute the ordinary leaf or history revision for this identity.
+    async fn lane_branch(&self, lane: &str) -> SessionResult<SessionLaneBranch> {
+        let _ = lane;
+        Err(SessionError::storage("lane branch identity is unsupported"))
+    }
 
     // Transient payloads use a separate sequence domain and never enter history.
     // CommitStream bindings remain immutable lane records.

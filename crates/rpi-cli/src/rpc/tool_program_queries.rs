@@ -98,6 +98,21 @@ fn page<T: serde::Serialize>(value: T) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|error| error.to_string())
 }
 
+pub(crate) async fn branch(harness: &AgentHarness, message: &Value) -> Result<Value, String> {
+    let object = message
+        .as_object()
+        .ok_or_else(|| "branch request must be an object".to_owned())?;
+    if object.keys().any(|key| key != "type" && key != "id") {
+        return Err("get_tool_program_branch accepts only type and id".into());
+    }
+    let result = harness
+        .session()
+        .tool_program_branch(harness.lane_name())
+        .await
+        .map_err(|error| error.to_string())?;
+    page(result)
+}
+
 pub(crate) async fn children(harness: &AgentHarness, message: &Value) -> Result<Value, String> {
     let query: ChildPageQuery = query(message)?;
     let result: ChildPage = rpi_harness::tool_program_queries::read_child_page(
@@ -139,6 +154,35 @@ mod tests {
     use super::*;
     use rpi_harness::tool_program_queries::{ChildCursor, Direction};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn branch_identity_profile_and_strict_rpc_arguments() {
+        let ready = super::super::protocol::ready(crate::args::RpcMessageUpdates::CompactDeltas);
+        assert_eq!(
+            ready["toolProgramBranch"],
+            json!({"version":1,
+            "command":"get_tool_program_branch","identity":"bindingAndLaneGeneration"})
+        );
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let initial = branch(
+            &harness,
+            &json!({"type":"get_tool_program_branch","id":"one"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(initial["lane"], "main");
+        assert_eq!(initial["generation"], 0);
+        let binding = uuid::Uuid::parse_str(initial["bindingId"].as_str().unwrap()).unwrap();
+        assert_eq!(binding.get_version_num(), 4);
+        for args in [
+            json!(null),
+            json!({"leafId":null}),
+            json!({"lane":"main"}),
+            json!({"generation":0}),
+        ] {
+            assert!(branch(&harness, &args).await.is_err());
+        }
+    }
 
     #[test]
     fn strips_only_rpc_envelope_and_preserves_query_fields() {

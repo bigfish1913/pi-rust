@@ -969,6 +969,9 @@ where
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
+            "get_tool_program_branch" => {
+                crate::rpc::tool_program_queries::branch(harness, &msg).await
+            }
             "get_message_summaries" => crate::rpc::message_queries::summaries(harness, &msg).await,
             "get_message_window" => crate::rpc::message_queries::window(harness, &msg).await,
             "get_tool_program_children" => {
