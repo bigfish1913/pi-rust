@@ -1,7 +1,7 @@
 //! Bounded resident history, independent of the prompt mailbox.
 use super::*;
 use rpi_harness::session::types::{
-    BranchEntryPage, BranchEntryPageQuery, BranchOverview, SessionStorage,
+    BranchEntryPage, BranchEntryPageQuery, BranchOverview, EntryCursor, SessionStorage,
 };
 use rpi_harness::session::Session;
 
@@ -283,8 +283,8 @@ fn clear_settled_active(state: &TuiState) {
 /// a two-turn chat with tool results already lost its opening question.
 const LATEST_ENTRY_BUDGET: usize = 2_000;
 
-/// Materialise the branch's recent history for the live view: ONE ancestry
-/// walk, then keep the newest `budget` entries.
+/// Materialise the branch's recent history for the live view: ONE bounded
+/// newest-first read, reversed for chronological rendering.
 ///
 /// Walking backwards page by page is the obvious reading of the paging API, and
 /// it is the wrong one here: every `BranchEntryPageQuery` re-walks the branch
@@ -292,20 +292,50 @@ const LATEST_ENTRY_BUDGET: usize = 2_000;
 /// JSONL backend, 2000 entries take 3.8 s that way versus 139 ms for a single
 /// ordered read, and the gap widens with the session. The page loop also cannot
 /// exceed 100 entries per call, so a long session needs dozens of them.
+///
+/// The budget is passed to the backend as `limit`, so it is a real bound on what
+/// is walked, kept and hydrated — not a slice applied after the whole branch has
+/// already been materialised. That is why the read is newest-first: pairing
+/// `OldestFirst` with a limit would return the START of the conversation, which
+/// is the opposite of the latest page. `has_more_before` is settled by a single
+/// cursor peek at the row just past the window, not by a full second walk.
 async fn latest_page(
     tree: &Arc<dyn rpi_harness::session::types::SessionTree>,
     budget: usize,
 ) -> rpi_harness::error::SessionResult<BranchEntryPage> {
-    let entries = tree
+    // `limit` must be a positive integer; a zero budget would ask for nothing.
+    let budget = budget.max(1);
+    let mut entries = tree
         .find_entries_on_branch(
             &EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
-                limit: None,
+                order: Some(EntryOrder::NewestFirst),
+                limit: Some(budget),
                 ..Default::default()
             },
             &BranchBounds::default(),
         )
         .await?;
+    // `has_more_before` must be truthful, and the only way to know it without
+    // walking the rest of the branch is to look at the row just past the window.
+    // A seq cursor turns that second read into one indexed lookup on top of the
+    // same bounded window, so the branch is never materialised in full.
+    let has_more_before = match entries.last().map(|entry| entry.seq()) {
+        Some(seq) if entries.len() == budget => !tree
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::NewestFirst),
+                    limit: Some(1),
+                    cursor: Some(EntryCursor { after_seq: seq }),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await?
+            .is_empty(),
+        _ => false,
+    };
+    // Newest-first in, chronological out: the window is rendered top to bottom.
+    entries.reverse();
     if entries.is_empty() {
         return Ok(BranchEntryPage {
             entries,
@@ -318,12 +348,7 @@ async fn latest_page(
             leaf_id: None,
         });
     }
-    // Keep the newest window but stay chronological, and report the older
-    // history so paging can still reach it.
-    let total = entries.len();
-    let start = total.saturating_sub(budget);
-    let has_more_before = start > 0;
-    let first_id = entries.get(start).map(|entry| entry.id().to_owned());
+    let first_id = entries.first().map(|entry| entry.id().to_owned());
     let last_id = entries.last().map(|entry| entry.id().to_owned());
     let leaf_id = last_id.clone();
     Ok(BranchEntryPage {
@@ -333,7 +358,7 @@ async fn latest_page(
             None
         },
         next_after_id: None,
-        entries: entries[start..].to_vec(),
+        entries,
         first_id,
         last_id,
         has_more_before,
