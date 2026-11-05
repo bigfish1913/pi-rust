@@ -416,10 +416,136 @@ jobs:
           if-no-files-found: ignore
           include-hidden-files: false
 
+  extension-compatibility:
+    name: Official extension compatibility (${{ matrix.os }})
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    env:
+      # Update this deliberately when rpi-package compatibility is reviewed.
+      # The SHA makes the extension set reproducible and auditable.
+      RPI_PACKAGE_REF: f3936a1a68d0bc9eb4d69dad99d13b0e647b3484
+      COMPAT_DIAGNOSTICS_NAME: extension-compat-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out host
+        uses: actions/checkout@v4
+
+      - name: Check out pinned official extension catalog
+        uses: actions/checkout@v4
+        with:
+          repository: pi-rust/rpi-package
+          ref: ${{ env.RPI_PACKAGE_REF }}
+          path: rpi-package
+          fetch-depth: 1
+
+      - name: Record source revisions and official catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "host=$(git rev-parse HEAD)"
+          echo "rpi-package=$(git -C rpi-package rev-parse HEAD)"
+          python - <<'PY'
+          import json
+          import pathlib
+          import tomllib
+          host = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          catalog = json.loads(pathlib.Path("rpi-package/catalog/packages.json").read_text())
+          print(f"host-version={host['workspace']['package']['version']}")
+          print(f"official-extension-count={len(catalog)}")
+          print("official-extensions=" + ",".join(item["name"] for item in catalog))
+          PY
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target/extension-compat
+            rpi-package -> rpi-package/target
+
+      - name: Build the current host
+        shell: bash
+        run: cargo build -p rpi-cli --bin rpi --release --locked --target-dir target/extension-compat
+
+      - name: Build every official extension and protocol bridge
+        shell: bash
+        working-directory: rpi-package
+        run: cargo build --workspace --release --locked
+
+      - name: Stage exactly the catalog extensions
+        shell: bash
+        working-directory: rpi-package
+        run: |
+          set -euo pipefail
+          cargo run --release --locked -p rpi-package-install -- pack --no-archive --out "$RUNNER_TEMP/rpi-package-dist"
+          stage="$(python - "$RUNNER_TEMP/rpi-package-dist" <<'PY'
+          import pathlib
+          import sys
+          matches = sorted(pathlib.Path(sys.argv[1]).glob("rpi-packages-*"))
+          if len(matches) != 1:
+              raise SystemExit(f"expected one staged bundle, found {matches!r}")
+          print(matches[0].resolve())
+          PY
+          )"
+          test -n "$stage"
+          echo "RPI_COMPAT_STAGE=$stage" >> "$GITHUB_ENV"
+          echo "staged=$stage"
+
+      - name: Assert every staged extension loads in the current host
+        shell: bash
+        run: RPI_SMOKE_PLUGIN_DIR="$RPI_COMPAT_STAGE" cargo test -p rpi-extensions --test extension_compat --locked -- --ignored
+
+      - name: Exercise native RPC, ACP and Web against the staged set
+        shell: bash
+        run: |
+          set -euo pipefail
+          rpi_bin="target/extension-compat/release/rpi"
+          acp_bin="rpi-package/target/release/rpi-acp-bridge"
+          web_bin="rpi-package/target/release/rpi-web"
+          case "$RUNNER_OS" in
+            Windows) rpi_bin="$rpi_bin.exe"; acp_bin="$acp_bin.exe"; web_bin="$web_bin.exe" ;;
+          esac
+          python scripts/extension-compatibility.py \
+            --rpi "$rpi_bin" \
+            --extensions-dir "$RPI_COMPAT_STAGE" \
+            --acp "$acp_bin" \
+            --web "$web_bin" \
+            --diagnostics-dir "$RUNNER_TEMP/$COMPAT_DIAGNOSTICS_NAME"
+
+      - name: Upload compatibility diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.COMPAT_DIAGNOSTICS_NAME }}-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/${{ env.COMPAT_DIAGNOSTICS_NAME }}
+            ${{ runner.temp }}/rpi-package-dist/**/web.log
+          if-no-files-found: ignore
+          include-hidden-files: true
+
   release:
     name: Release automation
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [msrv, check, test, resources, platform-startup, windows-installer]
+    needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
     permissions:
       contents: write
       pull-requests: read
@@ -431,7 +557,7 @@ jobs:
   preview-version:
     name: Prepare preview release
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/preview' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [msrv, check, test, resources, platform-startup, windows-installer]
+    needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
     runs-on: ubuntu-latest
     permissions:
       contents: write
