@@ -390,6 +390,7 @@ pub fn add_provider(
     api_key: &str,
     model_id: &str,
     model_name: Option<&str>,
+    context_window: Option<u64>,
 ) -> Result<(), String> {
     const MAX_FIELD: usize = 4096;
     let provider_id = provider_id.trim();
@@ -419,6 +420,9 @@ pub fn add_provider(
     }
     if model_name.is_some_and(|value| value.len() > MAX_FIELD) {
         return Err("model name is too long".into());
+    }
+    if context_window == Some(0) {
+        return Err("context window must be greater than zero".into());
     }
     if !matches!(
         api,
@@ -450,7 +454,7 @@ pub fn add_provider(
                 base_url: None,
                 reasoning: None,
                 thinking_level_map: None,
-                context_window: None,
+                context_window,
                 max_tokens: None,
                 cost: None,
                 input: None,
@@ -921,6 +925,7 @@ mod tests {
             "fixture-key",
             "model-a",
             Some("Model A"),
+            Some(128_000),
         )
         .unwrap();
         let config = load_models_config().unwrap();
@@ -933,6 +938,7 @@ mod tests {
         assert_eq!(provider.api_key.as_deref(), Some("fixture-key"));
         assert_eq!(provider.models[0].id, "model-a");
         assert_eq!(provider.models[0].name.as_deref(), Some("Model A"));
+        assert_eq!(provider.models[0].context_window, Some(128_000));
     }
 
     #[test]
@@ -945,6 +951,7 @@ mod tests {
             "fixture-key",
             "model-a",
             None,
+            None,
         )
         .unwrap();
         let duplicate = add_provider(
@@ -953,6 +960,7 @@ mod tests {
             "https://api.example.test/v1",
             "fixture-key-2",
             "model-b",
+            None,
             None,
         )
         .unwrap_err();
@@ -964,9 +972,21 @@ mod tests {
             "fixture-key",
             "model-a",
             None,
+            None,
         )
         .unwrap_err();
         assert!(unsupported.contains("unsupported"));
+        let invalid_context = add_provider(
+            "context-zero",
+            "openai-completions",
+            "https://api.example.test/v1",
+            "fixture-key",
+            "model-a",
+            None,
+            Some(0),
+        )
+        .unwrap_err();
+        assert!(invalid_context.contains("context window"));
     }
 
     #[test]

@@ -18,6 +18,7 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub struct ProviderModel {
     pub id: String,
     pub owned_by: Option<String>,
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,12 +213,31 @@ fn parse_models(body: &str) -> Result<Vec<ProviderModel>, String> {
                     .get("owned_by")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                context_window: model_context_window(entry),
             })
         })
         .collect::<Vec<_>>();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     models.dedup_by(|a, b| a.id == b.id);
     Ok(models)
+}
+
+fn model_context_window(entry: &Value) -> Option<u64> {
+    [
+        entry.get("contextWindow"),
+        entry.get("context_window"),
+        entry.get("context_length"),
+        entry.get("max_context_size"),
+        entry.get("limit").and_then(|limit| limit.get("context")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+            .filter(|value| *value > 0)
+    })
 }
 
 fn request_error(error: &reqwest::Error) -> String {
@@ -251,11 +271,18 @@ mod tests {
 
     #[test]
     fn parse_openai_and_anthropic_model_shapes() {
-        let models = parse_models(r#"{"data":[{"id":"b"},{"id":"a","owned_by":"x"}]}"#).unwrap();
+        let models = parse_models(
+            r#"{"data":[{"id":"b"},{"id":"a","owned_by":"x","contextWindow":128000}]}"#,
+        )
+        .unwrap();
         assert_eq!(models[0].id, "a");
+        assert_eq!(models[0].context_window, Some(128000));
         assert_eq!(models[1].id, "b");
-        let models = parse_models(r#"{"models":[{"slug":"models/gemini"}]}"#).unwrap();
+        let models =
+            parse_models(r#"{"models":[{"slug":"models/gemini","limit":{"context":"1000"}}]}"#)
+                .unwrap();
         assert_eq!(models[0].id, "gemini");
+        assert_eq!(models[0].context_window, Some(1000));
     }
 
     #[test]

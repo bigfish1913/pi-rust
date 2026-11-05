@@ -2499,7 +2499,23 @@ fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value,
     let api_key = required("apiKey")?;
     let model_id = required("modelId")?;
     let model_name = msg.get("modelName").and_then(serde_json::Value::as_str);
-    crate::config::add_provider(provider, api, base_url, api_key, model_id, model_name)?;
+    let context_window = match msg.get("contextWindow") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+            .ok_or_else(|| "contextWindow must be a positive integer".to_string())
+            .map(Some)?,
+    };
+    crate::config::add_provider(
+        provider,
+        api,
+        base_url,
+        api_key,
+        model_id,
+        model_name,
+        context_window,
+    )?;
     Ok(serde_json::json!({
         "provider": provider,
         "modelId": model_id,
