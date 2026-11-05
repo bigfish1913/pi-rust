@@ -205,15 +205,15 @@ impl JsonlSessionStorage {
                             break;
                         }
                         max_seq = seq;
-                        runs.push(run);
+                        runs.push((seq, run));
                     }
                 }
                 preview.recycle(raw);
             }
             if clean {
                 let mut state = storage.state.lock().await;
-                for run in runs {
-                    state.activate_terminal_clear_run(&run);
+                for (seq, run) in runs {
+                    state.activate_terminal_clear_run(&run, seq);
                 }
             }
         }
@@ -245,7 +245,7 @@ impl JsonlSessionStorage {
                     let applied = if matches!(policy, ReadPolicy::FactsOnly) {
                         state.reserve_loaded_frame(frame)
                     } else if frame.op == AssistantFrameOp::Append
-                        && state.has_terminal_clear(frame.run_id.as_ref())
+                        && state.retires_append(frame.run_id.as_ref(), frame.seq)
                     {
                         // Its future clear was validated by the pre-scan. Keep
                         // the append-only ID/sequence contract without indexing
@@ -310,7 +310,7 @@ impl JsonlSessionStorage {
                             record: LaneRecord::AssistantFrame(frame),
                         } => {
                             frame.op == AssistantFrameOp::Append
-                                && state.has_terminal_clear(&frame.run_id)
+                                && state.retires_append(&frame.run_id, frame.base.seq)
                         }
                         _ => false,
                     };

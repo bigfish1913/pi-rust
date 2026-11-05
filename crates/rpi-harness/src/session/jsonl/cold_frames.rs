@@ -257,9 +257,12 @@ pub(super) struct ResidentState {
     // these two symbols, not a lifetime-wide interning table.
     last_frame_lane: Option<Arc<str>>,
     last_frame_run: Option<Arc<str>>,
-    // Runs whose append bodies are retired by a later clear_run. Filled only
-    // by a conservative load pre-scan; live appends use incremental retirement.
-    terminal_clears: std::collections::HashSet<String>,
+    // Latest clear_run marker seq per run, from a conservative load pre-scan;
+    // live appends use incremental retirement. A marker retires only the
+    // appends that physically precede it, so the value is a per-run threshold,
+    // not a "this run is gone" flag: an append written after the marker is a
+    // live frame the existing loader still exposes.
+    terminal_clears: HashMap<String, u64>,
 }
 impl Default for ResidentState {
     fn default() -> Self {
@@ -413,11 +416,23 @@ impl ResidentState {
         }
         Ok(())
     }
-    pub fn activate_terminal_clear_run(&mut self, run_id: &str) {
-        self.terminal_clears.insert(run_id.to_owned());
+    /// Record a run's `clear_run` marker seq. Several markers for one run
+    /// collapse to the largest seq, because the retired set is the union of
+    /// "appends before this marker" over every marker.
+    pub fn activate_terminal_clear_run(&mut self, run_id: &str, clear_seq: u64) {
+        let threshold = self
+            .terminal_clears
+            .entry(run_id.to_owned())
+            .or_insert(clear_seq);
+        *threshold = (*threshold).max(clear_seq);
     }
-    pub fn has_terminal_clear(&self, run_id: &str) -> bool {
-        self.terminal_clears.contains(run_id)
+    /// True only for an append that some `clear_run` of the same run retires.
+    /// This mirrors `IndexedState::retire_frames` (`frame.base.seq < before_seq`)
+    /// so the optimization can never outrun the authoritative reducer.
+    pub fn retires_append(&self, run_id: &str, seq: u64) -> bool {
+        self.terminal_clears
+            .get(run_id)
+            .is_some_and(|clear_seq| seq < *clear_seq)
     }
     /// Reserve only the durable identity of an append whose payload a known
     /// later `clear_run` retires. No cold Location, digest, or record/log row

@@ -269,3 +269,119 @@ async fn review_issue12_recovery_boundaries_and_strict_reader_are_unchanged() {
         assert_eq!(seqs, vec![3, 5, 6, 7, 8]);
     }
 }
+
+// Maintainer P1 on head 5a936e7: the pre-scan treated any run with a clear_run
+// as fully retired, so an append written *after* its own clear marker was
+// silently dropped. The existing loader keeps that later frame visible, so the
+// optimization must retire only appends that physically precede their marker.
+// Covered for both readers: the streaming path and the eager compatibility path.
+fn append_after_clear_history() -> String {
+    let header = JsonlV4Header::new("issue12-late".into(), 1, "/".into(), None, None, None);
+    let mut raw = encode_header(&header);
+    for (seq, op) in [
+        (1, AssistantFrameOp::Append),
+        (2, AssistantFrameOp::ClearRun),
+        (3, AssistantFrameOp::Append),
+    ] {
+        raw.push_str(&encode_mutation(&frame(seq, "late", op)));
+    }
+    raw
+}
+
+#[tokio::test]
+async fn review_issue12_append_after_its_own_clear_stays_visible() {
+    let raw = append_after_clear_history();
+    for eager in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (fs, path): (Arc<dyn FileSystem>, &str) = if eager {
+            (
+                Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into())),
+                "/late.jsonl",
+            )
+        } else {
+            (
+                Arc::new(OsExecutionEnv::with_cwd(dir.path().into())),
+                "late.jsonl",
+            )
+        };
+        fs.write_file(path, FileContent::Text(raw.clone()), None)
+            .await
+            .unwrap();
+        let storage = load(fs.clone(), path).await;
+
+        let shared = storage.state();
+        let state = shared.lock().await;
+        if !eager {
+            // Only the streaming reader indexes payload locations; the eager
+            // compatibility path keeps real payloads resident (pre-existing
+            // split, see `expect_cold = !eager` in the axis probe).
+            let locations = state.cold_locations();
+            assert_eq!(
+                locations.len(),
+                2,
+                "clear marker and the post-clear append keep payloads"
+            );
+            assert_eq!(locations[0], ("late".into(), false));
+            assert_eq!(locations[1], ("late".into(), true));
+        }
+        assert!(
+            state.validate_unused_id("f-1").is_err(),
+            "eager={eager}: a retired frame ID stays reserved"
+        );
+        drop(state);
+
+        let mut all = storage.find_records(&RecordQuery::default()).await.unwrap();
+        all.sort_unstable_by_key(|record| record.seq());
+        let seqs: Vec<_> = all.iter().map(|record| record.seq()).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 3],
+            "eager={eager}: an append after clear_run must stay visible, as before this PR"
+        );
+        assert_eq!(
+            fs.read_text_file(path, None).await.unwrap(),
+            raw,
+            "eager={eager}: neither reader may rewrite the history"
+        );
+    }
+}
+
+/// Several markers for one run: the retired set is every append before the
+/// largest marker seq, so an append between two markers stays visible.
+#[tokio::test]
+async fn review_issue12_only_appends_before_the_last_clear_are_retired() {
+    let header = JsonlV4Header::new("issue12-multi".into(), 1, "/".into(), None, None, None);
+    let mut raw = encode_header(&header);
+    for (seq, op) in [
+        (1, AssistantFrameOp::Append),
+        (2, AssistantFrameOp::ClearRun),
+        (3, AssistantFrameOp::Append),
+        (4, AssistantFrameOp::ClearRun),
+        (5, AssistantFrameOp::Append),
+    ] {
+        raw.push_str(&encode_mutation(&frame(seq, "multi", op)));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(OsExecutionEnv::with_cwd(dir.path().into()));
+    fs.write_file("multi.jsonl", FileContent::Text(raw.clone()), None)
+        .await
+        .unwrap();
+    let storage = load(fs.clone(), "multi.jsonl").await;
+    let mut all = storage.find_records(&RecordQuery::default()).await.unwrap();
+    all.sort_unstable_by_key(|record| record.seq());
+    let seqs: Vec<_> = all.iter().map(|record| record.seq()).collect();
+    assert_eq!(
+        seqs,
+        vec![2, 4, 5],
+        "appends before a later clear are retired; the trailing append survives"
+    );
+    let shared = storage.state();
+    let state = shared.lock().await;
+    assert_eq!(
+        state.cold_locations().len(),
+        3,
+        "two markers plus the trailing live append"
+    );
+    drop(state);
+    assert_eq!(fs.read_text_file("multi.jsonl", None).await.unwrap(), raw);
+}
