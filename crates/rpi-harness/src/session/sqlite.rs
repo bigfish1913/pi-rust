@@ -18,7 +18,7 @@ use crate::session::state::SessionState;
 use crate::session::types::{
     BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator, LanePointer, LaneRecord, LogItem,
     LogOptions, OperationStartedRecord, ProvisionedEntry, RecordQuery, SessionCreateOptions,
-    SessionMetadata, SessionRepo, SessionStats, SessionStorage,
+    SessionLaneBranch, SessionMetadata, SessionRepo, SessionStats, SessionStorage,
 };
 
 #[derive(Clone)]
@@ -149,6 +149,10 @@ impl SessionStorage for SqliteSessionStorage {
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
         let _gate = self.refresh_read().await?;
         self.inner.get_lanes().await
+    }
+    async fn lane_branch(&self, lane: &str) -> SessionResult<SessionLaneBranch> {
+        let _gate = self.refresh_read().await?;
+        self.inner.lane_branch(lane).await
     }
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
         let lane = lane.to_string();

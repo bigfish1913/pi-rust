@@ -113,6 +113,20 @@ impl SessionState {
         self.index.get_lanes()
     }
 
+    /// Atomically snapshot the authoritative lane leaf and explicit navigation
+    /// generation while the reducer is held by its storage backend.
+    pub fn lane_branch(
+        &self,
+        lane: &str,
+    ) -> SessionResult<crate::session::types::SessionLaneBranch> {
+        let (leaf_id, generation) = self.index.lane_branch(lane)?;
+        Ok(crate::session::types::SessionLaneBranch {
+            lane: lane.to_owned(),
+            leaf_id,
+            generation,
+        })
+    }
+
     /// Look up a lane's leaf, or `invalid_lane` if the lane doesn't exist.
     pub fn require_lane(&self, lane: &str) -> SessionResult<Option<String>> {
         self.index.require_lane(lane)
@@ -635,6 +649,7 @@ impl<P: Clone> IndexedState<P> {
                 retire_record_checks: self.retire_record_checks,
                 open_operations_by_lane: self.open_operations_by_lane,
                 lanes: self.lanes,
+                lane_generations: self.lane_generations,
                 log: self.log,
                 stats: self.stats,
                 name: self.name,

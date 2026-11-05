@@ -121,6 +121,23 @@ impl<'de> Deserialize<'de> for SessionState {
         {
             return Err(D::Error::custom("snapshot contains unreferenced payloads"));
         }
+        // Derive identity only from the authoritative ordered lane mutations;
+        // no new persisted generation field or migration is needed.
+        let mut lane_generations: BTreeMap<String, u64> = snapshot
+            .lanes
+            .keys()
+            .map(|lane| (lane.clone(), 0))
+            .collect();
+        for item in &snapshot.log {
+            if let StoredLogItem::Other(item) = item {
+                if let LogItem::Lane { seq, lane, .. } = item.as_ref() {
+                    if !snapshot.lanes.contains_key(lane) {
+                        return Err(D::Error::custom("snapshot lane mutation has no lane"));
+                    }
+                    lane_generations.insert(lane.clone(), *seq);
+                }
+            }
+        }
         let mut open_operations_by_lane: HashMap<String, BTreeMap<u64, OperationStartedRecord>> =
             HashMap::new();
         for record in &snapshot.records {
@@ -191,6 +208,7 @@ impl<'de> Deserialize<'de> for SessionState {
                 retire_record_checks: 0,
                 open_operations_by_lane,
                 lanes: snapshot.lanes,
+                lane_generations,
                 log: snapshot.log,
                 stats: snapshot.stats,
                 name: snapshot.name,

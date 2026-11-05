@@ -20,6 +20,34 @@ and logs. A numeric handle alone is not a credential or authorization. A registr
 a tool invocation. Synchronous callbacks inherit their actual driver identity;
 foreign workers authenticate the captured invocation, including child subsets.
 
+## Additive live branch identity
+
+Native RPC separately advertises `toolProgramBranch` exactly as
+`{"version":1,"command":"get_tool_program_branch","identity":"bindingAndLaneGeneration"}`.
+The argument-free read (RPC `type`/`id` only) returns
+`{sessionId, lane, bindingId, generation, leafId}`. A UUIDv4 binding ID changes on
+facade replacement; the generation derives from explicit native lane mutations,
+including same-leaf/away-and-back navigation, and remains stable on normal entry
+append. Reads pin one storage binding and atomically capture leaf/generation.
+Clones/pins share identity. JSONL/SQLite replay derives generation from existing
+lane records; no journal format, transcript field, migration or SDK/ABI change.
+Custom storage without atomic lane identity support fails closed (the optional
+experimental backend does not implement this new read).
+
+The companion extcore live path now requires this additional exact capability
+and command, brackets attachment/every per-event bounded proof, and permits a
+final leaf advance only with unchanged binding/generation and retained begin/
+phase membership. Navigation/ABA/rebind and missing facts still resync. Frozen
+child-query/event v1 profiles and old-host read-only recovery remain unchanged.
+This is not a generic navigation event feed or protection from raw-storage forgery.
+
+A local isolated Windows ACP run with freshly built test binaries received three
+ordinary post-subscribe-ACK updates from a real Code Mode bash child, including
+final/closed and succeeded outcome, reconciled to persisted native entries.
+Evidence: companion `target/branch-live-native-5/` and final-source repeat
+`target/branch-live-native-6/`. It is not full parity, a real
+external-provider test, Unix/UI qualification, installation or deployment.
+
 ## Latest bounded native child queries and commit events
 
 Native RPC now advertises **`toolProgramChildren.version = 1`** with three

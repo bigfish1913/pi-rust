@@ -18,6 +18,10 @@ pub(crate) struct IndexedState<P: Clone> {
     pub(super) retire_record_checks: usize,
     pub(super) open_operations_by_lane: HashMap<String, BTreeMap<u64, OperationStartedRecord>>,
     pub(super) lanes: BTreeMap<String, Option<String>>,
+    /// Sequence of the latest explicit create/move mutation for each lane.
+    /// This is deliberately independent of the history sequence and ordinary
+    /// entry appends, so ABA navigation cannot be mistaken for an append.
+    pub(super) lane_generations: BTreeMap<String, u64>,
     pub(super) log: Vec<StoredLogItem>,
     pub(super) stats: SessionStats,
     pub(super) name: Option<String>,
@@ -40,6 +44,7 @@ impl<P: Clone> IndexedState<P> {
             #[cfg(test)]
             retire_record_checks: 0,
             open_operations_by_lane: HashMap::new(),
+            lane_generations: lanes.keys().map(|lane| (lane.clone(), 0)).collect(),
             lanes,
             log: Vec::new(),
             stats: SessionStats::default(),
@@ -144,6 +149,16 @@ impl<P: Clone> IndexedState<P> {
         if seq > self.sequence {
             self.sequence = seq;
         }
+    }
+
+    pub(crate) fn lane_branch(&self, lane: &str) -> SessionResult<(Option<String>, u64)> {
+        let leaf = self.require_lane(lane)?;
+        let generation = self
+            .lane_generations
+            .get(lane)
+            .copied()
+            .ok_or_else(|| SessionError::storage("lane branch generation is unavailable"))?;
+        Ok((leaf, generation))
     }
 
     pub(crate) fn get_lanes(&self) -> Vec<LanePointer> {
@@ -484,6 +499,7 @@ impl<P: Clone> IndexedState<P> {
                 }
                 self.sequence = seq;
                 self.lanes.insert(lane.clone(), leaf_id.clone());
+                self.lane_generations.insert(lane.clone(), seq);
                 self.log.push(StoredLogItem::Other(Box::new(LogItem::Lane {
                     seq,
                     lane,
