@@ -36,10 +36,10 @@ pub const INLINE_IMAGE_MAX_SIDE: u32 = 2000;
 pub const INLINE_IMAGE_MAX_BASE64_BYTES: usize = 9 * 1024 * 1024 / 2;
 
 /// Restricted RPC input profile. This is deliberately narrower than tool images.
-pub const RPC_IMAGE_MAX_BYTES: usize = 256 * 1024;
+pub const RPC_IMAGE_MAX_BYTES: usize = 1024 * 1024;
 pub const RPC_IMAGE_MAX_BASE64_BYTES: usize = RPC_IMAGE_MAX_BYTES.div_ceil(3) * 4;
 pub const RPC_IMAGE_MAX_PIXELS: u64 = 4_000_000;
-pub const RPC_IMAGE_MAX_ALLOC: u64 = 32 * 1024 * 1024;
+pub const RPC_IMAGE_MAX_ALLOC: u64 = 64 * 1024 * 1024;
 
 /// Validate without transforming or omitting any image. Call on a blocking worker
 /// before accepting a prompt, not via `normalize_image_blocks` (which omits errors).
@@ -58,13 +58,19 @@ pub fn validate_rpc_inline_image(data: &str, mime_type: &str) -> Result<(), Stri
         _ => return Err("image MIME must be image/png or image/jpeg".into()),
     };
     if data.is_empty() || data.len() > RPC_IMAGE_MAX_BASE64_BYTES {
-        return Err("image data must contain 1..262144 decoded bytes".into());
+        return Err(format!(
+            "image data must contain 1..{} decoded bytes",
+            RPC_IMAGE_MAX_BYTES
+        ));
     }
     let bytes = STANDARD
         .decode(data)
         .map_err(|_| "image data must be canonical standard base64".to_string())?;
     if bytes.is_empty() || bytes.len() > RPC_IMAGE_MAX_BYTES {
-        return Err("image data must contain 1..262144 decoded bytes".into());
+        return Err(format!(
+            "image data must contain 1..{} decoded bytes",
+            RPC_IMAGE_MAX_BYTES
+        ));
     }
     if STANDARD.encode(&bytes) != data {
         return Err("image data must be canonical standard base64".into());
@@ -99,9 +105,12 @@ pub fn validate_rpc_inline_image(data: &str, mime_type: &str) -> Result<(), Stri
     // remaining budget to set_limits, matching ImageReader::decode. The locked
     // PNG decoder cannot update its internal budget here, and JPEG scratch
     // allocations are not accounted (see the public function documentation).
-    limits
-        .reserve(decoder.total_bytes())
-        .map_err(|_| "image exceeds the 32 MiB decode allocation budget".to_string())?;
+    limits.reserve(decoder.total_bytes()).map_err(|_| {
+        format!(
+            "image exceeds the {} MiB decode allocation budget",
+            RPC_IMAGE_MAX_ALLOC / (1024 * 1024)
+        )
+    })?;
     decoder
         .set_limits(limits)
         .map_err(|_| "image exceeds decoder limits".to_string())?;
