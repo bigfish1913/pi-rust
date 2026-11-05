@@ -338,9 +338,9 @@ def web_smoke(web: Path, rpi: Path, root: Path, env: dict[str, str]) -> dict:
 
 def main() -> int:
     args = parse_args()
-    rpi = executable(args.rpi)
-    acp = executable(args.acp)
-    web = executable(args.web)
+    rpi = executable(args.rpi.resolve())
+    acp = executable(args.acp.resolve())
+    web = executable(args.web.resolve())
     extensions = args.extensions_dir.resolve()
     assert extensions.is_dir(), extensions
     args.diagnostics_dir.mkdir(parents=True, exist_ok=True)
