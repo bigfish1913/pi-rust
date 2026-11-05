@@ -634,8 +634,10 @@ pub(crate) fn update_plan_panel(chat: &Arc<Container>, result: &Value) -> bool {
                 if let Some(expanded) = details.get("expanded").and_then(Value::as_bool) {
                     component.set_expanded(expanded);
                 }
-                chat.remove_child(&child);
-                chat.add_child(child);
+                // Keep the panel at the position where planning started. Moving
+                // it to the tail makes all later transcript rows jump above the
+                // completed plan and, in regular mode, turns the reorder into a
+                // native-scrollback rebuild on macOS.
                 return true;
             }
         }
@@ -1384,6 +1386,79 @@ mod tests {
             &json!({"details":{"todos":[{}]}})
         ));
         assert_eq!(view.chat.child_count(), 3);
+    }
+
+    #[test]
+    fn completed_plan_keeps_its_transcript_position() {
+        let view = view();
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Text("planning context".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::AssistantEnd {
+                blocks: vec![AssistantBlock::Text("planning context".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::ToolEnd {
+                id: "start".into(),
+                name: "plan_mode_start".into(),
+                result: json!({"details":{"kind":"plan","active":true}}),
+                is_error: false,
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Text("repository findings".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::AssistantEnd {
+                blocks: vec![AssistantBlock::Text("repository findings".into())],
+            },
+            80,
+        );
+
+        view.apply(
+            &UiEvent::ToolEnd {
+                id: "complete".into(),
+                name: "plan_mode_complete".into(),
+                result: json!({
+                    "details": {
+                        "kind": "plan",
+                        "active": false,
+                        "plan": "1. Keep the plan in place"
+                    }
+                }),
+                is_error: false,
+            },
+            80,
+        );
+
+        let lines: Vec<_> = view
+            .chat
+            .render(80)
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect();
+        let plan = lines
+            .iter()
+            .position(|line| line.contains("Plan · Ready"))
+            .expect("completed plan panel should render");
+        let findings = lines
+            .iter()
+            .position(|line| line.contains("repository findings"))
+            .expect("later assistant output should render");
+        assert!(
+            plan < findings,
+            "plan completion must not move the plan below later transcript output: {lines:?}"
+        );
     }
 
     #[test]
