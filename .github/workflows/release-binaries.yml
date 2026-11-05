@@ -46,6 +46,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Release binaries must be built with the same warning policy as CI tests.
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   build:
