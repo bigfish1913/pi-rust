@@ -379,6 +379,89 @@ pub fn save_models_config(cfg: &ModelsConfig) -> Result<(), ConfigError> {
     atomic_write(&path, text.as_bytes())
 }
 
+/// Add one user-configured provider and its first model to `models.json`.
+///
+/// This is shared by the interactive provider form and RPC clients so both
+/// surfaces enforce the same protocol, URL, duplicate, and size checks.
+pub fn add_provider(
+    provider_id: &str,
+    api: &str,
+    base_url: &str,
+    api_key: &str,
+    model_id: &str,
+    model_name: Option<&str>,
+) -> Result<(), String> {
+    const MAX_FIELD: usize = 4096;
+    let provider_id = provider_id.trim();
+    let api = api.trim();
+    let base_url = base_url.trim();
+    let api_key = api_key.trim();
+    let model_id = model_id.trim();
+    let model_name = model_name.map(str::trim).filter(|value| !value.is_empty());
+    if provider_id.is_empty()
+        || api.is_empty()
+        || base_url.is_empty()
+        || api_key.is_empty()
+        || model_id.is_empty()
+    {
+        return Err("provider, protocol, base URL, API key, and model ID are required".into());
+    }
+    for (label, value) in [
+        ("provider", provider_id),
+        ("protocol", api),
+        ("base URL", base_url),
+        ("API key", api_key),
+        ("model ID", model_id),
+    ] {
+        if value.len() > MAX_FIELD {
+            return Err(format!("{label} is too long"));
+        }
+    }
+    if model_name.is_some_and(|value| value.len() > MAX_FIELD) {
+        return Err("model name is too long".into());
+    }
+    if !matches!(
+        api,
+        "anthropic-messages" | "openai-completions" | "openai-responses"
+    ) {
+        return Err("unsupported provider protocol".into());
+    }
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err("base URL must start with http:// or https://".into());
+    }
+    let mut config = load_models_config().map_err(|error| error.to_string())?;
+    if config.providers.contains_key(provider_id) {
+        return Err(format!(
+            "provider {provider_id:?} already has a models.json configuration"
+        ));
+    }
+    config.providers.insert(
+        provider_id.to_owned(),
+        ProviderConfig {
+            name: None,
+            base_url: Some(base_url.to_owned()),
+            api_key: Some(api_key.to_owned()),
+            api: Some(api.to_owned()),
+            headers: None,
+            auth_header: None,
+            models: vec![ModelDefinition {
+                id: model_id.to_owned(),
+                name: model_name.map(str::to_owned),
+                base_url: None,
+                reasoning: None,
+                thinking_level_map: None,
+                context_window: None,
+                max_tokens: None,
+                cost: None,
+                input: None,
+                headers: None,
+                compat: None,
+            }],
+        },
+    );
+    save_models_config(&config).map_err(|error| error.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // trust.json — project-trust store (read-only layout parity with pi)
 // ---------------------------------------------------------------------------
@@ -826,6 +909,64 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"anthropic\""));
         assert!(raw.contains("api_key"));
+    }
+
+    #[test]
+    fn add_provider_writes_protocol_endpoint_key_and_model() {
+        let _cfg = TempConfig::new();
+        add_provider(
+            "gateway",
+            "openai-completions",
+            "https://api.example.test/v1",
+            "fixture-key",
+            "model-a",
+            Some("Model A"),
+        )
+        .unwrap();
+        let config = load_models_config().unwrap();
+        let provider = config.providers.get("gateway").unwrap();
+        assert_eq!(provider.api.as_deref(), Some("openai-completions"));
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.example.test/v1")
+        );
+        assert_eq!(provider.api_key.as_deref(), Some("fixture-key"));
+        assert_eq!(provider.models[0].id, "model-a");
+        assert_eq!(provider.models[0].name.as_deref(), Some("Model A"));
+    }
+
+    #[test]
+    fn add_provider_rejects_duplicate_and_unsupported_protocol() {
+        let _cfg = TempConfig::new();
+        add_provider(
+            "gateway",
+            "openai-responses",
+            "https://api.example.test/v1",
+            "fixture-key",
+            "model-a",
+            None,
+        )
+        .unwrap();
+        let duplicate = add_provider(
+            "gateway",
+            "openai-completions",
+            "https://api.example.test/v1",
+            "fixture-key-2",
+            "model-b",
+            None,
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("already"));
+        let unsupported = add_provider(
+            "other",
+            "unsupported",
+            "https://api.example.test/v1",
+            "fixture-key",
+            "model-a",
+            None,
+        )
+        .unwrap_err();
+        assert!(unsupported.contains("unsupported"));
     }
 
     #[test]

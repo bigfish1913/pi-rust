@@ -996,6 +996,7 @@ where
             "get_auth_status" => Ok(rpc_get_auth_status(&model_catalog, oauth_snapshot.as_ref())),
             "oauth" => rpc_oauth(&oauth_snapshot, &msg),
             "set_api_key" => rpc_set_api_key(&msg).await,
+            "set_provider_config" => rpc_set_provider_config(&msg),
             "set_model" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
                 Err("cannot set model while a run or prompt validation is active".into())
             }
@@ -2448,6 +2449,29 @@ fn oauth_display(payload: &serde_json::Value) -> serde_json::Value {
         }
     }
     serde_json::Value::Object(safe)
+}
+
+fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let required = |name: &str| {
+        msg.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("set_provider_config requires {name}"))
+    };
+    let provider = required("provider")?;
+    let api = required("api")?;
+    let base_url = required("baseUrl")?;
+    let api_key = required("apiKey")?;
+    let model_id = required("modelId")?;
+    let model_name = msg.get("modelName").and_then(serde_json::Value::as_str);
+    crate::config::add_provider(provider, api, base_url, api_key, model_id, model_name)?;
+    Ok(serde_json::json!({
+        "provider": provider,
+        "modelId": model_id,
+        "api": api,
+        "requiresRestart": true,
+    }))
 }
 
 async fn rpc_set_api_key(msg: &serde_json::Value) -> Result<serde_json::Value, String> {

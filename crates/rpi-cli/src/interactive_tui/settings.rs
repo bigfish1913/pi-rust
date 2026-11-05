@@ -1792,34 +1792,14 @@ pub(super) fn remove_provider(input: &str) -> Result<String, String> {
 /// Write the completed form into `models.json` as a new provider with one
 /// model.
 pub(super) fn save_provider_from_form(form: &ProviderFormState) -> Result<String, String> {
-    let mut cfg = crate::config::load_models_config().map_err(|error| error.to_string())?;
-    let provider = crate::config::ProviderConfig {
-        name: None,
-        base_url: Some(form.base_url.clone()),
-        api_key: Some(form.api_key.clone()),
-        api: Some(form.api.clone()),
-        headers: None,
-        auth_header: None,
-        models: vec![crate::config::ModelDefinition {
-            id: form.model_id.clone(),
-            name: if form.model_name.is_empty() {
-                None
-            } else {
-                Some(form.model_name.clone())
-            },
-            base_url: None,
-            reasoning: None,
-            thinking_level_map: None,
-            context_window: None,
-            max_tokens: None,
-            cost: None,
-            input: None,
-            headers: None,
-            compat: None,
-        }],
-    };
-    cfg.providers.insert(form.id.clone(), provider);
-    crate::config::save_models_config(&cfg).map_err(|error| error.to_string())?;
+    crate::config::add_provider(
+        &form.id,
+        &form.api,
+        &form.base_url,
+        &form.api_key,
+        &form.model_id,
+        Some(&form.model_name),
+    )?;
     Ok(format!(
         "Added provider \"{}\" ({} · {} model) — restart rpi to use it.",
         form.id, form.api, form.model_id
