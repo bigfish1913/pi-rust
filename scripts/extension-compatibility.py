@@ -69,6 +69,9 @@ def clean_environment(root: Path, extensions: Path) -> dict[str, str]:
                     "compat-fixture": {
                         "api": "openai-completions",
                         "baseUrl": "http://127.0.0.1:1/v1",
+                        # Deliberately non-secret: startup requires a configured
+                        # key even though offline smoke never calls the provider.
+                        "apiKey": "compatibility-test-only",
                         "models": [
                             {
                                 "id": "synthetic",
