@@ -384,12 +384,14 @@ def main() -> int:
         results["acp"] = acp_smoke(acp, rpi, root, env)
         results["web"] = web_smoke(web, rpi, root, env)
         results["status"] = "passed"
-        print(json.dumps(results, indent=2, ensure_ascii=False))
+        # GitHub's Windows shell may still use cp1252; escaped JSON keeps
+        # diagnostics printable without changing the UTF-8 artifact on disk.
+        print(json.dumps(results, indent=2, ensure_ascii=True))
         return 0
     except Exception as error:
         results["status"] = "failed"
         results["error"] = repr(error)
-        print(json.dumps(results, indent=2, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps(results, indent=2, ensure_ascii=True), file=sys.stderr)
         raise
     finally:
         (args.diagnostics_dir / "results.json").write_text(
