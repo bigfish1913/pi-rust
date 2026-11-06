@@ -94,7 +94,7 @@ pub(super) async fn restore_queued_messages_to_editor(
         }
         Err(error) => {
             add_error_message(
-                &state.chat_container,
+                &state.transcript_container(),
                 &format!("Could not restore queued messages: {error}"),
             );
             tui.request_render(false);
@@ -116,11 +116,14 @@ pub(super) async fn handle_dequeue(
     let restored =
         restore_queued_messages_to_editor(lane, editor, state.clone(), tui.clone()).await;
     if restored == 0 {
-        add_note_message(&state.chat_container, "No queued messages to restore");
+        add_note_message(
+            &state.transcript_container(),
+            "No queued messages to restore",
+        );
     } else {
         let plural = if restored > 1 { "s" } else { "" };
         add_note_message(
-            &state.chat_container,
+            &state.transcript_container(),
             &format!("Restored {restored} queued message{plural} to editor"),
         );
     }
@@ -208,7 +211,10 @@ pub(super) async fn handle_agent_event(
                         .history_page
                         .unsaved
                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                    add_error_message(chat, &format!("Could not record bash result: {error}"));
+                    add_error_message(
+                        &state.transcript_container(),
+                        &format!("Could not record bash result: {error}"),
+                    );
                 }
             }
             // The run drained the queue; refresh so consumed entries drop out
@@ -218,7 +224,7 @@ pub(super) async fn handle_agent_event(
             // the run outcome. Report it here: inside the alternate screen a
             // `tracing::warn!` reaches nobody, and the user must know before
             // exiting that the conversation stopped being saved.
-            if report_write_failures(chat, lane) {
+            if report_write_failures(&state.transcript_container(), lane) {
                 state
                     .history_page
                     .unsaved
@@ -309,7 +315,10 @@ pub(super) async fn handle_agent_event(
                     chat.add_child(Arc::new(Spacer::new(1)));
                     tui.request_render(false);
                 } else {
-                    add_note_message(chat, &custom_message_fallback(&custom));
+                    add_note_message(
+                        &state.transcript_container(),
+                        &custom_message_fallback(&custom),
+                    );
                     tui.request_render(false);
                 }
             }
@@ -414,7 +423,7 @@ pub(super) async fn handle_agent_event(
                         String::new()
                     };
                     add_note_message(
-                        &state.chat_container,
+                        &state.transcript_container(),
                         &format!(
                             "Cache miss: {} tokens re-billed{}",
                             format_tokens(miss.missed_tokens),
@@ -423,14 +432,14 @@ pub(super) async fn handle_agent_event(
                     );
                 }
                 if let Some(text) = extension_usage_text(Some(&state.extension_session), usage) {
-                    add_note_message(chat, &text);
+                    add_note_message(&state.transcript_container(), &text);
                 }
                 // Error assistant messages carry the provider diagnostic in
                 // `error_message`, not in text content. The assistant
                 // component is empty for these messages, so surface the
                 // diagnostic as a visible error row in the transcript.
                 if let Some(error) = assistant_error_text(a) {
-                    add_error_message(chat, &error);
+                    add_error_message(&state.transcript_container(), &error);
                 }
             }
             tui.request_render(false);

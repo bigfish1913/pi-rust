@@ -2053,20 +2053,25 @@ impl TuiState {
         self.markdown_transformer.lock().unwrap().clone()
     }
 
+    /// Runtime messages belong beside streamed output, before later replies.
+    /// The root is only a layout host once paged history is bound.
+    pub(super) fn transcript_container(&self) -> Arc<Container> {
+        if self.history_page.is_bound() {
+            self.history_page.active.clone()
+        } else {
+            self.chat_container.clone()
+        }
+    }
+
     /// Build a [`TranscriptView`] over the shared component maps. Cheap (clones
     /// a handful of `Arc`s) and lets the event drain render the transcript
     /// through the same code path as the remote client.
     ///
     /// [`TranscriptView`]: crate::transcript_view::TranscriptView
     pub(super) fn transcript_view(&self) -> crate::transcript_view::TranscriptView {
-        // Hosts/tests without a managed history binding keep the original flat view.
         let managed = self.history_page.is_bound();
         crate::transcript_view::TranscriptView::with_maps(
-            if managed {
-                self.history_page.active.clone()
-            } else {
-                self.chat_container.clone()
-            },
+            self.transcript_container(),
             self.current_assistant.clone(),
             self.tool_components.clone(),
             self.bash_components.clone(),
