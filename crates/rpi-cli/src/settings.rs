@@ -127,6 +127,11 @@ pub struct Settings {
     #[serde(default)]
     pub http_proxy: Option<String>,
 
+    /// Optional HTTPS base URL for release archive downloads. GitHub manifests
+    /// remain authoritative and the CDN is only a transport accelerator.
+    #[serde(default)]
+    pub cdn_base_url: Option<String>,
+
     /// Retry policy for assistant turns. Mirrors upstream `retry`; the fields
     /// map 1:1 onto the harness's `RetryPolicy`.
     #[serde(default)]
@@ -555,6 +560,7 @@ fn save_settings_to_path(
             settings.default_thinking_level.as_ref(),
         ),
         ("theme", settings.theme.as_ref()),
+        ("cdnBaseUrl", settings.cdn_base_url.as_ref()),
         (
             "lastChangelogVersion",
             settings.last_changelog_version.as_ref(),
@@ -941,6 +947,28 @@ mod scoped_tests {
             Some("http://127.0.0.1:8888")
         );
         assert_eq!(Settings::default().http_proxy, None);
+    }
+
+    #[test]
+    fn cdn_base_url_setting_round_trips() {
+        let (_tmp, _guard) = with_temp_env();
+        let mut settings = Settings::default();
+        settings.cdn_base_url = Some("https://assets.bigfisharc.cn".into());
+        save_settings(&settings).unwrap();
+
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(config::settings_path().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["cdnBaseUrl"], "https://assets.bigfisharc.cn");
+        assert_eq!(
+            load_settings().unwrap().cdn_base_url.as_deref(),
+            Some("https://assets.bigfisharc.cn")
+        );
+
+        settings.cdn_base_url = None;
+        save_settings(&settings).unwrap();
+        assert!(load_settings().unwrap().cdn_base_url.is_none());
     }
     #[test]
     fn harness_options_come_from_settings() {

@@ -177,6 +177,22 @@ impl FilePathAutocompleteProvider {
             return Some((token[1..].to_string(), start + 1));
         }
 
+        // Native pi's `extractPathPrefix` only hands a token to the file
+        // provider when it actually looks like a path: a separator anywhere
+        // in the token, or a leading `.` / `~/`. A bare word in prose (`c`,
+        // `hhhh`) must not trigger a cwd `read_dir` on every caret move.
+        // The `@` branch above is the explicit opt-in; a token right after
+        // a `"` keeps the port's pre-existing quoted-path channel (`"` is
+        // itself a delimiter, so `start` points past it).
+        let looks_like_path = token.contains('/')
+            || token.contains('\\')
+            || token.starts_with('.')
+            || token.starts_with("~/");
+        let quoted = start > 0 && input[..start].ends_with('"');
+        if !looks_like_path && !quoted {
+            return None;
+        }
+
         Some((token.to_string(), start))
     }
 
@@ -565,5 +581,110 @@ mod tests {
         assert_eq!(texts, vec!["nested/"]);
         assert_eq!(suggestions.start, 1);
         assert_eq!(suggestions.end, prefix.len());
+    }
+
+    /// Fork issue #11: a bare word in prose is not a path. Holding an arrow
+    /// key moves the caret through `n n` / `cc cc` / `hhhh hhhh`, and every
+    /// keystroke called `refresh_autocomplete`; the old provider answered
+    /// each token (`c`, `hhhh`, ...) with a `read_dir` of cwd, so the file
+    /// panel flickered open and shut. Native pi keeps an explicit path
+    /// appearance gate here — this probe fails on the pre-fix provider.
+    #[test]
+    fn bare_word_tokens_never_open_the_file_panel() {
+        let scratch = Scratch::new("bare-token");
+        std::fs::write(scratch.0.join("chromium-proxy-policy.reg"), "fixture").unwrap();
+        let provider = FilePathAutocompleteProvider::with_root(scratch.0.clone());
+        let text = "n n\ncc cc\nhhhh hhhh";
+        // Every caret position inside a bare word, including the `c` in
+        // `cc c|c` from the report: the popup must stay closed for the whole
+        // arrow-key sweep. `cursor` is a byte offset, as the editor supplies.
+        for (cursor, _) in text
+            .char_indices()
+            .chain(std::iter::once((text.len(), ' ')))
+        {
+            if text[..cursor]
+                .chars()
+                .last()
+                .is_some_and(char::is_whitespace)
+            {
+                continue;
+            }
+            assert!(
+                provider.get_suggestions(text, cursor).is_none(),
+                "bare word at byte {cursor} in {text:?} opened a file panel"
+            );
+        }
+        assert!(provider.get_suggestions("n n\ncc cc", 5).is_none());
+    }
+
+    #[test]
+    fn a_leading_dot_still_looks_like_a_path() {
+        let scratch = Scratch::new("leading-dot");
+        std::fs::write(scratch.0.join(".env"), "fixture").unwrap();
+        let provider = FilePathAutocompleteProvider::with_root(scratch.0.clone());
+        // Native pi treats any leading `.` as a path trigger, including a
+        // lone dot in prose. Keep that exemption rather than inventing a
+        // stricter gate than upstream.
+        let suggestions = provider
+            .get_suggestions("hello .", 7)
+            .expect("a leading dot still looks like a path");
+        assert_eq!(suggestions.start, 6);
+        assert_eq!(suggestions.end, 7);
+    }
+
+    /// The gate must not take away any of the explicit ways to ask for a
+    /// file: `@` references, quoted paths, and path-shaped tokens. Assert on
+    /// the extraction step, not `get_suggestions`: a relative path containing
+    /// a separator is resolved against the process cwd (pre-existing
+    /// `get_path_completions` behavior), so whether it finds an entry is not
+    /// a property of this gate.
+    #[test]
+    fn path_appearance_and_explicit_references_still_complete() {
+        let provider = FilePathAutocompleteProvider::new();
+        let cases: &[(&str, &str, usize)] = &[
+            ("@st", "st", 1),
+            ("@nested/", "nested/", 1),
+            ("@\"no", "no", 2),
+            ("\"no", "no", 1),
+            ("./ed", "./ed", 0),
+            ("./", "./", 0),
+            ("~/", "~/", 0),
+            ("a/b", "a/b", 0),
+            ("a\\b", "a\\b", 0),
+            ("/ab", "/ab", 0),
+        ];
+        for (input, prefix, start) in cases {
+            let extracted = provider.extract_path_prefix(input, input.len());
+            assert_eq!(
+                extracted.as_ref().map(|(p, s)| (p.as_str(), *s)),
+                Some((*prefix, *start)),
+                "{input:?} must still be extracted as a path"
+            );
+        }
+    }
+
+    /// End-to-end: an `@` reference and an absolute path still produce
+    /// candidates through `get_suggestions` after the gate.
+    #[test]
+    fn explicit_file_references_still_resolve() {
+        let scratch = Scratch::new("path-gate");
+        std::fs::write(scratch.0.join("notes.txt"), "fixture").unwrap();
+        let nested = scratch.0.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("report.txt"), "fixture").unwrap();
+        let provider = FilePathAutocompleteProvider::with_root(scratch.0.clone());
+
+        let at = "@notes";
+        let suggestions = provider
+            .get_suggestions(at, at.len())
+            .expect("an @ reference completes a root entry");
+        assert_eq!(suggestions.items[0].text, "notes.txt");
+        assert_eq!(suggestions.start, 1);
+
+        let absolute = format!("@{}{}repo", nested.display(), std::path::MAIN_SEPARATOR);
+        let suggestions = provider
+            .get_suggestions(&absolute, absolute.len())
+            .expect("an absolute @ path completes its basename");
+        assert_eq!(suggestions.items[0].text, "report.txt");
     }
 }

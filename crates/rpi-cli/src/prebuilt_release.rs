@@ -93,7 +93,11 @@ fn validate<'a>(
     Ok(distribution)
 }
 
-pub(crate) async fn download_to(version: &str, staging: &Path) -> Result<(), String> {
+pub(crate) async fn download_to(
+    version: &str,
+    staging: &Path,
+    cdn_base: Option<&reqwest::Url>,
+) -> Result<(), String> {
     semver::Version::parse(version).map_err(|_| "invalid CLI release version")?;
     let target = host_target()?;
     let client = reqwest::Client::builder()
@@ -110,7 +114,7 @@ pub(crate) async fn download_to(version: &str, staging: &Path) -> Result<(), Str
         .await
         .map_err(|e| format!("CLI manifest request failed: {e}"))?;
     let manifest = read_manifest(response, version).await?;
-    let path = download_manifest_to(&client, &manifest, version, target, staging).await?;
+    let path = download_manifest_to(&client, &manifest, version, target, staging, cdn_base).await?;
     crate::updates::validate_downloaded_rpi(&path, staging, version)
 }
 
@@ -134,20 +138,22 @@ async fn download_manifest_to(
     version: &str,
     target: &str,
     staging: &Path,
+    cdn_base: Option<&reqwest::Url>,
 ) -> Result<PathBuf, String> {
     let distribution = validate(manifest, version, target)?;
-    let response = client
-        .get(&distribution.url)
-        .send()
-        .await
-        .map_err(|e| format!("CLI archive request failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "CLI archive request returned {}",
-            response.status()
-        ));
-    }
-    let archive = body_limited(response, distribution.size).await?;
+    let cdn_url = cdn_base
+        .map(|base| crate::cdn::archive_url(base, REPOSITORY, &manifest.tag, &distribution.url))
+        .transpose()?
+        .flatten();
+    let archive = crate::cdn::download_with_fallback(
+        client,
+        cdn_url.as_ref(),
+        &distribution.url,
+        distribution.size,
+        &distribution.sha256,
+        "CLI archive",
+    )
+    .await?;
     stage_archive(manifest, version, target, &archive, staging)
 }
 
@@ -250,6 +256,7 @@ mod tests {
             &manifest.version,
             host_target().unwrap(),
             staging.path(),
+            None,
         )
         .await
         .unwrap();

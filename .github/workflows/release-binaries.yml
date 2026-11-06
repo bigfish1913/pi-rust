@@ -29,6 +29,17 @@ on:
         required: false
         type: string
         default: ''
+    secrets:
+      RPI_RUSTFS_ENDPOINT:
+        required: false
+      RPI_RUSTFS_BUCKET:
+        required: false
+      RPI_RUSTFS_ACCESS_KEY:
+        required: false
+      RPI_RUSTFS_SECRET_KEY:
+        required: false
+      RPI_CDN_BASE_URL:
+        required: false
   push:
     tags: ["v*"]
   workflow_dispatch:
@@ -275,6 +286,27 @@ jobs:
           fi
           # Upload last: a manifest means all six verified archives are ready.
           gh release upload "${TAG}" rpi-release.json --clobber
+
+      - name: Optionally mirror immutable release files to RustFS
+        id: rustfs_mirror
+        continue-on-error: true
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          RPI_RUSTFS_ENDPOINT: ${{ secrets.RPI_RUSTFS_ENDPOINT }}
+          RPI_RUSTFS_BUCKET: ${{ secrets.RPI_RUSTFS_BUCKET }}
+          RPI_RUSTFS_ACCESS_KEY: ${{ secrets.RPI_RUSTFS_ACCESS_KEY }}
+          RPI_RUSTFS_SECRET_KEY: ${{ secrets.RPI_RUSTFS_SECRET_KEY }}
+          RPI_CDN_BASE_URL: ${{ secrets.RPI_CDN_BASE_URL }}
+        run: |
+          cp rpi-release.json dist/rpi-release.json
+          python scripts/mirror-release-to-rustfs.py \
+            --directory dist --manifest rpi-release.json --tag "$TAG"
+
+      - name: Report RustFS mirror failure
+        if: steps.rustfs_mirror.outcome == 'failure'
+        run: |
+          echo "::warning::RustFS/CDN mirror failed; the GitHub Release remains canonical."
+          echo "- WARNING: RustFS/CDN mirror failed; GitHub Release remains canonical." >> "$GITHUB_STEP_SUMMARY"
 
   channels:
     if: inputs.preview != true
