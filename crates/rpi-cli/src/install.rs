@@ -114,7 +114,25 @@ impl NativePackageMutationLock {
         let parent = metadata_path
             .parent()
             .ok_or_else(|| "native package metadata has no parent".to_string())?;
+        let resource_lease = crate::resource_management::shared_lease(parent)?;
+        Self::acquire_with_lease(metadata_path, resource_lease)
+    }
+
+    fn acquire_exclusive(metadata_path: &Path) -> Result<Self, String> {
+        let parent = metadata_path
+            .parent()
+            .ok_or_else(|| "native package metadata has no parent".to_string())?;
         let resource_lease = crate::resource_management::mutation_lease(parent)?;
+        Self::acquire_with_lease(metadata_path, resource_lease)
+    }
+
+    fn acquire_with_lease(
+        metadata_path: &Path,
+        resource_lease: crate::resource_management::Lease,
+    ) -> Result<Self, String> {
+        let parent = metadata_path
+            .parent()
+            .ok_or_else(|| "native package metadata has no parent".to_string())?;
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         let lock_path = parent.join(NATIVE_PACKAGES_LOCK_FILE);
         let file = std::fs::OpenOptions::new()
@@ -396,6 +414,7 @@ pub fn run(args: &[String]) -> i32 {
     for target in installed {
         println!("installed {}", target.display());
     }
+    gc_retired_native_artifacts(&agent_dir);
     println!("rpi will load this extension on the next start.");
     0
 }
@@ -427,7 +446,7 @@ pub fn uninstall(args: &[String]) -> i32 {
     };
     let extension_dir = agent.join("extensions");
     let metadata_path = agent.join(NATIVE_PACKAGES_FILE);
-    let _lock = match NativePackageMutationLock::acquire(&metadata_path) {
+    let _lock = match NativePackageMutationLock::acquire_exclusive(&metadata_path) {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("error: cannot safely uninstall: {error}");
@@ -467,17 +486,18 @@ pub fn uninstall(args: &[String]) -> i32 {
     if let Ok(entries) = std::fs::read_dir(&extension_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let is_artifact = artifact_names.contains(
-                &path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            ) || (use_legacy_name_fallback
-                && path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(|stem| normalize_name(stem.trim_start_matches("lib")) == wanted)
-                    .unwrap_or(false));
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let is_artifact = artifact_names.contains(&file_name)
+                || is_versioned_artifact_for_package(&file_name, &wanted)
+                || (use_legacy_name_fallback
+                    && path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(|stem| normalize_name(stem.trim_start_matches("lib")) == wanted)
+                        .unwrap_or(false));
             if is_artifact && is_dynamic_library(&path) {
                 artifact_targets.push(path);
             }
@@ -618,6 +638,116 @@ pub(crate) fn installed_native_packages_strict() -> Result<Vec<InstalledNativePa
     read_native_package_registry().map(NativePackageRegistry::into_records)
 }
 
+/// Resolve the active global native package libraries without scanning the
+/// extension directory. New records name the active files explicitly; older
+/// records had no artifact ledger, so they retain the historical crate-name
+/// scan as a compatibility fallback.
+pub fn active_global_native_package_artifacts() -> Vec<PathBuf> {
+    let Ok(agent_dir) = crate::config::agent_dir() else {
+        return Vec::new();
+    };
+    active_global_native_package_artifacts_at(&agent_dir).unwrap_or_default()
+}
+
+/// Resolve unmanaged legacy libraries from the global extension directory.
+/// Managed versioned artifacts are deliberately omitted: only the active
+/// artifact list above may be loaded for an installed native package.
+pub fn unregistered_global_native_package_artifacts() -> Vec<PathBuf> {
+    let Ok(agent_dir) = crate::config::agent_dir() else {
+        return Vec::new();
+    };
+    unregistered_global_native_package_artifacts_at(&agent_dir).unwrap_or_default()
+}
+
+pub(crate) fn active_global_native_package_artifacts_at(
+    agent_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let destination = agent_dir.join("extensions");
+    let records =
+        read_native_package_registry_at(&agent_dir.join(NATIVE_PACKAGES_FILE))?.into_records();
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for record in records {
+        if record.artifacts.is_empty() {
+            let wanted = normalize_name(&record.name);
+            let Ok(entries) = std::fs::read_dir(&destination) else {
+                continue;
+            };
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    format!("could not inspect native extension directory: {error}")
+                })?;
+                let path = entry.path();
+                let matches = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| normalize_name(stem.trim_start_matches("lib")) == wanted)
+                    .unwrap_or(false);
+                if matches && is_dynamic_library(&path) {
+                    let identity = transaction_path_identity(&path);
+                    if seen.insert(identity) {
+                        paths.push(path);
+                    }
+                }
+            }
+        } else {
+            for artifact in record.artifacts {
+                let path = checked_registered_artifact_path(&destination, &artifact)?;
+                if seen.insert(transaction_path_identity(&path)) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+pub(crate) fn unregistered_global_native_package_artifacts_at(
+    agent_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let destination = agent_dir.join("extensions");
+    let records =
+        read_native_package_registry_at(&agent_dir.join(NATIVE_PACKAGES_FILE))?.into_records();
+    let managed = records
+        .iter()
+        .flat_map(|record| record.artifacts.iter())
+        .map(|artifact| native_artifact_identity(artifact))
+        .collect::<HashSet<_>>();
+    let legacy_names = records
+        .iter()
+        .filter(|record| record.artifacts.is_empty())
+        .map(|record| normalize_name(&record.name))
+        .collect::<HashSet<_>>();
+    let mut paths = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&destination) else {
+        return Ok(paths);
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("could not inspect native extension directory: {error}"))?
+            .path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let legacy_managed = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| legacy_names.contains(&normalize_name(stem.trim_start_matches("lib"))))
+            .unwrap_or(false);
+        if !is_dynamic_library(&path)
+            || managed.contains(&native_artifact_identity(name))
+            || is_versioned_artifact_name(name)
+            || legacy_managed
+        {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 #[cfg(test)]
 fn record_native_package_at(path: &Path, record: &InstalledNativePackage) -> Result<(), String> {
     let mut records = read_native_package_registry_at(path)?.into_records();
@@ -724,8 +854,8 @@ fn install_native_package_at_with_hook(
         return Ok(Vec::new());
     }
 
-    let mut new_artifacts = Vec::with_capacity(artifacts.len());
-    let mut new_keys = HashSet::new();
+    let mut source_artifacts = Vec::with_capacity(artifacts.len());
+    let mut source_keys = HashSet::new();
     for artifact in artifacts {
         let metadata = std::fs::symlink_metadata(artifact).map_err(|error| {
             format!(
@@ -740,14 +870,31 @@ fn install_native_package_at_with_hook(
             ));
         }
         let name = artifact_file_name(artifact)?;
-        let key = native_artifact_identity(&name);
-        if !new_keys.insert(key) {
+        if !source_keys.insert(native_artifact_identity(&name)) {
             return Err(format!("duplicate built artifact name `{name}`"));
         }
-        new_artifacts.push((name, artifact.clone()));
+        source_artifacts.push((name, artifact.clone()));
     }
-    if new_artifacts.is_empty() {
+    if source_artifacts.is_empty() {
         return Err("Cargo produced no installable cdylib artifacts".to_string());
+    }
+
+    // Upgrades get a fresh, version-bearing filename, so an already loaded
+    // DLL/SO/DYLIB is never replaced or unlinked. First installs retain the
+    // historical stable name for compatibility; later upgrades switch to the
+    // immutable versioned name.
+    let mut new_artifacts = Vec::with_capacity(source_artifacts.len());
+    let mut new_keys = HashSet::new();
+    for (name, source) in source_artifacts {
+        let target_name = if previous.is_some() || (force && destination.join(&name).exists()) {
+            versioned_artifact_name(&name, &record.version, destination)?
+        } else {
+            name
+        };
+        if !new_keys.insert(native_artifact_identity(&target_name)) {
+            return Err(format!("duplicate versioned artifact name `{target_name}`"));
+        }
+        new_artifacts.push((target_name, source));
     }
 
     for other in records
@@ -786,67 +933,25 @@ fn install_native_package_at_with_hook(
         }
     }
 
-    let mut stale_targets = Vec::new();
-    let mut owned_keys = HashSet::new();
-    if let Some(previous) = &previous {
-        if previous.artifacts.is_empty() {
-            let wanted = normalize_name(&record.name);
-            for entry in std::fs::read_dir(destination).map_err(|error| {
-                format!(
-                    "could not inspect extension directory {}: {error}",
-                    destination.display()
-                )
-            })? {
-                let entry = entry.map_err(|error| {
-                    format!("could not inspect installed extension artifact: {error}")
-                })?;
-                let path = entry.path();
-                let matches_legacy_name = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(|stem| normalize_name(stem.trim_start_matches("lib")) == wanted)
-                    .unwrap_or(false);
-                if matches_legacy_name && is_dynamic_library(&path) {
-                    owned_keys.insert(native_artifact_identity(&artifact_file_name(&path)?));
-                    stale_targets.push(path);
-                }
-            }
-        } else {
-            for old_name in &previous.artifacts {
-                let old_path = checked_registered_artifact_path(destination, old_name)?;
-                owned_keys.insert(native_artifact_identity(old_name));
-                if !new_keys.contains(&native_artifact_identity(old_name)) {
-                    stale_targets.push(old_path);
-                }
-            }
-        }
-    }
-
     let installed_targets = new_artifacts
         .iter()
         .map(|(name, _)| destination.join(name))
         .collect::<Vec<_>>();
     crate::resource_management::legacy_unowned_targets(metadata_parent, &installed_targets)?;
-    crate::resource_management::legacy_unowned_targets(metadata_parent, &stale_targets)?;
-    if !force {
-        for target in &installed_targets {
-            if owned_keys.contains(&native_artifact_identity(&artifact_file_name(target)?)) {
-                continue;
+    for target in &installed_targets {
+        match std::fs::symlink_metadata(target) {
+            Ok(_) => {
+                return Err(format!(
+                    "versioned extension target {} already exists",
+                    target.display()
+                ))
             }
-            match std::fs::symlink_metadata(target) {
-                Ok(_) => {
-                    return Err(format!(
-                        "extension {} already exists; use --force to replace it",
-                        target.display()
-                    ))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "could not inspect extension target {}: {error}",
-                        target.display()
-                    ))
-                }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect extension target {}: {error}",
+                    target.display()
+                ))
             }
         }
     }
@@ -966,7 +1071,9 @@ fn install_native_package_at_with_hook(
         }
     }
 
-    let mut removals = stale_targets;
+    // Dynamic-library artifacts are intentionally retained across upgrades.
+    // Only replaceable sidecar files follow the old cleanup behavior.
+    let mut removals = Vec::new();
     removals.extend(stale_asset_targets.iter().cloned());
     if let Err(error) = activate_native_transaction(&replacements, &removals, &mut before_activate)
     {
@@ -1106,6 +1213,130 @@ fn prune_empty_dirs(root: &Path, removed: &[PathBuf]) {
             current = dir.parent();
         }
     }
+}
+
+fn is_versioned_artifact_name(name: &str) -> bool {
+    let Some(stem) = Path::new(name).file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some((prefix, token)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    prefix.rsplit_once("-v").is_some()
+        && token.len() == 32
+        && token.bytes().all(|value| value.is_ascii_hexdigit())
+}
+
+fn is_versioned_artifact_for_package(name: &str, normalized_package: &str) -> bool {
+    let Some(stem) = Path::new(name).file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some((prefix, _)) = stem.rsplit_once("-v") else {
+        return false;
+    };
+    is_versioned_artifact_name(name)
+        && normalize_name(prefix.trim_start_matches("lib")) == normalized_package
+}
+
+/// Best-effort cleanup for retired native artifacts. The exclusive resource
+/// lease is the proof that no host is currently holding the old libraries; a
+/// live host therefore only causes cleanup to be deferred until a later
+/// install or explicit maintenance command.
+fn gc_retired_native_artifacts(agent_dir: &Path) {
+    let metadata_path = agent_dir.join(NATIVE_PACKAGES_FILE);
+    let lease = match crate::resource_management::mutation_lease(agent_dir) {
+        Ok(lease) => lease,
+        Err(_) => return,
+    };
+    let _lock = match NativePackageMutationLock::acquire_with_lease(&metadata_path, lease) {
+        Ok(lock) => lock,
+        Err(_) => return,
+    };
+    let records = match read_native_package_registry_at(&metadata_path) {
+        Ok(registry) => registry.into_records(),
+        Err(_) => return,
+    };
+    let active = records
+        .iter()
+        .flat_map(|record| record.artifacts.iter())
+        .map(|artifact| native_artifact_identity(artifact))
+        .collect::<HashSet<_>>();
+    let destination = agent_dir.join("extensions");
+    let Ok(entries) = std::fs::read_dir(&destination) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !is_dynamic_library(&path)
+            || !is_versioned_artifact_name(name)
+            || active.contains(&native_artifact_identity(name))
+        {
+            continue;
+        }
+        if crate::resource_management::legacy_unowned_targets(
+            agent_dir,
+            std::slice::from_ref(&path),
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_file() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub(crate) fn versioned_artifact_name(
+    original: &str,
+    version: &str,
+    destination: &Path,
+) -> Result<String, String> {
+    let path = Path::new(original);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("artifact has no UTF-8 file stem: {original}"))?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("artifact has no dynamic-library extension: {original}"))?;
+    let version = version
+        .chars()
+        .map(|value| {
+            if value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_') {
+                value
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let version = if version.is_empty() {
+        "unknown"
+    } else {
+        &version
+    };
+    for _ in 0..8 {
+        let name = format!(
+            "{stem}-v{version}-{}.{}",
+            uuid::Uuid::new_v4().simple(),
+            extension
+        );
+        let target = destination.join(&name);
+        if matches!(std::fs::symlink_metadata(&target), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(name);
+        }
+    }
+    Err(format!(
+        "could not allocate a unique versioned artifact for {original}"
+    ))
 }
 
 fn artifact_file_name(path: &Path) -> Result<String, String> {
@@ -1786,14 +2017,16 @@ mod tests {
                 true,
             )
             .unwrap();
-            assert_eq!(
-                std::fs::read(destination.join("demo.dll")).unwrap(),
-                b"rebuilt"
-            );
             let records = read_native_package_registry_at(&metadata)
                 .unwrap()
                 .into_records();
             assert_eq!(records[0].version, forced.version);
+            let active = destination.join(&records[0].artifacts[0]);
+            assert_eq!(std::fs::read(active).unwrap(), b"rebuilt");
+            assert_eq!(
+                std::fs::read(destination.join("demo.dll")).unwrap(),
+                b"installed"
+            );
         }
         assert_no_native_transaction_files(&destination);
     }
@@ -1808,15 +2041,14 @@ mod tests {
         std::fs::write(destination.join("unowned.dll"), b"unowned").unwrap();
         write_native_packages_at(&metadata, &[native_record("demo")]).unwrap();
         let original_registry = std::fs::read(&metadata).unwrap();
-        let artifact = temp.path().join("unowned.dll");
+        let artifact = temp.path().join("build-unowned.dll");
         std::fs::write(&artifact, b"new").unwrap();
         let mut upgraded = native_record("demo");
         upgraded.version = "2.0.0".into();
-        assert!(
-            install_native_package_at(&destination, &metadata, upgraded, &[artifact], false,)
-                .unwrap_err()
-                .contains("already exists")
-        );
+        let installed =
+            install_native_package_at(&destination, &metadata, upgraded, &[artifact], false)
+                .unwrap();
+        assert_eq!(installed.len(), 1);
         assert_eq!(
             std::fs::read(destination.join("demo.dll")).unwrap(),
             b"installed"
@@ -1825,7 +2057,7 @@ mod tests {
             std::fs::read(destination.join("unowned.dll")).unwrap(),
             b"unowned"
         );
-        assert_eq!(std::fs::read(&metadata).unwrap(), original_registry);
+        assert_ne!(std::fs::read(&metadata).unwrap(), original_registry);
         assert_no_native_transaction_files(&destination);
     }
 
@@ -2007,6 +2239,38 @@ mod tests {
     }
 
     #[test]
+    fn active_global_artifacts_exclude_retired_versioned_files() {
+        let agent = tempfile::tempdir().unwrap();
+        let extensions = agent.path().join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        let active = "libdemo-v2.0.0-0123456789abcdef0123456789abcdef.dll";
+        let retired = "libdemo-v1.0.0-abcdef0123456789abcdef0123456789.dll";
+        std::fs::write(extensions.join(active), b"active").unwrap();
+        std::fs::write(extensions.join(retired), b"retired").unwrap();
+        std::fs::write(extensions.join("legacy.dll"), b"legacy").unwrap();
+        write_native_packages_at(
+            &agent.path().join(NATIVE_PACKAGES_FILE),
+            &[InstalledNativePackage {
+                name: "demo".into(),
+                version: "2.0.0".into(),
+                source: None,
+                prebuilt: None,
+                artifacts: vec![active.into()],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            active_global_native_package_artifacts_at(agent.path()).unwrap(),
+            vec![extensions.join(active)]
+        );
+        assert_eq!(
+            unregistered_global_native_package_artifacts_at(agent.path()).unwrap(),
+            vec![extensions.join("legacy.dll")]
+        );
+    }
+
+    #[test]
     fn registry_read_rejects_corrupt_json() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(NATIVE_PACKAGES_FILE);
@@ -2038,7 +2302,7 @@ mod tests {
     }
 
     #[test]
-    fn native_install_transaction_replaces_artifacts_and_removes_stale_ones() {
+    fn native_install_transaction_preserves_loaded_artifacts_and_publishes_new_ones() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("extensions");
         let metadata_path = temp.path().join(NATIVE_PACKAGES_FILE);
@@ -2073,25 +2337,32 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(installed.len(), 2);
+        assert!(installed.iter().all(|path| path.exists()));
         assert_eq!(
-            installed,
-            vec![destination.join("new.dll"), destination.join("same.dll")]
-        );
-        assert!(!destination.join("old.dll").exists());
-        assert_eq!(
-            std::fs::read(destination.join("new.dll")).unwrap(),
-            b"new-only"
+            std::fs::read(destination.join("old.dll")).unwrap(),
+            b"old-only"
         );
         assert_eq!(
             std::fs::read(destination.join("same.dll")).unwrap(),
-            b"new-shared"
+            b"old-shared"
         );
+        assert!(installed
+            .iter()
+            .any(|path| { std::fs::read(path).ok().as_deref() == Some(b"new-only".as_slice()) }));
+        assert!(installed
+            .iter()
+            .any(|path| { std::fs::read(path).ok().as_deref() == Some(b"new-shared".as_slice()) }));
         let records = read_native_package_registry_at(&metadata_path)
             .unwrap()
             .into_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].version, "2.0.0");
-        assert_eq!(records[0].artifacts, vec!["new.dll", "same.dll"]);
+        let active_names = installed
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0].artifacts, active_names);
         assert_no_native_transaction_files(temp.path());
         assert_no_native_transaction_files(&destination);
     }
@@ -2344,17 +2615,16 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(
-            installed,
-            vec![
-                destination.join("libdemo.so"),
-                destination.join("runtime/main.mjs"),
-                destination.join("runtime/deep/lib.mjs"),
-            ]
-        );
+        assert_eq!(installed.len(), 3);
+        let active_library = installed
+            .iter()
+            .find(|path| is_dynamic_library(path))
+            .expect("installed library");
+        assert_ne!(active_library, &destination.join("libdemo.so"));
+        assert_eq!(std::fs::read(active_library).unwrap(), b"library v2");
         assert_eq!(
             std::fs::read(destination.join("libdemo.so")).unwrap(),
-            b"library v2"
+            b"library v1"
         );
         assert_eq!(
             std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
@@ -2382,9 +2652,14 @@ mod tests {
         )
         .unwrap();
         assert!(!destination.join("runtime").exists());
+        let records = read_native_package_registry_at(&metadata)
+            .unwrap()
+            .into_records();
+        let active_library = destination.join(&records[0].artifacts[0]);
+        assert_eq!(std::fs::read(active_library).unwrap(), b"library v2");
         assert_eq!(
             std::fs::read(destination.join("libdemo.so")).unwrap(),
-            b"library v2"
+            b"library v1"
         );
         assert_no_native_transaction_files(temp.path());
         assert_no_native_transaction_files(&destination);
@@ -2648,7 +2923,7 @@ mod tests {
                 })
                 .sum()
         }
-        assert_eq!(store_files(&destination), 2);
+        assert_eq!(store_files(&destination), 3);
     }
 
     #[test]

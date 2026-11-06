@@ -1762,6 +1762,7 @@ pub struct ReloadOutcome {
 
 struct PreparedReloadInputs {
     extension_dirs: Vec<PathBuf>,
+    extension_files: Vec<PathBuf>,
     skill_base_dirs: Vec<PathBuf>,
     prompt_base_dirs: Vec<PathBuf>,
 }
@@ -1990,6 +1991,7 @@ where
     after_prepare();
     let PreparedReloadInputs {
         extension_dirs,
+        extension_files,
         skill_base_dirs,
         prompt_base_dirs,
     } = prepared;
@@ -2061,9 +2063,9 @@ where
     let extension_session = if effective_args.no_extensions {
         rpi_extensions::ExtensionSession::none()
     } else {
-        load_extensions_from_dirs(
-            &effective_args,
+        load_extensions_from_files(
             &extension_dirs,
+            &extension_files,
             Some(Arc::clone(&fresh_bridge)),
             Some(ctx.resource_leases.clone()),
         )
@@ -2558,6 +2560,22 @@ where
     if !args.no_extensions {
         extension_dirs.extend(args.extensions_dir.iter().cloned());
     }
+    remove_global_native_package_dir(&mut extension_dirs);
+    remove_project_package_dirs(cwd, &mut extension_dirs);
+    let mut extension_files = if args.no_extensions {
+        Vec::new()
+    } else {
+        args.extension.clone()
+    };
+    if !args.no_extensions && !args.dev_local_only {
+        if project_trusted || args.project_only {
+            extension_files.extend(crate::packages::active_project_package_artifacts(cwd));
+        }
+        if !args.project_only {
+            extension_files.extend(crate::install::active_global_native_package_artifacts());
+            extension_files.extend(crate::install::unregistered_global_native_package_artifacts());
+        }
+    }
 
     let skill_base_dirs = if args.no_skills {
         Vec::new()
@@ -2589,6 +2607,7 @@ where
 
     Ok(PreparedReloadInputs {
         extension_dirs,
+        extension_files,
         skill_base_dirs,
         prompt_base_dirs,
     })
@@ -2714,6 +2733,18 @@ pub(crate) fn load_extensions(
         global_extension_dirs()
     };
     dirs.extend(args.extensions_dir.iter().cloned());
+    remove_global_native_package_dir(&mut dirs);
+    remove_project_package_dirs(cwd, &mut dirs);
+    let mut files = args.extension.clone();
+    if !args.dev_local_only {
+        if project_trusted || args.project_only {
+            files.extend(crate::packages::active_project_package_artifacts(cwd));
+        }
+        if !args.project_only {
+            files.extend(crate::install::active_global_native_package_artifacts());
+            files.extend(crate::install::unregistered_global_native_package_artifacts());
+        }
+    }
     let leases = match crate::resource_management::host_leases(cwd) {
         Ok(leases) => leases,
         Err(error) => {
@@ -2721,29 +2752,35 @@ pub(crate) fn load_extensions(
             return ExtensionSession::none();
         }
     };
-    load_extensions_from_dirs(args, &dirs, action_bridge, Some(leases))
+    load_extensions_from_files(&dirs, &files, action_bridge, Some(leases))
 }
 
-fn load_extensions_from_dirs(
-    args: &Args,
+fn remove_global_native_package_dir(dirs: &mut Vec<PathBuf>) {
+    let Ok(agent_dir) = crate::config::agent_dir() else {
+        return;
+    };
+    let native_dir = agent_dir.join("extensions");
+    dirs.retain(|dir| dir != &native_dir);
+}
+
+fn remove_project_package_dirs(cwd: &Path, dirs: &mut Vec<PathBuf>) {
+    let package_dirs = crate::packages::project_package_dirs(cwd, "extensions");
+    dirs.retain(|dir| !package_dirs.iter().any(|package_dir| dir == package_dir));
+}
+
+fn load_extensions_from_files(
     dirs: &[PathBuf],
+    files: &[PathBuf],
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
     host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> ExtensionSession {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
     // B5a: the action bridge is cloned into every loaded plugin's vtable
     // `user_data` so post-register `runtime_action` calls recover the harness
-    // host from any thread. The call site already gates `load_extensions` behind
-    // `!no_extensions` and threads `Some(bridge)`; `None` is only passed by the
-    // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
-    // and tests. Explicit `--extension`/`-e` files load after the dirs.
-    rpi_extensions::load_session_mixed_guarded(
-        dirs,
-        &args.extension,
-        diagnostics,
-        action_bridge,
-        host_guard,
-    )
+    // host from any thread. Directory scanning remains for project/configured
+    // extensions; installed global packages are supplied as explicit active
+    // artifact paths so retired versions are never loaded accidentally.
+    rpi_extensions::load_session_mixed_guarded(dirs, files, diagnostics, action_bridge, host_guard)
 }
 
 /// Merge the loaded extension tools into the built-in set. An extension tool
