@@ -28,7 +28,7 @@ async fn runtime_errors_and_theme_notices_scroll_above_later_replies() {
         let (_, state, tui) = fixture(0).await;
         state.history_page.mount_active(&state.chat_container);
         state.transcript_view().add_user("first-prompt");
-        let notify = theme_watch_notify(state.transcript_container(), tui.clone());
+        let notify = theme_watch_notify(&state, tui.clone());
         notify(Ok("Theme set to Dark (saved)".into()));
         for (reason, error) in [
             (
@@ -103,9 +103,9 @@ async fn runtime_errors_and_theme_notices_scroll_above_later_replies() {
 async fn settled_errors_replay_once_and_runtime_notices_do_not_remain_at_the_root() {
     let (storage, state, tui) = fixture(80).await;
     state.history_page.mount_active(&state.chat_container);
-    let notify = theme_watch_notify(state.transcript_container(), tui.clone());
+    let notify = theme_watch_notify(&state, tui.clone());
     notify(Err("synthetic-theme-error".into()));
-    add_error_message(&state.transcript_container(), "synthetic-provider-error");
+    add_error_message(&state.notice_container(), "synthetic-provider-error");
     append(
         &storage,
         80,
@@ -138,10 +138,62 @@ async fn settled_errors_replay_once_and_runtime_notices_do_not_remain_at_the_roo
 #[test]
 fn unbound_transcripts_keep_runtime_messages_in_the_flat_chat() {
     let state = super::super::super::tests::test_tui_state();
-    add_error_message(&state.transcript_container(), "flat-error");
-    add_note_message(&state.transcript_container(), "flat-note");
+    add_error_message(&state.notice_container(), "flat-error");
+    add_note_message(&state.notice_container(), "flat-note");
     state.transcript_view().add_user("flat-next-prompt");
     let content = text(&state);
     assert!(content.find("flat-error") < content.find("flat-note"));
     assert!(content.find("flat-note") < content.find("flat-next-prompt"));
+}
+
+#[tokio::test]
+async fn command_notices_remain_visible_on_older_history_pages() {
+    let (_, state, tui) = fixture(80).await;
+    request(state.clone(), tui.clone(), Direction::Latest);
+    finish_request(&state).await;
+    let notify = theme_watch_notify(&state, tui.clone());
+    request(state.clone(), tui.clone(), Direction::Older);
+    finish_request(&state).await;
+    assert!(!state.history_page.is_latest());
+    let retired_page_notices = state.notice_container();
+    notify(Ok("old-page-theme-notice".into()));
+    notify(Err("old-page-theme-error".into()));
+    copy_last_assistant(&state);
+    let content = text(&state);
+    assert!(content.contains("Nothing to copy yet"), "{content}");
+    assert!(content.contains("old-page-theme-notice"), "{content}");
+    assert!(content.contains("old-page-theme-error"), "{content}");
+    assert!(content.contains("history-entry-000"));
+    assert!(!content.contains("history-entry-079"));
+    request(state.clone(), tui.clone(), Direction::Latest);
+    finish_request(&state).await;
+    assert!(!text(&state).contains("Nothing to copy yet"));
+    assert!(!text(&state).contains("old-page-theme"));
+    // A callback holding the old destination must not append behind live output.
+    add_error_message(&retired_page_notices, "late-old-page-error");
+    assert!(!text(&state).contains("late-old-page-error"));
+    notify(Ok("latest-page-theme-notice".into()));
+    state
+        .transcript_view()
+        .add_user("next-prompt-after-navigation");
+    let content = text(&state);
+    assert!(
+        content.find("latest-page-theme-notice").unwrap()
+            < content.find("next-prompt-after-navigation").unwrap()
+    );
+}
+
+#[test]
+fn theme_watcher_does_not_retain_the_session_state() {
+    let state = super::super::super::tests::test_tui_state();
+    let weak = Arc::downgrade(&state);
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let notify = theme_watch_notify(&state, tui);
+    drop(state);
+    assert!(weak.upgrade().is_none());
+    notify(Err("late-notice-after-session-drop".into()));
 }

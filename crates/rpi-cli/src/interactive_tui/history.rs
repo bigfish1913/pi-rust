@@ -29,6 +29,8 @@ struct Resident {
     // Entries belong to rendered components, not a second retained payload copy.
     page: Option<BranchEntryPage>,
     error: Option<Arc<Container>>,
+    // Page-local runtime notices retire with that page, including late callbacks.
+    notices: Arc<Container>,
 }
 #[derive(Default)]
 pub(super) struct HistoryUi {
@@ -56,6 +58,7 @@ impl HistoryUi {
         resident.generation += 1;
         resident.page = None;
         resident.error = None;
+        resident.notices = Arc::new(Container::new());
         resident.storage = None;
         self.unsaved
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -75,11 +78,26 @@ impl HistoryUi {
             .is_some_and(|bound| Arc::ptr_eq(bound, &storage))
         {
             resident.page = None;
+            resident.notices = Arc::new(Container::new());
         }
         resident.storage = Some(storage);
     }
     pub(super) fn is_bound(&self) -> bool {
         self.resident.lock().unwrap().storage.is_some()
+    }
+    pub(super) fn notice_container(&self, root: &Arc<Container>) -> Arc<Container> {
+        let resident = self.resident.lock().unwrap();
+        if resident.storage.is_none() {
+            root.clone()
+        } else if resident
+            .page
+            .as_ref()
+            .is_some_and(|page| page.has_more_after)
+        {
+            resident.notices.clone()
+        } else {
+            self.active.clone()
+        }
     }
     pub(super) fn is_latest(&self) -> bool {
         self.resident
@@ -181,6 +199,8 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
         return;
     }
     let page_chat = render_page(state, &page.entries);
+    resident.notices = Arc::new(Container::new());
+    page_chat.add_child(resident.notices.clone());
     clear_settled_active(state);
     chat.clear();
     state.history_page.mount_header(chat);
@@ -313,6 +333,8 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
         match result {
             Ok(Some(page)) => {
                 let page_chat = render_page(&state, &page.entries);
+                resident.notices = Arc::new(Container::new());
+                page_chat.add_child(resident.notices.clone());
                 clear_settled_active(&state);
                 resident.error = None;
                 // Drop every reference to the old page (including image components).

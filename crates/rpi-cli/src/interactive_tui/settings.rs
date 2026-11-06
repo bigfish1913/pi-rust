@@ -91,7 +91,7 @@ pub(super) fn open_settings_selector(
     // ---- value rows ----
     // Apply live where possible, then persist so the choice survives a restart.
     let state_change = state.clone();
-    let chat_change = state.transcript_container();
+    let chat_change = state.notice_container();
     let tui_change = tui.clone();
     list.on_change(Arc::new(move |key, value| {
         let mut settings = crate::settings::load_settings().unwrap_or_default();
@@ -406,7 +406,7 @@ pub(super) fn open_settings_theme_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = state.transcript_container();
+    let chat_sel = state.notice_container();
     list.on_select(Arc::new(move |item| {
         let registry = state_sel.theme_registry.read().ok().map(|r| r.clone());
         match crate::themes::apply_and_persist(
@@ -416,14 +416,13 @@ pub(super) fn open_settings_theme_selector(
         ) {
             Ok(message) => {
                 state_sel.set_active_theme_spec(Some(item.value.clone()));
-                let chat_watcher = chat_sel.clone();
                 if let Some(registry_now) = registry.as_ref() {
                     crate::themes::restart_theme_watcher(
                         &state_sel.theme_watcher,
                         Some(&item.value),
                         registry_now,
                         &state_sel.theme_manager,
-                        theme_watch_notify(chat_watcher, tui_sel.clone()),
+                        theme_watch_notify(&state_sel, tui_sel.clone()),
                     );
                 }
                 add_note_message(&chat_sel, &message);
@@ -465,7 +464,7 @@ pub(super) fn open_settings_model_selector(
 ) {
     let items = model_selector_items(catalog, lane_model_id);
     if items.is_empty() {
-        add_note_message(&state.transcript_container(), "No models in the catalog.");
+        add_note_message(&state.notice_container(), "No models in the catalog.");
         tui.request_render(false);
         return;
     }
@@ -476,7 +475,7 @@ pub(super) fn open_settings_model_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = state.transcript_container();
+    let chat_sel = state.notice_container();
     let lane_sel = lane.clone();
     list.on_select(Arc::new(move |item| {
         let Some(model) = find_model_selector_match(&catalog_arc, &item.value) else {
@@ -832,7 +831,7 @@ fn begin_api_key_login(
         let key = text.trim();
         if key.is_empty() {
             add_error_message(
-                &state_submit.transcript_container(),
+                &state_submit.notice_container(),
                 &format!("API key for {provider_submit} cannot be empty."),
             );
             tui_submit.request_render(false);
@@ -847,14 +846,14 @@ fn begin_api_key_login(
         ) {
             Ok(()) => {
                 add_note_message(
-                    &state_submit.transcript_container(),
+                    &state_submit.notice_container(),
                     &format!("Saved credentials for {provider_submit}; reloading providers…"),
                 );
                 let _ = tx_submit.send(TuiMessage::ReloadExtensions);
                 finish_provider_login(&state_submit, &ec_submit, &editor_submit, &tui_submit);
             }
             Err(error) => add_error_message(
-                &state_submit.transcript_container(),
+                &state_submit.notice_container(),
                 &format!("Could not save {provider_submit} credentials: {error}"),
             ),
         }
@@ -868,7 +867,7 @@ fn begin_api_key_login(
     input.on_escape(Arc::new(move || {
         finish_provider_login(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
         add_note_message(
-            &state_cancel.transcript_container(),
+            &state_cancel.notice_container(),
             "Provider login cancelled.",
         );
     }));
@@ -1004,7 +1003,7 @@ pub(super) fn handle_provider_oauth_result(
         Ok(response) => response,
         Err(message) => {
             restore_provider_editor(state, editor_container, editor, tui);
-            add_error_message(&state.transcript_container(), &message);
+            add_error_message(&state.notice_container(), &message);
             tui.request_render(false);
             return;
         }
@@ -1034,7 +1033,7 @@ pub(super) fn handle_provider_oauth_result(
                     Ok(()) => {
                         restore_provider_editor(state, editor_container, editor, tui);
                         add_note_message(
-                            &state.transcript_container(),
+                            &state.notice_container(),
                             &format!(
                                 "OAuth credentials saved for {provider}; reloading providers…"
                             ),
@@ -1044,7 +1043,7 @@ pub(super) fn handle_provider_oauth_result(
                     Err(error) => {
                         restore_provider_editor(state, editor_container, editor, tui);
                         add_error_message(
-                            &state.transcript_container(),
+                            &state.notice_container(),
                             &format!("Could not save OAuth credentials for {provider}: {error}"),
                         );
                     }
@@ -1052,7 +1051,7 @@ pub(super) fn handle_provider_oauth_result(
                 Ok(None) | Err(_) => {
                     restore_provider_editor(state, editor_container, editor, tui);
                     add_error_message(
-                        &state.transcript_container(),
+                        &state.notice_container(),
                         &format!("OAuth login for {provider} returned no valid credential."),
                     );
                 }
@@ -1063,7 +1062,7 @@ pub(super) fn handle_provider_oauth_result(
         | (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Success) => {
             restore_provider_editor(state, editor_container, editor, tui);
             add_error_message(
-                &state.transcript_container(),
+                &state.notice_container(),
                 &format!("OAuth login for {provider} did not return credentials."),
             );
             tui.request_render(false);
@@ -1073,17 +1072,17 @@ pub(super) fn handle_provider_oauth_result(
             match crate::config::delete_credential(provider) {
                 Ok(true) => {
                     add_note_message(
-                        &state.transcript_container(),
+                        &state.notice_container(),
                         &format!("OAuth credentials revoked for {provider}; reloading providers…"),
                     );
                     let _ = tx.send(TuiMessage::ReloadExtensions);
                 }
                 Ok(false) => add_note_message(
-                    &state.transcript_container(),
+                    &state.notice_container(),
                     &format!("No saved credentials found for {provider}."),
                 ),
                 Err(error) => add_error_message(
-                    &state.transcript_container(),
+                    &state.notice_container(),
                     &format!("Could not remove {provider} credentials: {error}"),
                 ),
             }
@@ -1092,7 +1091,7 @@ pub(super) fn handle_provider_oauth_result(
         (ProviderOAuthPurpose::Logout, _) => {
             restore_provider_editor(state, editor_container, editor, tui);
             add_error_message(
-                &state.transcript_container(),
+                &state.notice_container(),
                 &format!(
                     "OAuth revoke for {provider} did not succeed; local credentials were kept."
                 ),
@@ -1157,7 +1156,7 @@ pub(super) fn begin_provider_oauth_input(
         let value = text.trim();
         if value.is_empty() {
             add_error_message(
-                &state_submit.transcript_container(),
+                &state_submit.notice_container(),
                 "OAuth input cannot be empty.",
             );
             tui_submit.request_render(false);
@@ -1171,7 +1170,7 @@ pub(super) fn begin_provider_oauth_input(
             &format!("Completing OAuth login for {provider_submit}…"),
         );
         add_note_message(
-            &state_submit.transcript_container(),
+            &state_submit.notice_container(),
             &format!("Completing OAuth login for {provider_submit}…"),
         );
         let _ = tx_submit.send(TuiMessage::ProviderOAuthAction {
@@ -1190,10 +1189,7 @@ pub(super) fn begin_provider_oauth_input(
     let tui_cancel = tui.clone();
     input.on_escape(Arc::new(move || {
         if finish_provider_login(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel) {
-            add_note_message(
-                &state_cancel.transcript_container(),
-                "OAuth login cancelled.",
-            );
+            add_note_message(&state_cancel.notice_container(), "OAuth login cancelled.");
         }
     }));
     // Publish the form only once its callbacks exist, so no key reaches it
@@ -1666,7 +1662,7 @@ fn handle_provider_form_input(
         ProviderFormStep::Id => {
             if provider_id_exists(text) {
                 add_error_message(
-                    &state.transcript_container(),
+                    &state.notice_container(),
                     &format!("Provider \"{text}\" already exists. Choose another id."),
                 );
                 *state.provider_form.lock().unwrap() = Some(form);
@@ -1687,7 +1683,7 @@ fn handle_provider_form_input(
         ProviderFormStep::BaseUrl => {
             if !is_valid_provider_url(text) {
                 add_error_message(
-                    &state.transcript_container(),
+                    &state.notice_container(),
                     &format!("Invalid URL \"{text}\". It must start with http:// or https://."),
                 );
                 *state.provider_form.lock().unwrap() = Some(form);
@@ -1708,8 +1704,8 @@ fn handle_provider_form_input(
         ProviderFormStep::ModelName => {
             form.model_name = text.to_string();
             match save_provider_from_form(&form) {
-                Ok(note) => add_note_message(&state.transcript_container(), &note),
-                Err(error) => add_error_message(&state.transcript_container(), &error),
+                Ok(note) => add_note_message(&state.notice_container(), &note),
+                Err(error) => add_error_message(&state.notice_container(), &error),
             }
             finish_provider_form(state, editor_container, editor, tui);
             return;
@@ -1745,7 +1741,7 @@ fn cancel_provider_form(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
 ) {
-    add_note_message(&state.transcript_container(), "Provider add cancelled.");
+    add_note_message(&state.notice_container(), "Provider add cancelled.");
     finish_provider_form(state, editor_container, editor, tui);
 }
 
@@ -1877,7 +1873,7 @@ pub(super) fn open_settings_thinking_selector(
     }
     if items.is_empty() {
         add_note_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             "This model has no supported thinking levels.",
         );
         tui.request_render(false);
@@ -1889,7 +1885,7 @@ pub(super) fn open_settings_thinking_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = state.transcript_container();
+    let chat_sel = state.notice_container();
     let lane_sel = lane.clone();
     list.on_select(Arc::new(move |item| {
         let Some(level) = thinking_level_from_name(&item.value) else {
@@ -1949,7 +1945,7 @@ pub(super) fn open_scoped_models_selector(
     catalog: &[rpi_ai::Model],
 ) {
     if catalog.is_empty() {
-        add_note_message(&state.transcript_container(), "No models in the catalog.");
+        add_note_message(&state.notice_container(), "No models in the catalog.");
         tui.request_render(false);
         return;
     }
@@ -1967,7 +1963,7 @@ pub(super) fn open_scoped_models_selector(
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
-    let chat_sel = state.transcript_container();
+    let chat_sel = state.notice_container();
     let tui_sel = tui.clone();
     list.on_select(Arc::new(move |item| {
         // Toggle the model in the in-progress set; the selector stays open.
@@ -1986,7 +1982,7 @@ pub(super) fn open_scoped_models_selector(
     let ec_cancel = editor_container.clone();
     let editor_cancel = editor.clone();
     let tui_cancel = tui.clone();
-    let chat_cancel = state.transcript_container();
+    let chat_cancel = state.notice_container();
     list.on_cancel(Arc::new(move || {
         // Save the edited set to settings.json and close.
         let set = state_cancel

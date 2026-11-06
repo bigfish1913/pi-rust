@@ -81,10 +81,7 @@ pub(super) fn handle_extension_ui_result(
     command_name: String,
 ) {
     let Some(value) = result else {
-        add_error_message(
-            &ctx.state.transcript_container(),
-            "Extension command failed.",
-        );
+        add_error_message(&ctx.state.notice_container(), "Extension command failed.");
         ctx.tui.request_render(false);
         return;
     };
@@ -113,7 +110,7 @@ pub(super) fn handle_extension_ui_result(
                         ctx.chat.add_child(component);
                     }
                 } else {
-                    add_note_message(&ctx.state.transcript_container(), &text);
+                    add_note_message(&ctx.state.notice_container(), &text);
                 }
             }
             ctx.tui.request_render(false);
@@ -126,7 +123,7 @@ pub(super) fn handle_extension_ui_result(
         Some("input") => open_extension_input(ctx, session, command_name, value),
         Some(other) => {
             add_error_message(
-                &ctx.state.transcript_container(),
+                &ctx.state.notice_container(),
                 &format!("Unsupported extension UI: {other}"),
             );
             ctx.tui.request_render(false);
@@ -305,7 +302,7 @@ pub(super) fn open_extension_selector(
         .unwrap_or_default();
     if items.is_empty() {
         add_error_message(
-            &ctx.state.transcript_container(),
+            &ctx.state.notice_container(),
             "Extension selector has no items.",
         );
         ctx.tui.request_render(false);

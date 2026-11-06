@@ -114,7 +114,7 @@ pub(super) async fn switch_to_session(
     }
     if let Err(error) = lane.wait_for_idle().await {
         add_error_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             &format!("Could not switch session: {error}"),
         );
         return false;
@@ -123,7 +123,7 @@ pub(super) async fn switch_to_session(
     // the live lane, which would be the NEW session after this swap.
     if state.user_bash_running() {
         add_note_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             "Wait for the !command to finish before switching sessions, or press Esc to cancel it.",
         );
         return false;
@@ -139,7 +139,7 @@ pub(super) async fn switch_to_session(
                     .await
             {
                 add_error_message(
-                    &state.transcript_container(),
+                    &state.notice_container(),
                     &format!("Could not switch session: {error}"),
                 );
                 state.set_status(RunStatus::Idle);
@@ -162,7 +162,7 @@ pub(super) async fn switch_to_session(
             history::restore(harness, state, chat).await;
             state.set_status(RunStatus::Idle);
             add_note_message(
-                &state.transcript_container(),
+                &state.notice_container(),
                 &format!("Switched to session {id}."),
             );
             // The tools' working directory is fixed by the run that built them;
@@ -171,7 +171,7 @@ pub(super) async fn switch_to_session(
             // Say where the session belongs instead of implying the move.
             match &restored.recorded_cwd {
                 Some(dir) if dir != cwd => add_note_message(
-                    &state.transcript_container(),
+                    &state.notice_container(),
                     &format!(
                         "This session was created in {}. Tools still run in {}; \
                          restart rpi in that directory to work there.",
@@ -180,7 +180,7 @@ pub(super) async fn switch_to_session(
                     ),
                 ),
                 None => add_note_message(
-                    &state.transcript_container(),
+                    &state.notice_container(),
                     "This session's recorded directory no longer exists; \
                      tools keep using the current one.",
                 ),
@@ -191,7 +191,7 @@ pub(super) async fn switch_to_session(
         Err(e) => {
             state.set_status(RunStatus::Idle);
             add_error_message(
-                &state.transcript_container(),
+                &state.notice_container(),
                 &format!("Could not open session {id}: {e}"),
             );
             false
@@ -217,21 +217,18 @@ pub(super) async fn import_session(
     let src = FsPath::new(path);
     if !src.is_file() {
         add_error_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             &format!("Import source not found: {path}"),
         );
         return;
     }
     let Some(fname) = src.file_name().and_then(|f| f.to_str()) else {
-        add_error_message(
-            &state.transcript_container(),
-            "Import source has no file name.",
-        );
+        add_error_message(&state.notice_container(), "Import source has no file name.");
         return;
     };
     if !fname.ends_with(".jsonl") {
         add_error_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             "Import source must be a .jsonl session file.",
         );
         return;
@@ -242,7 +239,7 @@ pub(super) async fn import_session(
     }
     if let Err(error) = lane.wait_for_idle().await {
         add_error_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             &format!("Could not import session: {error}"),
         );
         return;
@@ -251,7 +248,7 @@ pub(super) async fn import_session(
     // the live lane, which would be the NEW session after this swap.
     if state.user_bash_running() {
         add_note_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             "Wait for the !command to finish before importing a session, or press Esc to cancel it.",
         );
         return;
@@ -263,7 +260,7 @@ pub(super) async fn import_session(
         Err(error) => {
             state.set_status(RunStatus::Idle);
             add_error_message(
-                &state.transcript_container(),
+                &state.notice_container(),
                 &format!("Could not import session: {error}"),
             );
             return;
@@ -274,7 +271,7 @@ pub(super) async fn import_session(
     {
         state.set_status(RunStatus::Idle);
         add_error_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             &format!("Could not import session: {error}"),
         );
         return;
@@ -294,7 +291,7 @@ pub(super) async fn import_session(
     history::restore(harness, state, chat).await;
     state.set_status(RunStatus::Idle);
     add_note_message(
-        &state.transcript_container(),
+        &state.notice_container(),
         &format!("Imported session from {path}"),
     );
 }
@@ -314,7 +311,7 @@ pub(super) async fn fork_session(
     }
     if let Err(error) = lane.wait_for_idle().await {
         add_error_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             &format!("Could not fork session: {error}"),
         );
         return;
@@ -323,7 +320,7 @@ pub(super) async fn fork_session(
     // the live lane, which would be the NEW session after this swap.
     if state.user_bash_running() {
         add_note_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             "Wait for the !command to finish before forking a session, or press Esc to cancel it.",
         );
         return;
@@ -339,7 +336,7 @@ pub(super) async fn fork_session(
         Err(error) => {
             state.set_status(RunStatus::Idle);
             add_error_message(
-                &state.transcript_container(),
+                &state.notice_container(),
                 &format!("Could not fork session: {error}"),
             );
             return;
@@ -350,7 +347,7 @@ pub(super) async fn fork_session(
     {
         state.set_status(RunStatus::Idle);
         add_error_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             &format!("Could not fork session: {error}"),
         );
         return;
@@ -371,7 +368,7 @@ pub(super) async fn fork_session(
     // live model instead of replaying.
     history::restore(harness, state, chat).await;
     state.set_status(RunStatus::Idle);
-    add_note_message(&state.transcript_container(), "Forked into a new session.");
+    add_note_message(&state.notice_container(), "Forked into a new session.");
 }
 
 /// `/new` (alias `/clear`): begin a fresh session.
@@ -406,7 +403,7 @@ pub(super) async fn start_new_session(
     }
     if let Err(error) = lane.wait_for_idle().await {
         add_error_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             &format!("Could not start a new session: {error}"),
         );
         state.set_status(RunStatus::Idle);
@@ -419,7 +416,7 @@ pub(super) async fn start_new_session(
     // cancelling would not close the race: the completion is still coming.
     if state.user_bash_running() {
         add_note_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             "Wait for the !command to finish before starting a new session, or press Esc to cancel it.",
         );
         return false;
@@ -433,7 +430,7 @@ pub(super) async fn start_new_session(
         let dir = &state.session_dir;
         if let Err(error) = std::fs::create_dir_all(dir) {
             add_error_message(
-                &state.transcript_container(),
+                &state.notice_container(),
                 &format!(
                     "Could not create session dir {}: {error} — check write permissions",
                     dir.display()
@@ -447,7 +444,7 @@ pub(super) async fn start_new_session(
             Ok(session) => session,
             Err(error) => {
                 add_error_message(
-                    &state.transcript_container(),
+                    &state.notice_container(),
                     &format!(
                         "Could not create session: {error} — the current session is still active"
                     ),
@@ -465,7 +462,7 @@ pub(super) async fn start_new_session(
         crate::session::set_active_session(harness, new_session, Some(tool_context)).await
     {
         add_error_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             &format!(
                 "Could not start a new session: {error} — the previous session is still active"
             ),
@@ -486,12 +483,12 @@ pub(super) async fn start_new_session(
     state.set_status(RunStatus::Idle);
     if ephemeral {
         add_note_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             "Started a new ephemeral session (--no-session).",
         );
     } else {
         add_note_message(
-            &state.transcript_container(),
+            &state.notice_container(),
             &format!("Started new session {new_id}."),
         );
     }

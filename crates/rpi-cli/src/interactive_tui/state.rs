@@ -2053,14 +2053,20 @@ impl TuiState {
         self.markdown_transformer.lock().unwrap().clone()
     }
 
-    /// Runtime messages belong beside streamed output, before later replies.
-    /// The root is only a layout host once paged history is bound.
+    /// Streamed messages belong in the live slot, even while it is detached.
     pub(super) fn transcript_container(&self) -> Arc<Container> {
         if self.history_page.is_bound() {
             self.history_page.active.clone()
         } else {
             self.chat_container.clone()
         }
+    }
+
+    /// Keep command/background notices visible on the page being viewed.
+    /// On latest history they join streamed output, so later replies follow them.
+    /// Older pages have no live slot; their notices retire with the visible page.
+    pub(super) fn notice_container(&self) -> Arc<Container> {
+        self.history_page.notice_container(&self.chat_container)
     }
 
     /// Build a [`TranscriptView`] over the shared component maps. Cheap (clones
