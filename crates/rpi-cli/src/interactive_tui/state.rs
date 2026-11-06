@@ -2053,20 +2053,31 @@ impl TuiState {
         self.markdown_transformer.lock().unwrap().clone()
     }
 
+    /// Streamed messages belong in the live slot, even while it is detached.
+    pub(super) fn transcript_container(&self) -> Arc<Container> {
+        if self.history_page.is_bound() {
+            self.history_page.active.clone()
+        } else {
+            self.chat_container.clone()
+        }
+    }
+
+    /// Keep command/background notices visible on the page being viewed.
+    /// On latest history they join streamed output, so later replies follow them.
+    /// Older pages have no live slot; their notices retire with the visible page.
+    pub(super) fn notice_container(&self) -> Arc<Container> {
+        self.history_page.notice_container(&self.chat_container)
+    }
+
     /// Build a [`TranscriptView`] over the shared component maps. Cheap (clones
     /// a handful of `Arc`s) and lets the event drain render the transcript
     /// through the same code path as the remote client.
     ///
     /// [`TranscriptView`]: crate::transcript_view::TranscriptView
     pub(super) fn transcript_view(&self) -> crate::transcript_view::TranscriptView {
-        // Hosts/tests without a managed history binding keep the original flat view.
         let managed = self.history_page.is_bound();
         crate::transcript_view::TranscriptView::with_maps(
-            if managed {
-                self.history_page.active.clone()
-            } else {
-                self.chat_container.clone()
-            },
+            self.transcript_container(),
             self.current_assistant.clone(),
             self.tool_components.clone(),
             self.bash_components.clone(),

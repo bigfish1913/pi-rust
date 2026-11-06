@@ -1379,7 +1379,6 @@ pub async fn interactive_tui(
     // one mtime entry — see fs_watch.rs). The handle lives in the state slot
     // and is re-targeted by selection and reload.
     {
-        let chat_ref = chat_container.clone();
         let tui_ref = tui.clone();
         let registry_snapshot = state.theme_registry.read().ok().map(|r| r.clone());
         crate::themes::restart_theme_watcher(
@@ -1389,7 +1388,7 @@ pub async fn interactive_tui(
                 .as_ref()
                 .unwrap_or(&crate::themes::ThemeRegistry::default()),
             &state.theme_manager,
-            theme_watch_notify(chat_ref, tui_ref),
+            theme_watch_notify(&state, tui_ref),
         );
     }
 
@@ -1529,7 +1528,7 @@ pub async fn interactive_tui(
         if let Some((command, exclude_from_context)) = parse_user_bash(text) {
             if ctx_for_cb.state.user_bash_running() {
                 add_error_message(
-                    &ctx_for_cb.chat,
+                    &ctx_for_cb.state.notice_container(),
                     "A bash command is already running. Press Esc to cancel it first.",
                 );
                 ctx_for_cb.tui.request_render(false);
@@ -1544,7 +1543,7 @@ pub async fn interactive_tui(
             let images = ctx_for_cb.state.take_pending_images();
             let message = user_message_with_images(text, images.clone());
             let lane = ctx_for_cb.lane.clone();
-            let chat = ctx_for_cb.chat.clone();
+            let chat = ctx_for_cb.state.notice_container();
             let tui = ctx_for_cb.tui.clone();
             let state = ctx_for_cb.state.clone();
             tokio::spawn(async move {
@@ -2008,7 +2007,7 @@ pub async fn interactive_tui(
                                     == Some(false)
                             {
                                 add_note_message(
-                                    &state_for_key.chat_container,
+                                    &state_for_key.notice_container(),
                                     "Clipboard unavailable. Selection kept; press Ctrl+X to retry.",
                                 );
                                 tui_for_key.request_render(false);
@@ -2067,7 +2066,7 @@ pub async fn interactive_tui(
                             state_for_key.queue_image(image);
                         }
                         add_note_message(
-                            &state_for_key.chat_container,
+                            &state_for_key.notice_container(),
                             "Dropped images attached to the next prompt.",
                         );
                         tui_for_key.request_render(false);
@@ -2239,7 +2238,7 @@ pub async fn interactive_tui(
                         &tui_for_key,
                     )
                 {
-                    add_note_message(&state_for_key.chat_container, "OAuth flow cancelled.");
+                    add_note_message(&state_for_key.notice_container(), "OAuth flow cancelled.");
                 }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
@@ -2338,7 +2337,7 @@ pub async fn interactive_tui(
             {
                 match copy_mouse_selection_with(&tui_for_key, copy_to_clipboard) {
                     Some(copied) => add_note_message(
-                        &state_for_key.chat_container,
+                        &state_for_key.notice_container(),
                         if copied {
                             "Copied selection to the clipboard."
                         } else {
@@ -2347,9 +2346,9 @@ pub async fn interactive_tui(
                     ),
                     None => {
                         if editor_for_key.has_selection() && editor_for_key.copy_selection() {
-                            add_note_message(&state_for_key.chat_container, "Copied!");
+                            add_note_message(&state_for_key.notice_container(), "Copied!");
                         } else {
-                            copy_last_assistant(&state_for_key, &state_for_key.chat_container);
+                            copy_last_assistant(&state_for_key);
                         }
                     }
                 }
@@ -2565,7 +2564,7 @@ pub async fn interactive_tui(
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            add_error_message(&state.chat_container, &error);
+                            add_error_message(&state.notice_container(), &error);
                             tui.request_render(false);
                         }
                     }
@@ -2650,7 +2649,7 @@ pub async fn interactive_tui(
                             state_for_key.queue_image(image);
                         }
                         add_note_message(
-                            &state_for_key.chat_container,
+                            &state_for_key.notice_container(),
                             "Clipboard images attached to the next prompt.",
                         );
                     } else {
@@ -2662,7 +2661,7 @@ pub async fn interactive_tui(
                 if let Ok(Some(image)) = read_clipboard_image() {
                     state_for_key.queue_image(image);
                     add_note_message(
-                        &state_for_key.chat_container,
+                        &state_for_key.notice_container(),
                         "Clipboard image attached to the next prompt.",
                     );
                     tui_for_key.request_render(false);
@@ -2886,7 +2885,7 @@ pub async fn interactive_tui(
                     let images = state_for_key.take_pending_images();
                     let message = user_message_with_images(&prompt, images.clone());
                     let lane = lane_for_key.clone();
-                    let chat = state_for_key.chat_container.clone();
+                    let chat = state_for_key.notice_container();
                     let tui = tui_for_key.clone();
                     let state = state_for_key.clone();
                     tokio::spawn(async move {
@@ -3156,9 +3155,9 @@ pub async fn interactive_tui(
                 match switch_provider(&input, &manifests, &available, &lane).await {
                     Ok((model, note)) => {
                         state.set_current_model(&model);
-                        add_note_message(&chat_container, &note);
+                        add_note_message(&state.notice_container(), &note);
                     }
-                    Err(error) => add_error_message(&chat_container, &error),
+                    Err(error) => add_error_message(&state.notice_container(), &error),
                 }
                 tui.request_render(false);
             }
@@ -3178,7 +3177,7 @@ pub async fn interactive_tui(
                 );
                 if !prompt_images.is_empty() {
                     add_note_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!("Attached {} image(s) to this prompt.", prompt_images.len()),
                     );
                 }
@@ -3199,9 +3198,12 @@ pub async fn interactive_tui(
                         let cursor = text.chars().count();
                         editor.set_text(&text);
                         editor.set_cursor(0, cursor);
-                        add_note_message(&chat_container, "Draft updated from external editor.");
+                        add_note_message(
+                            &state.notice_container(),
+                            "Draft updated from external editor.",
+                        );
                     }
-                    Err(error) => add_error_message(&chat_container, &error),
+                    Err(error) => add_error_message(&state.notice_container(), &error),
                 }
                 tui.request_render(false);
             }
@@ -3229,7 +3231,7 @@ pub async fn interactive_tui(
                             .unsaved
                             .store(true, std::sync::atomic::Ordering::SeqCst);
                         add_error_message(
-                            &chat_container,
+                            &state.notice_container(),
                             &format!("Could not record bash result: {error}"),
                         );
                         tui.request_render(false);
@@ -3242,21 +3244,13 @@ pub async fn interactive_tui(
             Some(TuiMessage::OpenTree) => {
                 if *state.status.lock().unwrap() != RunStatus::Idle {
                     add_note_message(
-                        &chat_container,
+                        &state.notice_container(),
                         "Wait for the current run to finish before opening the tree.",
                     );
                     tui.request_render(false);
                 } else {
-                    open_tree_selector(
-                        harness,
-                        &state,
-                        &editor_container,
-                        &editor,
-                        &tui,
-                        &chat_container,
-                        &tx,
-                    )
-                    .await;
+                    open_tree_selector(harness, &state, &editor_container, &editor, &tui, &tx)
+                        .await;
                 }
             }
             Some(TuiMessage::NavigateTree(entry_id)) => {
@@ -3276,20 +3270,20 @@ pub async fn interactive_tui(
                             );
                             history::restore(harness, &state, &chat_container).await;
                             add_note_message(
-                                &chat_container,
+                                &state.notice_container(),
                                 "Moved to the selected session entry.",
                             );
                         }
                         rpi_harness::agent_harness::NavigationOutcome::Failed { error, .. } => {
-                            add_error_message(&chat_container, &error.message);
+                            add_error_message(&state.notice_container(), &error.message);
                         }
                         _ => add_note_message(
-                            &chat_container,
+                            &state.notice_container(),
                             "The selected entry could not be opened.",
                         ),
                     },
                     Err(error) => add_error_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!("Could not navigate session tree: {error}"),
                     ),
                 }
@@ -3315,7 +3309,7 @@ pub async fn interactive_tui(
                 run_compact(&lane, &tui, &state).await;
             }
             Some(TuiMessage::Copy) => {
-                copy_last_assistant(&state, &chat_container);
+                copy_last_assistant(&state);
                 tui.request_render(false);
             }
             Some(TuiMessage::Exit) => {
@@ -3351,7 +3345,7 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ShareSession) => {
-                share_session(harness, &chat_container).await;
+                share_session(harness, &state.notice_container()).await;
                 tui.request_render(false);
             }
             Some(TuiMessage::SetSessionName(name)) => {
@@ -3363,12 +3357,12 @@ pub async fn interactive_tui(
                         // and `/name` looked like a no-op on screen.
                         state.footer.set_session_name(Some(&name));
                         add_note_message(
-                            &chat_container,
+                            &state.notice_container(),
                             &format!("Session renamed to \"{name}\"."),
                         );
                     }
                     Err(e) => add_error_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!("Could not rename session: {e}"),
                     ),
                 }
@@ -3381,12 +3375,13 @@ pub async fn interactive_tui(
                 let path = cwd.join(&file_name);
                 match agent_session.export_to_markdown(&path).await {
                     Ok(_) => add_note_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!("Exported session to {}", path.display()),
                     ),
-                    Err(e) => {
-                        add_error_message(&chat_container, &format!("Could not write export: {e}"))
-                    }
+                    Err(e) => add_error_message(
+                        &state.notice_container(),
+                        &format!("Could not write export: {e}"),
+                    ),
                 }
                 tui.request_render(false);
             }
@@ -3395,12 +3390,13 @@ pub async fn interactive_tui(
                 let path = cwd.join(&file_name);
                 match agent_session.export(format, &path).await {
                     Ok(_) => add_note_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!("Exported session to {}", path.display()),
                     ),
-                    Err(e) => {
-                        add_error_message(&chat_container, &format!("Could not write export: {e}"))
-                    }
+                    Err(e) => add_error_message(
+                        &state.notice_container(),
+                        &format!("Could not write export: {e}"),
+                    ),
                 }
                 tui.request_render(false);
             }
@@ -3447,11 +3443,12 @@ pub async fn interactive_tui(
                                 ));
                             }
                         }
-                        add_note_message(&chat_container, &lines.join("\n"));
+                        add_note_message(&state.notice_container(), &lines.join("\n"));
                     }
-                    None => {
-                        add_error_message(&chat_container, "Could not read session usage stats.")
-                    }
+                    None => add_error_message(
+                        &state.notice_container(),
+                        "Could not read session usage stats.",
+                    ),
                 }
                 tui.request_render(false);
             }
@@ -3549,7 +3546,7 @@ pub async fn interactive_tui(
                     Ok(auth) => auth,
                     Err(error) => {
                         add_error_message(
-                            &chat_container,
+                            &state.notice_container(),
                             &format!("Could not read saved credentials: {error}"),
                         );
                         tui.request_render(false);
@@ -3576,17 +3573,17 @@ pub async fn interactive_tui(
                         match crate::config::delete_credential(&provider) {
                             Ok(true) => {
                                 add_note_message(
-                                    &chat_container,
+                                    &state.notice_container(),
                                     &format!("Removed saved credentials for {provider}; reloading providers…"),
                                 );
                                 let _ = ctx.tx.send(TuiMessage::ReloadExtensions);
                             }
                             Ok(false) => add_note_message(
-                                &chat_container,
+                                &state.notice_container(),
                                 &format!("No saved credentials found for {provider}."),
                             ),
                             Err(error) => add_error_message(
-                                &chat_container,
+                                &state.notice_container(),
                                 &format!("Could not remove {provider} credentials: {error}"),
                             ),
                         }
@@ -3594,7 +3591,7 @@ pub async fn interactive_tui(
                     }
                     None => {
                         add_note_message(
-                            &chat_container,
+                            &state.notice_container(),
                             &format!("No saved credentials found for {provider}."),
                         );
                         tui.request_render(false);
@@ -3621,7 +3618,10 @@ pub async fn interactive_tui(
                 // clone the `Arc` out so the borrow of `harness` (the main
                 // loop's `&AgentHarness`) lives across the await.
                 let reload_ctx = ctx.reload_context.clone();
-                add_note_message(&chat_container, "Reloading extensions + resources…");
+                add_note_message(
+                    &state.notice_container(),
+                    "Reloading extensions + resources…",
+                );
                 tui.request_render(false);
                 let outcome =
                     crate::session::reload_extension_resources(harness, &reload_ctx).await;
@@ -3695,7 +3695,7 @@ pub async fn interactive_tui(
                             &registry,
                             &state.theme_manager,
                         ) {
-                            add_note_message(&chat_container, &notice);
+                            add_note_message(&state.notice_container(), &notice);
                             state.set_active_theme_spec(Some("dark".to_string()));
                         }
                         rebuilt = Some(registry);
@@ -3711,34 +3711,33 @@ pub async fn interactive_tui(
                             .map(|guard| guard.clone())
                             .unwrap_or_default()
                     });
-                    let chat_ref = chat_container.clone();
                     crate::themes::restart_theme_watcher(
                         &state.theme_watcher,
                         state.active_theme_spec().as_deref(),
                         &registry,
                         &state.theme_manager,
-                        theme_watch_notify(chat_ref, tui.clone()),
+                        theme_watch_notify(&state, tui.clone()),
                     );
                 }
                 if outcome.had_errors {
                     // Hard failure: the summary itself carries the error detail
                     // (e.g. "Settings reload failed: …"), so render it as an
                     // error without an extra stderr pointer.
-                    add_error_message(&chat_container, &outcome.summary);
+                    add_error_message(&state.notice_container(), &outcome.summary);
                 } else if outcome.had_warnings {
                     // Reload succeeded but produced soft diagnostics (skill
                     // shadowing, name validation, …). The details are printed
                     // to stderr; keep this as an informational note so a
                     // successful reload isn't shown as a red ✗ error.
                     add_note_message(
-                        &chat_container,
+                        &state.notice_container(),
                         &format!(
                             "{} (with warnings — see stderr for details).",
                             outcome.summary
                         ),
                     );
                 } else {
-                    add_note_message(&chat_container, &outcome.summary);
+                    add_note_message(&state.notice_container(), &outcome.summary);
                 }
                 tui.request_render(false);
             }
