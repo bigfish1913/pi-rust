@@ -342,6 +342,30 @@ Method, raw per-run numbers, and what is *not* measured (LLM latency, tool-loop
 throughput, long sessions, TUI frame cost) are in
 [`docs/performance/benchmark-vs-pi.md`](docs/performance/benchmark-vs-pi.md).
 
+## Optional release CDN
+
+GitHub Releases and their validated manifests remain authoritative. To use the
+optional RustFS-backed archive accelerator, pass an HTTPS base URL, set
+`RPI_CDN_BASE_URL`, or save `cdnBaseUrl` in `~/.rpi/agent/settings.json`:
+
+```json
+{
+  "cdnBaseUrl": "https://assets.bigfisharc.cn"
+}
+```
+
+The precedence is `--cdn` > `RPI_CDN_BASE_URL` > `settings.json`:
+
+```bash
+rpi update --cdn https://assets.bigfisharc.cn
+rpi install rpi-todo --cdn https://assets.bigfisharc.cn/rpi-package
+```
+
+The CLI verifies the GitHub manifest's archive size and SHA-256, then falls
+back to GitHub when the CDN is unavailable or serves invalid content. The
+`--offline` mode never contacts either source. Release mirrors use immutable
+version paths below `rpi/releases/<tag>/` and `rpi-package/releases/<tag>/`.
+
 ## Plugins
 
 Plugins are Rust `cdylib` libraries behind a stable `#[repr(C)]` ABI. A plugin
