@@ -261,6 +261,7 @@ pub(super) async fn apply_model_selection(
         .await
         .map_err(|error| format!("Could not switch model: {error}"))?;
     state.set_current_model(&model);
+    dispatch_model_select(state, &model);
     let mut note = format!(
         "Model set to {}/{} — applies to the next message.",
         model.provider, model.id
@@ -276,6 +277,21 @@ pub(super) async fn apply_model_selection(
         note.push_str(" Not saved as the default — use /settings to change it.");
     }
     Ok(note)
+}
+
+/// Notify extensions immediately, including while the agent is idle. The
+/// payload mirrors the JS extension API's `model_select` event.
+pub(super) fn dispatch_model_select(state: &Arc<TuiState>, model: &rpi_ai::Model) {
+    let snapshot = state
+        .extension_session
+        .lock()
+        .ok()
+        .and_then(|session| session.snapshot_arc());
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let payload = serde_json::json!({ "model": model }).to_string();
+    rpi_extensions::dispatch_data_event(&snapshot, rpi_plugin_sdk::EventTag::ModelSelect, &payload);
 }
 
 pub(super) async fn report_model_selection(

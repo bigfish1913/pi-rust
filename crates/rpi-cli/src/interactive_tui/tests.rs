@@ -724,6 +724,66 @@ async fn dequeue_restores_both_queues_images_and_folded_draft_without_aborting()
 }
 
 #[test]
+fn model_selection_dispatches_provider_payload_while_idle() {
+    use rpi_extensions::{ExtensionRegistry, ExtensionSession, PluginKeepalive};
+    use rpi_plugin_sdk::{EventTag, StablePluginEvent};
+
+    static EVENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    extern "C" fn record(raw: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+        // SAFETY: the host keeps the event alive for the duration of the callback.
+        let event = unsafe { rpi_plugin_sdk::events::EventView::from_raw(&raw) };
+        EVENTS
+            .lock()
+            .unwrap()
+            .push(event.data_text().expect("model_select payload"));
+        0
+    }
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            EVENTS.lock().unwrap().clear();
+            let harness = AgentHarness::create(Default::default()).await.unwrap();
+            let lane: Arc<dyn AgentLane> = harness.lane("main");
+            let state = test_tui_state();
+            let mut registry = ExtensionRegistry::new();
+            registry.register_event_handler(
+                "test".into(),
+                EventTag::ModelSelect,
+                record,
+                std::ptr::null_mut(),
+            );
+            *state.extension_session.lock().unwrap() = ExtensionSession::from_parts(
+                Arc::new(registry.snapshot()),
+                PluginKeepalive::empty(),
+                vec![],
+                None,
+            );
+            let model = rpi_ai::Model::new(
+                "selected-model",
+                "Selected",
+                rpi_ai::Api::OpenaiCompletions,
+                "selected-provider",
+                "http://selected.invalid",
+            );
+
+            apply_model_selection(&lane, &state, model, false)
+                .await
+                .unwrap();
+
+            let events = EVENTS.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            let payload: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+            assert_eq!(payload["model"]["provider"], "selected-provider");
+            assert_eq!(payload["model"]["id"], "selected-model");
+            drop(events);
+            harness.close().await.unwrap();
+        });
+}
+
+#[test]
 fn hot_cycle_crosses_providers_and_anchors_duplicate_ids_to_the_live_lane() {
     with_isolated_config_dir(|| {
         tokio::runtime::Builder::new_current_thread()
