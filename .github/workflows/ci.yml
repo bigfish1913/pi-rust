@@ -269,6 +269,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
@@ -279,8 +281,15 @@ jobs:
             target: x86_64-pc-windows-msvc
     env:
       RUSTFLAGS: "-D warnings"
+      # musl-tools installs `musl-gcc`; make both Cargo and cc-rs use it for
+      # the target instead of looking for x86_64-linux-musl-gcc.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
       - uses: actions/checkout@v4
+      - name: Install musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

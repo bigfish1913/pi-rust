@@ -47,13 +47,14 @@ Add `-- --dry-run` to print the plan without executing anything.
 `.github/workflows/release-binaries.yml` publishes one archive per target, **with
 the binary at the archive root** and a `.sha256` beside every archive.
 
-The table below records the original four targets. The workflow also builds
-Intel macOS as `rpi-v<version>-x86_64-apple-darwin.tar.gz`, with a matching
-`.sha256`; this asset is available in releases whose tag includes that target.
+The table below records the release targets, including the statically linked
+Linux musl build. The workflow also builds Intel macOS as
+`rpi-v<version>-x86_64-apple-darwin.tar.gz`, with a matching `.sha256`.
 
-| Target | Asset | sha256 (v0.5.1) |
+| Target | Asset | sha256 (v0.5.1, where published) |
 | --- | --- | --- |
 | `x86_64-unknown-linux-gnu` | `rpi-v0.5.1-x86_64-unknown-linux-gnu.tar.gz` | `45a638aaf6cbefb3304174c687069abd3ed5fd89fcc178151f7a3fc8db9617ef` |
+| `x86_64-unknown-linux-musl` | `rpi-v<version>-x86_64-unknown-linux-musl.tar.gz` | generated per release |
 | `aarch64-unknown-linux-gnu` | `rpi-v0.5.1-aarch64-unknown-linux-gnu.tar.gz` | `f8eb9e5a3973993516f0575ce75705d807d971accfca3f2fb691922615e567b3` |
 | `aarch64-apple-darwin` | `rpi-v0.5.1-aarch64-apple-darwin.tar.gz` | `e2591167842e40e09ed1f3bc0904787f2ecbd8adb784e9c637b7a24611ee49a5` |
 | `x86_64-pc-windows-msvc` | `rpi-v0.5.1-x86_64-pc-windows-msvc.zip` | `6c3140c30f92af7cbb64cd0c115f0ce66233ab9b1541e3c6991563dd50bd0d9f` |
@@ -63,6 +64,8 @@ Two consequences worth knowing:
 - Intel Macs can use `scripts/install.sh` for releases containing that asset,
   or `cargo install rpi-cli`. The Homebrew formula currently covers Apple
   silicon on macOS.
+- The musl asset is intended for x86_64 musl-based Linux distributions; GNU
+  Linux keeps using the separate GNU asset.
 - The assets are named after the **binary** (`rpi`), while the crate is
   `rpi-cli`. Anything templating a URL from the crate name is wrong — which is
   why the binstall `pkg-url` uses `{ bin }` and not `{ name }`.

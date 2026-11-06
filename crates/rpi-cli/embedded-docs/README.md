@@ -416,8 +416,8 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 | Current release | **[0.20.0](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.88 |
-| Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
-| Binary release targets | Linux (x86_64/aarch64), macOS (Intel/Apple silicon), Windows (x86_64) |
+| Platforms | Linux (GNU and musl), macOS, Windows (CI runs the suite on Linux) |
+| Binary release targets | Linux (x86_64 GNU/musl, aarch64 GNU), macOS (Intel/Apple silicon), Windows (x86_64) |
 
 `rpi` is a self-contained Rust coding-agent stack. No Node component is
 required and none is loaded.

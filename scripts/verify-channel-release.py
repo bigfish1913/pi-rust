@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require all five verified archives before advertising a package-manager update."""
+"""Require all six verified archives before advertising a package-manager update."""
 import json
 from pathlib import Path
 import re
@@ -8,7 +8,8 @@ import sys
 
 REPOSITORY = "https://github.com/bigfish1913/pi-rust"
 TARGETS = {"x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu",
-           "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin"}
+           "x86_64-unknown-linux-musl", "aarch64-unknown-linux-gnu",
+           "x86_64-apple-darwin", "aarch64-apple-darwin"}
 
 
 def verify(tag, manifest, release):
@@ -19,7 +20,7 @@ def verify(tag, manifest, release):
             or manifest.get("version") != tag[1:]
             or not re.fullmatch(r"[0-9a-f]{40}", manifest.get("source_commit", ""))
             or set(manifest.get("targets", {})) != TARGETS):
-        raise ValueError("manifest must describe this upstream release and all five targets")
+        raise ValueError("manifest must describe this upstream release and all six targets")
     if release.get("draft") or release.get("prerelease") or release.get("tag_name") != tag:
         raise ValueError("install channels require a published stable release")
     assets = {asset["name"]: asset for asset in release["assets"]}
@@ -48,4 +49,4 @@ if __name__ == "__main__":
     if manifest.get("source_commit") != commit["sha"]:
         raise ValueError("release manifest source does not match the tag")
     verify(tag, manifest, release)
-    print(f"Verified all five platforms for {tag}")
+    print(f"Verified all six platforms for {tag}")

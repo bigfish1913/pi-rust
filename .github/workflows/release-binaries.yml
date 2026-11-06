@@ -46,6 +46,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # musl-tools installs `musl-gcc`, while cc-rs derives the target-prefixed
+  # compiler name unless this target-specific override is explicit.
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
   # Release binaries must be built with the same warning policy as CI tests.
   RUSTFLAGS: "-D warnings"
 
@@ -61,6 +65,9 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
             archive: tar.gz
           # GitHub-hosted arm64 Linux runners; available for public repos.
           - os: ubuntu-24.04-arm
@@ -82,6 +89,10 @@ jobs:
         with:
           ref: ${{ inputs.checkout_ref || inputs.tag || github.ref }}
           persist-credentials: false
+
+      - name: Install musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -262,7 +273,7 @@ jobs:
                 --generate-notes
             fi
           fi
-          # Upload last: a manifest means all five verified archives are ready.
+          # Upload last: a manifest means all six verified archives are ready.
           gh release upload "${TAG}" rpi-release.json --clobber
 
   channels:
