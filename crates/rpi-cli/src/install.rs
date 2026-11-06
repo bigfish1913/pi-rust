@@ -155,6 +155,7 @@ struct InstallOptions {
     force: bool,
     build: bool,
     repository: Option<String>,
+    cdn_base: Option<reqwest::Url>,
 }
 
 /// Default to the versioned prebuilt distribution protocol. Cargo builds are
@@ -195,6 +196,7 @@ pub async fn run_async(args: &[String]) -> i32 {
         options.version.as_deref(),
         options.repository.as_deref(),
         options.force,
+        options.cdn_base.as_ref(),
     )
     .await
     {
@@ -1400,6 +1402,7 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
     let mut force = false;
     let mut build = false;
     let mut repository = None;
+    let mut cdn = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1411,6 +1414,10 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
             "--github" => {
                 i += 1;
                 repository = Some(value(args, i, "--github")?);
+            }
+            "--cdn" => {
+                i += 1;
+                cdn = Some(value(args, i, "--cdn")?);
             }
             "--version" | "-V" => {
                 i += 1;
@@ -1452,6 +1459,11 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
     if !valid_package_name(&package) {
         return Err(format!("invalid Cargo package name `{package}`"));
     }
+    let cdn_base = if build || path.is_some() {
+        None
+    } else {
+        crate::cdn::resolve_base(cdn.as_deref())?
+    };
     Ok(InstallOptions {
         package,
         version,
@@ -1460,6 +1472,7 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
         force,
         build,
         repository,
+        cdn_base,
     })
 }
 
@@ -1526,7 +1539,7 @@ fn help_requested() -> &'static str {
 }
 
 pub fn print_help() {
-    println!("Usage: rpi install [<crate>] [options]\n\nInstall or upgrade a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata.\nNewer versions upgrade automatically; an already installed version is skipped.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Reinstall the same version or allow a downgrade/replacement\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
+    println!("Usage: rpi install [<crate>] [options]\n\nInstall or upgrade a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata.\nNewer versions upgrade automatically; an already installed version is skipped.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --cdn <URL>           Download release archives from this HTTPS CDN; manifests remain on GitHub\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Reinstall the same version or allow a downgrade/replacement\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
 }
 
 fn print_uninstall_help() {
