@@ -299,7 +299,7 @@ jobs:
           RPI_CDN_BASE_URL: ${{ secrets.RPI_CDN_BASE_URL }}
         run: |
           python scripts/mirror-release-to-rustfs.py \
-            --directory dist --manifest rpi-release.json --tag "$TAG"
+            --directory . --manifest rpi-release.json --tag "$TAG"
 
       - name: Report RustFS mirror failure
         if: steps.rustfs_mirror.outcome == 'failure'
