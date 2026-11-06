@@ -26,11 +26,11 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 ### Fixed
 
 - *(rpc)* raise ACP inline image prompt limit to 1 MiB
-- *(tui)* keep completed plan in transcript order ([#257](https://github.com/bigfish1913/pi-rust/pull/257))
+- *(tui)* keep completed plan in transcript order
 - *(cli)* keep the beginning of a conversation on screen: the paged history view
   rendered only the newest 50 entries, so a two-turn chat with tool results
   silently lost its first user question (paging could still reach it, but
-  nothing hinted that it was missing)
+  nothing hinted that it was missing) ([#257](https://github.com/bigfish1913/pi-rust/pull/257))
 - *(cli)* keep live notices in transcript order: model-switch, retry and error
   notes were appended after the growing live slot, so they stayed pinned below
   every line streamed afterwards instead of marking where they happened
