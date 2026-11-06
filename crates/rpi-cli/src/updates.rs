@@ -599,13 +599,14 @@ pub fn print_startup_notices(report: &UpdateReport) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SelfUpdateArgs {
     Help,
     Run {
         force: bool,
         build: bool,
         channel: UpdateChannel,
+        cdn_base: Option<reqwest::Url>,
     },
     Usage,
 }
@@ -616,25 +617,40 @@ fn parse_self_update_args(args: &[String]) -> SelfUpdateArgs {
     let mut force = false;
     let mut build = false;
     let mut channel = UpdateChannel::Stable;
-    for arg in args {
-        match arg.as_str() {
+    let mut cdn = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--help" | "-h" => return SelfUpdateArgs::Help,
             "--force" | "-f" => force = true,
             "--build" => build = true,
+            "--cdn" => {
+                i += 1;
+                let Some(value) = args.get(i).filter(|value| !value.starts_with('-')) else {
+                    return SelfUpdateArgs::Usage;
+                };
+                cdn = Some(value.as_str());
+            }
             "preview" if channel == UpdateChannel::Stable => channel = UpdateChannel::Preview,
             _ => return SelfUpdateArgs::Usage,
         }
+        i += 1;
     }
+    let cdn_base = match crate::cdn::resolve_base(cdn) {
+        Ok(base) => base,
+        Err(_) => return SelfUpdateArgs::Usage,
+    };
     SelfUpdateArgs::Run {
         force,
         build,
         channel,
+        cdn_base,
     }
 }
 
 fn print_self_update_help() {
     println!(
-        "Usage: rpi update [preview] [--force] [--offline] [--build]\n\n\
+        "Usage: rpi update [preview] [--force] [--offline] [--build] [--cdn <URL>]\n\n\
          Update the rpi CLI using verified GitHub prebuilt releases.\n\
          The optional `preview` channel installs the latest GitHub prerelease;\n\
          it is never selected by the normal update check.\n\n\
@@ -816,7 +832,7 @@ fn reclaim_self_update_artifacts() {
 pub fn run_self_update(args: &[String]) -> i32 {
     let offline = crate::args::normalize_offline_mode(args);
     let args = crate::args::without_offline_flag(args);
-    let (force, build, channel) = match parse_self_update_args(&args) {
+    let (force, build, channel, cdn_base) = match parse_self_update_args(&args) {
         SelfUpdateArgs::Help => {
             print_self_update_help();
             return 0;
@@ -825,10 +841,11 @@ pub fn run_self_update(args: &[String]) -> i32 {
             force,
             build,
             channel,
-        } => (force, build, channel),
+            cdn_base,
+        } => (force, build, channel, cdn_base),
         SelfUpdateArgs::Usage => {
             eprintln!(
-                "error: `rpi update` accepts only `preview`, `--force`, `--offline` and `--build`"
+                "error: `rpi update` accepts only `preview`, `--force`, `--offline`, `--build` and `--cdn <URL>`"
             );
             return 2;
         }
@@ -963,11 +980,11 @@ pub fn run_self_update(args: &[String]) -> i32 {
     let code = {
         #[cfg(windows)]
         {
-            run_windows_self_update(build, version)
+            run_windows_self_update(build, version, cdn_base.as_ref())
         }
         #[cfg(not(windows))]
         {
-            run_direct_self_update(build, version)
+            run_direct_self_update(build, version, cdn_base.as_ref())
         }
     };
     if code == 0 {
@@ -1036,7 +1053,12 @@ fn cargo_install_command(
 
 /// Both distribution paths feed the same validated staging/atomic replacement.
 /// Cargo is only reached when the user explicitly selects --build.
-fn prepare_self_update(staging: &Path, build: bool, version: Option<&str>) -> Result<(), String> {
+fn prepare_self_update(
+    staging: &Path,
+    build: bool,
+    version: Option<&str>,
+    cdn_base: Option<&reqwest::Url>,
+) -> Result<(), String> {
     if build {
         let command_dir = create_self_update_command_dir()?;
         let status = cargo_install_command(Some(staging), command_dir.path())?
@@ -1052,6 +1074,7 @@ fn prepare_self_update(staging: &Path, build: bool, version: Option<&str>) -> Re
         .ok_or("no verified release version is available")?
         .to_string();
     let staging = staging.to_path_buf();
+    let cdn_base = cdn_base.cloned();
     std::thread::Builder::new()
         .name("rpi-prebuilt-update".into())
         .spawn(move || {
@@ -1059,7 +1082,11 @@ fn prepare_self_update(staging: &Path, build: bool, version: Option<&str>) -> Re
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
-            runtime.block_on(crate::prebuilt_release::download_to(&version, &staging))
+            runtime.block_on(crate::prebuilt_release::download_to(
+                &version,
+                &staging,
+                cdn_base.as_ref(),
+            ))
         })
         .map_err(|e| e.to_string())?
         .join()
@@ -1240,7 +1267,11 @@ struct DirectUpdatePlan {
 }
 
 #[cfg(not(windows))]
-fn run_direct_self_update(build: bool, version: Option<&str>) -> i32 {
+fn run_direct_self_update(
+    build: bool,
+    version: Option<&str>,
+    cdn_base: Option<&reqwest::Url>,
+) -> i32 {
     let staging = match create_self_update_staging_directory() {
         Ok(directory) => directory,
         Err(error) => {
@@ -1248,7 +1279,7 @@ fn run_direct_self_update(build: bool, version: Option<&str>) -> i32 {
             return 1;
         }
     };
-    if let Err(error) = prepare_self_update(staging.path(), build, version) {
+    if let Err(error) = prepare_self_update(staging.path(), build, version, cdn_base) {
         eprintln!("error: {error}");
         return 1;
     }
@@ -1738,7 +1769,11 @@ exit 0
 "#;
 
 #[cfg(windows)]
-fn run_windows_self_update(build: bool, version: Option<&str>) -> i32 {
+fn run_windows_self_update(
+    build: bool,
+    version: Option<&str>,
+    cdn_base: Option<&reqwest::Url>,
+) -> i32 {
     let staging = match create_windows_update_staging() {
         Ok(staging) => staging,
         Err(error) => {
@@ -1772,7 +1807,7 @@ fn run_windows_self_update(build: bool, version: Option<&str>) -> i32 {
         }
     };
 
-    if let Err(error) = prepare_self_update(&staging_dir, build, version) {
+    if let Err(error) = prepare_self_update(&staging_dir, build, version, cdn_base) {
         let _ = write_windows_update_status(&status_file, "failed", &error);
         eprintln!("error: {error}");
         return 1;
@@ -2950,6 +2985,7 @@ mod tests {
                 force: true,
                 build: true,
                 channel: super::UpdateChannel::Stable,
+                cdn_base: None,
             }
         );
         assert_eq!(
@@ -2958,6 +2994,7 @@ mod tests {
                 force: false,
                 build: false,
                 channel: super::UpdateChannel::Stable,
+                cdn_base: None,
             }
         );
         for flag in ["--force", "-f"] {
@@ -2967,6 +3004,7 @@ mod tests {
                     force: true,
                     build: false,
                     channel: super::UpdateChannel::Stable,
+                    cdn_base: None,
                 }
             );
         }
@@ -2976,6 +3014,7 @@ mod tests {
                 force: false,
                 build: false,
                 channel: super::UpdateChannel::Preview,
+                cdn_base: None,
             }
         );
         for flag in ["--help", "-h"] {
@@ -2999,7 +3038,7 @@ mod tests {
     #[test]
     fn default_self_update_requires_a_release_and_never_falls_back_to_cargo() {
         let staging = tempfile::tempdir().unwrap();
-        let error = super::prepare_self_update(staging.path(), false, None).unwrap_err();
+        let error = super::prepare_self_update(staging.path(), false, None, None).unwrap_err();
         assert!(error.contains("no verified release version"));
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }

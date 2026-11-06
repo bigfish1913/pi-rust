@@ -219,6 +219,27 @@ task publish:crates RELEASE_VERSION=0.3.4
 | `crates` | `cargo login` (a publish-scoped token) |
 | `site` | SSH to the rpi web host |
 
+## Optional RustFS/CDN mirror
+
+`release-binaries.yml` always publishes and validates GitHub Release assets
+first. If the optional RustFS secrets are configured, a final best-effort
+step mirrors the exact `rpi-release.json`, archives, and checksum sidecars to
+an S3-compatible endpoint:
+
+```text
+RPI_RUSTFS_ENDPOINT
+RPI_RUSTFS_BUCKET
+RPI_RUSTFS_ACCESS_KEY
+RPI_RUSTFS_SECRET_KEY
+RPI_CDN_BASE_URL=https://assets.bigfisharc.cn
+```
+
+Objects are versioned under `rpi/releases/<tag>/`. GitHub remains the
+canonical manifest and trust source; a mirror failure is reported in the
+workflow summary without invalidating the GitHub Release. Configure public
+read-only object access, disable listing/write/delete, and use short caching
+for the JSON manifest and immutable caching for archives/checksums.
+
 ## What no command can finish
 
 - **winget**: `scripts/winget-submit.sh` only *opens* the PR. A winget-team
