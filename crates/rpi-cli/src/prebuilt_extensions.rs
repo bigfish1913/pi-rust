@@ -571,6 +571,7 @@ pub async fn install(
     version: Option<&str>,
     repository: Option<&str>,
     force: bool,
+    cdn_base: Option<&reqwest::Url>,
 ) -> Result<(), String> {
     let records = crate::install::installed_native_packages_strict()?;
     let existing = records.iter().find(|p| p.name == name);
@@ -610,16 +611,21 @@ pub async fn install(
     );
     let (manifest, manifest_bytes) = fetch_manifest(&client, &package).await?;
     let distribution = validate_manifest(&manifest, &package, target)?;
-    let response = client
-        .get(&distribution.url)
-        .timeout(std::time::Duration::from_secs(180))
-        .send()
-        .await
-        .map_err(|e| format!("archive request failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("archive request returned {}", response.status()));
-    }
-    let archive = body_limited(response, distribution.size).await?;
+    let cdn_url = cdn_base
+        .map(|base| {
+            crate::cdn::archive_url(base, &package.repository, &manifest.tag, &distribution.url)
+        })
+        .transpose()?
+        .flatten();
+    let archive = crate::cdn::download_with_fallback(
+        &client,
+        cdn_url.as_ref(),
+        &distribution.url,
+        distribution.size,
+        &distribution.sha256,
+        "archive",
+    )
+    .await?;
     let agent_dir = crate::config::agent_dir().map_err(|e| e.to_string())?;
     let target = target.to_string();
     let installed = tokio::task::spawn_blocking(move || {
