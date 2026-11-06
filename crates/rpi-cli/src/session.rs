@@ -2818,6 +2818,7 @@ fn merge_extension_tools(
                 tool.tool = rpi_extensions::with_tool_result_transform(
                     Arc::clone(&tool.tool),
                     Arc::clone(&snapshot),
+                    session.keepalive(),
                 );
             }
         }
