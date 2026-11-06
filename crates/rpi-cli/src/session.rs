@@ -2810,6 +2810,19 @@ fn merge_extension_tools(
             None => tools.push(harness_tool),
         }
     }
+    // `tool_result` transforms see every tool's result, built-in or plugin.
+    // Without one, the tools stay unwrapped.
+    if let Some(snapshot) = session.snapshot_arc() {
+        if !snapshot.tool_result().is_empty() {
+            for tool in tools.iter_mut() {
+                tool.tool = rpi_extensions::with_tool_result_transform(
+                    Arc::clone(&tool.tool),
+                    Arc::clone(&snapshot),
+                    session.keepalive(),
+                );
+            }
+        }
+    }
 }
 
 /// Build the tool list per `--tools`/`--exclude-tools`/`--no-tools`/

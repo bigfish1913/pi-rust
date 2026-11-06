@@ -17,7 +17,7 @@ use rpi_ai::types::Tool;
 use rpi_plugin_sdk::{
     BeforeAgentStartFn, CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn,
     OAuthRequestControlFn, OAuthRequestFn, ProviderRequestFn, ProviderStreamRequestFn, RenderFn,
-    ResourcesDiscoverFn, EVENT_TAG_COUNT,
+    ResourcesDiscoverFn, ToolResultFn, EVENT_TAG_COUNT,
 };
 
 use crate::tool::PluginToolHandle;
@@ -216,6 +216,22 @@ pub struct BeforeAgentStartHandler {
 unsafe impl Send for BeforeAgentStartHandler {}
 unsafe impl Sync for BeforeAgentStartHandler {}
 
+/// A registered `tool_result` transform. Same ownership shape as
+/// [`BeforeAgentStartHandler`]: the plugin-owned `out` is reclaimed through the
+/// plugin's own `plugin_free_string`.
+///
+/// SAFETY: same as [`RegisteredHandler`].
+#[derive(Clone, Copy)]
+pub struct ToolResultHandler {
+    pub handler: ToolResultFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+// SAFETY: fn pointers + an opaque plugin pointer the plugin warrants is
+// thread-safe; the host only reads `user_data` through `handler`.
+unsafe impl Send for ToolResultHandler {}
+unsafe impl Sync for ToolResultHandler {}
+
 /// A registered custom provider (B5c). The host wraps `request_fn` in a
 /// [`PluggableProvider`](crate::PluggableProvider) impl of `rpi_ai::Provider`;
 /// its `stream_simple` drives `request_fn` on `spawn_blocking` (the sync fn
@@ -393,6 +409,8 @@ pub struct ExtensionRegistry {
     /// returns the prompt to install), not a fire-and-forget event subscription,
     /// so it is not indexed by a tag. Chained in registration order.
     before_agent_start: Vec<BeforeAgentStartHandler>,
+    /// `tool_result` transforms, chained in registration order.
+    tool_result: Vec<ToolResultHandler>,
     /// Registered custom providers (B5c). The host wraps each in a
     /// [`PluggableProvider`](crate::PluggableProvider). First-registration-wins on
     /// `provider_id`.
@@ -440,6 +458,7 @@ impl ExtensionRegistry {
             handlers,
             resources_discover: Vec::new(),
             before_agent_start: Vec::new(),
+            tool_result: Vec::new(),
             providers: Vec::new(),
             provider_manifests: std::collections::BTreeMap::new(),
             oauth_providers: Vec::new(),
@@ -667,6 +686,22 @@ impl ExtensionRegistry {
         false
     }
 
+    /// Register a `tool_result` transform. Multiple handlers are kept and
+    /// chained in registration order. Always inserts; returns `false`.
+    pub fn register_tool_result(
+        &mut self,
+        handler: ToolResultFn,
+        plugin_free_string: FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool {
+        self.tool_result.push(ToolResultHandler {
+            handler,
+            plugin_free_string,
+            user_data,
+        });
+        false
+    }
+
     /// Register a custom provider (B5c). First-registration-wins on `provider_id`
     /// (a later registration for an existing id is dropped, mirroring tool/command
     /// first-wins). Returns `true` if a prior provider of the same id was kept.
@@ -788,6 +823,7 @@ impl ExtensionRegistry {
             handlers,
             resources_discover: self.resources_discover.clone(),
             before_agent_start: self.before_agent_start.clone(),
+            tool_result: self.tool_result.clone(),
             providers: self.providers.clone(),
             provider_manifests: self.provider_manifests.clone(),
             oauth_providers: self.oauth_providers.clone(),
@@ -868,6 +904,7 @@ impl ExtensionRegistry {
             .append(&mut other.resources_discover);
         self.before_agent_start
             .append(&mut other.before_agent_start);
+        self.tool_result.append(&mut other.tool_result);
         for p in other.providers.drain(..) {
             if self
                 .providers
@@ -943,6 +980,7 @@ pub struct RegistrySnapshot {
     handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT],
     resources_discover: Vec<ResourcesDiscoverHandler>,
     before_agent_start: Vec<BeforeAgentStartHandler>,
+    tool_result: Vec<ToolResultHandler>,
     providers: Vec<RegisteredProvider>,
     provider_manifests: std::collections::BTreeMap<String, ProviderManifest>,
     oauth_providers: Vec<RegisteredOAuthProvider>,
@@ -1014,6 +1052,12 @@ impl RegistrySnapshot {
     /// the one callers treat as "leave the prompt alone".
     pub fn before_agent_start(&self) -> &[BeforeAgentStartHandler] {
         &self.before_agent_start
+    }
+
+    /// The `tool_result` transforms, registration order. Empty when no plugin
+    /// registered one, in which case tools are not wrapped at all.
+    pub fn tool_result(&self) -> &[ToolResultHandler] {
+        &self.tool_result
     }
 
     /// The registered custom providers (B5c), registration order. The host wraps

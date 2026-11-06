@@ -361,6 +361,41 @@ extern "C" fn on_before_agent_start(
 该槽位在结构体末尾新增且可为 `None`：面向旧宿主的插件应检测后再注册（见 §3
 能力检测），宿主则在没有插件注册时完全不进入这条路径。
 
+### 改写工具结果
+
+`rpi_plugin_sdk::register_tool_result(api, handler, user_data)` 注册工具结果变换器，
+对应 pi 的 `tool_result` handler 返回 `content` / `details`。工具成功返回后、结果进入
+会话之前，宿主把 `{"toolCallId", "toolName", "input", "content", "details"}` 交给
+handler（`content` 与插件工具返回值同形：`text` 块和带 base64 `data`、`mimeType` 的
+`image` 块）；handler 在 `out` 里只写要替换的字段，例如把截图重新编码后返回新的
+`content`：
+
+```rust
+extern "C" fn on_tool_result(
+    event_json: StbStringRef,
+    out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    rpi_plugin_sdk::guard_or(1, || {
+        let env: serde_json::Value =
+            serde_json::from_str(unsafe { event_json.as_str() }).unwrap_or_default();
+        let Some(content) = shrink_images(&env["content"]) else {
+            return 0; // 不写 out = 不变
+        };
+        unsafe { *out = StbString::from_string(json!({ "content": content }).to_string()); }
+        0
+    })
+}
+```
+
+- **按注册顺序串联**，后一个 handler 看到前一个的结果；返回非零或 panic 时保持原样，
+  fan-out 继续。
+- **只改返回的字段。** `terminate`、usage 等仍是工具自己的；失败的调用不经过变换器。
+- **在阻塞线程上运行**，重新编码图片这类慢活不会卡住运行时；结果按变换后的样子写进
+  会话，以后每轮原样重发，提示词缓存不受影响。
+- 没有插件注册时宿主不包装任何工具。旧宿主的 `struct_size` 够不到这个槽，
+  `register_tool_result` 返回 `-1`。
+
 ### Provider 与渲染器
 
 推理 provider 的目录、认证、执行绑定与验收要求见本文末尾的「Provider 接入规范」。
