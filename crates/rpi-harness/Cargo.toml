@@ -43,6 +43,8 @@ sha2 = "0.10.9"
 rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
 rpi-telemetry = { workspace = true }
 rpi-ai = { workspace = true }
 rpi-agent = { workspace = true }
