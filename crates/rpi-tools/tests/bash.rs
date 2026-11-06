@@ -56,6 +56,10 @@ fn text_output(r: &rpi_agent::types::AgentToolResult) -> String {
 fn err_text(e: &AgentError) -> String {
     match e {
         AgentError::Tool(m) => m.clone(),
+        // The bash tool now reports failed commands as StructuredTool so the
+        // tool result can carry exit_code / failure_kind. The message lives in
+        // content, not in the error's Display.
+        AgentError::StructuredTool(r) => text_output(r),
         other => format!("{other:?}"),
     }
 }
@@ -115,6 +119,13 @@ async fn nonzero_exit_returns_error_with_output() {
     let msg = err_text(&err);
     assert!(msg.contains("failed"), "{msg}");
     assert!(msg.contains("Command exited with code 7"), "{msg}");
+    // PR-B (fork issue #14): the failure stays isError=true in the agent loop,
+    // but details now says this was a command result, not a broken tool.
+    let AgentError::StructuredTool(result) = &err else {
+        panic!("bash failures must carry structured details: {err:?}");
+    };
+    assert_eq!(result.details["exit_code"], 7);
+    assert_eq!(result.details["failure_kind"], "command_failed");
 }
 
 #[tokio::test]
@@ -316,4 +327,113 @@ async fn real_shell_honors_fallback_and_explicit_timeouts() {
         let msg = err_text(&result.expect_err("slow command must time out"));
         assert!(msg.contains("Command timed out after 0.1s"), "{msg}");
     }
+}
+
+/// Fork issue #14 PR-B, compatibility version: keep `isError` semantics but
+/// classify the failure in `details`. Pins the whole "how did the call end"
+/// axis: command failed / cancelled / timed out / shell transport failed, plus
+/// the success cell (no failure_kind).
+#[tokio::test]
+async fn review_issue14_failure_kind_axis_and_success_have_no_classification() {
+    let (env, ctx) = fresh_context();
+    env.register_shell(
+        "fail",
+        ShellScript {
+            stdout: "grep: no match".into(),
+            stderr: String::new(),
+            exit_code: 1,
+            delay_ms: None,
+        },
+    )
+    .await;
+    env.register_shell("ok", ShellScript::success("done")).await;
+    let tool = rpi_tools::create_bash_tool(&ctx, None);
+
+    let ok = run_bash(tool.clone(), serde_json::json!({ "command": "ok" }))
+        .await
+        .expect("success");
+    assert!(ok.details.get("failure_kind").is_none(), "{:?}", ok.details);
+    assert_eq!(ok.details["exit_code"], 0);
+
+    let err = run_bash(tool.clone(), serde_json::json!({ "command": "fail" }))
+        .await
+        .expect_err("nonzero exit stays an error");
+    let AgentError::StructuredTool(result) = &err else {
+        panic!("expected StructuredTool: {err:?}");
+    };
+    assert_eq!(result.details["exit_code"], 1);
+    assert_eq!(result.details["failure_kind"], "command_failed");
+    // A probe command's output must still be visible: the classification is
+    // additive, it must not swallow what the command said.
+    assert!(text_output(result).contains("grep: no match"));
+
+    // Timeout cell: InMemoryExecutionEnv does not model a deadline, so use the
+    // real shell (same setup as `real_shell_honors_fallback_and_explicit_timeouts`).
+    use rpi_tools::{ExecutionErrorCode, OsExecutionEnv, Shell, ShellExecOptions};
+    let tmp = tempfile::tempdir().unwrap();
+    let os_env = Arc::new(OsExecutionEnv::with_cwd(tmp.path().to_path_buf()));
+    match os_env
+        .exec(
+            "echo ready",
+            ShellExecOptions {
+                timeout: Some(5.0),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Err(error) if error.code == ExecutionErrorCode::ShellUnavailable => {
+            eprintln!("skipping timeout cell: no bash on this host");
+        }
+        result => {
+            result.expect("shell is available");
+            let os_ctx =
+                ExecutionToolContext::new(os_env.clone() as Arc<dyn rpi_tools::ExecutionEnv>, None);
+            let slow_tool = rpi_tools::create_bash_tool(&os_ctx, None);
+            let err = run_bash(
+                slow_tool,
+                serde_json::json!({ "command": "sleep 30", "timeout": 0.1 }),
+            )
+            .await
+            .expect_err("timeout stays an error");
+            let AgentError::StructuredTool(result) = &err else {
+                panic!("expected StructuredTool: {err:?}");
+            };
+            assert_eq!(result.details["failure_kind"], "timeout");
+        }
+    }
+
+    // Cancellation cell.
+    let (env3, ctx3) = fresh_context();
+    env3.register_shell(
+        "slow3",
+        ShellScript {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            delay_ms: Some(5000),
+        },
+    )
+    .await;
+    let cancel_tool = rpi_tools::create_bash_tool(&ctx3, None);
+    let signal = CancellationToken::new();
+    let on_update = Arc::new(|_p| ());
+    let cancel = signal.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel.cancel();
+    });
+    let err = cancel_tool
+        .execute(
+            "bash-x",
+            serde_json::json!({ "command": "slow3" }),
+            signal,
+            on_update,
+        )
+        .await
+        .expect_err("cancel stays an error");
+    let AgentError::StructuredTool(result) = &err else {
+        panic!("expected StructuredTool: {err:?}");
+    };
+    assert_eq!(result.details["failure_kind"], "cancelled");
 }
