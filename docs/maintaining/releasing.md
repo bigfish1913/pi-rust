@@ -38,7 +38,8 @@ Release PR when ready to ship. After its main-branch CI passes:
 1. The existing release helper publishes the core crates in dependency order.
 2. Automation creates `vX.Y.Z` at the tested main commit. Existing tags are never
    moved; retrying the same release commit is supported.
-3. A reusable workflow builds all five platforms, verifies the archives, uploads
+3. A reusable workflow builds all six platforms (including the static
+   `x86_64-unknown-linux-musl` Linux binary), verifies the archives, uploads
    their checksums and publishes `rpi-release.json` last.
 4. Homebrew and Scoop are updated independently; a new-version PR is submitted
    to `microsoft/winget-pkgs`. Microsoft review/CLA completion remains external.
@@ -109,7 +110,7 @@ the built-in `GITHUB_TOKEN` does not start another push-triggered workflow.
 - Re-run failed jobs on the Release PR's original main CI run. Existing crates
   are skipped by the release helper; an existing tag must match the same commit.
 - For a channel failure, run **Release install channels** from Actions on `main`
-  with the published tag. It verifies all five archives before regenerating
+  with the published tag. It verifies all six archives before regenerating
   manifests. Existing winget PRs/files are reused; closed submissions require
   maintainer inspection. Tap updates refuse to downgrade a newer version.
 - Each run saves `channel-manifests-vX.Y.Z` as an artifact. The checked-in

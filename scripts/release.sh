@@ -30,6 +30,7 @@ REPO="bigfish1913/pi-rust"
 # `.sha256` sidecar), so requiring both formats here waits forever.
 ASSET_TARGETS=(
   "x86_64-unknown-linux-gnu:tar.gz"
+  "x86_64-unknown-linux-musl:tar.gz"
   "aarch64-unknown-linux-gnu:tar.gz"
   "aarch64-apple-darwin:tar.gz"
   "x86_64-apple-darwin:tar.gz"

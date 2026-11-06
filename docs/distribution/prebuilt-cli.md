@@ -42,8 +42,8 @@ plugin SDK ABI to match. The updater validates its exact `rpi --version` output.
 ```
 
 The example abbreviates the target map. Official releases contain Windows x64
-MSVC, Linux x64/ARM64 GNU, and macOS Intel/Apple Silicon. No architecture or
-GNU/musl substitution is allowed. Download URLs must identify the same official
+MSVC, Linux x64 GNU, Linux x64 musl, Linux ARM64 GNU, and macOS Intel/Apple
+Silicon. No architecture or GNU/musl substitution is allowed. Download URLs must identify the same official
 repository and versioned Release. Unknown fields may be ignored; unknown schema
 versions are rejected.
 
@@ -61,7 +61,7 @@ failure. On Unix the replacement uses the same directory as the current
 executable and rolls back if post-replacement validation fails.
 
 `scripts/prebuilt-release.py` records each target's archive and executable hashes
-and source commit. The release job verifies all five artifacts refer to the same
+and source commit. The release job verifies all six artifacts refer to the same
 version and commit, preserves the existing archive names and `.sha256` files,
 uploads archives first, and uploads `rpi-release.json` last. The release driver
 waits for this manifest before declaring the binaries ready.
