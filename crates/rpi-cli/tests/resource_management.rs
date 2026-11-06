@@ -327,7 +327,7 @@ async fn preexisting_package_temp_hardlink_is_not_truncated_removed_or_activated
 }
 
 #[tokio::test]
-async fn legacy_package_artifact_alias_is_checked_and_unowned_force_still_works() {
+async fn legacy_package_artifact_alias_is_checked_and_versioned_force_preserves_legacy_artifacts() {
     let cli = Cli::new();
     cli.install_package().await;
     let managed = cli
@@ -361,8 +361,24 @@ async fn legacy_package_artifact_alias_is_checked_and_unowned_force_still_works(
     cli.ok(&["package", "link", "plain", "--force", "--path", "../source"])
         .await;
     assert_eq!(std::fs::read(&managed).unwrap(), b"managed bytes");
+    // The legacy hardlinked artifact is retained rather than replaced. The
+    // active registry entry points at the newly published versioned artifact.
+    assert_eq!(std::fs::read(&target).unwrap(), b"managed bytes");
+    let registry: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(cli.root.join("project/.rpi/packages.json")).unwrap(),
+    )
+    .unwrap();
+    let active = registry["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "plain")
+        .and_then(|package| package["artifacts"][0].as_str())
+        .unwrap();
+    let active_path = target.parent().unwrap().join(active);
+    assert_ne!(active_path, target);
     assert_eq!(
-        std::fs::read(&target).unwrap(),
+        std::fs::read(active_path).unwrap(),
         b"fixture artifact, never executable"
     );
     cli.ok(&["package", "link", "plain", "--force", "--path", "../source"])

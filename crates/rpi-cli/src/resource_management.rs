@@ -360,6 +360,17 @@ pub(crate) fn mutation_lease(root: &Path) -> Result<Lease> {
     ensure_complete(root)?;
     Ok(lease)
 }
+
+/// Hold a shared resource lease while updating native package metadata. Native
+/// package installation is append/version based and therefore safe alongside
+/// live hosts, but it must still exclude resource mutations that could race
+/// with the registry/receipt ownership checks.
+pub(crate) fn shared_lease(root: &Path) -> Result<Lease> {
+    let lease = Lease::acquire(root, false, true)?.ok_or("missing resource lease")?;
+    ensure_complete(root)?;
+    Ok(lease)
+}
+
 fn ensure_complete(root: &Path) -> Result<()> {
     if read_bytes(&root.join(JOURNAL), MAX_META)?.is_some() {
         return Err(
@@ -374,8 +385,7 @@ pub(crate) fn host_leases(cwd: &Path) -> Result<Arc<Vec<Lease>>> {
     roots.dedup();
     let mut leases = Vec::new();
     for root in roots {
-        leases.push(Lease::acquire(&root, false, true)?.ok_or("missing resource lease")?);
-        ensure_complete(&root)?;
+        leases.push(shared_lease(&root)?);
     }
     Ok(Arc::new(leases))
 }
