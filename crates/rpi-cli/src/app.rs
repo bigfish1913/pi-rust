@@ -404,6 +404,9 @@ async fn run_inner() -> i32 {
         }
     };
     extension_prepare.finish();
+    if let Some(code) = crate::session::run_prepared_service(&prepared).await {
+        return code;
+    }
     let model_resolve = StartupSpan::start(Phase::ModelResolve);
     let resolved = match resolve_with_extensions(
         &parsed,
