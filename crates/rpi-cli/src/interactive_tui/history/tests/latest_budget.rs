@@ -328,3 +328,70 @@ async fn latest_page_never_asks_for_more_than_the_budget() {
     assert!(page.next_after_id.is_none());
     assert!(!page.has_more_after);
 }
+
+/// Paging chain: from the bounded window, `Older` must reach every entry exactly
+/// once. The window carries the newest rows; a wrong `next_before_id` cursor
+/// would either repeat the boundary row or skip it, and both are silent in a
+/// rendered screen (a duplicate looks like a rendering glitch, a gap like a lost
+/// message). This walks the whole chain and asserts the ids match exactly.
+#[tokio::test]
+async fn bounded_window_pages_backwards_without_gaps_or_repeats() {
+    const ENTRIES: usize = 23;
+    const BUDGET: usize = 5;
+    let (storage, state, _tui) = fixture(ENTRIES).await;
+    state.history_page.set_latest_budget(BUDGET);
+    let tree: Arc<dyn SessionTree> = Session::new(storage, None).view("main");
+
+    let mut page = latest_page(&tree, BUDGET).await.expect("latest page loads");
+    let mut seen: Vec<String> = page
+        .entries
+        .iter()
+        .map(|entry| entry.id().to_owned())
+        .collect();
+    assert_eq!(seen.len(), BUDGET);
+    assert_eq!(seen.first().map(String::as_str), Some("entry-018"));
+    assert_eq!(seen.last().map(String::as_str), Some("entry-022"));
+
+    // Walk backwards exactly as the UI does, until history is exhausted.
+    while page.has_more_before {
+        let previous = page.clone();
+        page = tree
+            .branch_entry_page(&BranchEntryPageQuery {
+                leaf_id: previous.leaf_id.clone(),
+                before_id: previous.next_before_id.clone(),
+                limit: BUDGET,
+                ..Default::default()
+            })
+            .await
+            .expect("older page loads");
+        for entry in &page.entries {
+            seen.push(entry.id().to_owned());
+        }
+        assert!(
+            page.entries.len() <= BUDGET,
+            "each page stays inside the budget"
+        );
+    }
+
+    // Every entry exactly once. Pages are chronological inside themselves and
+    // disjoint from each other, so the chain is `seen` sliced by page, each slice
+    // reversed — no repeats, no gaps, no overlap at the boundaries.
+    let mut expected: Vec<String> = (0..ENTRIES)
+        .map(|index| format!("entry-{index:03}"))
+        .collect();
+    expected.reverse();
+    let mut chained = Vec::new();
+    for chunk in seen.chunks(BUDGET) {
+        chained.extend(chunk.iter().rev().cloned());
+    }
+    assert_eq!(
+        chained, expected,
+        "walking Older from the bounded window must enumerate every entry once, \
+         newest to oldest"
+    );
+    // A set would hide a duplicate; check uniqueness explicitly.
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), ENTRIES, "no entry may be shown twice");
+}
