@@ -298,6 +298,7 @@ jobs:
           RPI_RUSTFS_SECRET_KEY: ${{ secrets.RPI_RUSTFS_SECRET_KEY }}
           RPI_CDN_BASE_URL: ${{ secrets.RPI_CDN_BASE_URL }}
         run: |
+          cp rpi-release.json dist/rpi-release.json
           python scripts/mirror-release-to-rustfs.py \
             --directory dist --manifest rpi-release.json --tag "$TAG"
 
