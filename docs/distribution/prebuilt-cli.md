@@ -84,6 +84,16 @@ rpi update --cdn https://assets.bigfisharc.cn
 # or set RPI_CDN_BASE_URL for both `rpi update` and `rpi install`
 ```
 
+For a persistent user default, add this to `~/.rpi/agent/settings.json`:
+
+```json
+{
+  "cdnBaseUrl": "https://assets.bigfisharc.cn"
+}
+```
+
+The precedence is `--cdn` > `RPI_CDN_BASE_URL` > `settings.json`.
+
 The CLI still obtains and validates `rpi-release.json` from GitHub. When the
 CDN is selected, it derives the archive path from the validated release tag and
 filename under `/rpi/releases/<tag>/`; it verifies the GitHub manifest's size

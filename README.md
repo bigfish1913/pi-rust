@@ -345,8 +345,16 @@ throughput, long sessions, TUI frame cost) are in
 ## Optional release CDN
 
 GitHub Releases and their validated manifests remain authoritative. To use the
-optional RustFS-backed archive accelerator, pass an HTTPS base URL or set
-`RPI_CDN_BASE_URL`:
+optional RustFS-backed archive accelerator, pass an HTTPS base URL, set
+`RPI_CDN_BASE_URL`, or save `cdnBaseUrl` in `~/.rpi/agent/settings.json`:
+
+```json
+{
+  "cdnBaseUrl": "https://assets.bigfisharc.cn"
+}
+```
+
+The precedence is `--cdn` > `RPI_CDN_BASE_URL` > `settings.json`:
 
 ```bash
 rpi update --cdn https://assets.bigfisharc.cn

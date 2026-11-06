@@ -8,10 +8,18 @@ const PACKAGE_REPOSITORY: &str = "https://github.com/pi-rust/rpi-package";
 
 /// Resolve and validate the optional CDN base. The CDN is only a transport;
 /// manifests and all release identity fields still come from GitHub.
+///
+/// Precedence is explicit CLI (`--cdn`), environment (`RPI_CDN_BASE_URL`), then
+/// global `settings.json` (`cdnBaseUrl`). Settings are a convenience default;
+/// they never override an explicit invocation or environment configuration.
 pub(crate) fn resolve_base(cli_value: Option<&str>) -> Result<Option<Url>, String> {
+    let configured_setting = crate::settings::load_settings()
+        .ok()
+        .and_then(|settings| settings.cdn_base_url);
     let value = cli_value
         .map(str::to_owned)
         .or_else(|| std::env::var(CDN_ENV).ok())
+        .or(configured_setting)
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     let Some(value) = value else { return Ok(None) };
