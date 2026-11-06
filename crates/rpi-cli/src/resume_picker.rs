@@ -19,60 +19,13 @@ pub async fn select(cwd: &Path) -> Result<Option<String>, String> {
 
 pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<String>, String> {
     let cwd_text = cwd.to_string_lossy().into_owned();
-    let metadata = crate::session::list_session_metadata_in_dir(&cwd_text, dir)
-        .await
-        .map_err(|e| e.to_string())?;
-    if metadata.is_empty() {
-        return Err(format!("no sessions found in {}", dir.display()));
-    }
-
-    // Each summary opens + reads a (bounded) slice of the session file. That is
-    // blocking file I/O over every saved session, so keep it off the async
-    // runtime the TUI will later run on.
-    let metas_for_summary = metadata.clone();
-    let summaries = tokio::task::spawn_blocking(move || {
-        metas_for_summary
-            .iter()
-            .map(|meta| crate::session::summarize_session_file(Path::new(&meta.path)))
-            .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(|e| format!("session summary task failed: {e}"))?;
-
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64;
-    let mut items: Vec<SelectItem> = Vec::new();
-    for (meta, summary) in metadata.iter().zip(summaries.iter()) {
-        // A header-only session has nothing to restore; offering it is how a
-        // resume lands on an empty transcript. Skip them so every listed row is
-        // resumable.
-        if summary.empty {
-            continue;
-        }
-        let file_name = Path::new(&meta.path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&meta.id);
-        let label = crate::session::session_display_label(summary);
-        let short_id = crate::session::short_session_id(&meta.id);
-        let description = format!(
-            "{} · {} · {}",
-            format_modified_age(now_ms, meta.modified_at),
-            crate::session::format_session_bytes(summary.bytes),
-            short_id,
-        );
-        items.push(
-            SelectItem::new(&meta.id, &label)
-                .with_description(&description)
-                .with_search_text(&format!("{label} {short_id} {file_name}")),
-        );
-    }
+    // Same default scope as the in-TUI `/session` picker: current project
+    // first, All is an explicit Tab away (fork issue #13).
+    let scope = crate::session::SessionScope::Project;
+    let items = build_items(&cwd_text, dir, scope).await?;
     if items.is_empty() {
         return Err(format!(
-            "no resumable sessions with messages in {}",
+            "no resumable sessions with messages for this project in {} (Tab in the picker lists all projects)",
             dir.display()
         ));
     }
@@ -91,7 +44,7 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
     let root = Arc::new(Container::new());
     root.add_child(Arc::new(Text::new("Resume session", 1, 1)));
     root.add_child(Arc::new(Text::new(
-        "  Type to filter, Enter to resume, Esc to cancel",
+        "  Type to filter · Tab: all projects · Enter to resume · Esc to cancel",
         0,
         0,
     )));
@@ -114,6 +67,9 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
     let input_tui = tui.clone();
     let input_list = list.clone();
     let input_search = search.clone();
+    let input_scope = Arc::new(std::sync::Mutex::new(scope));
+    let input_cwd_text = cwd_text.clone();
+    let input_dir = dir.to_path_buf();
     let task = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
         let mut query = String::new();
         loop {
@@ -159,6 +115,29 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
                             query.clear();
                             input_list.set_filter("");
                         }
+                        KeyCode::Tab if key.modifiers == KeyModifiers::NONE => {
+                            let mut current = input_scope.lock().unwrap();
+                            let next = current.toggled();
+                            *current = next;
+                            drop(current);
+                            // Rebuild for the other scope. `build_items`
+                            // awaits `spawn_blocking`, so it needs an IO/timer
+                            // driven runtime; use a dedicated current-thread
+                            // runtime instead of blocking a worker of the
+                            // caller's multi-thread runtime.
+                            let items = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(|e| format!("session picker runtime: {e}"))?
+                                .block_on(build_items(&input_cwd_text, &input_dir, next));
+                            match items {
+                                Ok(items) => {
+                                    input_list.set_items(items);
+                                    input_list.set_filter(&query);
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
                         KeyCode::Backspace => {
                             query.pop();
                             input_list.set_filter(&query);
@@ -186,6 +165,73 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
         .map_err(|e| format!("session picker task failed: {e}"));
     tui.stop(Default::default());
     result?
+}
+
+/// Build picker rows for one scope. All rows carry their project cwd so the
+/// All view stays attributable; the Project view lists only this cwd's
+/// directory via the repo's own typed list API.
+async fn build_items(
+    cwd_text: &str,
+    dir: &Path,
+    scope: crate::session::SessionScope,
+) -> Result<Vec<SelectItem>, String> {
+    let metadata = crate::session::list_session_metadata_in_scope_in_dir(cwd_text, dir, scope)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Each summary opens + reads a (bounded) slice of the session file. That is
+    // blocking file I/O over every saved session, so keep it off the async
+    // runtime the TUI will later run on.
+    let metas_for_summary = metadata.clone();
+    let summaries = tokio::task::spawn_blocking(move || {
+        metas_for_summary
+            .iter()
+            .map(|meta| crate::session::summarize_session_file(Path::new(&meta.path)))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("session summary task failed: {e}"))?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let mut items: Vec<SelectItem> = Vec::new();
+    for (meta, summary) in metadata.iter().zip(summaries.iter()) {
+        if summary.empty {
+            continue;
+        }
+        let file_name = Path::new(&meta.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&meta.id);
+        let label = crate::session::session_display_label(summary);
+        let short_id = crate::session::short_session_id(&meta.id);
+        let mut description = format!(
+            "{} · {} · {}",
+            format_modified_age(now_ms, meta.modified_at),
+            crate::session::format_session_bytes(summary.bytes),
+            short_id,
+        );
+        if scope == crate::session::SessionScope::All {
+            description = format!("{} · {}", short_project_name(&meta.cwd), description);
+        }
+        items.push(
+            SelectItem::new(&meta.id, &label)
+                .with_description(&description)
+                .with_search_text(&format!("{label} {short_id} {file_name}")),
+        );
+    }
+    Ok(items)
+}
+
+/// Last path component of a project cwd, for a compact All-view tag.
+fn short_project_name(cwd: &str) -> String {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| cwd.to_string())
 }
 
 fn format_modified_age(now_ms: i64, modified_ms: i64) -> String {

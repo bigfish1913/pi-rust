@@ -106,7 +106,11 @@ fn validate_session_id(id: &str) -> SessionResult<()> {
 /// `--<cwd-with-leading-/-or-\-stripped-and-/-\-:-replaced-by-->--`.
 /// Mirrors TS `jsonlSessionDirectoryName`. Strips one leading `/` or `\`, then
 /// replaces every `/`, `\`, and `:` with `-`.
-fn jsonl_session_directory_name(cwd: &str) -> String {
+///
+/// Public so callers that enumerate session files synchronously (the CLI's
+/// `/session` picker) can resolve the same per-cwd directory the repo writes
+/// into, instead of duplicating the encoding and drifting from the open path.
+pub fn jsonl_session_directory_name(cwd: &str) -> String {
     let stripped = cwd
         .strip_prefix('/')
         .or_else(|| cwd.strip_prefix('\\'))
