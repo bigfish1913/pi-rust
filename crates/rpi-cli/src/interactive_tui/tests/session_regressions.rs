@@ -1782,13 +1782,14 @@ fn review_pr202_theme_watch_notify_repaints_idle_session() {
     tui.start_readerless();
     let before = frames.load(Ordering::SeqCst);
 
+    let state = test_tui_state();
     // Both callback outcomes must leave the old palette behind.
-    let notify_ok = theme_watch_notify(Arc::new(Container::new()), tui.clone());
+    let notify_ok = theme_watch_notify(&state, tui.clone());
     notify_ok(Ok("Theme reloaded.".into()));
     let after_ok = frames.load(Ordering::SeqCst);
     assert!(after_ok > before, "success notice must schedule a repaint");
 
-    let notify_err = theme_watch_notify(Arc::new(Container::new()), tui.clone());
+    let notify_err = theme_watch_notify(&state, tui.clone());
     notify_err(Err("cannot load theme: bad value".into()));
     assert!(
         frames.load(Ordering::SeqCst) > after_ok,

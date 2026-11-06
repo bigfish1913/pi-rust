@@ -33,7 +33,10 @@ impl SlashCommand for HistoryCommand {
         if let Some(direction) = history::Direction::parse(args) {
             history::request(ctx.state.clone(), ctx.tui.clone(), direction);
         } else {
-            add_error_message(&ctx.chat, "Usage: /history [older|newer|latest]");
+            add_error_message(
+                &ctx.state.notice_container(),
+                "Usage: /history [older|newer|latest]",
+            );
             ctx.tui.request_render(false);
         }
     }
@@ -177,7 +180,6 @@ impl SlashCommand for ModelCommand {
                 .unwrap_or_else(|error| error.into_inner()),
             &ctx.lane,
             &current_id,
-            &ctx.chat,
             (!term.is_empty()).then_some(term),
         );
     }
@@ -199,8 +201,8 @@ impl SlashCommand for ProviderCommand {
         }
         if let Some(id) = term.strip_prefix("remove ") {
             match remove_provider(id) {
-                Ok(note) => add_note_message(&ctx.chat, &note),
-                Err(error) => add_error_message(&ctx.chat, &error),
+                Ok(note) => add_note_message(&ctx.state.notice_container(), &note),
+                Err(error) => add_error_message(&ctx.state.notice_container(), &error),
             }
             ctx.tui.request_render(false);
             return;
@@ -230,7 +232,7 @@ impl SlashCommand for ThinkingCommand {
             // /thinking <level> — direct set (pi supports the param form).
             let Some(level) = thinking_level_from_name(level_name) else {
                 add_error_message(
-                    &ctx.chat,
+                    &ctx.state.notice_container(),
                     &format!(
                         "Unknown thinking level \"{level_name}\". Valid: {}",
                         crate::args::VALID_THINKING_LEVELS.join(", ")
@@ -245,7 +247,10 @@ impl SlashCommand for ThinkingCommand {
                 let _ = lane.set_thinking_level(level).await;
             });
             footer.set_thinking_level(Some(thinking_level_name(level)));
-            add_note_message(&ctx.chat, &format!("Thinking set to {level_name}."));
+            add_note_message(
+                &ctx.state.notice_container(),
+                &format!("Thinking set to {level_name}."),
+            );
             ctx.tui.request_render(false);
             return;
         }
@@ -260,7 +265,6 @@ impl SlashCommand for ThinkingCommand {
                 .read()
                 .unwrap_or_else(|error| error.into_inner()),
             &current_id,
-            &ctx.chat,
         );
     }
 }
@@ -280,7 +284,6 @@ impl SlashCommand for ToolsCommand {
             &ctx.editor,
             &ctx.tui,
             &ctx.lane,
-            &ctx.chat,
         );
     }
 }
@@ -294,13 +297,7 @@ impl SlashCommand for ImagesCommand {
         "Toggle inline images"
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
-        open_images_selector(
-            &ctx.state,
-            &ctx.editor_container,
-            &ctx.editor,
-            &ctx.tui,
-            &ctx.chat,
-        );
+        open_images_selector(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
     }
 }
 
@@ -350,7 +347,7 @@ impl SlashCommand for ThemeCommand {
             let resolved = crate::themes::resolve_command_theme(arg, registry.as_ref());
             let Some(spec) = resolved else {
                 add_error_message(
-                    &ctx.chat,
+                    &ctx.state.notice_container(),
                     &format!(
                         "Unknown theme \"{arg}\". Valid: dark, light, monochrome, or a discovered theme."
                     ),
@@ -377,19 +374,18 @@ impl SlashCommand for ThemeCommand {
                         .read()
                         .ok()
                         .map(|registry| registry.clone());
-                    let chat_watcher = ctx.chat.clone();
                     if let Some(registry_now) = registry_now.as_ref() {
                         crate::themes::restart_theme_watcher(
                             &ctx.state.theme_watcher,
                             Some(&spec),
                             registry_now,
                             &ctx.state.theme_manager,
-                            theme_watch_notify(chat_watcher, ctx.tui.clone()),
+                            theme_watch_notify(&ctx.state, ctx.tui.clone()),
                         );
                     }
-                    add_note_message(&ctx.chat, &message);
+                    add_note_message(&ctx.state.notice_container(), &message);
                 }
-                Err(message) => add_error_message(&ctx.chat, &message),
+                Err(message) => add_error_message(&ctx.state.notice_container(), &message),
             }
             ctx.tui.request_render(false);
             ctx.tui.render_now(true);
@@ -448,7 +444,7 @@ impl SlashCommand for ExportCommand {
         } else {
             // Invalid format, show error
             add_error_message(
-                &ctx.chat,
+                &ctx.state.notice_container(),
                 &format!(
                     "Unknown export format: {}. Supported: md, html, jsonl",
                     args.trim()
@@ -542,7 +538,7 @@ impl SlashCommand for LoginCommand {
                         .any(|oauth| oauth.id.eq_ignore_ascii_case(&item.value)) =>
                 {
                     add_error_message(
-                        &ctx.chat,
+                        &ctx.state.notice_container(),
                         &format!(
                             "Provider '{first}' uses OAuth. Use /login to start its interactive login."
                         ),
@@ -553,7 +549,7 @@ impl SlashCommand for LoginCommand {
                 Some(item) => (item.value.clone(), key.to_string()),
                 None => {
                     add_error_message(
-                        &ctx.chat,
+                        &ctx.state.notice_container(),
                         &format!(
                             "Unknown provider '{first}'. Use /login to choose a provider, or /login <api-key> for the Anthropic shortcut."
                         ),
@@ -568,7 +564,7 @@ impl SlashCommand for LoginCommand {
                     .any(|item| item.value.eq_ignore_ascii_case(first))
                 {
                     add_error_message(
-                        &ctx.chat,
+                        &ctx.state.notice_container(),
                         &format!("Missing API key for provider '{first}'."),
                     );
                     ctx.tui.request_render(false);
@@ -586,13 +582,13 @@ impl SlashCommand for LoginCommand {
         ) {
             Ok(()) => {
                 add_note_message(
-                    &ctx.chat,
+                    &ctx.state.notice_container(),
                     &format!("Saved credentials for {provider}; reloading providers…"),
                 );
                 let _ = ctx.tx.send(TuiMessage::ReloadExtensions);
             }
             Err(error) => add_error_message(
-                &ctx.chat,
+                &ctx.state.notice_container(),
                 &format!("Could not save {provider} credentials: {error}"),
             ),
         }
@@ -652,7 +648,10 @@ impl SlashCommand for TrustCommand {
             "no" | "n" | "false" => Some(false),
             "clear" | "reset" | "none" => None,
             _ => {
-                add_note_message(&ctx.chat, "Usage: /trust [yes|no|clear]");
+                add_note_message(
+                    &ctx.state.notice_container(),
+                    "Usage: /trust [yes|no|clear]",
+                );
                 ctx.tui.request_render(false);
                 return;
             }
@@ -664,10 +663,13 @@ impl SlashCommand for TrustCommand {
                     Some(false) => "untrusted",
                     None => "trust decision cleared",
                 };
-                add_note_message(&ctx.chat, &format!("Current project marked {label}."));
+                add_note_message(
+                    &ctx.state.notice_container(),
+                    &format!("Current project marked {label}."),
+                );
             }
             Err(error) => add_error_message(
-                &ctx.chat,
+                &ctx.state.notice_container(),
                 &format!("Could not save trust decision: {error}"),
             ),
         }
@@ -687,7 +689,7 @@ impl SlashCommand for NameCommand {
         let name = args.trim();
         if name.is_empty() {
             add_note_message(
-                &ctx.chat,
+                &ctx.state.notice_container(),
                 "Usage: /name <display name> — sets the current session's name.",
             );
             ctx.tui.request_render(false);
@@ -709,7 +711,7 @@ impl SlashCommand for ImportCommand {
         let path = args.trim();
         if path.is_empty() {
             add_note_message(
-                &ctx.chat,
+                &ctx.state.notice_container(),
                 "Usage: /import <path-to-session.jsonl> — copies the file into the session dir and switches to it.",
             );
             ctx.tui.request_render(false);
@@ -739,7 +741,6 @@ impl SlashCommand for SettingsCommand {
                 .read()
                 .unwrap_or_else(|error| error.into_inner()),
             &current_id,
-            &ctx.chat,
         );
     }
 }
@@ -761,7 +762,6 @@ impl SlashCommand for ScopedModelsCommand {
             &ctx.model_catalog
                 .read()
                 .unwrap_or_else(|error| error.into_inner()),
-            &ctx.chat,
         );
     }
 }
@@ -812,7 +812,7 @@ impl SlashCommand for SkillsCommand {
             .any(|skill| skill.name == name);
         if !exists {
             add_error_message(
-                &ctx.chat,
+                &ctx.state.notice_container(),
                 &format!("Unknown skill \"{name}\". Use /skills to list available skills."),
             );
             ctx.tui.request_render(false);
@@ -820,7 +820,7 @@ impl SlashCommand for SkillsCommand {
         }
         if !ctx.state.try_start_working() {
             add_error_message(
-                &ctx.chat,
+                &ctx.state.notice_container(),
                 "A run is already in progress. Press Esc to abort it first.",
             );
             ctx.tui.request_render(false);
@@ -900,7 +900,10 @@ impl SlashCommand for ReloadCommand {
         // Signal the main loop. It owns the `&AgentHarness` borrow the
         // `reload_extension_resources` routine needs (the blocking submit thread
         // only has the context's `Arc<ReloadContext>` + the `Arc<dyn AgentLane>`).
-        add_note_message(&ctx.chat, "Reloading extensions + resources…");
+        add_note_message(
+            &ctx.state.notice_container(),
+            "Reloading extensions + resources…",
+        );
         ctx.tui.request_render(false);
         let _ = ctx.tx.send(TuiMessage::ReloadExtensions);
     }
