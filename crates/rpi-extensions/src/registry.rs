@@ -434,8 +434,6 @@ pub struct ExtensionRegistry {
     /// claiming plugin projects `true`). The scoped ActionBridge arbitrates
     /// exclusivity before registries are merged. Default `false`.
     owns_stdio: bool,
-    /// A stdio owner explicitly opting out of an Agent/model bootstrap.
-    service_only: bool,
     /// Shared staleness flag. `true` while the session owning this registry is
     /// active; set `false` on swap/`/reload`. Tool/event dispatch checks it.
     active: Arc<AtomicBool>,
@@ -468,7 +466,6 @@ impl ExtensionRegistry {
             priority: DEFAULT_PRIORITY,
             platforms: Vec::new(),
             owns_stdio: false,
-            service_only: false,
             active: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -608,8 +605,7 @@ impl ExtensionRegistry {
 
     /// Parse a v3 `declare` JSON payload and apply it (P2). Recognised keys:
     /// `priority` (integer), `platforms` (array of strings) and `ownsStdio`
-    /// (boolean; see [`ExtensionRegistry::declared_owns_stdio`]). A stdio owner
-    /// may opt into model-free startup with `requiresAgent:false`. Returns `true`
+    /// (boolean; see [`ExtensionRegistry::declared_owns_stdio`]). Returns `true`
     /// if the payload parsed as JSON (even with no recognised keys), `false` on
     /// a parse error.
     pub fn apply_declaration_json(&mut self, json: &str) -> bool {
@@ -651,9 +647,6 @@ impl ExtensionRegistry {
             // A claim, not a toggle: once a plugin owns stdio it stays claimed
             // (and `absorb` ORs it across plugins).
             self.owns_stdio = self.owns_stdio || owns;
-            if owns && value.get("requiresAgent").and_then(|v| v.as_bool()) == Some(false) {
-                self.service_only = true;
-            }
         }
         self.apply_declaration(priority, platforms);
         true
@@ -836,7 +829,6 @@ impl ExtensionRegistry {
             oauth_providers: self.oauth_providers.clone(),
             renderers: self.renderers.clone(),
             owns_stdio: self.owns_stdio,
-            service_only: self.service_only,
             active: Arc::clone(&self.active),
         }
     }
@@ -966,7 +958,6 @@ impl ExtensionRegistry {
         // session own stdio. The live bridge has already checked the exclusive
         // owner; this flag projects that claim into the immutable snapshot.
         self.owns_stdio |= other.owns_stdio;
-        self.service_only |= other.service_only;
     }
 }
 
@@ -998,8 +989,6 @@ pub struct RegistrySnapshot {
     /// host reads this after `load_session` to defer `read_piped_stdin` and run
     /// the headless `Rpc` lifecycle. See [`ExtensionRegistry::declared_owns_stdio`].
     owns_stdio: bool,
-    /// A stdio owner explicitly opting out of an Agent/model bootstrap.
-    service_only: bool,
     active: Arc<AtomicBool>,
 }
 
@@ -1029,11 +1018,6 @@ impl RegistrySnapshot {
     /// `read_piped_stdin` and run the headless `Rpc` lifecycle.
     pub fn owns_stdio(&self) -> bool {
         self.owns_stdio
-    }
-
-    /// Only an exclusive stdio owner can request a model-free service bootstrap.
-    pub fn service_only(&self) -> bool {
-        self.owns_stdio && self.service_only
     }
 
     /// Keyboard shortcuts declared by extensions, insertion order.
@@ -1327,24 +1311,6 @@ mod tests {
         plain.absorb(claiming);
         assert!(plain.declared_owns_stdio());
         assert!(plain.snapshot().owns_stdio());
-    }
-
-    #[test]
-    fn service_bootstrap_requires_explicit_stdio_owner_opt_in() {
-        let mut legacy = ExtensionRegistry::new();
-        legacy.apply_declaration_json(r#"{"ownsStdio":true}"#);
-        assert!(!legacy.snapshot().service_only());
-        let mut ordinary = ExtensionRegistry::new();
-        ordinary.apply_declaration_json(r#"{"requiresAgent":false}"#);
-        assert!(!ordinary.snapshot().service_only());
-        ordinary.absorb(legacy);
-        assert!(!ordinary.snapshot().service_only());
-        let mut service = ExtensionRegistry::new();
-        service.apply_declaration_json(r#"{"ownsStdio":true,"requiresAgent":false}"#);
-        assert!(service.snapshot().service_only());
-        let mut merged = ExtensionRegistry::new();
-        merged.absorb(service);
-        assert!(merged.snapshot().service_only());
     }
 
     #[test]
