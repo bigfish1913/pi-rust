@@ -384,8 +384,9 @@ fn resize_image(
         return img;
     }
 
-    let new_width = (orig_width as f64 * scale).round() as u32;
-    let new_height = (orig_height as f64 * scale).round() as u32;
+    // A skinny image can round one side to zero; encoders reject that.
+    let new_width = ((orig_width as f64 * scale).round() as u32).max(1);
+    let new_height = ((orig_height as f64 * scale).round() as u32).max(1);
 
     resize_exact(&img, new_width, new_height)
 }
@@ -576,6 +577,22 @@ mod tests {
         let resized = image::load_from_memory(&STANDARD.decode(processed.data).unwrap()).unwrap();
         assert_eq!((resized.width(), resized.height()), (2000, 1000));
         assert!(processed.hints[0].contains("2400x1200 to 2000x1000"));
+    }
+
+    #[test]
+    fn inline_skinny_images_keep_a_nonzero_side() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        for (width, height, expected) in [(1, 10_000, (1, 2000)), (10_000, 1, (2000, 1))] {
+            let png = encode_image(
+                &DynamicImage::new_rgb8(width, height),
+                Some(OutputFormat::Png),
+            )
+            .unwrap();
+            let processed = prepare_inline_image(&png).unwrap();
+            let resized =
+                image::load_from_memory(&STANDARD.decode(processed.data).unwrap()).unwrap();
+            assert_eq!((resized.width(), resized.height()), expected);
+        }
     }
 
     #[test]
