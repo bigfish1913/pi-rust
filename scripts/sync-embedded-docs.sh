@@ -22,6 +22,7 @@ docs/rpi-tool/agent-project.md:agent-project.md \
 docs/rpi-tool/architecture.md:architecture.md \
 docs/rpi-tool/extension-authoring.md:extension-authoring.md \
 docs/rpi-tool/rust-debugging.md:rust-debugging.md \
+docs/rpi-tool/operations.md:operations.md \
 docs/rpi-tool/user-guide.md:user-guide.md \
 CHANGELOG.md:changelog.md"
 

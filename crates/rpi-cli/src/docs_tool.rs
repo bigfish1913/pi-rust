@@ -65,6 +65,25 @@ static DOCS: &[DocPage] = &[
         aliases: &["design", "crates", "sdk"],
     },
     DocPage {
+        topic: "operations",
+        description: "运维速查：skills 发现顺序、诊断自检入口（auth check / events / 诊断变量）、provider 与 models.json、会话 scope 与排查",
+        content: include_str!("../embedded-docs/operations.md"),
+        aliases: &[
+            "skills",
+            "skill",
+            "doctor",
+            "diagnose",
+            "diagnostics",
+            "troubleshooting",
+            "provider",
+            "providers",
+            "models",
+            "models.json",
+            "sessions",
+            "session",
+        ],
+    },
+    DocPage {
         topic: "debugging",
         description: "Rust cdylib 扩展编写（统一 C ABI、工具生命周期、事件处理器）与 agent/扩展调试（事件日志、rpi dev-local、常见失败定位）",
         content: include_str!("../embedded-docs/rust-debugging.md"),
@@ -92,7 +111,7 @@ impl DocsTool {
         Self {
             schema: Tool {
                 name: "docs".to_string(),
-                description: "Look up rpi usage documentation. Omit topic (or use topic=list) to list topics; pass a topic such as guide, authoring, agent, debugging, architecture, or overview. Add query to find relevant sections. Use this before guessing rpi commands, creating an agent project or extension, extension APIs, or .rpi configuration.".to_string(),
+                description: "Look up rpi usage documentation. Omit topic (or use topic=list) to list topics; pass a topic such as guide, operations, authoring, agent, debugging, architecture, or overview. Add query to find relevant sections. Use this before guessing rpi commands, creating an agent project or extension, extension APIs, or .rpi configuration.".to_string(),
                 parameters: rpi_ai::types::Schema::new(
                     serde_json::to_value(params).unwrap_or_default(),
                 ),
@@ -399,6 +418,36 @@ mod tests {
             assert!(output.starts_with("# rpi docs: guide"));
             assert!(output.contains("Matches for"));
         }
+    }
+
+    /// Fork issue #14 PR-C's other half: the audit's top operational queries
+    /// (`skills`, `doctor`/`troubleshooting`, `provider`/`models.json`,
+    /// `sessions`) must resolve to a topic that actually covers them — not to
+    /// an alias that returns an unrelated whole page.
+    #[tokio::test]
+    async fn review_issue14_operational_topics_resolve_to_their_content() {
+        for (alias, needle) in [
+            ("skills", "SKILL.md"),
+            ("doctor", "rpi auth check"),
+            ("troubleshooting", "auth check"),
+            ("provider", "models.json"),
+            ("models.json", "models.json"),
+            ("sessions", "--session-dir"),
+        ] {
+            let output = execute(serde_json::json!({ "topic": alias })).await;
+            assert!(
+                output.starts_with("# rpi docs: operations"),
+                "alias {alias} must resolve to the operations topic: {output}"
+            );
+            assert!(
+                output.contains(needle),
+                "alias {alias} must expose {needle}: {output}"
+            );
+        }
+        // The catalog advertises it, so a caller can discover it without
+        // knowing the alias list.
+        let catalog = execute(serde_json::json!({})).await;
+        assert!(catalog.contains("- operations:"), "{catalog}");
     }
 
     #[tokio::test]
