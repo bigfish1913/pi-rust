@@ -589,7 +589,6 @@ jobs:
     with:
       # Daily runs prepare a Release PR and request Auto-merge for it; ordinary PRs remain manual.
       prepare: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.prepare_release == true) }}
-      auto_merge: ${{ github.event_name == 'schedule' }}
     secrets: inherit
 
   preview-version:

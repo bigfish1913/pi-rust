@@ -8,11 +8,6 @@ on:
         required: false
         type: boolean
         default: false
-      auto_merge:
-        description: 'Request GitHub Auto-merge for the prepared Release PR'
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -88,7 +83,7 @@ jobs:
           EXISTING_RELEASE_PR_JSON: ${{ steps.draft-release-pr.outputs.pr }}
         run: bash scripts/sync-release-pr.sh
       - name: Request Auto-merge for the Release PR
-        if: inputs.auto_merge == true
+        if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
         run: |
