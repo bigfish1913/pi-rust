@@ -67,6 +67,16 @@ class ReleaseGateTests(unittest.TestCase):
                     automation.main()
                 api.assert_not_called()
 
+    def test_scheduled_main_run_can_prepare_a_release_pr(self):
+        with patch.dict(os.environ, {"GITHUB_REPOSITORY": automation.REPOSITORY,
+                                      "GITHUB_EVENT_NAME": "schedule", "GITHUB_REF": "refs/heads/main",
+                                      "GITHUB_SHA": self.commit}), \
+                patch.object(sys, "argv", ["script", "draft-release-prs"]), \
+                patch.object(automation, "run", return_value=self.commit), \
+                patch.object(automation, "api", return_value=[[]]), \
+                patch.object(automation, "output"):
+            automation.main()
+
     def test_ordinary_merge_skips_release_even_when_a_version_was_edited(self):
         with patch.dict(os.environ, {"GITHUB_REPOSITORY": automation.REPOSITORY,
                                       "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main",

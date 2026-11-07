@@ -80,7 +80,7 @@ def main():
     args = parser.parse_args()
     if (os.environ.get("GITHUB_REPOSITORY") != REPOSITORY
             or os.environ.get("GITHUB_REF") != "refs/heads/main"
-            or os.environ.get("GITHUB_EVENT_NAME") not in ("push", "workflow_dispatch")):
+            or os.environ.get("GITHUB_EVENT_NAME") not in ("push", "schedule", "workflow_dispatch")):
         raise ValueError("publishing is only allowed from the upstream main branch")
     commit = run("git", "rev-parse", "HEAD")
     if commit != os.environ["GITHUB_SHA"]:
