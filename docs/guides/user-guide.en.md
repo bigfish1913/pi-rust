@@ -252,7 +252,7 @@ Global resources normally live under `~/.rpi/agent/`. Project resources take pre
 
 The shorthand keys `skills`, `prompts`, and `extensions` are also supported. Paths are relative to the project root; global settings resolve relative paths against the agent directory. Use `--package-only` or `--project-only` to load only the current project's package and resources. This is different from `--local-only`, which limits extensions to explicitly supplied local paths.
 
-Set `RPI_CODING_AGENT_DIR=/work/rpi-agent` to relocate configuration and default sessions. Use `--no-session` when a temporary, non-persistent run is required.
+Set `RPI_CODING_AGENT_DIR=/work/rpi-agent` to relocate configuration. Sessions default to `<cwd>/.rpi/sessions`; `RPI_CODING_AGENT_SESSION_DIR` overrides that root, while `--session-dir <dir>` and the `sessionDir` setting take precedence. The root is further divided into cwd-encoded subdirectories. Use `--no-session` when a temporary, non-persistent run is required.
 
 ## 6. Rust extensions
 

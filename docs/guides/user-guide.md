@@ -375,7 +375,7 @@ rpi --project-only
 RPI_CODING_AGENT_DIR=/work/rpi-agent rpi
 ```
 
-会话默认保存到 agent 配置目录下的 sessions；`--no-session` 可使用临时会话。
+会话默认保存到当前项目的 `<cwd>/.rpi/sessions`；`RPI_CODING_AGENT_SESSION_DIR` 可覆盖该路径，命令行 `--session-dir <dir>` 和 `settings.json` 的 `sessionDir` 优先于它。根目录内再按 cwd 编码分子目录。`--no-session` 可使用临时会话。
 
 ## 6. Rust 插件
 

@@ -38,7 +38,7 @@ static DOCS: &[DocPage] = &[
         topic: "guide",
         description: "完整使用手册：安装、模型、CLI、.rpi 资源、Rust 扩展、SDK、排错和发布",
         content: include_str!("../embedded-docs/user-guide.md"),
-        aliases: &["manual", "user-guide", "cli", "quickstart", "package", "packages", "extension", "extensions"],
+        aliases: &["manual", "user-guide", "cli", "quickstart", "package", "packages", "extension", "extensions", "provider", "providers", "models", "models.json", "sessions", "session", "skills", "skill"],
     },
     DocPage {
         topic: "overview",
@@ -65,29 +65,10 @@ static DOCS: &[DocPage] = &[
         aliases: &["design", "crates", "sdk"],
     },
     DocPage {
-        topic: "operations",
-        description: "运维速查：skills 发现顺序、诊断自检入口（auth check / events / 诊断变量）、provider 与 models.json、会话 scope 与排查",
-        content: include_str!("../embedded-docs/operations.md"),
-        aliases: &[
-            "skills",
-            "skill",
-            "doctor",
-            "diagnose",
-            "diagnostics",
-            "troubleshooting",
-            "provider",
-            "providers",
-            "models",
-            "models.json",
-            "sessions",
-            "session",
-        ],
-    },
-    DocPage {
         topic: "debugging",
         description: "Rust cdylib 扩展编写（统一 C ABI、工具生命周期、事件处理器）与 agent/扩展调试（事件日志、rpi dev-local、常见失败定位）",
         content: include_str!("../embedded-docs/rust-debugging.md"),
-        aliases: &["rust", "rust-debug", "extension-debug", "troubleshoot", "debug"],
+        aliases: &["rust", "rust-debug", "extension-debug", "troubleshoot", "debug", "doctor", "diagnose", "diagnostics", "troubleshooting"],
     },
 ];
 
@@ -111,7 +92,7 @@ impl DocsTool {
         Self {
             schema: Tool {
                 name: "docs".to_string(),
-                description: "Look up rpi usage documentation. Omit topic (or use topic=list) to list topics; pass a topic such as guide, operations, authoring, agent, debugging, architecture, or overview. Add query to find relevant sections. Use this before guessing rpi commands, creating an agent project or extension, extension APIs, or .rpi configuration.".to_string(),
+                description: "Look up rpi usage documentation. Omit topic (or use topic=list) to list topics; pass a topic such as guide, authoring, agent, debugging, architecture, or overview. Add query to find relevant sections. Use this before guessing rpi commands, creating an agent project or extension, extension APIs, or .rpi configuration.".to_string(),
                 parameters: rpi_ai::types::Schema::new(
                     serde_json::to_value(params).unwrap_or_default(),
                 ),
@@ -420,34 +401,43 @@ mod tests {
         }
     }
 
-    /// Fork issue #14 PR-C's other half: the audit's top operational queries
-    /// (`skills`, `doctor`/`troubleshooting`, `provider`/`models.json`,
-    /// `sessions`) must resolve to a topic that actually covers them — not to
-    /// an alias that returns an unrelated whole page.
+    /// Review #273: the audit's operational queries must resolve to an
+    /// existing page that actually covers their subject. This is a routing
+    /// index, not a second copy of configuration and command behaviour, so
+    /// each alias is pinned to a needle in the page it routes to.
     #[tokio::test]
-    async fn review_issue14_operational_topics_resolve_to_their_content() {
-        for (alias, needle) in [
-            ("skills", "SKILL.md"),
-            ("doctor", "rpi auth check"),
-            ("troubleshooting", "auth check"),
-            ("provider", "models.json"),
-            ("models.json", "models.json"),
-            ("sessions", "--session-dir"),
+    async fn review273_operational_aliases_expose_relevant_existing_content() {
+        for (alias, page, needle) in [
+            ("skills", "guide", "skills"),
+            ("skill", "guide", "skills"),
+            ("doctor", "debugging", "rpi auth check"),
+            ("diagnose", "debugging", "RPI_EVENT_LOG"),
+            ("diagnostics", "debugging", "RPI_AGENT_DIAGNOSTICS"),
+            ("troubleshooting", "debugging", "rpi events tail"),
+            ("provider", "guide", "models.json"),
+            ("providers", "guide", "models.json"),
+            ("models", "guide", "models.json"),
+            ("models.json", "guide", "models.json"),
+            ("sessions", "guide", "--session-dir"),
+            ("session", "guide", "--session-dir"),
         ] {
             let output = execute(serde_json::json!({ "topic": alias })).await;
             assert!(
-                output.starts_with("# rpi docs: operations"),
-                "alias {alias} must resolve to the operations topic: {output}"
+                output.starts_with(&format!("# rpi docs: {page}")),
+                "alias {alias} must route to {page}: {output}"
             );
             assert!(
                 output.contains(needle),
-                "alias {alias} must expose {needle}: {output}"
+                "alias {alias} must expose {needle} in {page}: {output}"
             );
         }
-        // The catalog advertises it, so a caller can discover it without
-        // knowing the alias list.
+        // Aliases are discoverable from the catalog without maintaining a
+        // separate operations page.
         let catalog = execute(serde_json::json!({})).await;
-        assert!(catalog.contains("- operations:"), "{catalog}");
+        for topic in ["guide", "authoring", "debugging"] {
+            assert!(catalog.contains(&format!("- {topic}:")), "{catalog}");
+        }
+        assert!(!catalog.contains("- operations:"), "{catalog}");
     }
 
     #[tokio::test]
