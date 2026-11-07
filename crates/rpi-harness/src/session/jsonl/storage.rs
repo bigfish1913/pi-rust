@@ -1965,6 +1965,249 @@ where
     result
 }
 
+/// Result of scanning a JSONL history for frames a `clear_run` already retired.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetiredFrameGcReport {
+    /// Total physical lines after the header.
+    pub lines: usize,
+    /// `assistant_frame` `append` lines that a later `clear_run` of the same run
+    /// makes unreachable.
+    pub retired_frames: usize,
+    /// Lines that must be kept (everything that is not a retired frame).
+    pub kept_lines: usize,
+    /// Bytes before / after the rewrite.
+    pub bytes_before: usize,
+    pub bytes_after: usize,
+}
+
+impl RetiredFrameGcReport {
+    /// Whether a rewrite would actually change the file.
+    pub fn would_rewrite(&self) -> bool {
+        self.retired_frames > 0
+    }
+}
+
+/// Plan (and optionally apply) an offline compaction of retired stream frames.
+///
+/// Mirrors the write-side half of fork issue DavidHinton-xcpc/pi-rust#14 §4
+/// PR-D. Only `assistant_frame` rows whose `op` is `append` are candidates, and
+/// only when the **same run** has a later `clear_run` marker (the reducer's
+/// retirement rule: an append at or after its own clear marker stays visible —
+/// see `cold_frames::retires_append`). Every other line is preserved verbatim,
+/// and sequences are never renumbered, so subsequent appends stay consistent.
+///
+/// The header is kept as-is. A run without a `clear_run` keeps all its frames:
+/// `frame_progress::salvage_run_frames` replays them after a crash.
+///
+/// Retired rows keep their id/seq/lane and are republished with the `frame`
+/// payload stripped: the reducer treats a retired row as fully retired
+/// regardless of its body (state.rs "the file still holds them, so they stay
+/// taken"), so the ID-reservation contract survives compaction through the
+/// ordinary replay path — no tombstone sidecar or migration is needed.
+///
+/// `dry_run = true` only reports; nothing is written.
+///
+/// Preconditions and staleness contract: the caller must hold the session's
+/// exclusive lock (the CLI's `session gc` claims the OS file lock per file).
+/// As a deterministic guard for callers without an enforceable lock, the
+/// rewrite refuses to publish unless a re-read inside the publication window is
+/// byte-identical to the snapshot the plan was built from: an append
+/// acknowledged after that snapshot makes compaction fail with an error,
+/// leaving the destination untouched, instead of dropping it.
+///
+/// Unlike `load`, this does **not** repair or interpret the file: a header-only
+/// file with no mutations is a no-op, and an unreadable/torn tail is left
+/// untouched (the rewrite is refused rather than guessed).
+#[allow(clippy::too_many_lines)]
+pub async fn compact_retired_frames(
+    fs: Arc<dyn FileSystem>,
+    path: &str,
+    dry_run: bool,
+) -> SessionResult<RetiredFrameGcReport> {
+    let content = file_result(
+        fs.read_text_file(path, None).await,
+        &format!("Failed to read session {path}"),
+    )?;
+    let plan = plan_retired_frame_gc(&content, path)?;
+    if dry_run || !plan.would_rewrite() {
+        return Ok(plan.report(content.len()));
+    }
+
+    let rewritten = plan.encode();
+    let report = plan.report(content.len());
+    let fs_for_write = fs.clone();
+    let path_owned = path.to_string();
+    publish_file_atomically(&fs, path, move |fs, temp_path| {
+        let rewritten = rewritten.clone();
+        let snapshot = content.clone();
+        let path_owned = path_owned.clone();
+        Box::pin(async move {
+            let _ = fs_for_write;
+            file_result(
+                fs.write_file(temp_path, FileContent::Text(rewritten), None)
+                    .await,
+                &format!("Failed to stage retired-frame compaction {path_owned}"),
+            )?;
+            // Last-instant staleness check: the published replacement must
+            // still be built from the current file. An append acknowledged
+            // after the snapshot read lands here as a mismatch; publication is
+            // refused and the staged `.tmp` removed, so the acknowledged bytes
+            // stay in the destination. A caller holding the exclusive lock
+            // never reaches this arm; the check keeps lock-less callers from
+            // silently dropping acknowledged appends.
+            let current = file_result(
+                fs.read_text_file(&path_owned, None).await,
+                &format!("Failed to recheck session {path_owned}"),
+            )?;
+            if current != snapshot {
+                return Err(SessionError::invalid_entry(format!(
+                    "Session {path_owned} changed during retired-frame compaction; reopen it and retry"
+                )));
+            }
+            Ok(())
+        })
+    })
+    .await?;
+    Ok(report)
+}
+
+/// A decided compaction: which physical lines to keep, and which kept lines are
+/// retired appends whose payload is stripped on republication.
+struct RetiredFrameGcPlan<'a> {
+    /// `(raw line, strip payload)` for the header plus every kept line, in
+    /// file order.
+    kept: Vec<(&'a str, bool)>,
+    retired_frames: usize,
+}
+
+impl RetiredFrameGcPlan<'_> {
+    fn would_rewrite(&self) -> bool {
+        self.retired_frames > 0
+    }
+
+    /// Encode the replacement file. Retired appends are re-encoded without
+    /// their `frame` payload (see the [`compact_retired_frames`] contract); the
+    /// authoritative codec round-trips them, so id/seq/lane stay reserved while
+    /// the dominant bytes disappear.
+    fn encode(&self) -> String {
+        let mut rewritten = String::new();
+        for (line, strip) in &self.kept {
+            if *strip {
+                rewritten.push_str(&encode_without_retired_payload(line));
+            } else {
+                rewritten.push_str(line);
+            }
+            rewritten.push('\n');
+        }
+        rewritten
+    }
+
+    fn report(&self, bytes_before: usize) -> RetiredFrameGcReport {
+        let bytes_after = if self.would_rewrite() {
+            self.encode().len()
+        } else {
+            bytes_before
+        };
+        RetiredFrameGcReport {
+            lines: self.kept.len().saturating_sub(1) + self.retired_frames,
+            retired_frames: self.retired_frames,
+            kept_lines: self.kept.len().saturating_sub(1),
+            bytes_before,
+            bytes_after,
+        }
+    }
+}
+
+/// Re-encode one assistant-frame append line without its payload.
+fn encode_without_retired_payload(line: &str) -> String {
+    match parse_mutation(line) {
+        Ok(SessionMutation::Record {
+            record: LaneRecord::AssistantFrame(mut frame),
+        }) if frame.op == crate::session::types::AssistantFrameOp::Append => {
+            frame.frame = None;
+            let mut encoded = Vec::new();
+            encode_mutation_into(
+                &SessionMutation::Record {
+                    record: LaneRecord::AssistantFrame(frame),
+                },
+                &mut encoded,
+            );
+            // encode_mutation_into terminates with '\n'; the caller adds the
+            // newline for every kept line uniformly.
+            let encoded = String::from_utf8(encoded).unwrap_or_else(|_| line.to_owned());
+            encoded
+                .strip_suffix('\n')
+                .map(str::to_owned)
+                .unwrap_or(encoded)
+        }
+        // Only decided retired appends get here; anything else stays verbatim.
+        _ => line.to_owned(),
+    }
+}
+
+/// Decide which lines a compaction keeps. An unparseable line is kept
+/// verbatim: this pass must never delete something it does not understand.
+fn plan_retired_frame_gc<'a>(
+    content: &'a str,
+    path: &str,
+) -> SessionResult<RetiredFrameGcPlan<'a>> {
+    let mut physical_lines: Vec<&str> = content.split('\n').collect();
+    if physical_lines.last() == Some(&"") {
+        physical_lines.pop();
+    }
+    if physical_lines.is_empty() {
+        return Err(SessionError::invalid_entry(format!(
+            "Session {path} is empty"
+        )));
+    }
+    parse_header(physical_lines[0])
+        .map_err(|e| SessionError::invalid_entry(format!("Session {path} {e}")))?;
+
+    // Pass 1: the last clear_run seq per run. A later clear supersedes an
+    // earlier one, so only the maximum matters.
+    let mut clears: HashMap<String, u64> = HashMap::new();
+    for line in physical_lines.iter().skip(1) {
+        if let Ok(SessionMutation::Record {
+            record: LaneRecord::AssistantFrame(frame),
+        }) = parse_mutation(line)
+        {
+            if frame.op == crate::session::types::AssistantFrameOp::ClearRun {
+                let entry = clears.entry(frame.run_id.clone()).or_insert(frame.base.seq);
+                *entry = (*entry).max(frame.base.seq);
+            }
+        }
+    }
+
+    // Pass 2: decide per line. An append already stripped by a previous pass
+    // (`frame: null`/absent) is not a candidate again: its identity row is kept
+    // verbatim, so the rewrite stays idempotent.
+    let mut kept: Vec<(&str, bool)> = Vec::with_capacity(physical_lines.len());
+    kept.push((physical_lines[0], false));
+    let mut retired = 0usize;
+    for line in physical_lines.iter().skip(1) {
+        let is_retired_append = matches!(
+            parse_mutation(line),
+            Ok(SessionMutation::Record {
+                record: LaneRecord::AssistantFrame(frame),
+            }) if frame.op == crate::session::types::AssistantFrameOp::Append
+                && frame.frame.is_some()
+                && clears
+                    .get(&frame.run_id)
+                    .is_some_and(|clear_seq| frame.base.seq < *clear_seq)
+        );
+        if is_retired_append {
+            retired += 1;
+            kept.push((line, true));
+        } else {
+            kept.push((line, false));
+        }
+    }
+    Ok(RetiredFrameGcPlan {
+        kept,
+        retired_frames: retired,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
