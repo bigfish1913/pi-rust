@@ -1191,8 +1191,20 @@ pub struct EntryCursor {
     pub after_seq: u64,
 }
 
+/// Reserved native archival data, not context-transform/projector input.
+/// Match exact versioned types; ordinary extension custom entries stay visible.
+pub(crate) fn is_tool_program_body_type(custom_type: &str) -> bool {
+    matches!(
+        custom_type,
+        crate::tool_program_body::CHUNK_CUSTOM_TYPE | crate::tool_program_body::COMMIT_CUSTOM_TYPE
+    )
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EntryQuery {
+    /// Internal context/recovery policy, applied before payload hydration.
+    /// False by default: explicit history/export queries still expose bodies.
+    pub exclude_tool_program_bodies: bool,
     pub entry_type: Option<&'static str>,
     pub custom_type: Option<String>,
     /// Exact identity, useful for a bounded branch-membership check.
@@ -1206,6 +1218,14 @@ pub struct EntryQuery {
     pub order: Option<EntryOrder>,
     pub limit: Option<usize>,
     pub cursor: Option<EntryCursor>,
+}
+
+/// Real entry identity and parent link, without a transcript payload.
+/// Ancestry includes all entry kinds, including archival custom entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryAncestry {
+    pub id: String,
+    pub parent_id: Option<String>,
 }
 
 /// Branch-scan bounds. Mirrors TS `BranchBounds`.
@@ -1442,6 +1462,15 @@ pub struct LanePointer {
     pub leaf_id: Option<String>,
 }
 
+/// Authoritative live lane identity. `generation` advances only for explicit
+/// lane create/move mutations; ordinary entry/record appends do not change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLaneBranch {
+    pub lane: String,
+    pub leaf_id: Option<String>,
+    pub generation: u64,
+}
+
 /// `LogItem` — the unified mutation log `get_log` returns. Mirrors the TS union
 /// (`entry | record | lane | fact(name) | fact(label)`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1627,6 +1656,14 @@ pub trait SessionStorage: Send + Sync {
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>>;
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()>;
     async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()>;
+
+    /// Atomically read one lane's current leaf and explicit lane-mutation
+    /// generation. Custom storage defaults to fail-closed: callers must not
+    /// substitute the ordinary leaf or history revision for this identity.
+    async fn lane_branch(&self, lane: &str) -> SessionResult<SessionLaneBranch> {
+        let _ = lane;
+        Err(SessionError::storage("lane branch identity is unsupported"))
+    }
 
     // Transient payloads use a separate sequence domain and never enter history.
     // CommitStream bindings remain immutable lane records.
@@ -1868,6 +1905,34 @@ pub trait SessionStorage: Send + Sync {
         start: &str,
     ) -> SessionResult<Vec<Entry>>;
 
+    /// Validated ancestry, newest first, inclusive of the first matching bound.
+    /// `start` is the resolved branch tip; `bounds.start` is resolved by the view.
+    /// Native metadata-backed stores avoid payload reads. The compatibility
+    /// fallback hydrates full entries through the ordinary, unfiltered query;
+    /// custom stores should override this method to provide metadata-only reads.
+    async fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<Vec<EntryAncestry>> {
+        Ok(self
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::NewestFirst),
+                    ..Default::default()
+                },
+                bounds,
+                start,
+            )
+            .await?
+            .into_iter()
+            .map(|entry| EntryAncestry {
+                id: entry.id().to_owned(),
+                parent_id: entry.parent_id().map(str::to_owned),
+            })
+            .collect())
+    }
+
     /// Default, hook-free context projection. Backends may override this to
     /// walk their owned state while borrowing entries; the fallback preserves
     /// custom-storage compatibility and defensive-copy semantics.
@@ -1879,6 +1944,7 @@ pub trait SessionStorage: Send + Sync {
         let path = self
             .find_entries_on_branch(
                 &EntryQuery {
+                    exclude_tool_program_bodies: true,
                     order: Some(EntryOrder::OldestFirst),
                     ..Default::default()
                 },
@@ -1998,6 +2064,28 @@ pub trait SessionTree: Send + Sync {
         query: &EntryQuery,
         bounds: &BranchBounds,
     ) -> SessionResult<Vec<Entry>>;
+    /// All identities on this branch, newest first, inclusive of the first
+    /// matching bound. Native views forward to storage metadata without loading
+    /// bodies. This compatibility fallback may hydrate full entries on custom
+    /// trees; override it to avoid those reads. Empty lane yields an empty path.
+    async fn branch_ancestry(&self, bounds: &BranchBounds) -> SessionResult<Vec<EntryAncestry>> {
+        Ok(self
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::NewestFirst),
+                    ..Default::default()
+                },
+                bounds,
+            )
+            .await?
+            .into_iter()
+            .map(|entry| EntryAncestry {
+                id: entry.id().to_owned(),
+                parent_id: entry.parent_id().map(str::to_owned),
+            })
+            .collect())
+    }
+
     async fn find_entry_on_branch(
         &self,
         query: &EntryQuery,

@@ -1,7 +1,9 @@
 //! Minimal P0 JSONL protocol for the native rpi RPC host.
 use serde_json::{json, Value};
 
-pub const MAX_FRAME_BYTES: usize = 1_048_576;
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub const TOOL_PROGRAM_CHILD_EVENT_MAX_BYTES: usize =
+    rpi_harness::session::session::NATIVE_JOURNAL_EVENT_MAX_BYTES;
 pub const PI_BASELINE: &str = "1.2.0";
 
 #[allow(dead_code)]
@@ -63,6 +65,8 @@ pub enum Command {
         #[serde(default)]
         args: String,
     },
+    /// Read-only identity snapshot for ToolProgram live reconciliation.
+    GetToolProgramBranch,
     /// Read-only snapshot of the current branch's message entries.
     GetMessages {
         limit: Option<u64>,
@@ -89,6 +93,10 @@ pub enum Command {
         #[serde(rename = "leafId")]
         leaf_id: Option<String>,
     },
+    /// Strict typed queries are validated after stripping only the RPC envelope.
+    GetToolProgramChildren,
+    GetToolProgramChildPhases,
+    GetToolProgramChildBody,
     GetHistory {
         limit: Option<u64>,
         #[serde(rename = "afterSeq")]
@@ -216,6 +224,17 @@ impl<'de> serde::Deserialize<'de> for PromptPayload {
     }
 }
 
+pub const SUPPORTED_EVENTS: &[&str] = &[
+    "session_entry_committed",
+    "external_tool_request",
+    "external_tool_request_closed",
+    "file_io_request",
+    "file_io_request_closed",
+    "tool_program_child_begin",
+    "tool_program_child_phase",
+    "tool_program_child_resync_required",
+];
+
 pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_resource_state",
     "get_durable_state",
@@ -225,9 +244,13 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_state",
     "get_commands",
     "execute_command",
+    "get_tool_program_branch",
     "get_messages",
     "get_message_summaries",
     "get_message_window",
+    "get_tool_program_children",
+    "get_tool_program_child_phases",
+    "get_tool_program_child_body",
     "get_history",
     "get_session_branch",
     "append_entry",
@@ -243,8 +266,13 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "abort",
     "get_available_models",
     "get_auth_status",
+    "get_provider_models",
+    "test_provider_config",
     "oauth",
     "set_api_key",
+    "set_provider_config",
+    "update_provider_config",
+    "delete_provider_config",
     "set_model",
     "get_available_thinking_levels",
     "set_thinking_level",
@@ -289,10 +317,39 @@ pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
         "protocol": "rpi",
         "piCompatibilityTarget": PI_BASELINE,
         "supportedCommands": SUPPORTED_COMMANDS,
-        "supportedEvents": ["session_entry_committed", "external_tool_request", "external_tool_request_closed", "file_io_request", "file_io_request_closed"],
+        "supportedEvents": SUPPORTED_EVENTS,
         "promptContent": super::prompt_content::prompt_capabilities(),
         "fileIO": super::file_io::capabilities(),
         "durable": crate::native_durable::capabilities(false),
+        "toolProgramChildren": {
+            "version": 1,
+            "summaryCommand": "get_tool_program_children",
+            "phaseCommand": "get_tool_program_child_phases",
+            "bodyCommand": "get_tool_program_child_body",
+            "maxCount": rpi_harness::tool_program_queries::MAX_COUNT,
+            "maxPhaseCandidates": rpi_harness::tool_program_queries::MAX_PHASE_CANDIDATES,
+            // This bounds the serialized native data page, not the RPC frame:
+            // response() duplicates data into result for compatibility.
+            "maxResponseBytes": rpi_harness::tool_program_queries::MAX_RESPONSE_BYTES,
+            "responseBytesScope": "pageBytes",
+            "maxBodyDecodedBytes": rpi_harness::tool_program_body::MAX_PAGE_BYTES,
+            "summaryState": "unknown",
+            "recovery": "readOnly"
+        },
+        "toolProgramChildEvents": {
+            "version": 1,
+            "beginEvent": "tool_program_child_begin",
+            "phaseEvent": "tool_program_child_phase",
+            "resyncEvent": "tool_program_child_resync_required",
+            "sequence": "nativeEntrySeq-v1",
+            "delivery": "bestEffortResync",
+            "maxEventBytes": TOOL_PROGRAM_CHILD_EVENT_MAX_BYTES
+        },
+        "toolProgramBranch": {
+            "version": 1,
+            "command": "get_tool_program_branch",
+            "identity": "bindingAndLaneGeneration"
+        },
         "semantics": {
             "messageUpdates": mode.as_str(),
             "messageIds": "sessionEntryId-v1",
@@ -312,6 +369,7 @@ pub fn model_descriptor(model: &rpi_ai::Model) -> Value {
         "name": model.name,
         "api": model.api,
         "provider": model.provider,
+        "baseUrl": model.base_url,
         "reasoning": model.reasoning,
         "input": model.input,
         "contextWindow": model.context_window,
@@ -327,6 +385,90 @@ mod tests {
     fn advertised_commands_are_unique() {
         let commands: std::collections::HashSet<_> = SUPPORTED_COMMANDS.iter().collect();
         assert_eq!(commands.len(), SUPPORTED_COMMANDS.len());
+    }
+
+    #[test]
+    fn child_inspection_capability_is_exact_v1_and_advertises_only_read_commands() {
+        let ready = ready(crate::args::RpcMessageUpdates::default());
+        let capability = &ready["toolProgramChildren"];
+        assert_eq!(
+            capability,
+            &json!({
+                "version": 1,
+                "summaryCommand": "get_tool_program_children",
+                "phaseCommand": "get_tool_program_child_phases",
+                "bodyCommand": "get_tool_program_child_body",
+                "maxCount": 32,
+                "maxPhaseCandidates": 128,
+                "maxResponseBytes": 131072,
+                "responseBytesScope": "pageBytes",
+                "maxBodyDecodedBytes": 65536,
+                "summaryState": "unknown",
+                "recovery": "readOnly"
+            })
+        );
+        for (key, matches) in [
+            ("summaryCommand", 0),
+            ("phaseCommand", 1),
+            ("bodyCommand", 2),
+        ] {
+            let name = capability[key].as_str().unwrap();
+            assert!(SUPPORTED_COMMANDS.contains(&name));
+            let request: Request =
+                serde_json::from_value(json!({"type": name, "id": "req"})).unwrap();
+            assert_eq!(request.id, Some(json!("req")));
+            assert!(match (matches, request.command) {
+                (0, Command::GetToolProgramChildren)
+                | (1, Command::GetToolProgramChildPhases)
+                | (2, Command::GetToolProgramChildBody) => true,
+                _ => false,
+            });
+        }
+        for name in ["get_tool_program_children_v2", "replay_tool_program_child"] {
+            assert!(!SUPPORTED_COMMANDS.contains(&name));
+            assert!(serde_json::from_value::<Request>(json!({"type": name})).is_err());
+        }
+        assert!(capability.get("events").is_none());
+        let events = &ready["toolProgramChildEvents"];
+        assert_eq!(
+            events,
+            &json!({
+                "version": 1,
+                "beginEvent": "tool_program_child_begin",
+                "phaseEvent": "tool_program_child_phase",
+                "resyncEvent": "tool_program_child_resync_required",
+                "sequence": "nativeEntrySeq-v1",
+                "delivery": "bestEffortResync",
+                "maxEventBytes": 32 * 1024
+            })
+        );
+        for event in [
+            "tool_program_child_begin",
+            "tool_program_child_phase",
+            "tool_program_child_resync_required",
+        ] {
+            assert!(ready["supportedEvents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|advertised| advertised == event));
+        }
+        assert_eq!(ready["limits"]["frameBytes"], MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn child_page_budget_does_not_claim_to_bound_the_compatibility_response_frame() {
+        let data = json!({"body": "x".repeat(100_000)});
+        assert!(serde_json::to_vec(&data).unwrap().len() <= 131072);
+        let frame = response(
+            Some(json!("req")),
+            "get_tool_program_child_body",
+            Ok(Some(data)),
+        );
+        let bytes = serde_json::to_vec(&frame).unwrap().len();
+        assert!(bytes > 131072);
+        assert!(bytes < MAX_FRAME_BYTES);
+        assert_eq!(frame["data"], frame["result"]);
     }
 
     #[test]

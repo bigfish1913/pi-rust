@@ -42,8 +42,8 @@ plugin SDK ABI to match. The updater validates its exact `rpi --version` output.
 ```
 
 The example abbreviates the target map. Official releases contain Windows x64
-MSVC, Linux x64/ARM64 GNU, and macOS Intel/Apple Silicon. No architecture or
-GNU/musl substitution is allowed. Download URLs must identify the same official
+MSVC, Linux x64 GNU, Linux x64 musl, Linux ARM64 GNU, and macOS Intel/Apple
+Silicon. No architecture or GNU/musl substitution is allowed. Download URLs must identify the same official
 repository and versioned Release. Unknown fields may be ignored; unknown schema
 versions are rejected.
 
@@ -61,7 +61,7 @@ failure. On Unix the replacement uses the same directory as the current
 executable and rolls back if post-replacement validation fails.
 
 `scripts/prebuilt-release.py` records each target's archive and executable hashes
-and source commit. The release job verifies all five artifacts refer to the same
+and source commit. The release job verifies all six artifacts refer to the same
 version and commit, preserves the existing archive names and `.sha256` files,
 uploads archives first, and uploads `rpi-release.json` last. The release driver
 waits for this manifest before declaring the binaries ready.
@@ -73,3 +73,35 @@ after the assets are published, or explicitly use `rpi update --build`.
 
 `--force` permits reinstalling the resolved version; `--offline` only reports
 cached update information and performs no downloads or builds.
+
+## Optional RustFS/CDN mirror
+
+GitHub Releases remain the canonical source. An optional S3-compatible RustFS
+mirror can be enabled for archive transport only:
+
+```bash
+rpi update --cdn https://assets.bigfisharc.cn
+# or set RPI_CDN_BASE_URL for both `rpi update` and `rpi install`
+```
+
+For a persistent user default, add this to `~/.rpi/agent/settings.json`:
+
+```json
+{
+  "cdnBaseUrl": "https://assets.bigfisharc.cn"
+}
+```
+
+The precedence is `--cdn` > `RPI_CDN_BASE_URL` > `settings.json`.
+
+The CLI still obtains and validates `rpi-release.json` from GitHub. When the
+CDN is selected, it derives the archive path from the validated release tag and
+filename under `/rpi/releases/<tag>/`; it verifies the GitHub manifest's size
+and SHA-256 values and falls back to GitHub on any CDN error or mismatch.
+`--offline` contacts neither source.
+
+The release workflow optionally mirrors archives, sidecar checksums and the
+manifest to RustFS when `RPI_RUSTFS_ENDPOINT`, `RPI_RUSTFS_BUCKET`,
+`RPI_RUSTFS_ACCESS_KEY` and `RPI_RUSTFS_SECRET_KEY` are configured. The public
+CDN base is `RPI_CDN_BASE_URL`. Versioned objects are immutable; configure
+short caching for `rpi-release.json` and long/immutable caching for archives.

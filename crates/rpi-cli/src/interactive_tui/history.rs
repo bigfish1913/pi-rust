@@ -29,6 +29,8 @@ struct Resident {
     // Entries belong to rendered components, not a second retained payload copy.
     page: Option<BranchEntryPage>,
     error: Option<Arc<Container>>,
+    // Page-local notices retire with the page, including late callbacks.
+    notices: Arc<Container>,
 }
 #[derive(Default)]
 pub(super) struct HistoryUi {
@@ -41,6 +43,8 @@ pub(super) struct HistoryUi {
     // An ephemeral component, not a durable state cache or persisted transcript.
     native_durable_enabled: bool,
     native_durable_notice: Arc<Container>,
+    /// Startup/update notices stay before the live transcript slot.
+    pub(super) updates: Arc<Container>,
 }
 impl HistoryUi {
     pub(super) fn with_native_durable(enabled: bool) -> Self {
@@ -61,12 +65,14 @@ impl HistoryUi {
         resident.generation += 1;
         resident.page = None;
         resident.error = None;
+        resident.notices = Arc::new(Container::new());
         resident.storage = None;
         self.unsaved
             .store(false, std::sync::atomic::Ordering::SeqCst);
         self.active.clear();
         self.panels.clear();
         self.header.clear();
+        self.updates.clear();
         self.native_durable_notice.clear();
     }
     pub(super) fn bind(&self, harness: &AgentHarness) {
@@ -80,12 +86,27 @@ impl HistoryUi {
             .is_some_and(|bound| Arc::ptr_eq(bound, &storage))
         {
             resident.page = None;
+            resident.notices = Arc::new(Container::new());
             self.native_durable_notice.clear();
         }
         resident.storage = Some(storage);
     }
     pub(super) fn is_bound(&self) -> bool {
         self.resident.lock().unwrap().storage.is_some()
+    }
+    pub(super) fn notice_container(&self, root: &Arc<Container>) -> Arc<Container> {
+        let resident = self.resident.lock().unwrap();
+        if resident.storage.is_none() {
+            root.clone()
+        } else if resident
+            .page
+            .as_ref()
+            .is_some_and(|page| page.has_more_after)
+        {
+            resident.notices.clone()
+        } else {
+            self.active.clone()
+        }
     }
     pub(super) fn is_latest(&self) -> bool {
         self.resident
@@ -106,7 +127,21 @@ impl HistoryUi {
             chat.add_child(header);
         }
     }
+    /// Reserve the update slot even while empty so late background notices do
+    /// not render after the live transcript.
+    pub(super) fn mount_updates(&self, chat: &Arc<Container>) {
+        let updates: Arc<dyn Component> = self.updates.clone();
+        if !chat
+            .get_children()
+            .iter()
+            .any(|child| Arc::ptr_eq(child, &updates))
+        {
+            chat.add_child(updates);
+        }
+    }
     pub(super) fn mount_active(&self, chat: &Arc<Container>) {
+        self.mount_header(chat);
+        self.mount_updates(chat);
         let active: Arc<dyn Component> = self.active.clone();
         if !chat
             .get_children()
@@ -207,6 +242,7 @@ async fn refresh_notice_from(
 async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
     // Even an empty or unreadable session must have a visible live-operation slot.
     state.history_page.mount_header(chat);
+    state.history_page.mount_updates(chat);
     state.history_page.mount_active(chat);
     let (generation, storage) = {
         let resident = state.history_page.resident.lock().unwrap();
@@ -231,9 +267,12 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
         return;
     }
     let page_chat = render_page(state, &page.entries);
+    resident.notices = Arc::new(Container::new());
+    page_chat.add_child(resident.notices.clone());
     clear_settled_active(state);
     chat.clear();
     state.history_page.mount_header(chat);
+    state.history_page.mount_updates(chat);
     chat.add_child(page_chat);
     resident.error = None;
     state.history_page.panels.clear();
@@ -362,11 +401,14 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
         match result {
             Ok(Some(page)) => {
                 let page_chat = render_page(&state, &page.entries);
+                resident.notices = Arc::new(Container::new());
+                page_chat.add_child(resident.notices.clone());
                 clear_settled_active(&state);
                 resident.error = None;
                 // Drop every reference to the old page (including image components).
                 state.chat_container.clear();
                 state.history_page.mount_header(&state.chat_container);
+                state.history_page.mount_updates(&state.chat_container);
                 state.chat_container.add_child(page_chat);
                 if !page.has_more_after {
                     state

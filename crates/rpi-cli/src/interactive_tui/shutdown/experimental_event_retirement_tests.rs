@@ -6,11 +6,18 @@
 
 const HOST_SOURCE: &str = include_str!("../../interactive_tui.rs");
 
+// Source-order checks must be independent of Git's Windows line-ending
+// checkout policy; the contract is about ordering, not CRLF versus LF.
+fn normalized_host_source() -> String {
+    HOST_SOURCE.replace("\r\n", "\n")
+}
+
 fn after_shutdown(needle: &str) -> usize {
-    let shutdown = HOST_SOURCE
+    let source = normalized_host_source();
+    let shutdown = source
         .rfind("    // ---- Shutdown ----")
         .expect("interactive TUI shutdown tail must remain present");
-    HOST_SOURCE[shutdown..]
+    source[shutdown..]
         .find(needle)
         .map(|offset| shutdown + offset)
         .unwrap_or_else(|| panic!("shutdown source is missing marker: {needle:?}"))
@@ -36,10 +43,11 @@ fn event_and_reload_handles_retire_only_after_native_settlement() {
 
 #[test]
 fn reload_bridge_is_installed_before_its_shutdown_cleanup() {
-    let install = HOST_SOURCE
+    let source = normalized_host_source();
+    let install = source
         .find("reload_context.mailbox.install(reload_sig_tx);")
         .expect("reload mailbox installation must remain present");
-    let bridge = HOST_SOURCE
+    let bridge = source
         .find("let reload_bridge_handle = tokio::spawn(async move {")
         .expect("reload bridge task must remain present");
     let clear = after_shutdown("reload_context.mailbox.clear();");
@@ -51,7 +59,7 @@ fn reload_bridge_is_installed_before_its_shutdown_cleanup() {
 
 #[test]
 fn event_consumer_is_kept_live_through_native_settlement() {
-    let source = HOST_SOURCE;
+    let source = normalized_host_source();
     assert!(source.contains("the streaming event consumer stays live through producer settlement"));
 
     let settle = after_shutdown(

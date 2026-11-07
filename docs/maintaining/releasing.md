@@ -1,16 +1,20 @@
 # Releasing rpi
 
-## Normal releases: manually prepare, then merge the Release PR
+## Normal releases: daily preparation and automatic merge
 
 Contributors, including fork contributors, submit code and tests without changing
-versions. After an ordinary PR lands on `main`, CI only runs the normal validation
-jobs; it does **not** prepare a Release PR automatically. When maintainers want to
-ship the accumulated changes, manually run the **CI** workflow from the `main`
-branch with `prepare_release` enabled (the default). After CI passes,
-`release-plz` creates or updates a draft Release PR. It prepares the version and
-root changelog, synchronizes the embedded documentation, validates the core
+versions. Every day at 00:00 Asia/Shanghai (16:00 UTC), the **CI** workflow runs
+against `main`. If `release-plz` finds publishable package changes since the last
+stable release, it creates or updates a draft Release PR. It prepares the version
+and root changelog, synchronizes the embedded documentation, validates the core
 crates, and marks the PR ready. The shared workspace version and `rpi` version
 group keep the core crates together; examples are excluded.
+
+The automation requests GitHub Auto-merge **only for this upstream
+`release-plz-*` Release PR**. It never enables or requests Auto-merge for ordinary
+feature, fix, dependency, or fork PRs. `main` remains protected by its Ruleset;
+the Release PR is merged only after the required validation checks pass. No
+publishable package changes means no Release PR, tag, or release.
 
 Only same-repository `release-plz-*` draft PRs targeting `main` defer CI until
 preparation is complete; ordinary PRs (including drafts and fork PRs) still run
@@ -30,15 +34,17 @@ minor series or rewriting it to a patch release. Versions such as `0.9.0` and
 requires a stable version newer than existing release tags, or an identical-commit
 retry. API compatibility findings remain visible in the Release PR.
 
-An ordinary merge runs CI but does not prepare a Release PR. To start a release,
-use **Actions → CI → Run workflow**, select `main`, leave `prepare_release`
-enabled, and wait for the workflow to finish. Review and merge the resulting
-Release PR when ready to ship. After its main-branch CI passes:
+An ordinary merge runs CI and the next daily run prepares a Release PR. To
+prepare one immediately instead, use **Actions → CI → Run workflow**, select
+`main`, and leave `prepare_release` enabled. The manual dispatch does not request
+Auto-merge. After the automatically merged Release PR reaches `main` and its
+main-branch CI passes:
 
 1. The existing release helper publishes the core crates in dependency order.
 2. Automation creates `vX.Y.Z` at the tested main commit. Existing tags are never
    moved; retrying the same release commit is supported.
-3. A reusable workflow builds all five platforms, verifies the archives, uploads
+3. A reusable workflow builds all six platforms (including the static
+   `x86_64-unknown-linux-musl` Linux binary), verifies the archives, uploads
    their checksums and publishes `rpi-release.json` last.
 4. Homebrew and Scoop are updated independently; a new-version PR is submitted
    to `microsoft/winget-pkgs`. Microsoft review/CLA completion remains external.
@@ -64,10 +70,8 @@ run `task publish` or merge a Release PR solely to publish documentation. Update
 the relevant `docs/rpi-tool/` sources and run `sh scripts/sync-embedded-docs.sh`
 when the bundled documentation changes.
 
-An ordinary merge runs CI but does not prepare or authorize a Release PR. A
-maintainer must explicitly dispatch the CI workflow with `prepare_release`
-enabled to create/update one; merging that Release PR is still the only action
-that authorizes publication. If the explicit requirement is to avoid release
+The Release PR merge remains the only action that authorizes publication. If the
+explicit requirement is to avoid release
 automation entirely for a documentation-only change, maintainers can include
 `[skip ci]` in the final merge commit message (or the squash commit message).
 GitHub then skips the push/PR workflows, including the CI job that calls release
@@ -99,7 +103,13 @@ Set it in repository Settings → Secrets and variables → Actions, or locally 
 input). Never put the token in a commit or PR description. The publishing jobs
 use the built-in `GITHUB_TOKEN` for this repository and the Cargo secret only in
 the crates publishing step. The automation token is only supplied to the steps
-that prepare PRs or write channels.
+that prepare PRs, request Auto-merge for the Release PR, or write channels.
+
+Repository Settings must have **Allow auto-merge** enabled. The `main` Ruleset
+continues to protect the branch and must require the `Release PR validation`
+check, which aggregates the complete Release PR CI. Auto-merge is requested only
+when the PR head is an upstream `release-plz-*` branch; ordinary and fork PRs
+remain manual.
 
 The binaries workflow is called directly after tag creation: a tag created with
 the built-in `GITHUB_TOKEN` does not start another push-triggered workflow.
@@ -109,7 +119,7 @@ the built-in `GITHUB_TOKEN` does not start another push-triggered workflow.
 - Re-run failed jobs on the Release PR's original main CI run. Existing crates
   are skipped by the release helper; an existing tag must match the same commit.
 - For a channel failure, run **Release install channels** from Actions on `main`
-  with the published tag. It verifies all five archives before regenerating
+  with the published tag. It verifies all six archives before regenerating
   manifests. Existing winget PRs/files are reused; closed submissions require
   maintainer inspection. Tap updates refuse to downgrade a newer version.
 - Each run saves `channel-manifests-vX.Y.Z` as an artifact. The checked-in
@@ -217,6 +227,27 @@ task publish:crates RELEASE_VERSION=0.3.4
 | `winget` | `gh` authenticated (forks `winget-pkgs`, opens the PR) |
 | `crates` | `cargo login` (a publish-scoped token) |
 | `site` | SSH to the rpi web host |
+
+## Optional RustFS/CDN mirror
+
+`release-binaries.yml` always publishes and validates GitHub Release assets
+first. If the optional RustFS secrets are configured, a final best-effort
+step mirrors the exact `rpi-release.json`, archives, and checksum sidecars to
+an S3-compatible endpoint:
+
+```text
+RPI_RUSTFS_ENDPOINT
+RPI_RUSTFS_BUCKET
+RPI_RUSTFS_ACCESS_KEY
+RPI_RUSTFS_SECRET_KEY
+RPI_CDN_BASE_URL=https://assets.bigfisharc.cn
+```
+
+Objects are versioned under `rpi/releases/<tag>/`. GitHub remains the
+canonical manifest and trust source; a mirror failure is reported in the
+workflow summary without invalidating the GitHub Release. Configure public
+read-only object access, disable listing/write/delete, and use short caching
+for the JSON manifest and immutable caching for archives/checksums.
 
 ## What no command can finish
 

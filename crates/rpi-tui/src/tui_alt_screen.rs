@@ -184,6 +184,9 @@ pub struct TuiAltScreen {
     main_hardware_row: Mutex<usize>,
     main_viewport_top: Mutex<usize>,
     main_previous_cursor: Mutex<Option<(usize, usize)>>,
+    /// Force live rows to repaint without forgetting the saved document or
+    /// the physical cursor used for the next relative movement.
+    main_force_repaint: AtomicBool,
     // Input handlers
     #[allow(dead_code)]
     input_handler: Mutex<Option<Arc<dyn Fn(InputEvent) + Send + Sync>>>,
@@ -247,6 +250,7 @@ impl TuiAltScreen {
             main_hardware_row: Mutex::new(0),
             main_viewport_top: Mutex::new(0),
             main_previous_cursor: Mutex::new(None),
+            main_force_repaint: AtomicBool::new(false),
             input_handler: Mutex::new(None),
             resize_handler: Mutex::new(None),
             overlays: Arc::new(OverlayManager::new()),
@@ -871,8 +875,9 @@ impl TuiAltScreen {
             .unwrap_or_else(|| Arc::new(self.container.clone()));
         // Components inside the frame read the geometry this renderer polled
         // (frame-scoped), not the process-wide cache.
-        let raw_lines =
-            crate::terminal_image::with_frame_cell_geometry(cells, || root.render(width));
+        let raw_lines = crate::render::with_main_screen_frame(|| {
+            crate::terminal_image::with_frame_cell_geometry(cells, || root.render(width))
+        });
         let cursor = raw_lines.iter().enumerate().rev().find_map(|(row, line)| {
             line.find(CURSOR_MARKER)
                 .map(|idx| (row, visible_width(&line[..idx])))
@@ -904,6 +909,13 @@ impl TuiAltScreen {
             }
         }
         let viewport_top = *self.main_viewport_top.lock().unwrap();
+        let force_repaint = self.main_force_repaint.swap(false, Ordering::AcqRel);
+        if force_repaint && !previous.is_empty() {
+            let first = viewport_top.min(lines.len().saturating_sub(1));
+            first_changed = Some(first_changed.map_or(first, |changed| changed.min(first)));
+            let last = lines.len().saturating_sub(1);
+            last_changed = Some(last_changed.map_or(last, |changed| changed.max(last)));
+        }
         let changed_in_scrollback = first_changed.is_some_and(|first| {
             first < viewport_top || lines.len().saturating_sub(1) < viewport_top
         });
@@ -977,8 +989,15 @@ impl TuiAltScreen {
                         if index > first {
                             output.push_str("\r\n");
                         }
+                        if force_repaint {
+                            // Repair unknown cells beyond the logical line too.
+                            // Clear before writing: ED/EL after a full-width row
+                            // can erase its last cell on pending-wrap terminals.
+                            output.push_str("\x1b[2K");
+                        }
                         if let Some((column, text)) = previous
                             .get(index)
+                            .filter(|_| !force_repaint)
                             .and_then(|old| crate::line_diff::patch(old, &lines[index]))
                         {
                             if column > 0 {
@@ -1016,6 +1035,18 @@ impl TuiAltScreen {
                         final_row = lines.len().saturating_sub(1);
                     }
                 }
+                if force_repaint {
+                    // Short documents also own blank live rows below their
+                    // tail. Clear these without scrolling or erasing saved rows,
+                    // then return to the row recorded in the physical ledger.
+                    let unused = height.saturating_sub(final_row.saturating_sub(viewport_top) + 1);
+                    for _ in 0..unused {
+                        output.push_str("\x1b[1B\r\x1b[2K");
+                    }
+                    if unused > 0 {
+                        output.push_str(&format!("\x1b[{unused}A"));
+                    }
+                }
                 output.push_str("\x1b[?2026l");
                 terminal.write(&output);
                 let advanced = final_row.saturating_sub(viewport_top + height.saturating_sub(1));
@@ -1047,29 +1078,11 @@ impl TuiAltScreen {
                 terminal.write(&output);
                 viewport_top += scroll;
             } else if row < viewport_top {
-                // The editor row is above the visible window. Scroll up so it
-                // becomes the top row, then repaint the revealed viewport — SD
-                // leaves the scrolled-off bottom rows blank otherwise.
-                let scroll = viewport_top - row;
-                terminal.write(&format!("\x1b[H\x1b[{scroll}T"));
-                viewport_top = row;
-                let mut output = String::from("\x1b[?2026h");
-                for i in 0..height {
-                    let line = lines
-                        .get(viewport_top + i)
-                        .map(String::as_str)
-                        .unwrap_or("");
-                    if i > 0 {
-                        output.push_str("\r\n");
-                    }
-                    output.push_str("\x1b[2K");
-                    output.push_str(line);
-                }
-                // Return the cursor to the top row (the editor row) so the
-                // column move below lands on it.
-                output.push_str(&format!("\x1b[{}A", height.saturating_sub(1)));
-                output.push_str("\x1b[?2026l");
-                terminal.write(&output);
+                // Saved rows are not addressable: CSI T inserts blanks in the
+                // live screen, it never retrieves scrollback. Keep the real
+                // cursor/viewport ledger and hide the off-screen logical cursor.
+                // It will be restored when a later layout puts it on screen.
+                terminal.write("\x1b[?25l");
             } else {
                 // Within the window: a relative move is enough (and never
                 // scrolls, so it cannot drift the viewport bookkeeping).
@@ -1084,10 +1097,19 @@ impl TuiAltScreen {
                 }
             }
 
-            terminal.write(&format!("\r\x1b[{}C", col));
-            terminal.write("\x1b[?25h");
-            *self.main_hardware_row.lock().unwrap() = row;
-            *self.main_viewport_top.lock().unwrap() = viewport_top;
+            if row >= viewport_top {
+                terminal.write("\r");
+                if col > 0 {
+                    terminal.write(&format!("\x1b[{col}C"));
+                }
+                if self.get_show_hardware_cursor() {
+                    terminal.write("\x1b[?25h");
+                } else {
+                    terminal.write("\x1b[?25l");
+                }
+                *self.main_hardware_row.lock().unwrap() = row;
+                *self.main_viewport_top.lock().unwrap() = viewport_top;
+            }
         } else {
             terminal.write("\x1b[?25l");
         }
@@ -1516,7 +1538,12 @@ impl TUI for TuiAltScreen {
             return;
         }
         if force {
-            if let Ok(mut prev) = self.previous_screen.lock() {
+            if self.uses_main_screen() {
+                // Forgetting the baseline while retaining a physical cursor
+                // makes the "first frame" branch append the whole transcript at
+                // that cursor. Preserve both ledgers and repaint live rows only.
+                self.main_force_repaint.store(true, Ordering::Release);
+            } else if let Ok(mut prev) = self.previous_screen.lock() {
                 prev.clear();
             }
         }

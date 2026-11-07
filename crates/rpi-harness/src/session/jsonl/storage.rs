@@ -100,6 +100,8 @@ pub struct JsonlSessionFacts {
 enum ReadPolicy {
     Restore,
     ReadOnly,
+    /// Private, capability-free facts replay only; it never exports storage.
+    FactsOnly,
     ResourceTransitionStrict,
     SavedReadCold(std::time::Instant),
 }
@@ -446,7 +448,7 @@ impl JsonlSessionStorage {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<JsonlSessionFacts> {
-        Self::load_impl(fs, path, clock, ids, ReadPolicy::ReadOnly)
+        Self::load_impl(fs, path, clock, ids, ReadPolicy::FactsOnly)
             .await?
             .facts()
             .await
@@ -1811,6 +1813,19 @@ impl SessionStorage for JsonlSessionStorage {
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
         let state = self.state.lock().await;
         Ok(state.get_lanes())
+    }
+
+    async fn lane_branch(
+        &self,
+        lane: &str,
+    ) -> SessionResult<crate::session::types::SessionLaneBranch> {
+        let state = self.state.lock().await;
+        let (leaf_id, generation) = state.lane_branch(lane)?;
+        Ok(crate::session::types::SessionLaneBranch {
+            lane: lane.to_owned(),
+            leaf_id,
+            generation,
+        })
     }
 
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {

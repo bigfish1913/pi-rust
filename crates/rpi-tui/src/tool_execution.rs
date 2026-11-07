@@ -422,8 +422,12 @@ impl ToolExecutionComponent {
         let summary = tools::parse_args_summary(&name, &args);
         // Calculate elapsed time
         let elapsed_str = if *status == ToolStatus::Running {
-            // Real-time elapsed while running
-            if let Some(started) = *started_at {
+            // Regular-mode transcript headers must stay stable when they enter
+            // saved scrollback. The editor/status dock still reports live time;
+            // fullscreen panels keep their per-tool clock as before.
+            if crate::render::is_main_screen_frame() {
+                String::new()
+            } else if let Some(started) = *started_at {
                 let elapsed = started.elapsed();
                 format_elapsed(elapsed)
             } else {
@@ -1192,6 +1196,36 @@ mod tools {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn regular_panels_have_stable_running_headers_and_keep_final_elapsed() {
+        use super::*;
+        use std::time::Duration;
+
+        let tool = ToolExecutionComponent::new("read", r#"{"path":"complete-path.rs"}"#);
+        tool.set_running();
+        *tool.started_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(2));
+        let fullscreen = tool.render(80);
+        let regular = crate::render::with_main_screen_frame(|| tool.render(80));
+        assert!(strip_ansi(&regular.join("\n")).contains("complete-path.rs"));
+        assert_ne!(regular, fullscreen, "fullscreen must keep its live timer");
+
+        *tool.started_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(65));
+        assert_ne!(tool.render(80), fullscreen, "fullscreen clock must advance");
+        assert_eq!(
+            crate::render::with_main_screen_frame(|| tool.render(80)),
+            regular,
+            "regular transcript must not change with wall-clock time"
+        );
+
+        tool.set_result("complete result", false);
+        let start = Instant::now() - Duration::from_secs(10);
+        *tool.started_at.lock().unwrap() = Some(start);
+        *tool.finished_at.lock().unwrap() = Some(start + Duration::from_millis(3200));
+        let finished_regular = crate::render::with_main_screen_frame(|| tool.render(80));
+        assert!(strip_ansi(&finished_regular.join("\n")).contains("3.2s"));
+        assert_eq!(finished_regular, tool.render(80));
+    }
+
     #[test]
     fn finalized_documents_share_rows_and_refresh_after_changes() {
         use super::*;

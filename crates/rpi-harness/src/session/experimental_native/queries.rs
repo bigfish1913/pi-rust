@@ -64,6 +64,17 @@ pub(super) fn entries(db: &Connection, identity: &Identity, q: &EntryQuery) -> R
     if let Some(value) = &q.custom_type {
         query.text("json_extract(s.keys,'$.custom_type')", value);
     }
+    if q.exclude_tool_program_bodies {
+        query
+            .sql
+            .push_str(" AND (COALESCE(json_extract(s.keys,'$.custom_type'),'') NOT IN (?,?))");
+        for custom_type in [
+            crate::tool_program_body::CHUNK_CUSTOM_TYPE,
+            crate::tool_program_body::COMMIT_CUSTOM_TYPE,
+        ] {
+            query.values.push(Value::Text(custom_type.into()));
+        }
+    }
     if let Some(value) = &q.entry_id {
         query.text("f.id", value);
     }

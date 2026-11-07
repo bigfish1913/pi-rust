@@ -542,24 +542,10 @@ where
     let commit_task = {
         let out = stdout.clone();
         tokio::spawn(async move {
-            loop {
-                match commit_rx.recv().await {
-                    Ok(commit) => {
-                        write_line(
-                            &out,
-                            &serde_json::json!({
-                                "type": "session_entry_committed",
-                                "entryId": commit.entry_id,
-                                "entryType": commit.entry_type,
-                                "customType": commit.custom_type,
-                                "lane": commit.lane,
-                            }),
-                        )
-                        .await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
+            while let Some(event) =
+                crate::rpc::tool_program_queries::commit_stream_event(commit_rx.recv().await)
+            {
+                write_line(&out, &event).await;
             }
         })
     };
@@ -1188,8 +1174,20 @@ where
                 Ok(data)
             }
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
+            "get_tool_program_branch" => {
+                crate::rpc::tool_program_queries::branch(harness, &msg).await
+            }
             "get_message_summaries" => crate::rpc::message_queries::summaries(harness, &msg).await,
             "get_message_window" => crate::rpc::message_queries::window(harness, &msg).await,
+            "get_tool_program_children" => {
+                crate::rpc::tool_program_queries::children(harness, &msg).await
+            }
+            "get_tool_program_child_phases" => {
+                crate::rpc::tool_program_queries::phases(harness, &msg).await
+            }
+            "get_tool_program_child_body" => {
+                crate::rpc::tool_program_queries::body(harness, &msg).await
+            }
             "get_history" => rpc_get_history(&lane, harness, &msg).await,
             "get_session_branch" => rpc_get_session_branch(harness, &msg).await,
             "append_entry" => rpc_append_entry(harness, &msg).await,
@@ -1201,8 +1199,13 @@ where
             "navigate" => rpc_navigate(&lane, &msg).await,
             "get_available_models" => Ok(rpc_get_available_models(&model_catalog)),
             "get_auth_status" => Ok(rpc_get_auth_status(&model_catalog, oauth_snapshot.as_ref())),
+            "get_provider_models" => rpc_get_provider_models(&msg).await,
+            "test_provider_config" => rpc_test_provider_config(&msg).await,
             "oauth" => rpc_oauth(&oauth_snapshot, &msg),
             "set_api_key" => rpc_set_api_key(&msg).await,
+            "set_provider_config" => rpc_set_provider_config(&msg),
+            "update_provider_config" => rpc_update_provider_config(&msg),
+            "delete_provider_config" => rpc_delete_provider_config(&msg),
             "set_model" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
                 Err("cannot set model while a run or prompt validation is active".into())
             }
@@ -2662,6 +2665,138 @@ fn oauth_display(payload: &serde_json::Value) -> serde_json::Value {
         }
     }
     serde_json::Value::Object(safe)
+}
+
+async fn rpc_get_provider_models(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let required = |name: &str| {
+        msg.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("get_provider_models requires {name}"))
+    };
+    let api = required("api")?;
+    let base_url = required("baseUrl")?;
+    let api_key = required("apiKey")?;
+    let models = crate::provider_probe::get_models(api, base_url, api_key).await?;
+    Ok(serde_json::json!({"models": models}))
+}
+
+async fn rpc_test_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let required = |name: &str| {
+        msg.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("test_provider_config requires {name}"))
+    };
+    let result = crate::provider_probe::test_connection(
+        required("api")?,
+        required("baseUrl")?,
+        required("apiKey")?,
+    )
+    .await?;
+    Ok(serde_json::to_value(result).map_err(|error| error.to_string())?)
+}
+
+fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let required = |name: &str| {
+        msg.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("set_provider_config requires {name}"))
+    };
+    let provider = required("provider")?;
+    let api = required("api")?;
+    let base_url = required("baseUrl")?;
+    let api_key = required("apiKey")?;
+    let model_id = required("modelId")?;
+    let model_name = msg.get("modelName").and_then(serde_json::Value::as_str);
+    let positive_integer = |name: &str| match msg.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+            .ok_or_else(|| format!("{name} must be a positive integer"))
+            .map(Some),
+    };
+    let context_window = positive_integer("contextWindow")?;
+    let max_tokens = positive_integer("maxOutputTokens")?;
+    let supports_images = msg
+        .get("supportsImages")
+        .and_then(serde_json::Value::as_bool);
+    crate::config::add_provider(
+        provider,
+        api,
+        base_url,
+        api_key,
+        model_id,
+        model_name,
+        context_window,
+        max_tokens,
+        supports_images,
+    )?;
+    Ok(serde_json::json!({
+        "provider": provider,
+        "modelId": model_id,
+        "api": api,
+        "requiresRestart": true,
+    }))
+}
+
+fn rpc_update_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let required = |name: &str| {
+        msg.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("update_provider_config requires {name}"))
+    };
+    let positive_integer = |name: &str| match msg.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+            .ok_or_else(|| format!("{name} must be a positive integer"))
+            .map(Some),
+    };
+    let provider = required("provider")?;
+    let api = required("api")?;
+    let base_url = required("baseUrl")?;
+    let model_id = required("modelId")?;
+    crate::config::update_provider(
+        provider,
+        api,
+        base_url,
+        msg.get("apiKey").and_then(serde_json::Value::as_str),
+        model_id,
+        msg.get("modelName").and_then(serde_json::Value::as_str),
+        positive_integer("contextWindow")?,
+        positive_integer("maxOutputTokens")?,
+        msg.get("supportsImages")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    )?;
+    Ok(serde_json::json!({
+        "provider": provider,
+        "modelId": model_id,
+        "requiresRestart": true,
+    }))
+}
+
+fn rpc_delete_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let provider = msg
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "delete_provider_config requires provider".to_string())?;
+    crate::config::delete_provider(provider)?;
+    Ok(serde_json::json!({
+        "provider": provider,
+        "requiresRestart": true,
+    }))
 }
 
 async fn rpc_set_api_key(msg: &serde_json::Value) -> Result<serde_json::Value, String> {

@@ -1,5 +1,6 @@
 # Contributors do not bump versions. Release-plz prepares one workspace PR;
-# release.yml publishes it only after a maintainer merges that PR into main.
+# the scheduled release workflow requests Auto-merge after validation, and
+# release.yml publishes it only after that PR merges into main.
 [workspace]
 release = false
 release_always = false

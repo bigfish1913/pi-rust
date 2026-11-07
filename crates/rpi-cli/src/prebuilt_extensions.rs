@@ -189,12 +189,13 @@ async fn repository_version(
     stable_tag_version(&refs, name)
 }
 
-/// The five supported triples are deliberately exact: GNU/musl and MSVC/GNU
-/// are different native-library distributions.
+/// Supported triples are deliberately exact: GNU/musl and MSVC/GNU are
+/// different native-library distributions.
 pub fn host_target() -> Result<&'static str, String> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") if cfg!(target_env = "msvc") => Ok("x86_64-pc-windows-msvc"),
         ("linux", "x86_64") if cfg!(target_env = "gnu") => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "x86_64") if cfg!(target_env = "musl") => Ok("x86_64-unknown-linux-musl"),
         ("linux", "aarch64") if cfg!(target_env = "gnu") => Ok("aarch64-unknown-linux-gnu"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
@@ -570,6 +571,7 @@ pub async fn install(
     version: Option<&str>,
     repository: Option<&str>,
     force: bool,
+    cdn_base: Option<&reqwest::Url>,
 ) -> Result<(), String> {
     let records = crate::install::installed_native_packages_strict()?;
     let existing = records.iter().find(|p| p.name == name);
@@ -609,16 +611,21 @@ pub async fn install(
     );
     let (manifest, manifest_bytes) = fetch_manifest(&client, &package).await?;
     let distribution = validate_manifest(&manifest, &package, target)?;
-    let response = client
-        .get(&distribution.url)
-        .timeout(std::time::Duration::from_secs(180))
-        .send()
-        .await
-        .map_err(|e| format!("archive request failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("archive request returned {}", response.status()));
-    }
-    let archive = body_limited(response, distribution.size).await?;
+    let cdn_url = cdn_base
+        .map(|base| {
+            crate::cdn::archive_url(base, &package.repository, &manifest.tag, &distribution.url)
+        })
+        .transpose()?
+        .flatten();
+    let archive = crate::cdn::download_with_fallback(
+        &client,
+        cdn_url.as_ref(),
+        &distribution.url,
+        distribution.size,
+        &distribution.sha256,
+        "archive",
+    )
+    .await?;
     let agent_dir = crate::config::agent_dir().map_err(|e| e.to_string())?;
     let target = target.to_string();
     let installed = tokio::task::spawn_blocking(move || {
@@ -1140,7 +1147,7 @@ fn validate_native_target(bytes: &[u8], target: &str, library: bool) -> Result<(
                     }
                 })
         }
-        "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu" => {
+        "x86_64-unknown-linux-gnu" | "x86_64-unknown-linux-musl" | "aarch64-unknown-linux-gnu" => {
             bytes.starts_with(b"\x7fELF\x02\x01")
                 && u16_at(16).is_some_and(|kind| kind == 3 || (!library && kind == 2))
                 && u16_at(18)
@@ -1180,9 +1187,10 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    const TARGETS: [&str; 5] = [
+    const TARGETS: [&str; 6] = [
         "x86_64-pc-windows-msvc",
         "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-gnu",
         "x86_64-apple-darwin",
         "aarch64-apple-darwin",
@@ -1965,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn all_five_distributions_install_and_record_exact_provenance() {
+    fn all_six_distributions_install_and_record_exact_provenance() {
         for target in TARGETS {
             let (package, value, archive) = fixture(target);
             let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
@@ -2212,6 +2220,15 @@ mod tests {
             assert!(validate_library_target(&object(target), target).is_ok());
             for other in TARGETS {
                 if other != target {
+                    // ELF headers do not encode the libc choice, so GNU and
+                    // musl x86_64 objects are intentionally indistinguishable
+                    // to this architecture check. Exact target manifests still
+                    // keep those distributions separate.
+                    if target.starts_with("x86_64-unknown-linux-")
+                        && other.starts_with("x86_64-unknown-linux-")
+                    {
+                        continue;
+                    }
                     assert!(validate_library_target(&object(other), target).is_err());
                 }
             }

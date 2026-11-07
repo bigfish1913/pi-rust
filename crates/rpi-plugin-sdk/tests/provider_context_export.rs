@@ -87,6 +87,7 @@ fn api() -> sdk::PluginApi {
         register_plugin_lifecycle: None,
         register_tool_prompt: None,
         register_oauth_provider_cancellable: None,
+        register_tool_result: None,
     }
 }
 

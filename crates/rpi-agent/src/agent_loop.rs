@@ -212,10 +212,10 @@ pub async fn run_agent_loop_from_assistant(
 
 /// A finalized tool call: the raw call, the merged result, and the error flag.
 #[derive(Clone)]
-struct FinalizedToolCall {
-    tool_call: ToolCall,
-    result: AgentToolResult,
-    is_error: bool,
+pub(crate) struct FinalizedToolCall {
+    pub(crate) tool_call: ToolCall,
+    pub(crate) result: AgentToolResult,
+    pub(crate) is_error: bool,
 }
 
 /// A batch of executed tool calls: the per-call `ToolResultMessage`s (in source
@@ -997,6 +997,9 @@ async fn execute_tool_calls_sequential(
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
 ) -> Result<ExecutedToolBatch, AgentError> {
+    // One immutable snapshot per batch, shared by every capability/descendant.
+    let current_context = &Arc::new(current_context.clone());
+    let assistant_message = &Arc::new(assistant_message.clone());
     let mut finalized_calls: Vec<FinalizedToolCall> = Vec::new();
     let mut messages: Vec<ToolResultMessage> = Vec::new();
 
@@ -1067,12 +1070,10 @@ async fn execute_tool_calls_parallel(
     let mut running = RunningToolCalls::new();
     let mut completed = VecDeque::new();
     let mut finalized_by_index = Vec::with_capacity(tool_calls.len());
-    let after_context = config.after_tool_call.as_ref().map(|_| {
-        (
-            Arc::new(current_context.clone()),
-            Arc::new(assistant_message.clone()),
-        )
-    });
+    let execution_context = (
+        Arc::new(current_context.clone()),
+        Arc::new(assistant_message.clone()),
+    );
 
     for tool_call in tool_calls {
         let index = finalized_by_index.len();
@@ -1115,23 +1116,16 @@ async fn execute_tool_calls_parallel(
             Prepared::Ready { tool, args } => {
                 let tc = tool_call.clone();
                 let panic_call = tc.clone();
-                let after_context = after_context
-                    .as_ref()
-                    .map(|(ctx, am)| (Arc::clone(ctx), Arc::clone(am)));
+                let (ctx, am) = (
+                    Arc::clone(&execution_context.0),
+                    Arc::clone(&execution_context.1),
+                );
                 let cfg = config.clone();
                 let emit = Arc::clone(emit);
                 let execute = std::panic::AssertUnwindSafe(async move {
-                    let executed = execute_prepared_tool_call(&tc, &tool, &args, &cfg, &emit).await;
-                    match after_context {
-                        Some((ctx, am)) => {
-                            finalize_executed_tool_call(&ctx, &am, &tc, &args, executed, &cfg).await
-                        }
-                        None => FinalizedToolCall {
-                            tool_call: tc,
-                            result: executed.result,
-                            is_error: executed.is_error,
-                        },
-                    }
+                    let executed =
+                        execute_prepared_tool_call(&tc, &tool, &args, &cfg, &emit, &ctx, &am).await;
+                    finalize_executed_tool_call(&ctx, &am, &tc, &args, executed, &cfg).await
                 })
                 .catch_unwind();
                 running.push(Box::pin(async move {
@@ -1206,9 +1200,9 @@ async fn drive_tool_calls_while<F: std::future::Future>(
 }
 
 /// Shared core for the sequential path: prepare → execute → finalize.
-async fn run_one_tool_call(
-    current_context: &AgentContext,
-    assistant_message: &AssistantMessage,
+pub(crate) async fn run_one_tool_call(
+    current_context: &Arc<AgentContext>,
+    assistant_message: &Arc<AssistantMessage>,
     tool_call: &ToolCall,
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
@@ -1220,7 +1214,16 @@ async fn run_one_tool_call(
             is_error,
         }),
         Prepared::Ready { tool, args } => {
-            let executed = execute_prepared_tool_call(tool_call, &tool, &args, config, emit).await;
+            let executed = execute_prepared_tool_call(
+                tool_call,
+                &tool,
+                &args,
+                config,
+                emit,
+                current_context,
+                assistant_message,
+            )
+            .await;
             Ok(finalize_executed_tool_call(
                 current_context,
                 assistant_message,
@@ -1424,7 +1427,7 @@ pub fn recorded_tool_result(
         Some(_) => {
             return Err(
                 "Unsupported recorded tool result version; replay cannot execute work".into(),
-            )
+            );
         }
         None => return Err(INVALID.into()),
     }
@@ -1492,7 +1495,13 @@ async fn execute_prepared_tool_call(
     args: &serde_json::Value,
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
+    current_context: &Arc<AgentContext>,
+    assistant_message: &Arc<AssistantMessage>,
 ) -> ExecutedToolCallOutcome {
+    let child_token = config.signal.child_token();
+    // Retire the native invocation after execute (including adapter image
+    // postprocessing) and descendant drain, not when its program binding closes.
+    let _native_lifetime = crate::tool_program::InvocationLifetime(child_token.clone());
     // Gate for late updates: flipped false once execute resolves. on_update
     // checks it and returns early. This is the late-update-suppression invariant.
     let accepting_updates = Arc::new(AtomicBool::new(true));
@@ -1505,12 +1514,12 @@ async fn execute_prepared_tool_call(
 
     let on_update: Arc<dyn Fn(crate::types::ToolResultPartial) + Send + Sync> = {
         let gate = Arc::clone(&accepting_updates);
+        let update_signal = child_token.clone();
         Arc::new(move |partial: crate::types::ToolResultPartial| {
-            if !gate.load(Ordering::SeqCst) {
+            if !gate.load(Ordering::SeqCst) || update_signal.is_cancelled() {
                 return;
             }
-            // Cancellation during a cancelled batch: still emit for non-cancelled
-            // runs; the gate above is the real suppression.
+            // Both completion and cancellation retire the native update callback.
             let ev = AgentEvent::ToolExecutionUpdate {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
@@ -1525,25 +1534,46 @@ async fn execute_prepared_tool_call(
         })
     };
 
-    let child_token = config.signal.child_token();
+    let capability = crate::tool_program::ToolProgram::capture(
+        current_context,
+        assistant_message,
+        tool_call,
+        config,
+        child_token.clone(),
+        on_update.clone(),
+        emit,
+    );
+    let _lifetime = crate::tool_program::InvocationLifetime(capability.signal.clone());
     let execute_started = agent_diagnostics_enabled().then(Instant::now);
-    let outcome = match tool
-        .execute(&tool_call.id, args.clone(), child_token, on_update)
+    let executed = std::panic::AssertUnwindSafe(async {
+        crate::tool_program::scope(
+            capability.clone(),
+            tool.execute(&tool_call.id, args.clone(), child_token, on_update),
+        )
         .await
-    {
-        Ok(result) => {
-            accepting_updates.store(false, Ordering::SeqCst);
-            ExecutedToolCallOutcome {
-                result,
-                is_error: false,
-            }
-        }
-        Err(e) => {
-            accepting_updates.store(false, Ordering::SeqCst);
-            ExecutedToolCallOutcome {
-                result: create_error_tool_result(&e.to_string()),
-                is_error: true,
-            }
+    })
+    .catch_unwind()
+    .await;
+    accepting_updates.store(false, Ordering::SeqCst);
+    let mut outcome = match executed {
+        Ok(Ok(result)) => ExecutedToolCallOutcome {
+            result,
+            is_error: false,
+        },
+        Ok(Err(AgentError::StructuredTool(result))) => ExecutedToolCallOutcome {
+            result: *result,
+            is_error: true,
+        },
+        Ok(Err(e)) => ExecutedToolCallOutcome {
+            result: create_error_tool_result(&e.to_string()),
+            is_error: true,
+        },
+        Err(panic) => {
+            // Keep the containing request's gate/permits until every descendant
+            // has stopped, even when execute unwinds. Then let the existing
+            // outer panic handler preserve its error and hook semantics.
+            capability.finish().await;
+            std::panic::resume_unwind(panic);
         }
     };
     if let Some(started) = execute_started {
@@ -1554,6 +1584,11 @@ async fn execute_prepared_tool_call(
             outcome.is_error,
             started.elapsed().as_nanos().min(u64::MAX as u128),
         );
+    }
+    capability.finish().await;
+    if let Err(error) = capability.merge_accounting(&mut outcome.result) {
+        outcome.is_error = true;
+        outcome.result.content.push(TextContentOrImage::text(error));
     }
     outcome
 }

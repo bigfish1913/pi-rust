@@ -234,7 +234,9 @@ async fn reservation_only_adds_durable_when_enabled_and_preserves_hidden_names_a
         host.publish_registry_impl(Some(Arc::new(registry.snapshot())));
         let commands = inventory(&host).await;
         assert!(named(&commands, "/q").is_empty());
-        assert!(named(&commands, "/context").is_empty());
+        let context = named(&commands, "/context");
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0]["source"], "builtin");
         let durable = named(&commands, "/durable");
         assert_eq!(durable.len(), 1);
         assert_eq!(
@@ -255,6 +257,8 @@ async fn reservation_only_adds_durable_when_enabled_and_preserves_hidden_names_a
             reserved,
         );
         assert!(named(&merged, "/q").is_empty());
-        assert!(named(&merged, "/context").is_empty());
+        let context = named(&merged, "/context");
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0]["source"], "builtin");
     }
 }

@@ -162,6 +162,14 @@ impl SessionStorage for SqliteSessionStorage {
         let _gate = self.refresh_read().await?;
         self.inner.get_lanes().await
     }
+    async fn lane_branch(
+        &self,
+        lane: &str,
+    ) -> SessionResult<crate::session::types::SessionLaneBranch> {
+        let _gate = self.refresh_read().await?;
+        self.inner.lane_branch(lane).await
+    }
+
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
         let lane = lane.to_string();
         let at = at.map(str::to_string);

@@ -6,6 +6,13 @@
 
 const HOST_SOURCE: &str = include_str!("../../interactive_tui.rs");
 
+// Git may materialize this source as CRLF on Windows. Normalize before
+// checking source-order sentinels so these tests assert wiring, not checkout
+// line endings.
+fn normalized_host_source() -> String {
+    HOST_SOURCE.replace("\r\n", "\n")
+}
+
 fn offset(source: &str, needle: &str) -> usize {
     source
         .find(needle)
@@ -14,7 +21,7 @@ fn offset(source: &str, needle: &str) -> usize {
 
 #[test]
 fn native_shutdown_settles_before_retiring_runtime_tasks() {
-    let source = HOST_SOURCE;
+    let source = normalized_host_source();
     let shutdown = source
         .rfind("    // ---- Shutdown ----")
         .expect("shutdown tail must remain present");
@@ -57,7 +64,7 @@ fn native_shutdown_settles_before_retiring_runtime_tasks() {
 
 #[test]
 fn flag_off_shutdown_does_not_invoke_native_settlement() {
-    let source = HOST_SOURCE;
+    let source = normalized_host_source();
     let shutdown = source
         .rfind("    // ---- Shutdown ----")
         .expect("shutdown tail must remain present");
@@ -73,7 +80,7 @@ fn flag_off_shutdown_does_not_invoke_native_settlement() {
 
 #[test]
 fn native_shutdown_keeps_dialog_shutdown_idempotent_and_single_settlement() {
-    let source = HOST_SOURCE;
+    let source = normalized_host_source();
     let shutdown = source
         .rfind("    // ---- Shutdown ----")
         .expect("shutdown tail must remain present");

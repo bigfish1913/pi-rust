@@ -1083,6 +1083,30 @@ pub type ResourcesDiscoverFn = extern "C" fn(
 pub type BeforeAgentStartFn =
     extern "C" fn(event_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
+/// `tool_result` transform signature: pi's `tool_result` handler, which may
+/// return a changed `content` / `details` for a finished tool call
+/// (`ToolResultEventResult`). The [`EventTag::ToolResult`] broadcast only
+/// observes.
+///
+/// `event_json` is a borrowed envelope `{"toolCallId", "toolName", "input",
+/// "content", "details"}`: `input` holds the arguments the tool ran with,
+/// `content` is the result in the shape a plugin tool returns (`text` and
+/// `image` blocks, `image` carrying base64 `data` and `mimeType`). `out` is
+/// plugin-produced JSON with the fields to replace, `{"content": [...]}`,
+/// `{"details": ...}` or both; an empty string or object leaves the result
+/// alone. It is reclaimed via the `plugin_free_string` given at registration.
+///
+/// Handlers chain in registration order, each seeing the previous one's
+/// result. A nonzero return or a panic leaves the result as it was and the
+/// fan-out continues. Only successful results are offered: a tool that fails
+/// reports an error, not content. Handlers run on a blocking thread, so slow
+/// work (re-encoding an image) does not stall the runtime.
+///
+/// SAFETY: the plugin warrants `user_data` is valid for the registry's lifetime
+/// and the handler is callable from any thread.
+pub type ToolResultFn =
+    extern "C" fn(event_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
 // ---------------------------------------------------------------------------
 // Runtime actions — uniform JSON-RPC dispatch by RuntimeActionId
 // ---------------------------------------------------------------------------
@@ -1231,6 +1255,26 @@ pub enum RuntimeActionId {
     /// The flag is one-shot: it is consumed at the next turn boundary and
     /// cleared when a new run starts. Setting it while idle is a harmless no-op.
     StopRound = 29,
+    /// Invocation-bound nested tool execution (protocol version 1).
+    ToolProgram = 30,
+    /// Re-read the model/provider catalog from disk **without** reloading
+    /// extensions.
+    ///
+    /// Why this exists next to `Reload` (`15`): `Reload` re-runs extension
+    /// discovery and swaps the whole `ExtensionSession`. That swap invalidates
+    /// the old `RegistrySnapshot`, so the **in-flight run** — which captured
+    /// its emitter at run start — silently stops receiving plugin events
+    /// (`dispatch_to_handlers` drops everything from a stale snapshot). The
+    /// TUI keeps rendering (it uses the broadcast emitter), so the session
+    /// looks alive while every plugin event is dead until the next run.
+    ///
+    /// `ReloadModels` is the cheap counterpart: it re-reads `models.json`,
+    /// re-resolves the provider catalog and swaps the runtime bindings, but
+    /// **never touches the extension registry, the emitter, or the event
+    /// snapshot**. A running turn is unaffected.
+    ///
+    /// Args: `{}`; result: `{"models": <count>}`.
+    ReloadModels = 31,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1281,6 +1325,8 @@ impl TryFrom<u32> for RuntimeActionId {
             27 => Ok(Self::Abort),
             28 => Ok(Self::RelayUiDialog),
             29 => Ok(Self::StopRound),
+            30 => Ok(Self::ToolProgram),
+            31 => Ok(Self::ReloadModels),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1324,6 +1370,8 @@ impl RuntimeActionId {
         Self::Abort,
         Self::RelayUiDialog,
         Self::StopRound,
+        Self::ToolProgram,
+        Self::ReloadModels,
     ];
 
     /// The highest defined action id.
@@ -1872,6 +1920,18 @@ pub struct PluginApi {
             user_data: *mut c_void,
         ) -> i32,
     >,
+    /// Register a [`ToolResultFn`] transform, appended after
+    /// `register_oauth_provider_cancellable`. A host that predates this slot
+    /// does not reach it with `struct_size`: register through
+    /// [`register_tool_result`], which checks that and returns `-1` on such a
+    /// host, whose tool results then stay as the tools returned them.
+    pub register_tool_result: Option<
+        extern "C" fn(
+            handler: ToolResultFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 }
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
@@ -1908,6 +1968,22 @@ pub fn register_oauth_provider_cancellable(
         )
     } else {
         -1
+    }
+}
+
+/// Register a `tool_result` transform (see [`ToolResultFn`]).
+///
+/// Returns the host's registration status, or `-1` when the host predates the
+/// slot (its `struct_size` does not reach it) or leaves it `None`.
+pub fn register_tool_result(api: &PluginApi, handler: ToolResultFn, user_data: *mut c_void) -> i32 {
+    let end =
+        core::mem::offset_of!(PluginApi, register_tool_result) + core::mem::size_of::<usize>();
+    if (api.struct_size as usize) < end {
+        return -1;
+    }
+    match api.register_tool_result {
+        Some(register) => register(handler, callbacks::free_string, user_data),
+        None => -1,
     }
 }
 
@@ -2301,6 +2377,7 @@ mod tests {
             register_plugin_lifecycle: None,
             register_tool_prompt: None,
             register_oauth_provider_cancellable: None,
+            register_tool_result: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -2402,14 +2479,19 @@ mod tests {
         );
         let tool_prompt = core::mem::offset_of!(PluginApi, register_tool_prompt);
         assert_eq!(tool_prompt, lifecycle + size_of::<usize>());
-        // The cancellable OAuth slot is the newest and therefore the last field.
         let cancellable = core::mem::offset_of!(PluginApi, register_oauth_provider_cancellable);
         assert_eq!(
             cancellable,
             tool_prompt + size_of::<usize>(),
             "register_oauth_provider_cancellable must be appended after register_tool_prompt"
         );
-        assert_eq!(size_of::<PluginApi>(), cancellable + size_of::<usize>());
+        let tool_result = core::mem::offset_of!(PluginApi, register_tool_result);
+        assert_eq!(
+            tool_result,
+            cancellable + size_of::<usize>(),
+            "register_tool_result must be appended after register_oauth_provider_cancellable"
+        );
+        assert_eq!(size_of::<PluginApi>(), tool_result + size_of::<usize>());
         assert_eq!(align_of::<PluginApi>(), align_of::<*const ()>());
     }
 
@@ -2446,6 +2528,8 @@ mod tests {
             RuntimeActionId::Abort,
             RuntimeActionId::RelayUiDialog,
             RuntimeActionId::StopRound,
+            RuntimeActionId::ToolProgram,
+            RuntimeActionId::ReloadModels,
         ];
 
         // Stable wire ids must not depend on which proposal was merged first.
@@ -2458,11 +2542,14 @@ mod tests {
         assert_eq!(u32::from(RuntimeActionId::Abort), 27);
         assert_eq!(u32::from(RuntimeActionId::RelayUiDialog), 28);
         assert_eq!(u32::from(RuntimeActionId::StopRound), 29);
+        assert_eq!(u32::from(RuntimeActionId::ToolProgram), 30);
+        assert_eq!(u32::from(RuntimeActionId::ReloadModels), 31);
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ListCommands));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::Abort));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::RelayUiDialog));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::StopRound));
-        assert_eq!(RuntimeActionId::MAX, 29);
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ReloadModels));
+        assert_eq!(RuntimeActionId::MAX, 31);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         let one_past_last = RuntimeActionId::MAX + 1;
@@ -2502,6 +2589,7 @@ mod tests {
             register_plugin_lifecycle: None,
             register_tool_prompt: None,
             register_oauth_provider_cancellable: None,
+            register_tool_result: None,
         }
     }
 

@@ -22,10 +22,10 @@ use crate::compaction::tokens::{
     compute_file_lists, create_file_ops, estimate_tokens, extract_file_ops_from_message,
     format_file_operations, serialize_conversation, FileOperations,
 };
-use crate::error::{SessionError, SessionResult};
+use crate::error::SessionResult;
 use crate::messages::convert_to_llm;
 use crate::messages::{create_branch_summary_message, create_compaction_summary_message};
-use crate::session::types::{BranchBounds, Entry, EntryQuery, SessionTree};
+use crate::session::types::{BranchBounds, Entry, EntryOrder, EntryQuery, SessionTree};
 
 // Re-export so callers can reach the branch-summary error type via
 // `compaction::branch_summary`.
@@ -133,7 +133,11 @@ fn get_message_from_entry(entry: &Entry) -> Option<AgentMessage> {
 ///
 /// Walks `old_leaf_id` back toward the common ancestor with `target_id`'s path
 /// (exclusive of the ancestor), reversed into chronological order. Returns
-/// empty when `old_leaf_id` is `None`.
+/// empty when `old_leaf_id` is `None`. Archival tool-program body entries are
+/// excluded from the collected payloads, not from common-ancestor identity.
+/// Ordinary custom and metadata entries retain their historical collection
+/// semantics. Native metadata ancestry is O(history); custom tree/storage trait
+/// fallbacks may hydrate full entries unless they override `branch_ancestry`.
 pub async fn collect_entries_for_branch_summary<S: SessionTree + ?Sized>(
     session: &S,
     old_leaf_id: Option<&str>,
@@ -149,48 +153,47 @@ pub async fn collect_entries_for_branch_summary<S: SessionTree + ?Sized>(
         }
     };
 
+    // Identity must include archival nodes: filtering these paths would move
+    // the reported LCA backward when the fork is rooted at an archive entry.
     let old_path: BTreeSet<String> = session
+        .branch_ancestry(&BranchBounds {
+            start: Some(old_leaf_id.to_string()),
+            ..Default::default()
+        })
+        .await?
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+    let target_path = session
+        .branch_ancestry(&BranchBounds {
+            start: Some(target_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let common_ancestor_id = target_path
+        .into_iter()
+        .find(|entry| old_path.contains(&entry.id))
+        .map(|entry| entry.id);
+
+    // Read only the abandoned tail's semantic payloads. Use newest-first for
+    // inclusive stop bounds (oldest-first queries have historical truncation
+    // semantics), remove the ancestor itself, then restore chronological order.
+    // Ordinary custom/metadata entries remain part of the public collection.
+    let mut entries = session
         .find_entries_on_branch(
-            &EntryQuery::default(),
-            &BranchBounds {
-                start: Some(old_leaf_id.to_string()),
+            &EntryQuery {
+                exclude_tool_program_bodies: true,
+                order: Some(EntryOrder::NewestFirst),
                 ..Default::default()
             },
-        )
-        .await?
-        .iter()
-        .map(|e| e.id().to_string())
-        .collect();
-
-    let target_path = session
-        .find_entries_on_branch(
-            &EntryQuery::default(),
             &BranchBounds {
-                start: Some(target_id.to_string()),
+                start: Some(old_leaf_id.to_string()),
+                stop_at_id: common_ancestor_id.clone(),
                 ..Default::default()
             },
         )
         .await?;
-
-    let common_ancestor_id = target_path
-        .iter()
-        .find(|e| old_path.contains(e.id()))
-        .map(|e| e.id().to_string());
-
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut current: Option<String> = Some(old_leaf_id.to_string());
-    while let Some(cur) = current {
-        if Some(&cur) == common_ancestor_id.as_ref() {
-            break;
-        }
-        let entry = session.get_entry(&cur).await?.ok_or_else(|| {
-            SessionError::invalid_entry(format!(
-                "Entry {cur} not found while collecting branch summary"
-            ))
-        })?;
-        current = entry.parent_id().map(|s| s.to_string());
-        entries.push(entry);
-    }
+    entries.retain(|entry| Some(entry.id()) != common_ancestor_id.as_deref());
     entries.reverse();
     Ok(CollectEntriesResult {
         entries,

@@ -94,7 +94,7 @@ rpi dev                                        # build + watch a local extension
 
 `rpi install <name>` installs or upgrades an extension without `--force`. An already installed version is skipped; use `--force` to reinstall the same version or allow a downgrade. These rules also apply to explicit Cargo builds and local installs.
 
-`rpi extension update` updates all project-linked extensions and globally installed registry/prebuilt extensions; `rpi extension update <name>` selects one extension by name. Updates retain the original Cargo build backend or explicit GitHub source. Global development installs made with `--path` are excluded. The old `rpi package update [name]` remains compatible, but `rpi extension update [name]` is recommended for extension updates. Project linking commands remain `rpi package link`, `rpi package list`, and `rpi package unlink`.
+`rpi extension update` updates all project-linked extensions and globally installed registry/prebuilt extensions; `rpi extension update <name>` selects one extension by name. Add `--cdn <URL>` to download prebuilt archives through an HTTPS CDN; manifests remain on GitHub, CDN failures fall back to GitHub, and project-linked/Cargo-built extensions are unchanged. Updates retain the original Cargo build backend or explicit GitHub source. Global development installs made with `--path` are excluded. The old `rpi package update [name]` remains compatible, but `rpi extension update [name]` is recommended for extension updates. Project linking commands remain `rpi package link`, `rpi package list`, and `rpi package unlink`.
 
 ## Remote mode
 
@@ -173,6 +173,28 @@ requiring filtering **must require `filtered == true`** in the reply and reject
 unsupported hosts rather than treating an unfiltered branch as filtered data.
 Plugin ABI compatibility alone does not establish this query capability.
 `get_messages`, `get_history`, and the append/write protocol are unchanged.
+
+## ToolProgram live branch identity (additive)
+
+`ready.toolProgramBranch` is exactly
+`{"version":1,"command":"get_tool_program_branch","identity":"bindingAndLaneGeneration"}`.
+`{"type":"get_tool_program_branch","id":"branch-1"}` accepts no query arguments.
+Its data is `{sessionId, lane, bindingId, generation, leafId}`: one pinned native
+binding and atomic lane snapshot, bounded to validated identity strings.
+`bindingId` is a live UUIDv4, shared by clones/pins and replaced on every facade
+storage rebind (including back to the same storage); it is not authorization.
+`generation` is the sequence of the latest explicit lane create/move mutation
+(zero for the initial main lane), not the ordinary entry sequence. Appending
+entries does not change it; navigation away/back does. Memory, JSONL cold/warm
+replay and SQLite derive it from existing authoritative lane mutations, without
+a new transcript field or migration. Unsupported custom/experimental backends
+reject the identity read rather than guessing a generation.
+
+Consumers bracket bounded snapshot/live proofs with this identity and keep
+checking retained native begin/phase membership; equal generation alone is not
+child-event proof. The frozen child-query/event v1 profiles, SDK/ABI, cursors,
+permissions, journal and accounting semantics are unchanged. Older hosts retain
+read-only child recovery but do not qualify the new live-proof path.
 
 ## Documentation
 

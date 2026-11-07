@@ -121,6 +121,23 @@ impl<'de> Deserialize<'de> for SessionState {
         {
             return Err(D::Error::custom("snapshot contains unreferenced payloads"));
         }
+        // Derive identity only from the authoritative ordered lane mutations;
+        // no new persisted generation field or migration is needed.
+        let mut lane_generations: BTreeMap<String, u64> = snapshot
+            .lanes
+            .keys()
+            .map(|lane| (lane.clone(), 0))
+            .collect();
+        for item in &snapshot.log {
+            if let StoredLogItem::Other(item) = item {
+                if let LogItem::Lane { seq, lane, .. } = item.as_ref() {
+                    if !snapshot.lanes.contains_key(lane) {
+                        return Err(D::Error::custom("snapshot lane mutation has no lane"));
+                    }
+                    lane_generations.insert(lane.clone(), *seq);
+                }
+            }
+        }
         let mut open_operations_by_lane: HashMap<String, BTreeMap<u64, OperationStartedRecord>> =
             HashMap::new();
         for record in &snapshot.records {
@@ -170,6 +187,13 @@ impl<'de> Deserialize<'de> for SessionState {
             );
         }
         let metadata = snapshot.entries.iter().map(EntryMeta::from_entry).collect();
+        let hot_append_count = snapshot
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(record, LaneRecord::AssistantFrame(frame) if frame.op == AssistantFrameOp::Append)
+            })
+            .count();
         let mut state = Self {
             index: IndexedState {
                 metadata,
@@ -179,8 +203,12 @@ impl<'de> Deserialize<'de> for SessionState {
                 entries: snapshot.entries,
                 entries_by_id,
                 records: snapshot.records,
+                hot_append_count,
+                #[cfg(test)]
+                retire_record_checks: 0,
                 open_operations_by_lane,
                 lanes: snapshot.lanes,
+                lane_generations,
                 log: snapshot.log,
                 stats: snapshot.stats,
                 name: snapshot.name,

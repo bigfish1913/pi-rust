@@ -100,6 +100,20 @@ fn assistant_message_all_blocks_raw_roundtrip() {
 }
 
 #[test]
+fn assistant_usage_cost_raw_roundtrip() {
+    // Costs are token counts times per-token prices, so they often land on
+    // f64s whose shortest decimal (`1.0500000000000001e-6` for 7 tokens at
+    // $0.15/M) only parses back exactly with serde_json's `float_roundtrip`.
+    // The harness compares the terminal assistant with its committed entry.
+    let mut message =
+        AssistantMessage::empty(Api::AnthropicMessages, "anthropic", "synthetic", 123);
+    for tokens in 1..2000 {
+        message.usage.cost.input = tokens as f64 * 0.15 / 1_000_000.0;
+        assert_raw_roundtrip(&message);
+    }
+}
+
+#[test]
 fn tool_result_mixed_blocks_raw_roundtrip() {
     let message = ToolResultMessage {
         role: Default::default(),

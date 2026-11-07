@@ -641,6 +641,31 @@ impl SessionStorage for ExperimentalNativeStorage {
         })
         .await
     }
+    async fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<Vec<EntryAncestry>> {
+        let (bounds, start) = (bounds.clone(), start.to_owned());
+        self.run(move |s, _| {
+            let tx = s.connection.transaction()?;
+            // path() validates metadata digests and parent links only; it never
+            // calls read_mutation or selects the facts.body column.
+            let ancestry = path(&tx, &s.identity, &start, &bounds)?
+                .into_iter()
+                .map(|meta| match meta.effect {
+                    Effect::Entry { id, parent, .. } => Ok(EntryAncestry {
+                        id,
+                        parent_id: parent,
+                    }),
+                    _ => Err("invalid ancestry metadata".into()),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            tx.commit()?;
+            Ok(ancestry)
+        })
+        .await
+    }
     async fn find_records(&self, q: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
         let q = q.clone();
         self.run(move |s, _| {

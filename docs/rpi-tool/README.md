@@ -327,12 +327,16 @@ renderers and discovered resources.
 rpi install rpi-todo                    # prebuilt extension; no Rust toolchain needed
 rpi install my-ext --path ../my-ext     # local, for development
 rpi extension update [name]             # all eligible extensions, or one by name
+rpi extension update --cdn <URL>         # use a CDN for prebuilt extension archives
 rpi dev                                 # build + watch + live reload
 ```
 
 Use `rpi extension update` to update all project-linked extensions and globally
 installed registry/prebuilt extensions, or `rpi extension update <name>` to select
-one by name. Updates preserve the original Cargo build backend or explicit GitHub
+one by name. Use `rpi extension update --cdn <URL>` to download prebuilt
+archives through an HTTPS CDN; manifests remain on GitHub and failed CDN
+requests fall back to GitHub. The option does not affect project-linked or
+Cargo-built extensions. Updates preserve the original Cargo build backend or explicit GitHub
 source. Global development installs made with `--path` are excluded. The old
 `rpi package update [name]` remains compatible; prefer `extension update` for
 extension updates. Project linking commands remain `rpi package link`,
@@ -413,11 +417,11 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.16.0](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
+| Current release | **[0.21.0](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.88 |
-| Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
-| Binary release targets | Linux (x86_64/aarch64), macOS (Intel/Apple silicon), Windows (x86_64) |
+| Platforms | Linux (GNU and musl), macOS, Windows (CI runs the suite on Linux) |
+| Binary release targets | Linux (x86_64 GNU/musl, aarch64 GNU), macOS (Intel/Apple silicon), Windows (x86_64) |
 
 `rpi` is a self-contained Rust coding-agent stack. No Node component is
 required and none is loaded.

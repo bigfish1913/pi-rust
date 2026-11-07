@@ -34,16 +34,25 @@ impl AgentTool for ImageTool {
         signal: CancellationToken,
         on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
     ) -> Result<AgentToolResult, AgentError> {
-        let mut result = self
-            .0
-            .execute(id, params, signal.clone(), on_update)
-            .await?;
+        let (mut result, is_error) =
+            match self.0.execute(id, params, signal.clone(), on_update).await {
+                Ok(result) => (result, false),
+                Err(AgentError::StructuredTool(result)) => (*result, true),
+                Err(error) => return Err(error),
+            };
+        let outcome = |result| {
+            if is_error {
+                Err(AgentError::StructuredTool(Box::new(result)))
+            } else {
+                Ok(result)
+            }
+        };
         if !result
             .content
             .iter()
             .any(|block| matches!(block, TextContentOrImage::Image(_)))
         {
-            return Ok(result);
+            return outcome(result);
         }
         result = tokio::task::spawn_blocking(move || {
             let mut blocks: Vec<Content> = std::mem::take(&mut result.content)
@@ -69,7 +78,7 @@ impl AgentTool for ImageTool {
         if signal.is_cancelled() {
             return Err(AgentError::Tool("Image processing cancelled".into()));
         }
-        Ok(result)
+        outcome(result)
     }
 }
 
@@ -121,5 +130,103 @@ mod tests {
         assert!(
             matches!(&result.content[0], TextContentOrImage::Text(text) if text.text.contains("Image omitted"))
         );
+    }
+
+    struct ResultTool(Result<AgentToolResult, AgentError>);
+    #[async_trait]
+    impl AgentTool for ResultTool {
+        fn schema(&self) -> &Tool {
+            panic!("test does not request schema")
+        }
+        fn label(&self) -> &str {
+            "result"
+        }
+        async fn execute(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: CancellationToken,
+            _: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+        ) -> Result<AgentToolResult, AgentError> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_error_images_use_native_normalization_and_retain_metadata() {
+        let mut usage = rpi_ai::types::Usage::zero();
+        usage.input = 3;
+        usage.total_tokens = 3;
+        let original = AgentToolResult {
+            content: vec![
+                TextContentOrImage::text("native failure"),
+                TextContentOrImage::Image(rpi_ai::types::ImageContent {
+                    kind: rpi_ai::types::ImageContentType,
+                    data: "invalid".into(),
+                    mime_type: "image/bmp".into(),
+                }),
+            ],
+            details: serde_json::json!({"retained": true, "nested": {"id": 7}}),
+            usage: Some(usage),
+            added_tool_names: vec!["z".into(), "a".into()],
+            terminate: true,
+        };
+        let execute = |result| async move {
+            wrap(Arc::new(ResultTool(result)))
+                .execute(
+                    "id",
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                    Arc::new(|_| {}),
+                )
+                .await
+        };
+        let success = execute(Ok(original.clone())).await.unwrap();
+        let Err(AgentError::StructuredTool(result)) =
+            execute(Err(AgentError::StructuredTool(Box::new(original.clone())))).await
+        else {
+            panic!("normalization must retain the structured error flag")
+        };
+        assert_eq!(result.content, success.content);
+        assert_eq!(result.content[0], original.content[0]);
+        assert!(
+            matches!(&result.content[1], TextContentOrImage::Text(text) if text.text.contains("Image omitted"))
+        );
+        assert_eq!(result.details, original.details);
+        assert_eq!(
+            serde_json::to_value(&result.usage).unwrap(),
+            serde_json::to_value(&original.usage).unwrap()
+        );
+        assert_eq!(result.added_tool_names, original.added_tool_names);
+        assert!(result.terminate);
+    }
+
+    #[tokio::test]
+    async fn non_image_structured_errors_and_ordinary_errors_are_unchanged() {
+        let original = AgentToolResult::text("structured failure without image");
+        let result = wrap(Arc::new(ResultTool(Err(AgentError::StructuredTool(
+            Box::new(original.clone()),
+        )))))
+        .execute(
+            "id",
+            serde_json::json!({}),
+            CancellationToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AgentError::StructuredTool(result)) if result.content == original.content)
+        );
+        let result = wrap(Arc::new(ResultTool(Err(AgentError::tool(
+            "ordinary failure",
+        )))))
+        .execute(
+            "id",
+            serde_json::json!({}),
+            CancellationToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await;
+        assert!(matches!(result, Err(AgentError::Tool(message)) if message == "ordinary failure"));
     }
 }

@@ -10,3 +10,4 @@ pub(crate) mod protocol;
 pub(crate) mod writer;
 
 pub(crate) mod message_queries;
+pub(crate) mod tool_program_queries;

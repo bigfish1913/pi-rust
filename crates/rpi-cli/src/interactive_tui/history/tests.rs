@@ -3,6 +3,11 @@ use super::*;
 use rpi_harness::session::types::{ProvisionedEntry, ProvisionedKind, SessionMetadata};
 use rpi_harness::session::{CounterIdGenerator, FakeClock, InMemorySessionStorage};
 
+#[path = "tests/startup_header.rs"]
+mod startup_header;
+#[path = "tests/update_notices.rs"]
+mod update_notices;
+
 async fn fixture(
     count: usize,
 ) -> (
@@ -65,6 +70,35 @@ fn text(state: &TuiState) -> String {
     strip_ansi(&state.chat_container.render(100).join("\n"))
 }
 
+#[test]
+fn update_notices_mount_before_live_transcript_slot() {
+    let history = HistoryUi::default();
+    let chat = Arc::new(Container::new());
+    history.mount_active(&chat);
+    add_update_notices(
+        &history.updates,
+        &crate::updates::UpdateReport {
+            notices: vec![crate::updates::UpdateNotice {
+                name: "rpi-im-message".into(),
+                current: "0.1.0".into(),
+                latest: "0.2.0".into(),
+                command: "rpi extension update rpi-im-message".into(),
+            }],
+            warnings: Vec::new(),
+        },
+    );
+
+    let children = chat.get_children();
+    assert_eq!(children.len(), 3);
+    let updates: Arc<dyn Component> = history.updates.clone();
+    let active: Arc<dyn Component> = history.active.clone();
+    let panels: Arc<dyn Component> = history.panels.clone();
+    assert!(Arc::ptr_eq(&children[0], &updates));
+    assert!(Arc::ptr_eq(&children[1], &active));
+    assert!(Arc::ptr_eq(&children[2], &panels));
+    assert!(strip_ansi(&chat.render(100).join("\\n")).contains("Package Update Available"));
+}
+
 #[tokio::test]
 async fn pages_replace_not_accumulate_and_release_old_components_and_search() {
     let (_, state, tui) = fixture(123).await;
@@ -73,7 +107,7 @@ async fn pages_replace_not_accumulate_and_release_old_components_and_search() {
     assert!(text(&state).contains("history-entry-122"));
     assert!(!text(&state).contains("history-entry-072"));
     let children = state.chat_container.get_children();
-    let old_page = Arc::downgrade(&children[0]);
+    let old_page = Arc::downgrade(&children[1]);
     drop(children);
     state.search.activate();
     state.search.set_query("history-entry-122");
@@ -95,7 +129,7 @@ async fn pages_replace_not_accumulate_and_release_old_components_and_search() {
     finish_request(&state).await;
     assert!(text(&state).contains("history-entry-122"));
     assert!(!text(&state).contains("history-entry-072"));
-    assert_eq!(state.chat_container.child_count(), 3);
+    assert_eq!(state.chat_container.child_count(), 4);
 }
 
 #[tokio::test]
@@ -103,7 +137,7 @@ async fn invalid_cursor_preserves_page_and_stale_generation_or_storage_never_mat
     let (storage, state, tui) = fixture(70).await;
     request(state.clone(), tui.clone(), Direction::Latest);
     finish_request(&state).await;
-    let original = state.chat_container.get_children()[0].clone();
+    let original = state.chat_container.get_children()[1].clone();
     state
         .history_page
         .resident
@@ -117,7 +151,7 @@ async fn invalid_cursor_preserves_page_and_stale_generation_or_storage_never_mat
     finish_request(&state).await;
     assert!(Arc::ptr_eq(
         &original,
-        &state.chat_container.get_children()[0]
+        &state.chat_container.get_children()[1]
     ));
     assert!(text(&state).contains("history-entry-069"));
     assert!(text(&state).contains("Could not load history"));
@@ -276,10 +310,10 @@ async fn byte_budget_keeps_oversized_entries_whole_and_all_variants_page() {
 async fn repeated_restore_replaces_the_page_and_mounts_live_user_messages() {
     let (_, state, _) = fixture(80).await;
     restore_bound(&state, &state.chat_container).await;
-    let old_page = Arc::downgrade(&state.chat_container.get_children()[0]);
+    let old_page = Arc::downgrade(&state.chat_container.get_children()[1]);
     restore_bound(&state, &state.chat_container).await;
     assert!(old_page.upgrade().is_none());
-    assert_eq!(state.chat_container.child_count(), 3);
+    assert_eq!(state.chat_container.child_count(), 4);
     state.set_status(RunStatus::Working);
     state.transcript_view().add_user("visible-live-user");
     assert!(text(&state).contains("visible-live-user"));
@@ -301,7 +335,7 @@ async fn repeated_page_failures_keep_one_notice_and_preserve_the_page() {
     let (_, state, tui) = fixture(80).await;
     request(state.clone(), tui.clone(), Direction::Latest);
     finish_request(&state).await;
-    let page = state.chat_container.get_children()[0].clone();
+    let page = state.chat_container.get_children()[1].clone();
     state
         .history_page
         .resident
@@ -314,13 +348,13 @@ async fn repeated_page_failures_keep_one_notice_and_preserve_the_page() {
     for _ in 0..8 {
         request(state.clone(), tui.clone(), Direction::Older);
         finish_request(&state).await;
-        assert!(Arc::ptr_eq(&page, &state.chat_container.get_children()[0]));
-        assert_eq!(state.chat_container.child_count(), 4);
+        assert!(Arc::ptr_eq(&page, &state.chat_container.get_children()[1]));
+        assert_eq!(state.chat_container.child_count(), 5);
         assert_eq!(text(&state).matches("Could not load history").count(), 1);
     }
     request(state.clone(), tui.clone(), Direction::Latest);
     finish_request(&state).await;
-    assert_eq!(state.chat_container.child_count(), 3);
+    assert_eq!(state.chat_container.child_count(), 4);
     assert!(!text(&state).contains("Could not load history"));
 }
 
@@ -481,3 +515,6 @@ async fn capability_header_survives_restore_and_page_replacement_once() {
     restore_bound(&state, &state.chat_container).await;
     assert_eq!(text(&state).matches("capability-header").count(), 1);
 }
+
+#[path = "tests/notice_order.rs"]
+mod notice_order;

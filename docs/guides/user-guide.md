@@ -235,9 +235,28 @@ Windows 会暂存更新，等待当前进程退出后完成替换。
 启动 TUI 时，`Context` 会列出实际加载成功的系统提示词和项目指令文件路径，
 包括 `SYSTEM.md`、`APPEND_SYSTEM.md` 以及 `AGENTS.md` / `CLAUDE.md`。
 项目 `SYSTEM.md` 和 `APPEND_SYSTEM.md` 优先于全局同名文件；清单只显示生效的来源。
-没有加载文件时，启动页会省略 `Context`。`/context` 可查看当前完整资源清单，
-成功执行 `/reload` 后，启动页的 `Context` 和 `/context` 都会更新。
+没有加载文件时，启动页会省略 `Context`。`/context` 可在临时面板中查看当前完整资源清单，
+输入文字可筛选，↑/↓ 浏览，Esc 或 Enter 关闭。关闭只移除面板，不会清空聊天记录、
+模型上下文或已加载的文件；用量统计请使用 `/usage`。
+成功执行 `/reload` 后，启动页的 `Context` 和再次打开的 `/context` 都会更新。
 设置 `quietStartup: true` 可隐藏启动资源清单。
+
+### 技能命令
+
+与 pi 一样，使用 `/skill:名称 [附加要求]` 显式调用已发现的技能，例如：
+
+```text
+/skill:review 检查本次改动，重点关注并发问题
+```
+
+`/` 补全会列出技能名。`disable-model-invocation: true` 只阻止模型自动选择，
+不影响显式调用或补全。设置 `enableSkillCommands: false` 可隐藏技能补全，
+但手动输入 `/skill:名称` 仍有效。成功执行 `/reload` 后，补全更新为最新技能清单。
+普通模式每次调用读取当前技能文件正文；`--resource-config` 精确资源模式则使用启动时已验证的正文快照，文件变更需重启生效。
+附加要求保留原有空格和换行。命令发现 API 同样列出技能，标记为 `source: "skill"`；
+`enableSkillCommands` 只过滤本地 TUI 补全，不影响 API 的技能清单。
+未知技能或读取/解析失败的命令原样进入普通输入流程，不会吞掉请求。
+`/skills` 仍可列出清单，旧的 `/skills 名称 [附加要求]` 用法保持兼容。
 
 ### 更新日志
 
@@ -406,8 +425,10 @@ rpi install my-extension --path ../my-rpi-extension --force
 ```
 
 推荐用 `rpi extension update` 更新全部项目链接扩展和全局 registry/prebuilt 扩展，
-或用 `rpi extension update <name>` 按名称更新。更新保留原来的 Cargo 构建后端或
-显式指定的 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
+或用 `rpi extension update <name>` 按名称更新。预编译扩展可以用
+`rpi extension update --cdn <URL>` 通过 HTTPS CDN 下载归档；清单仍从 GitHub
+获取，CDN 失败会回退到 GitHub。该选项不影响项目链接扩展或 Cargo 构建扩展。
+更新保留原来的 Cargo 构建后端或显式指定的 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
 旧命令 `rpi package update [name]` 仍兼容，但扩展更新推荐使用
 `rpi extension update [name]`。项目链接管理仍使用 `rpi package link`、
 `rpi package list`、`rpi package unlink`，这些命令名称不变。

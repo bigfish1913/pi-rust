@@ -216,6 +216,51 @@ async fn dropped_candidate_and_unknown_handles_are_rejected_without_pointer_dere
 }
 
 #[tokio::test]
+async fn owner_scan_does_not_upgrade_or_pin_unrelated_bridges() {
+    let root = ActionBridge::new(Handle::current(), Arc::new(Host::default()));
+    let plugin = root.for_plugin("retiring");
+    let invocation = plugin.for_invocation(false, CancellationToken::new());
+    let own = [&root, &plugin, &invocation];
+    for bridge in own {
+        bridge.user_data();
+        assert_eq!(Arc::strong_count(bridge), 1);
+    }
+
+    let unrelated = ActionBridge::new(Handle::current(), Arc::new(Host::default()));
+    let unrelated_plugin = unrelated.for_plugin("unrelated");
+    let unrelated_invocation = unrelated_plugin.for_invocation(false, CancellationToken::new());
+    let unrelated_ids: Vec<_> = [&unrelated, &unrelated_plugin, &unrelated_invocation]
+        .into_iter()
+        .map(|bridge| bridge.user_data() as usize)
+        .collect();
+
+    // Hold the exact scan used by invalidate at the former race window. The
+    // global upgrade-before-owner-filter pinned other sessions' invocations
+    // until this vector was dropped, delaying immediate handle retirement.
+    let live = root.bridges_for_owner();
+    assert_eq!(live.len(), own.len());
+    assert!(live
+        .iter()
+        .all(|bridge| Arc::ptr_eq(&bridge.active, &root.active)));
+    for bridge in own {
+        assert_eq!(Arc::strong_count(bridge), 2);
+    }
+    for bridge in [&unrelated, &unrelated_plugin, &unrelated_invocation] {
+        assert_eq!(Arc::strong_count(bridge), 1);
+    }
+    drop(unrelated_invocation);
+    drop(unrelated_plugin);
+    drop(unrelated);
+    for id in unrelated_ids {
+        assert!(ActionBridge::resolve_handle(id).is_none());
+    }
+    drop(live);
+    for bridge in own {
+        assert_eq!(Arc::strong_count(bridge), 1);
+    }
+}
+
+#[tokio::test]
 async fn finishing_an_invocation_does_not_unload_its_plugin_owner() {
     let host = Arc::new(Host::default());
     let root = ActionBridge::new(Handle::current(), host.clone());
@@ -348,3 +393,7 @@ async fn integrated_commands_abort_dialog_and_stop_round_dispatch_without_renumb
     assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
     assert_eq!(host.stop_rounds.load(Ordering::SeqCst), 1);
 }
+
+#[path = "../../../rpi-agent/tests/common/mod.rs"]
+mod agent_common;
+mod tool_program;

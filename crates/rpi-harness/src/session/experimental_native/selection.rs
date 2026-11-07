@@ -102,6 +102,13 @@ impl Selection {
             && q.custom_type
                 .as_ref()
                 .is_none_or(|t| self.custom_type.as_ref() == Some(t))
+            // This metadata oracle is also compiled by the standalone recovery
+            // fixture; keep exact wire keys independent of its crate root.
+            && (!q.exclude_tool_program_bodies
+                || !matches!(
+                    self.custom_type.as_deref(),
+                    Some("rpi.tool_program.body_chunk.v1" | "rpi.tool_program.body_commit.v1")
+                ))
             && q.entry_id.as_deref().is_none_or(|t| t == id)
             && q.tool_call_id
                 .as_ref()

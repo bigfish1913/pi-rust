@@ -11,6 +11,240 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/bigfish1913/pi-rust/compare/v0.20.0...v0.21.0) - 2026-11-06
+
+### Added
+
+- *(plugin-sdk)* tool_result transforms can rewrite a finished tool result ([#240](https://github.com/bigfish1913/pi-rust/pull/240))
+- allow configuring release CDN in settings
+- add optional release CDN mirror
+- version native extension artifacts for hot reload
+- *(release)* support x86_64 musl binaries
+
+### Fixed
+
+- *(tui)* keep runtime notices in transcript order ([#275](https://github.com/bigfish1913/pi-rust/pull/275))
+- *(cli)* tokenize docs queries and fall back across topics ([#272](https://github.com/bigfish1913/pi-rust/pull/272))
+- *(tools)* classify bash command failures in tool details ([#271](https://github.com/bigfish1913/pi-rust/pull/271))
+- *(tui)* gate file autocomplete on path appearance ([#264](https://github.com/bigfish1913/pi-rust/pull/264))
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/cdn-rustfs
+- *(read)* resize images with fast_image_resize ([#241](https://github.com/bigfish1913/pi-rust/pull/241))
+
+## [0.20.0](https://github.com/bigfish1913/pi-rust/compare/v0.19.0...v0.20.0) - 2026-11-05
+
+### Added
+
+- *(plugin-sdk)* add ReloadModels for a catalog-only refresh
+- *(config)* add provider update and delete RPCs
+- *(config)* persist image input support
+- *(config)* persist maximum output tokens
+- *(config)* persist provider context window
+- *(rpc)* probe provider models and connectivity
+- *(rpc)* persist provider configuration
+
+### Fixed
+
+- *(rpc)* raise ACP inline image prompt limit to 1 MiB
+- *(tui)* keep completed plan in transcript order ([#257](https://github.com/bigfish1913/pi-rust/pull/257))
+
+### Other
+
+- Merge branch 'main' into feat/web-provider-config
+- Merge branch 'main' into feat/web-provider-config
+
+## [0.19.0](https://github.com/bigfish1913/pi-rust/compare/v0.18.0...v0.19.0) - 2026-11-05
+
+### Added
+
+- *(harness)* expose bounded ToolProgram child queries and commit events
+- *(runtime)* add scoped native tool programs for Code Mode
+- *(agent)* observe genuine finalized ToolProgram children
+- *(tool-program)* resolve ordered native content attachments
+- *(codemode)* retain native results for bounded attachment
+- *(codemode)* preserve business values and guard invocation outputs
+- *(runtime)* preserve native results accounting and parent progress
+- *(harness)* persist genuine ToolProgram child observations
+- *(harness)* archive bounded native bodies in primary sessions
+
+### Fixed
+
+- *(rpc)* expose stable ToolProgram branch identity
+- *(rpc)* preserve canonical native tool result signatures
+- *(runtime)* drain panicking tool descendants and retain termination
+
+### Other
+
+- *(rpc)* simplify the owned child commit pump
+- add official extension compatibility gate ([#255](https://github.com/bigfish1913/pi-rust/pull/255))
+- *(harness)* initialize rebinding storage fixtures
+
+## [0.18.0](https://github.com/bigfish1913/pi-rust/compare/v0.17.2...v0.18.0) - 2026-11-04
+
+### Fixed
+
+- *(cli)* make context dismissible and align skill commands with pi ([#251](https://github.com/bigfish1913/pi-rust/pull/251))
+
+## [0.17.2](https://github.com/bigfish1913/pi-rust/compare/v0.17.1...v0.17.2) - 2026-11-04
+
+### Fixed
+
+- *(tui)* preserve startup output above the live transcript
+- parse JSON floats exactly so committed costs compare equal
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.17.1](https://github.com/bigfish1913/pi-rust/compare/v0.17.0...v0.17.1) - 2026-11-04
+
+### Fixed
+
+- *(resource)* resolve external scope prefixes before leasing
+
+## [0.17.0](https://github.com/bigfish1913/pi-rust/compare/v0.16.0...v0.17.0) - 2026-11-04
+
+### Added
+
+- *(plugin-sdk)* add StopRound for finishing the current turn only
+- *(plugin-sdk)* relay host UI dialogs to an external UI
+- *(plugin-sdk)* expose prompt templates in command listing
+- *(session)* share storage indexes and lazily page JSONL history
+- *(agent)* report queued message count on turn_end
+- *(cli)* add nonexecuting saved session resource reader
+- *(cli)* add explicit same-session resource transitions
+- *(cli)* opt in fresh print sessions to experimental native store
+- *(cli)* manage local packages skills and extensions
+- *(cli)* add exact native session resource selection
+- *(cli)* add exact native session resource selection
+- *(cli)* add extension update with legacy package compatibility
+- *(cli)* cancel provider OAuth calls when the TUI flow ends
+- *(extensions)* deliver OAuth cancellation to cancellable plugins
+- *(cli)* install runtime assets declared by prebuilt packages
+- *(plugin-sdk)* append a cancellable OAuth registration slot
+- *(durable)* share native progress checkpoints and restore pending queues
+- *(durable)* index experimental v3 queries and UI pages
+- *(durable)* add opt-in experimental native session backend
+
+### Fixed
+
+- preserve cold history validation and streamline session restore
+- preserve cold fork leaves and initialize verified resource authority before publication
+- enforce saved-read budgets and classify changed-branch cursors before anchors
+- *(cli)* canonicalize smoke fixtures and reject experimental extension dispatch
+- *(cli)* read steering text from the per-message view
+- *(cli)* drop unused queued_message_view_payloads
+- *(cli)* hand aborted queue back and keep per-queue views
+- *(harness)* reclaim queued messages atomically on abort
+- complete the relay lifecycle and unblock action 28
+- *(cli)* drop the unused merge_command_list wrapper
+- *(cli)* keep built-ins in the listing when reserving names
+- *(cli)* publish empty reloads and reserve built-in names
+- *(cli)* protect managed packages and preserve resource compatibility
+- *(cli)* validate selected Skills before startup side effects
+- *(cli)* validate selected Skills before startup side effects
+- *(cli)* initialize resource identity during native fork
+- make the TurnEnd payload ABI-safe and propagate it
+- *(cli)* honor deliverAs in SendUserMessage
+- *(tui)* derive spinner frames from wall clock at upstream cadence
+- *(cli)* keep history browsing alive after a single-line recall
+- *(cli)* move the caret through a multi-line draft before history
+- *(session)* lazily materialize legacy streaming frames
+- *(ai)* share image data between message copies
+- *(cli)* keep Linux clipboard data alive after selection copies
+- *(cli)* anchor autocomplete candidates to the editor
+- *(session)* upgrade locked legacy native sessions for progress
+- *(cli)* publish the OAuth flow id and its cancel token together
+- *(harness)* make host recovery and message settlement standalone
+- *(cli)* claim the OAuth flow before writing or deleting a credential
+- *(cli)* remove directories a failed sidecar install created
+- *(cli)* never treat an unowned sidecar as owned because of its case
+- *(cli)* prune a sidecar whose name changed only in case
+- *(cli)* reject Windows device names and trailing-dot sidecar paths
+- *(harness)* preserve run ownership and queued handoffs across caller drop
+- *(tools)* keep Windows shells suspended until they are in their job
+- *(test)* move the trampoline ceiling test into `mod tests`
+- *(extensions)* restore the relay test attribute and doc comment
+- *(test)* move the trampoline ceiling test into `mod tests`
+- *(extensions)* keep delivering the turn_end lifecycle event
+- *(extensions)* yield parallel tool scheduling during observer callbacks
+- *(tools)* kill Windows shell trees through a job object
+- *(harness)* reclaim native handles and classify create conflicts
+- *(harness)* recover recognized native hot journals before identity reads
+- *(session)* keep retired frame IDs reserved
+- *(session)* drop retired assistant frames from memory
+- *(harness)* hold AgentEnd until final assistant fallback is durable
+- *(harness)* retry final assistant entry ACK with its native ID
+- *(tui)* preserve native scrollback during live updates
+- *(tui)* share folded paste bodies across undo snapshots
+
+### Other
+
+- integrate latest main StopRound into preview
+- Merge main recovery store changes into StopRound preserving stream preconditions
+- retain latest preview runtime actions in resource transitions
+- preserve bounded history and strict transition reads on current resource base
+- Merge main into preview preserving native policy and runtime actions
+- Merge main into UI dialog relay and preserve all runtime actions
+- reconcile b with current preview storage and guards
+- Merge main into command listing and preserve atomic abort actions
+- Integrate bounded history and experimental backend policy with resource management
+- retain atomic abort and Notice fixes in optimized preview
+- Merge Notice and atomic abort fixes while preserving complete implicit forks
+- Merge reviewed preview Notice/abort fixes into resource d
+- Merge reviewed preview Notice/abort fixes into resource c
+- integrate bounded session history optimizations into preview
+- Merge reviewed preview Notice/abort fixes into resource b
+- Merge atomic abort recovery and restore pending Notice retry scheduling
+- *(session)* bound cold history reads and RPC state hydration
+- Merge updated resource reader and validate fork source identity
+- Merge updated transitions into nonexecuting saved-session reader
+- Merge updated resource foundation into same-session transitions
+- Merge preview into local resource management and preserve startup ownership
+- Merge main into preview and reconcile recovery/resource contracts
+- rustfmt the merge_command_list_reserved test call sites
+- Merge branch 'main' into pr/4-pending-messages
+- Merge branch 'main' into codex/session-resource-foundation
+- Merge branch 'main' into docs/skill-frontmatter-fields
+- *(skills)* describe the frontmatter fields the loader consumes
+- Merge reviewed resource fixes into native fork configuration
+- Merge reviewed resource fixes into saved session reads
+- Merge reviewed resource fixes into controlled rebind
+- synchronize main into preview with session history optimizations
+- integrate shared storage and lazy session history into preview
+- *(preview)* checkpoint extension updates and resource regression tooling
+- Merge branch 'main' into fix/spinner-cadence
+- Merge branch 'main' into fix/slash-panel-anchor
+- Merge branch 'main' into upstream/runtime-assets
+- Merge branch 'main' into fix/linux-clipboard-persistence
+- Merge branch 'main' into fix/slash-panel-anchor
+- Merge branch 'main' into upstream/runtime-assets
+- Merge branch 'main' into fix/linux-clipboard-persistence
+- Merge branch 'main' into upstream/oauth-cancel
+- sync embedded docs with the changelog entry
+- Merge main v0.16.0 into preview
+- Merge main into preview for the next preview release
+- *(cli)* describe only the runtime-assets.json index the host reads
+- *(oauth)* a cancelled login never saves a late credential, across reloads
+- *(cli)* list Windows device names among runtime asset path rules
+- *(cli)* cover runtime asset path, digest and entry-count cases
+- *(cli)* document runtime assets in the install guide
+- *(ai)* isolate body timeout from loopback connection timing
+- await persisted stream frames and cover integrated runtime actions
+- Merge remote-tracking branch 'upstream/main' into fix/windows-kill-job
+- Merge tested preview integration into local resource management
+- *(oauth)* pin the old keepalive and a live call across a reload
+- *(oauth)* keep an in-flight OAuth call's library mapped across an unload
+- rustfmt after the rebase onto the turn_end suite
+- Merge branch 'main' into fix/retire-frames-in-memory
+- *(harness)* cover large progress spill and prune crash boundaries
+- *(harness)* verify isolated native transaction process faults
+- *(durable)* verify native fact projections against session reducer
+- *(durable)* prototype bounded recovery and lazy indexed history
+- *(tui)* add native scrollback acceptance contracts
+
 ### Fixed
 
 - *(cli)* keep fullscreen mouse-selection copies on Linux: the arboard clipboard

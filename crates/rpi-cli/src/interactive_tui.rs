@@ -1429,7 +1429,6 @@ pub async fn interactive_tui(
     // one mtime entry — see fs_watch.rs). The handle lives in the state slot
     // and is re-targeted by selection and reload.
     {
-        let chat_ref = chat_container.clone();
         let tui_ref = tui.clone();
         let registry_snapshot = state.theme_registry.read().ok().map(|r| r.clone());
         crate::themes::restart_theme_watcher(
@@ -1439,7 +1438,7 @@ pub async fn interactive_tui(
                 .as_ref()
                 .unwrap_or(&crate::themes::ThemeRegistry::default()),
             &state.theme_manager,
-            theme_watch_notify(chat_ref, tui_ref),
+            theme_watch_notify(&state, tui_ref),
         );
     }
 
@@ -2377,7 +2376,7 @@ pub async fn interactive_tui(
                         if editor_for_key.has_selection() && editor_for_key.copy_selection() {
                             add_note_message(&state_for_key.chat_container, "Copied!");
                         } else {
-                            copy_last_assistant(&state_for_key, &state_for_key.chat_container);
+                            copy_last_assistant(&state_for_key);
                         }
                     }
                 }
@@ -3275,16 +3274,8 @@ pub async fn interactive_tui(
                     );
                     tui.request_render(false);
                 } else {
-                    open_tree_selector(
-                        harness,
-                        &state,
-                        &editor_container,
-                        &editor,
-                        &tui,
-                        &chat_container,
-                        &tx,
-                    )
-                    .await;
+                    open_tree_selector(harness, &state, &editor_container, &editor, &tui, &tx)
+                        .await;
                 }
             }
             Some(TuiMessage::NavigateTree(entry_id)) => {
@@ -3343,7 +3334,7 @@ pub async fn interactive_tui(
                 run_compact(&lane, &tui, &state).await;
             }
             Some(TuiMessage::Copy) => {
-                copy_last_assistant(&state, &chat_container);
+                copy_last_assistant(&state);
                 tui.request_render(false);
             }
             Some(TuiMessage::Exit) => {
@@ -3722,13 +3713,12 @@ pub async fn interactive_tui(
                             .map(|guard| guard.clone())
                             .unwrap_or_default()
                     });
-                    let chat_ref = chat_container.clone();
                     crate::themes::restart_theme_watcher(
                         &state.theme_watcher,
                         state.active_theme_spec().as_deref(),
                         &registry,
                         &state.theme_manager,
-                        theme_watch_notify(chat_ref, tui.clone()),
+                        theme_watch_notify(&state, tui.clone()),
                     );
                 }
                 if outcome.had_errors {

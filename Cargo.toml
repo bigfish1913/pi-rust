@@ -31,7 +31,7 @@ rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/bigfish1913/pi-rust"
 homepage = "https://rpi.laofu.online/"
-version = "0.16.0"
+version = "0.21.0"
 authors = ["BigFish <fuwei201473@gmail.com>"]
 
 [workspace.dependencies]
@@ -44,7 +44,7 @@ fs2 = "0.4"
 
 # Serialization / schemas
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "float_roundtrip"] }
 yaml_serde = "=0.10.2"
 indexmap = { version = "2", features = ["serde"] }
 schemars = { version = "0.8", features = ["preserve_order"] }
@@ -73,19 +73,19 @@ dirs = "5"
 rpassword = "7"
 
 # rpi internal crates (package names and directories both use the `rpi-` prefix).
-rpi-telemetry = { path = "crates/rpi-telemetry", version = "0.16.0" }
-rpi-ai = { path = "crates/rpi-ai", version = "0.16.0" }
-rpi-agent = { path = "crates/rpi-agent", version = "0.16.0" }
-rpi-tools = { path = "crates/rpi-tools", version = "0.16.0" }
-rpi-durable = { path = "crates/rpi-durable", version = "0.16.0" }
-rpi-harness = { path = "crates/rpi-harness", version = "0.16.0" }
+rpi-telemetry = { path = "crates/rpi-telemetry", version = "0.21.0" }
+rpi-ai = { path = "crates/rpi-ai", version = "0.21.0" }
+rpi-agent = { path = "crates/rpi-agent", version = "0.21.0" }
+rpi-tools = { path = "crates/rpi-tools", version = "0.21.0" }
+rpi-durable = { path = "crates/rpi-durable", version = "0.21.0" }
+rpi-harness = { path = "crates/rpi-harness", version = "0.21.0" }
 
-rpi-runtime = { path = "crates/rpi-runtime", version = "0.16.0" }
+rpi-runtime = { path = "crates/rpi-runtime", version = "0.21.0" }
 
-rpi-tui = { path = "crates/rpi-tui", version = "0.16.0" }
+rpi-tui = { path = "crates/rpi-tui", version = "0.21.0" }
 
-rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.16.0" }
-rpi-extensions = { path = "crates/rpi-extensions", version = "0.16.0" }
+rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.21.0" }
+rpi-extensions = { path = "crates/rpi-extensions", version = "0.21.0" }
 
 [profile.release]
 lto = "thin"

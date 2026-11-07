@@ -10,6 +10,10 @@ pub enum AgentError {
     #[error("tool error: {0}")]
     Tool(String),
 
+    /// A failed tool that still owns native content and accounting metadata.
+    #[error("structured tool error")]
+    StructuredTool(Box<crate::types::AgentToolResult>),
+
     #[error("validation error: {0}")]
     Validation(String),
 

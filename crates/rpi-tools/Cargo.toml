@@ -56,6 +56,8 @@ globset = { workspace = true }
 # (ravif -> rav1e -> aligned) needs Rust 1.85+ and stays in Cargo.lock even when
 # unused. Decoders are unchanged.
 image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+# SIMD Lanczos3 (runtime CPU detection): about 10x faster than `image`'s resize.
+fast_image_resize = { version = "5", default-features = false, features = ["image"] }
 
 [package.metadata.docs.rs]
 all-features = true

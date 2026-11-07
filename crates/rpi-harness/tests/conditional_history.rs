@@ -90,6 +90,30 @@ async fn conditional_history_revision_is_atomic_and_ignores_progress_on_all_back
     let stores: Vec<Arc<dyn SessionStorage>> =
         vec![Arc::new(memory), Arc::new(sqlite), Arc::new(jsonl)];
     for storage in stores {
+        let initial = storage.lane_branch("main").await.unwrap();
+        storage
+            .append_entry(state("branch-root"), "main")
+            .await
+            .unwrap();
+        let appended = storage.lane_branch("main").await.unwrap();
+        assert_eq!(initial.generation, appended.generation);
+        assert_eq!(appended.leaf_id.as_deref(), Some("branch-root"));
+        storage.move_lane("main", None).await.unwrap();
+        let away = storage.lane_branch("main").await.unwrap();
+        storage
+            .move_lane("main", Some("branch-root"))
+            .await
+            .unwrap();
+        let returned = storage.lane_branch("main").await.unwrap();
+        assert_eq!(returned.leaf_id, appended.leaf_id);
+        assert!(away.generation > appended.generation);
+        assert!(returned.generation > away.generation);
+        storage
+            .create_lane("branch-side", Some("branch-root"))
+            .await
+            .unwrap();
+        assert!(storage.lane_branch("branch-side").await.unwrap().generation > returned.generation);
+        assert!(storage.lane_branch("missing").await.is_err());
         let original = storage.history_revision().await.unwrap();
         storage
             .append_progress(vec![AssistantFrameRecord {
@@ -131,6 +155,26 @@ async fn conditional_history_revision_is_atomic_and_ignores_progress_on_all_back
             1
         );
     }
+    let jsonl = JsonlSessionStorage::load(
+        Arc::new(rpi_tools::OsExecutionEnv::with_cwd(temp.path().into())),
+        &path,
+        Arc::new(SystemClock),
+        Arc::new(DefaultIdGenerator::new()),
+    )
+    .await
+    .unwrap();
+    let reopened = jsonl.lane_branch("main").await.unwrap();
+    assert_eq!(reopened.generation, 3); // root append, move-away, move-back
+    assert_eq!(reopened.leaf_id.as_deref(), Some("accepted"));
+    let reopened_sqlite = repo
+        .open(&SessionMetadata {
+            id: "sqlite".into(),
+            created_at: 0,
+            parent_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(reopened_sqlite.lane_branch("main").await.unwrap(), reopened);
 }
 
 struct RendezvousClock {

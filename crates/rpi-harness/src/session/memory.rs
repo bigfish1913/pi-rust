@@ -334,6 +334,13 @@ impl SessionStorage for InMemorySessionStorage {
         Ok(self.inner.read_state(|state| state.get_lanes()))
     }
 
+    async fn lane_branch(
+        &self,
+        lane: &str,
+    ) -> SessionResult<crate::session::types::SessionLaneBranch> {
+        self.inner.read_state(|state| state.lane_branch(lane))
+    }
+
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
         self.inner.with_state(|state| {
             state.validate_new_lane(lane)?;

@@ -73,7 +73,7 @@ class MetricsTests(Base):
         self.assertEqual(change["memory_delta_bytes"], -5)
 
     def test_missing_decreasing_invalid_metrics(self):
-        for key in ("user_seconds", "kernel_seconds", "wall_seconds", "peak_rss_bytes"):
+        for key in ("user_seconds", "kernel_seconds", "wall_seconds"):
             with self.subTest(key=key), self.assertRaises(smoke.Problem):
                 value = metric()
                 value[key] -= 1
@@ -83,11 +83,70 @@ class MetricsTests(Base):
             del value[key]
             with self.subTest(missing=key), self.assertRaises(smoke.Problem):
                 smoke.validate_sample(value)
-        for bad in (float("nan"), float("inf"), -1):
-            with self.assertRaises(smoke.Problem):
-                smoke.validate_sample(metric(memory=bad))
+        for key in ("primary_bytes", "rss_bytes", "peak_rss_bytes", "user_seconds",
+                    "kernel_seconds", "wall_seconds"):
+            for bad in (float("nan"), float("inf"), -1):
+                value = metric()
+                value[key] = bad
+                with self.subTest(key=key, bad=bad), self.assertRaises(smoke.Problem):
+                    smoke.validate_sample(value)
         with self.assertRaises(smoke.Problem):
             smoke.delta(metric(), metric())
+
+    def test_linux_decreasing_approximate_rss_keeps_sampled_primary_peak(self):
+        before = metric(memory=20 * smoke.MIB) | {"peak_rss_bytes": 30 * smoke.MIB}
+        after = metric(wall=2, memory=10 * smoke.MIB) | {"peak_rss_bytes": 15 * smoke.MIB}
+        reader = Mock(side_effect=[before, after])
+        thread = Mock()
+        thread.is_alive.return_value = False
+        with patch.object(smoke.threading, "Thread", return_value=thread):
+            sampler = smoke.Sampler(123, .01, reader)
+            try:
+                self.assertEqual(sampler.take(), after)  # Raw values are not clamped.
+                self.assertEqual(sampler.latest["peak_rss_bytes"], 15 * smoke.MIB)
+                self.assertEqual(sampler.peak, 20 * smoke.MIB)
+                self.assertEqual(sampler.count, 2)
+                self.assertIsNone(sampler.error)
+                args, report = self.report("--max-memory-mib", "15")
+                with self.assertRaises(smoke.Problem) as caught:
+                    report.measure("rpc-round", 1, before, after, sampler, before)
+                self.assertEqual(caught.exception.category, "memory_ceiling")
+                self.assertEqual(smoke.delta(before, after)["memory_delta_bytes"], -10 * smoke.MIB)
+            finally:
+                sampler.close()
+        thread.start.assert_called_once()
+        thread.join.assert_called_once_with(timeout=5)
+        self.assertTrue(sampler.stop_event.is_set())
+        self.assertEqual(reader.call_count, 2)
+
+    def test_windows_peak_metrics_remain_monotonic(self):
+        before = metric() | dict(primary_metric="windows_private_commit", private_bytes=10,
+                                peak_commit_bytes=200)
+        for key in ("peak_rss_bytes", "peak_commit_bytes"):
+            after = before | {"wall_seconds": 2, key: before[key] - 1}
+            with self.subTest(key=key), self.assertRaisesRegex(smoke.Problem, "retrograde metric: " + key):
+                smoke.validate_sample(after, before)
+
+    def test_primary_metric_label_and_value_cannot_change(self):
+        for value in (metric() | {"primary_metric": "unknown"},
+                      metric() | {"primary_bytes": 11}):
+            with self.subTest(value=value), self.assertRaises(smoke.Problem):
+                smoke.validate_sample(value)
+        windows = metric() | dict(primary_metric="windows_private_commit", private_bytes=10)
+        for before, after in ((metric(), windows), (windows, metric())):
+            with self.subTest(metric=after["primary_metric"]), self.assertRaisesRegex(
+                    smoke.Problem, "primary metric changed"):
+                smoke.validate_sample(after, before)
+
+    def test_linux_memory_units_remain_strict(self):
+        fields = " ".join(["S"] + ["0"] * 12)
+        for field in ("VmRSS", "VmHWM"):
+            for invalid in ("1 MB", "1", "1 kB extra"):
+                status = {"VmRSS": "1 kB", "VmHWM": "2 kB", field: invalid}
+                with self.subTest(field=field, invalid=invalid), self.assertRaisesRegex(
+                        smoke.Problem, "invalid /proc memory unit"):
+                    smoke.linux_sample("\n".join(k + ": " + v for k, v in status.items()),
+                                       "1 (x) " + fields, 100)
 
     @unittest.skipUnless(sys.platform == "win32" or sys.platform.startswith("linux"), "supported OS only")
     def test_actual_process_metrics_and_primary(self):

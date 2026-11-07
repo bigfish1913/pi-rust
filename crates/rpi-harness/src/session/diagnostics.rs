@@ -1,5 +1,5 @@
 //! Opt-in numeric-only recovery timing. Does not read or copy session payloads.
-use std::time::Instant;
+use std::{io::Write, time::Instant};
 
 pub(crate) struct RecoveryPhase {
     phase: &'static str,
@@ -20,7 +20,9 @@ impl RecoveryPhase {
     /// absence of a phase is not evidence of a completed recovery.
     pub(crate) fn finish(self, input: usize, output: usize) {
         if let Some(started) = self.started {
-            eprintln!(
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
                 "RPI_SESSION_DIAGNOSTICS phase={} elapsed_ns={} input={} output={}",
                 self.phase,
                 started.elapsed().as_nanos().min(u64::MAX as u128),

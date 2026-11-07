@@ -1,7 +1,7 @@
 use super::*;
 use crate::session::jsonl::encode_mutation;
 use crate::session::state::SessionState;
-use crate::session::types::{QueueKind, RecordBase};
+use crate::session::types::{OperationIntent, OperationStartedRecord, QueueKind, RecordBase};
 use async_trait::async_trait;
 use rpi_tools::{env::ReadFile, FileError};
 use serde_json::json;
@@ -1322,4 +1322,265 @@ async fn detached_replay_skips_changed_retired_bodies_but_validates_live_frames(
         .offset as usize;
     reader.bytes.lock().unwrap()[live_offset] = b' ';
     assert!(lazy.into_detached().await.is_err());
+}
+
+#[tokio::test]
+async fn cold_clear_skips_resident_record_scan_without_hot_appends() {
+    for count in [8, 16, 32] {
+        let reader = entry_batch_reader();
+        let source: Arc<dyn ReadFile> = reader.clone();
+        let mut commits = ResidentState::default();
+        for index in 0..count {
+            let seq = commits.sequence() + 1;
+            let commit = frame(
+                seq,
+                "main",
+                &format!("commit-{index}"),
+                AssistantFrameOp::CommitStream,
+            );
+            commits
+                .apply_mutation(SessionMutation::Record {
+                    record: LaneRecord::AssistantFrame(commit),
+                })
+                .unwrap();
+            let seq = commits.sequence() + 1;
+            let clear = frame(
+                seq,
+                "main",
+                &format!("clear-{index}"),
+                AssistantFrameOp::ClearRun,
+            );
+            let line = encode_mutation(&SessionMutation::Record {
+                record: LaneRecord::AssistantFrame(clear),
+            });
+            let offset = reader.bytes.lock().unwrap().len() as u64;
+            reader
+                .bytes
+                .lock()
+                .unwrap()
+                .extend_from_slice(line.as_bytes());
+            commits
+                .apply_loaded_frame(
+                    super::super::cold_decode::parse_cold_frame(&line).unwrap(),
+                    &source,
+                    offset,
+                    line.as_bytes(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            commits.retire_record_checks(),
+            0,
+            "commit/clear count {count}"
+        );
+
+        let mut operations = ResidentState::default();
+        for index in 0..count {
+            let seq = operations.sequence() + 1;
+            operations
+                .apply_mutation(SessionMutation::Record {
+                    record: LaneRecord::OperationStarted(OperationStartedRecord {
+                        base: RecordBase {
+                            id: format!("operation-{index}"),
+                            seq,
+                            timestamp: 1,
+                            lane: "main".into(),
+                        },
+                        source_leaf_id: None,
+                        intent: OperationIntent::Navigation {
+                            target_id: None,
+                            summarize: false,
+                            custom_instructions: None,
+                            label: None,
+                            summary_entry_id: None,
+                        },
+                    }),
+                })
+                .unwrap();
+            let seq = operations.sequence() + 1;
+            let clear = frame(
+                seq,
+                "main",
+                &format!("operation-clear-{index}"),
+                AssistantFrameOp::ClearRun,
+            );
+            let line = encode_mutation(&SessionMutation::Record {
+                record: LaneRecord::AssistantFrame(clear),
+            });
+            let offset = reader.bytes.lock().unwrap().len() as u64;
+            reader
+                .bytes
+                .lock()
+                .unwrap()
+                .extend_from_slice(line.as_bytes());
+            operations
+                .apply_loaded_frame(
+                    super::super::cold_decode::parse_cold_frame(&line).unwrap(),
+                    &source,
+                    offset,
+                    line.as_bytes(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            operations.retire_record_checks(),
+            0,
+            "operation/clear count {count}"
+        );
+    }
+}
+
+#[test]
+fn fast_clear_still_retires_a_resident_append() {
+    let reader = entry_batch_reader();
+    let source: Arc<dyn ReadFile> = reader.clone();
+    let mut state = ResidentState::default();
+    let mut append = frame(1, "main", "resident", AssistantFrameOp::Append);
+    append.stream_index = 0;
+    state
+        .apply_mutation(SessionMutation::Record {
+            record: LaneRecord::AssistantFrame(append),
+        })
+        .unwrap();
+    let mut clear = frame(2, "main", "resident", AssistantFrameOp::ClearStream);
+    clear.stream_index = 0;
+    let line = encode_mutation(&SessionMutation::Record {
+        record: LaneRecord::AssistantFrame(clear),
+    });
+    state
+        .apply_loaded_frame(
+            super::super::cold_decode::parse_cold_frame(&line).unwrap(),
+            &source,
+            0,
+            line.as_bytes(),
+        )
+        .unwrap();
+    assert!(state.records().is_empty());
+    assert!(state.retire_record_checks() > 0);
+}
+
+#[tokio::test]
+async fn fast_cold_retirement_reindexes_new_appends_and_preserves_cross_lane_snapshots() {
+    let mut fast = ResidentState::default();
+    let mut full = ResidentState::default();
+    let mut eager = SessionState::new();
+    let reader = entry_batch_reader();
+    let source: Arc<dyn ReadFile> = reader.clone();
+    let lane = SessionMutation::Lane {
+        seq: 1,
+        lane: "side".into(),
+        leaf_id: None,
+    };
+    fast.apply_mutation(lane.clone()).unwrap();
+    full.apply_mutation(lane.clone()).unwrap();
+    eager.apply_mutation(lane).unwrap();
+    let mut snapshots = Vec::new();
+    // Clears deliberately originate on a different lane from some appends:
+    // historical matching is by run/stream, not by lane.
+    for (index, (lane, run, stream, op)) in [
+        ("main", "a", 0, AssistantFrameOp::Append),
+        ("side", "a", 0, AssistantFrameOp::Append),
+        ("main", "a", 1, AssistantFrameOp::Append),
+        ("side", "b", 0, AssistantFrameOp::Append),
+        ("main", "b", 1, AssistantFrameOp::Append),
+        ("side", "a", 0, AssistantFrameOp::ClearStream),
+        ("main", "a", 0, AssistantFrameOp::ClearStream),
+        ("side", "a", 0, AssistantFrameOp::Append),
+        ("main", "a", 1, AssistantFrameOp::ClearRun),
+        ("side", "a", 1, AssistantFrameOp::ClearRun),
+        ("side", "a", 0, AssistantFrameOp::Append),
+        ("main", "a", 1, AssistantFrameOp::Append),
+        ("main", "b", 0, AssistantFrameOp::ClearStream),
+        ("main", "a", 0, AssistantFrameOp::Append),
+        ("side", "a", 1, AssistantFrameOp::ClearStream),
+        ("main", "missing", 0, AssistantFrameOp::ClearRun),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seq = index as u64 + 2;
+        let mut record = frame(seq, lane, run, op);
+        record.stream_index = stream;
+        let mutation = SessionMutation::Record {
+            record: LaneRecord::AssistantFrame(record),
+        };
+        let line = encode_mutation(&mutation);
+        let offset = reader.bytes.lock().unwrap().len() as u64;
+        reader
+            .bytes
+            .lock()
+            .unwrap()
+            .extend_from_slice(line.as_bytes());
+        let metadata = super::super::cold_decode::parse_cold_frame(&line)
+            .expect("all fixture rows must exercise the metadata-only path");
+        fast.apply_loaded_frame(metadata, &source, offset, line.as_bytes())
+            .unwrap();
+        full.apply_loaded(mutation.clone(), &source, offset, line.as_bytes())
+            .unwrap();
+        eager.apply_mutation(mutation).unwrap();
+        assert_eq!(fast.sequence(), eager.sequence());
+        for lane in [None, Some("main".into()), Some("side".into())] {
+            let query = RecordQuery {
+                lane,
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            };
+            let expected = eager.find_records(&query).unwrap();
+            assert_eq!(
+                fast.record_plan(&query).unwrap().read().await.unwrap(),
+                expected
+            );
+            assert_eq!(
+                full.record_plan(&query).unwrap().read().await.unwrap(),
+                expected
+            );
+        }
+        if [6, 9, 15].contains(&seq) {
+            let query = RecordQuery::default();
+            snapshots.push((
+                fast.record_plan(&query).unwrap(),
+                eager.find_records(&query).unwrap(),
+            ));
+        }
+    }
+    assert_eq!(
+        fast.cold
+            .locations
+            .iter()
+            .filter(|location| location.append && !location.retired)
+            .map(|location| location.seq)
+            .collect::<Vec<_>>(),
+        [6, 12, 15],
+        "unrelated streams survive; appends after repeated clears are indexed again"
+    );
+    for (plan, expected) in snapshots {
+        assert_eq!(
+            plan.read().await.unwrap(),
+            expected,
+            "retirement must detach old Location Arcs"
+        );
+    }
+    assert_eq!(
+        fast.log_plan(&LogOptions::default())
+            .unwrap()
+            .read()
+            .await
+            .unwrap(),
+        eager.get_log(&LogOptions::default()).unwrap()
+    );
+    assert!(fast.validate_unused_id("frame-2").is_err());
+    let mut reused = frame(18, "main", "new-run", AssistantFrameOp::Append);
+    reused.base.id = "frame-2".into();
+    let mutation = SessionMutation::Record {
+        record: LaneRecord::AssistantFrame(reused),
+    };
+    let line = encode_mutation(&mutation);
+    let metadata = super::super::cold_decode::parse_cold_frame(&line).unwrap();
+    assert!(fast
+        .apply_loaded_frame(metadata, &source, 0, line.as_bytes())
+        .is_err());
+    assert!(full
+        .apply_loaded(mutation.clone(), &source, 0, line.as_bytes())
+        .is_err());
+    assert!(eager.apply_mutation(mutation).is_err());
 }

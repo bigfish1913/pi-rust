@@ -44,12 +44,83 @@ impl Scope {
         *self == Self::Project
     }
     pub fn root(self, cwd: &Path) -> Result<PathBuf> {
-        match self {
-            Self::Project => Ok(cwd.join(".rpi")),
-            Self::Global => crate::config::agent_dir().map_err(err),
-        }
+        let logical = match self {
+            Self::Project => cwd.join(".rpi"),
+            Self::Global => crate::config::agent_dir().map_err(err)?,
+        };
+        resolve_scope_root(&logical)
     }
 }
+
+/// Resolve only the external prefix of an owned scope root.
+///
+/// The root itself is deliberately appended after canonicalization so a link
+/// at `.rpi`/`agent` remains visible to `checked_path`. Missing parents are
+/// represented by a tail appended to the nearest existing parent; this is
+/// path resolution only and never creates directories or reads metadata files.
+fn resolve_scope_root(root: &Path) -> Result<PathBuf> {
+    if !root.is_absolute() {
+        return Err("resource root must be absolute".into());
+    }
+    if root.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err("resource path traversal".into());
+    }
+    let Some(name) = root.file_name() else {
+        // A filesystem root has no external prefix to resolve.
+        checked_path(root)?;
+        return Ok(root.to_path_buf());
+    };
+    #[cfg(windows)]
+    checked_scope_tail_component(name)?;
+    let mut parent = root.parent().ok_or("resource root has no parent")?;
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(parent) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    parent
+                        .file_name()
+                        .ok_or("resource root has no existing parent")?
+                        .to_os_string(),
+                );
+                parent = parent
+                    .parent()
+                    .ok_or("resource root has no existing parent")?;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "checking resource root parent {}: {e}",
+                    parent.display()
+                ))
+            }
+        }
+    }
+    let mut resolved = fs::canonicalize(parent).map_err(err)?;
+    for component in missing.into_iter().rev() {
+        #[cfg(windows)]
+        checked_scope_tail_component(&component)?;
+        resolved.push(component);
+    }
+    resolved.push(name);
+    checked_path(&resolved)?;
+    Ok(resolved)
+}
+
+#[cfg(windows)]
+fn checked_scope_tail_component(component: &std::ffi::OsStr) -> Result<()> {
+    let name = component
+        .to_str()
+        .ok_or("non-UTF-8 resource scope component")?;
+    // canonicalize returns an extended-length path. Appending a DOS name
+    // with trailing dots/spaces, a device name, or an ADS suffix could then
+    // address a different directory than loaders using the original path.
+    if name.ends_with(['.', ' ']) || name.contains(':') {
+        return Err("ambiguous Windows resource scope component".into());
+    }
+    reserved_identity(name)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Kind {
@@ -289,6 +360,17 @@ pub(crate) fn mutation_lease(root: &Path) -> Result<Lease> {
     ensure_complete(root)?;
     Ok(lease)
 }
+
+/// Hold a shared resource lease while updating native package metadata. Native
+/// package installation is append/version based and therefore safe alongside
+/// live hosts, but it must still exclude resource mutations that could race
+/// with the registry/receipt ownership checks.
+pub(crate) fn shared_lease(root: &Path) -> Result<Lease> {
+    let lease = Lease::acquire(root, false, true)?.ok_or("missing resource lease")?;
+    ensure_complete(root)?;
+    Ok(lease)
+}
+
 fn ensure_complete(root: &Path) -> Result<()> {
     if read_bytes(&root.join(JOURNAL), MAX_META)?.is_some() {
         return Err(
@@ -303,8 +385,7 @@ pub(crate) fn host_leases(cwd: &Path) -> Result<Arc<Vec<Lease>>> {
     roots.dedup();
     let mut leases = Vec::new();
     for root in roots {
-        leases.push(Lease::acquire(&root, false, true)?.ok_or("missing resource lease")?);
-        ensure_complete(&root)?;
+        leases.push(shared_lease(&root)?);
     }
     Ok(Arc::new(leases))
 }

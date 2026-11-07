@@ -258,12 +258,14 @@ pub(super) fn add_help_message(container: &Arc<Container>) {
         ("/images", "Toggle inline image rendering"),
         ("/session", "List saved sessions"),
         ("/theme", "Choose a theme (selector)"),
+        ("/context", "Browse loaded resources (Esc to close)"),
         ("/compact", "Compact the conversation"),
         ("/copy", "Copy last reply to clipboard"),
         ("/hotkeys", "Show keyboard shortcuts"),
+        ("/skill:<name>", "Invoke a skill with optional instructions"),
         (
             "/skills",
-            "List skills or invoke one: /skills <name> [instructions]",
+            "List skills (legacy invocation: /skills <name> [instructions])",
         ),
     ];
     let cmd_w = cmds.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -552,10 +554,17 @@ pub(super) fn add_note_message(container: &Arc<Container>, text: &str) {
 /// so without the repaint a background reload (or its parse error) stays
 /// invisible until the next interaction repaints the screen.
 pub(super) fn theme_watch_notify(
-    chat: Arc<Container>,
+    state: &Arc<TuiState>,
     tui: Arc<TuiAltScreen>,
 ) -> impl Fn(Result<String, String>) + Send + Sync + 'static {
+    // The watcher lives in TuiState; a weak reference avoids a cycle and lets
+    // each callback resolve the visible page after history/session navigation.
+    let state = Arc::downgrade(state);
     move |result| {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let chat = state.notice_container();
         match result {
             Ok(message) => add_note_message(&chat, &message),
             Err(message) => add_error_message(&chat, &message),
@@ -605,23 +614,17 @@ pub(super) fn show_skills_panel(
                 skill.description.chars().take(72).collect::<String>()
             ));
         }
-        lines.push("  Invoke with: /skills <name> [instructions]".into());
+        lines.push("  Invoke with: /skill:<name> [instructions]".into());
+        lines.push("  Compatibility: /skills <name> [instructions]".into());
     }
     container_note_block(chat, &lines.join("\n"));
 }
 
-/// Render the `/context` panel: a transcript message listing the discovered
-/// context files, skills, and prompt templates loaded for this session
-/// (Part A resource discovery). Reads the shared resources snapshot, initialized
-/// at startup and refreshed on reload, without awaiting the harness accessor.
-///
-/// Mirrors pi's context-panel intent (pi surfaces loaded resources on startup +
-/// via `/reload`); here it's a transcript note rather than an overlay since the
-/// resource set is refreshed after successful `/reload`s.
-pub(super) fn show_context_panel(
-    chat: &Arc<Container>,
+/// Build read-only `/context` rows from the resource snapshot, initialized at
+/// startup and refreshed on reload. The selector owns these rows, not the chat.
+pub(super) fn context_panel_lines(
     resources: &rpi_harness::types::AgentHarnessResources,
-) {
+) -> Vec<String> {
     let skills = resources.skills.as_deref().unwrap_or(&[]);
     let templates = resources.prompt_templates.as_deref().unwrap_or(&[]);
     let mut lines: Vec<String> = Vec::new();
@@ -676,8 +679,7 @@ pub(super) fn show_context_panel(
         "  Use --no-skills/-ns, --no-prompt-templates/-np, --no-context-files/-nc to suppress."
             .into(),
     );
-    let body = lines.join("\n");
-    container_note_block(chat, &body);
+    lines
 }
 
 /// Append a multi-line neutral note (header line + body) to the chat container.

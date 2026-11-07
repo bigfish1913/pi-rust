@@ -3,7 +3,9 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -47,6 +49,93 @@ class VerifierTests(unittest.TestCase):
         for url in ('file:///tmp/site', 'https://example.test/?lang=en', 'https://example.test/#top'):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 website.verify(url)
+
+
+class CommunityTests(unittest.TestCase):
+    def test_donation_images_use_shared_assets(self):
+        html = (ROOT / 'website/support.html').read_text(encoding='utf-8')
+        for name in ('wechat.png', 'alipay.jpg', 'binance.png'):
+            url = f'https://assets.bigfisharc.cn/images/support/{name}'
+            self.assertIn(f'src="{url}"', html)
+            self.assertEqual(html.count(f'href="{url}"'), 2)
+        self.assertNotIn('./images/support/', html)
+
+    def test_homepage_join_links_and_community_target(self):
+        home = (ROOT / 'website/index.html').read_text(encoding='utf-8')
+        support = (ROOT / 'website/support.html').read_text(encoding='utf-8')
+        self.assertIn('href="./support.html#community"', home)
+        self.assertIn('id="community" aria-labelledby="community-title"', support)
+        for html in (home, support):
+            self.assertIn('href="https://t.me/+7YfN4TZPP7Y0M2Q1"', html)
+        self.assertEqual(support.count('data-wechat-group'), 3)
+
+    def test_telegram_qr_uses_shared_asset_and_links_to_group(self):
+        html = (ROOT / 'website/support.html').read_text(encoding='utf-8')
+        self.assertRegex(html, r'<a class="community-qr" href="https://t\.me/\+7YfN4TZPP7Y0M2Q1"[^>]*><img src="https://assets\.bigfisharc\.cn/images/support/tg\.png"[^>]*alt="[^"]+"')
+
+    def test_community_labels_are_translated_in_both_languages(self):
+        locales = json.loads((ROOT / 'website/data/locales.json').read_text(encoding='utf-8'))
+        for name in ('index.html', 'support.html'):
+            html = (ROOT / 'website' / name).read_text(encoding='utf-8')
+            keys = re.findall(r'data-i18n="([^"]+)"', html)
+            keys += re.findall(r'\|((?:community|support)\.[^";]+)', html)
+            for key in keys:
+                for language in ('zh', 'en'):
+                    with self.subTest(page=name, key=key, language=language):
+                        self.assertTrue(locales[language]['ui'][key])
+
+    @unittest.skipUnless(shutil.which('node'), 'set up Node.js to test browser date refresh')
+    def test_wechat_cache_key_and_refresh_events(self):
+        # Exercise the real page script without network, a browser or npm dependencies.
+        script = r'''
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync('website/support.js', 'utf8').replace(/^import .*;\r?\n/, '');
+const elements = ['A', 'IMG', 'A'].map(tagName => ({
+  tagName, attributes: {}, writes: 0,
+  getAttribute(key) { return this.attributes[key]; },
+  setAttribute(key, value) { this.attributes[key] = value; this.writes++; }
+}));
+const pageEvents = {}, documentEvents = {}, intervals = [];
+const menu = { addEventListener() {}, querySelectorAll() { return []; } };
+const document = {
+  hidden: false,
+  querySelectorAll(selector) { assert.equal(selector, '[data-wechat-group]'); return elements; },
+  querySelector() { return menu; },
+  addEventListener(event, callback) { documentEvents[event] = callback; }
+};
+const context = {
+  document, initI18n: async () => {},
+  window: { addEventListener(event, callback) { pageEvents[event] = callback; } },
+  setInterval(callback, delay) { intervals.push({ callback, delay }); }
+};
+(async () => {
+  await vm.runInNewContext('(async () => {' + source + '\n globalThis.refresh = refreshCommunityImages; })()', context);
+  const url = day => `https://assets.bigfisharc.cn/images/support/weixin.png?date=${day}`;
+  const verify = day => elements.forEach(element => {
+    assert.equal(element.attributes[element.tagName === 'IMG' ? 'src' : 'href'], url(day));
+  });
+  context.refresh(new Date('2026-10-31T15:59:59Z'));
+  verify('2026-10-31');
+  context.refresh(new Date('2026-10-31T16:00:00Z'));
+  verify('2026-11-01');
+  const writes = elements.map(element => element.writes);
+  context.refresh(new Date('2026-11-01T03:00:00Z'));
+  assert.deepEqual(elements.map(element => element.writes), writes);
+  context.refresh(new Date('2028-02-28T16:00:00Z'));
+  verify('2028-02-29');
+  assert.equal(intervals[0].delay, 60000);
+  assert.equal(intervals[0].callback, context.refresh);
+  pageEvents.pageshow();
+  documentEvents.visibilitychange();
+  document.hidden = true;
+  const hiddenWrites = elements.map(element => element.writes);
+  documentEvents.visibilitychange();
+  assert.deepEqual(elements.map(element => element.writes), hiddenWrites);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        subprocess.run([shutil.which('node'), '-e', script], cwd=ROOT, check=True, timeout=30)
 
 
 @unittest.skipUnless(os.environ.get('CADDY_BIN'), 'set CADDY_BIN to run HTTP integration tests')
