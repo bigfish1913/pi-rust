@@ -534,3 +534,75 @@ async fn review274_gc_must_keep_retired_frame_ids_reserved() {
         "compaction must preserve the storage's ID uniqueness contract; got {reused:?}"
     );
 }
+
+/// Review #274 P1, generation half: an append handle that was opened before
+/// the atomic rewrite must not keep writing into the retired inode. The OS
+/// append capability detects the path's new identity and reopens; the CLI also
+/// holds the session lock, so a live storage in another process is rejected
+/// before this path can occur. This probe pins the in-process contract for a
+/// lock-less caller: the acknowledged append lands in the published file.
+#[cfg(unix)]
+#[tokio::test]
+async fn review274_gc_publishes_a_generation_existing_append_handles_follow() {
+    use rpi_harness::session::types::{ProvisionedEntry, ProvisionedKind};
+
+    let temp = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{}{}{}",
+        frame_line(1, "done", AssistantFrameOp::Append),
+        frame_line(2, "done", AssistantFrameOp::ClearRun),
+        entry_line(3, "e3", "existing")
+    );
+    let (fs, path) = write_session(temp.path(), "generation.jsonl", &body).await;
+    let storage = load(fs.clone(), &path).await;
+    // Force the reusable append handle to exist before the rewrite. This is
+    // the handle that would otherwise be bound to the old generation.
+    storage
+        .append_entry(
+            ProvisionedEntry {
+                id: "before-gc".into(),
+                kind: ProvisionedKind::Message {
+                    message: AgentMessage::User(UserMessage::new(
+                        UserContent::Text("before gc".into()),
+                        4,
+                    )),
+                    terminate: None,
+                },
+            },
+            "main",
+        )
+        .await
+        .unwrap();
+
+    compact_retired_frames(fs.clone(), &path, false)
+        .await
+        .unwrap();
+    storage
+        .append_entry(
+            ProvisionedEntry {
+                id: "after-gc".into(),
+                kind: ProvisionedKind::Message {
+                    message: AgentMessage::User(UserMessage::new(
+                        UserContent::Text("after gc".into()),
+                        5,
+                    )),
+                    terminate: None,
+                },
+            },
+            "main",
+        )
+        .await
+        .unwrap();
+    drop(storage);
+
+    let published = fs.read_text_file(&path, None).await.unwrap();
+    assert!(
+        published.contains("after gc"),
+        "an append handle opened before GC must follow the published generation: {published}"
+    );
+    let reloaded = load(fs, &path).await;
+    assert!(
+        reloaded.get_entry("after-gc").await.unwrap().is_some(),
+        "the acknowledged append must be recoverable from the published file"
+    );
+}
