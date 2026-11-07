@@ -560,7 +560,7 @@ jobs:
     needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
     permissions:
       contents: write
-      pull-requests: read
+      pull-requests: write
     uses: ./.github/workflows/release.yml
     with:
       # Daily runs prepare a Release PR and request Auto-merge for it; ordinary PRs remain manual.
