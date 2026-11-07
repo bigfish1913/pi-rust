@@ -574,9 +574,9 @@ jobs:
           test "${{ needs.check.result }}" = success
           test "${{ needs.test.result }}" = success
           test "${{ needs.resources.result }}" = success
-          test "${{ needs.platform-startup.result }}" = success
-          test "${{ needs.windows-installer.result }}" = success
-          test "${{ needs.extension-compatibility.result }}" = success
+          test "${{ needs['platform-startup'].result }}" = success
+          test "${{ needs['windows-installer'].result }}" = success
+          test "${{ needs['extension-compatibility'].result }}" = success
 
   release:
     name: Release automation
