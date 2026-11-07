@@ -8,6 +8,11 @@ on:
         required: false
         type: boolean
         default: false
+      auto_merge:
+        description: 'Request GitHub Auto-merge for the prepared Release PR'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     outputs:
       release: ${{ steps.detect.outputs.release }}
       version: ${{ steps.detect.outputs.version }}
@@ -41,6 +46,9 @@ jobs:
     needs: detect
     if: needs.detect.outputs.release == 'false' && inputs.prepare == true
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     timeout-minutes: 30
     concurrency:
       group: release-pr-main
@@ -79,6 +87,25 @@ jobs:
           RELEASE_PR_JSON: ${{ steps.release-pr.outputs.pr }}
           EXISTING_RELEASE_PR_JSON: ${{ steps.draft-release-pr.outputs.pr }}
         run: bash scripts/sync-release-pr.sh
+      - name: Request Auto-merge for the Release PR
+        if: inputs.auto_merge == true
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main \
+            --json number,headRefName,headRepositoryOwner,isDraft \
+            --jq '[.[] | select(.headRefName | startswith("release-plz-")) | select(.headRepositoryOwner.login == "bigfish1913")]')"
+          count="$(jq 'length' <<<"$prs")"
+          if [[ "$count" == 0 ]]; then
+            echo 'No Release PR was created; release-plz found no publishable package changes.'
+            exit 0
+          fi
+          [[ "$count" == 1 ]] || { echo '::error::Multiple upstream Release PRs are open.'; exit 1; }
+          number="$(jq -r '.[0].number' <<<"$prs")"
+          is_draft="$(jq -r '.[0].isDraft' <<<"$prs")"
+          [[ "$is_draft" == false ]] || { echo '::error::Release PR is still draft.'; exit 1; }
+          gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch
 
   publish:
     name: Publish crates and tag the tested Release PR

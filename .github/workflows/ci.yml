@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main, preview]
     types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    # 00:00 Asia/Shanghai (16:00 UTC on the previous day).
+    - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
       prepare_release:
@@ -551,16 +554,42 @@ jobs:
           if-no-files-found: ignore
           include-hidden-files: true
 
+  release-validation:
+    name: Release PR validation
+    if: always()
+    needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every validation job to pass for Release PRs
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.repository == 'bigfish1913/pi-rust' &&
+          github.event.pull_request.base.ref == 'main' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+          github.event.pull_request.draft == false
+        run: |
+          set -euo pipefail
+          test "${{ needs.msrv.result }}" = success
+          test "${{ needs.check.result }}" = success
+          test "${{ needs.test.result }}" = success
+          test "${{ needs.resources.result }}" = success
+          test "${{ needs.platform-startup.result }}" = success
+          test "${{ needs.windows-installer.result }}" = success
+          test "${{ needs.extension-compatibility.result }}" = success
+
   release:
     name: Release automation
-    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
     permissions:
       contents: write
       pull-requests: read
     uses: ./.github/workflows/release.yml
     with:
-      prepare: ${{ github.event_name == 'workflow_dispatch' && inputs.prepare_release == true }}
+      # Daily runs prepare a Release PR and request Auto-merge for it; ordinary PRs remain manual.
+      prepare: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.prepare_release == true) }}
+      auto_merge: ${{ github.event_name == 'schedule' }}
     secrets: inherit
 
   preview-version:

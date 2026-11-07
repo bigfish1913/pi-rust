@@ -32,8 +32,10 @@ class ReadinessWorkflowTests(unittest.TestCase):
         self.release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
 
     def test_ready_event_runs_ci_even_without_a_new_commit(self):
-        events = self.ci.split("  pull_request:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
+        events = self.ci.split("  pull_request:\n", 1)[1].split("  schedule:", 1)[0]
         self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", events)
+        self.assertIn("cron: '0 16 * * *'", self.ci)
+        self.assertIn("github.event_name == 'schedule'", self.ci)
         config = (ROOT / "release-plz.toml").read_text(encoding="utf-8")
         self.assertIn("pr_draft = true", config)
 
@@ -87,6 +89,12 @@ class ReadinessWorkflowTests(unittest.TestCase):
         self.assertLess(draft, update)
         self.assertLess(update, sync)
         self.assertIn("EXISTING_RELEASE_PR_JSON: ${{ steps.draft-release-pr.outputs.pr }}", self.release)
+        self.assertIn("github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch'", self.ci)
+        self.assertIn("auto_merge:", self.release)
+        self.assertIn("if: inputs.auto_merge == true", self.release)
+        self.assertIn("--auto --squash --delete-branch", self.release)
+        self.assertIn("name: Release PR validation", self.ci)
+        self.assertIn("needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]", self.ci)
         self.assertIn("python3 scripts/test_release_pr_readiness.py", self.ci)
         # Do not weaken the actual consistency check or workspace tests.
         self.assertIn("git diff --exit-code -- crates/rpi-cli/embedded-docs", self.ci)
