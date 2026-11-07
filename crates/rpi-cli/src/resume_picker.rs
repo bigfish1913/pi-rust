@@ -1,5 +1,6 @@
 //! Startup session picker used by `-r` / `--resume`.
 
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,7 +24,11 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
     // first, All is an explicit Tab away (fork issue #13).
     let scope = crate::session::SessionScope::Project;
     let items = build_items(&cwd_text, dir, scope).await?;
-    if items.is_empty() {
+    // Keep the picker open with zero rows: it advertises Tab for All, and a
+    // fresh project must be able to reach sessions from other projects.
+    // A non-TTY caller cannot drive the picker; keep the existing error-path
+    // behaviour for tests and headless invocations.
+    if items.is_empty() && !std::io::stdin().is_terminal() {
         return Err(format!(
             "no resumable sessions with messages for this project in {} (Tab in the picker lists all projects)",
             dir.display()
@@ -71,7 +76,23 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
     let input_cwd_text = cwd_text.clone();
     let input_dir = dir.to_path_buf();
     let task = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
-        let mut query = String::new();
+        let mut state = ResumePickerState {
+            cancelled: false,
+            query: String::new(),
+            scope: input_scope,
+            list: input_list,
+            search: input_search,
+            cwd_text: input_cwd_text,
+            dir: input_dir,
+        };
+        // The key loop lives on a blocking task with no runtime of its own;
+        // `build_items` uses `spawn_blocking`, so drive it on a dedicated
+        // current-thread runtime instead of blocking a worker of the caller's
+        // multi-thread runtime.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("session picker runtime: {e}"))?;
         loop {
             match crossterm::event::poll(Duration::from_millis(100)) {
                 Ok(true) => {}
@@ -86,76 +107,16 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
             let event = crossterm::event::read()
                 .map_err(|e| format!("could not read terminal input: {e}"))?;
             match event {
-                Event::Resize(..) => {
-                    input_tui.note_resize();
-                }
-                Event::Mouse(mouse) => {
-                    let code = match mouse.kind {
-                        MouseEventKind::ScrollUp => Some(KeyCode::Up),
-                        MouseEventKind::ScrollDown => Some(KeyCode::Down),
-                        _ => None,
-                    };
-                    if let Some(code) = code {
-                        input_list.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
-                        input_tui.request_render(false);
+                Event::Resize(..) => input_tui.note_resize(),
+                other => {
+                    if let Some(selected) = runtime.block_on(state.handle_event(other))? {
+                        return Ok(Some(selected));
                     }
-                }
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
+                    if state.cancelled {
                         return Ok(None);
                     }
-                    match key.code {
-                        KeyCode::Enter => {
-                            return Ok(input_list.get_selected_item().map(|item| item.value));
-                        }
-                        KeyCode::Esc if query.is_empty() => return Ok(None),
-                        KeyCode::Esc => {
-                            query.clear();
-                            input_list.set_filter("");
-                        }
-                        KeyCode::Tab if key.modifiers == KeyModifiers::NONE => {
-                            let mut current = input_scope.lock().unwrap();
-                            let next = current.toggled();
-                            *current = next;
-                            drop(current);
-                            // Rebuild for the other scope. `build_items`
-                            // awaits `spawn_blocking`, so it needs an IO/timer
-                            // driven runtime; use a dedicated current-thread
-                            // runtime instead of blocking a worker of the
-                            // caller's multi-thread runtime.
-                            let items = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .map_err(|e| format!("session picker runtime: {e}"))?
-                                .block_on(build_items(&input_cwd_text, &input_dir, next));
-                            match items {
-                                Ok(items) => {
-                                    input_list.set_items(items);
-                                    input_list.set_filter(&query);
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            query.pop();
-                            input_list.set_filter(&query);
-                        }
-                        KeyCode::Char(ch)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            query.push(ch);
-                            input_list.set_filter(&query);
-                        }
-                        _ => input_list.handle_key(key),
-                    }
-                    input_search.set_text(format!("  Filter: {query}"));
                     input_tui.request_render(false);
                 }
-                _ => {}
             }
         }
     });
@@ -165,6 +126,86 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
         .map_err(|e| format!("session picker task failed: {e}"));
     tui.stop(Default::default());
     result?
+}
+
+/// Testable core of the startup picker's key loop (review #269). Keeping the
+/// scope switch here lets a regression drive a bare Tab with real session
+/// fixtures instead of depending on a terminal's global event queue.
+struct ResumePickerState {
+    query: String,
+    scope: Arc<std::sync::Mutex<crate::session::SessionScope>>,
+    list: Arc<SelectList>,
+    search: Arc<Text>,
+    cwd_text: String,
+    dir: std::path::PathBuf,
+    cancelled: bool,
+}
+
+impl ResumePickerState {
+    /// `Ok(Some(id))` confirms a session, `Ok(None)` keeps waiting; `cancelled`
+    /// distinguishes Esc/Ctrl+C from a still-open picker.
+    async fn handle_event(&mut self, event: Event) -> Result<Option<String>, String> {
+        match event {
+            Event::Resize(..) => {}
+            Event::Mouse(mouse) => {
+                let code = match mouse.kind {
+                    MouseEventKind::ScrollUp => Some(KeyCode::Up),
+                    MouseEventKind::ScrollDown => Some(KeyCode::Down),
+                    _ => None,
+                };
+                if let Some(code) = code {
+                    self.list
+                        .handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+                }
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    self.cancelled = true;
+                    return Ok(None);
+                }
+                match key.code {
+                    KeyCode::Enter => {
+                        return Ok(self.list.get_selected_item().map(|item| item.value));
+                    }
+                    KeyCode::Esc if self.query.is_empty() => {
+                        self.cancelled = true;
+                        return Ok(None);
+                    }
+                    KeyCode::Esc => {
+                        self.query.clear();
+                        self.list.set_filter("");
+                    }
+                    KeyCode::Tab if key.modifiers == KeyModifiers::NONE => {
+                        let next = {
+                            let mut current = self.scope.lock().unwrap();
+                            let next = current.toggled();
+                            *current = next;
+                            next
+                        };
+                        let items = build_items(&self.cwd_text, &self.dir, next).await?;
+                        self.list.set_items(items);
+                        self.list.set_filter(&self.query);
+                    }
+                    KeyCode::Backspace => {
+                        self.query.pop();
+                        self.list.set_filter(&self.query);
+                    }
+                    KeyCode::Char(ch)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        self.query.push(ch);
+                        self.list.set_filter(&self.query);
+                    }
+                    _ => self.list.handle_key(key),
+                }
+                self.search.set_text(format!("  Filter: {}", self.query));
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
 }
 
 /// Build picker rows for one scope. All rows carry their project cwd so the
@@ -247,6 +288,64 @@ fn format_modified_age(now_ms: i64, modified_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review #269: the startup `-r` picker must not early-return on an empty
+    /// Project view. Drive the real key handler with a bare Tab against real
+    /// session fixtures and assert the foreign session becomes selectable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review269_empty_project_can_browse_foreign_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("fresh-project");
+        let foreign_cwd = tmp.path().join("another-project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&foreign_cwd).unwrap();
+        let foreign = crate::session::create_jsonl_session(&root, &foreign_cwd.to_string_lossy())
+            .await
+            .unwrap();
+        foreign
+            .append_message(rpi_agent::message::AgentMessage::from(
+                rpi_ai::types::UserMessage::new("foreign project prompt", 42),
+            ))
+            .await
+            .unwrap();
+        let foreign_id = foreign.storage().metadata().id.clone();
+        drop(foreign);
+
+        let scope = crate::session::SessionScope::Project;
+        let items = build_items(&cwd.to_string_lossy(), &root, scope)
+            .await
+            .unwrap();
+        assert!(items.is_empty(), "the fresh project has no sessions");
+        let list = Arc::new(SelectList::new(items, 12));
+        let mut state = ResumePickerState {
+            cancelled: false,
+            query: String::new(),
+            scope: Arc::new(std::sync::Mutex::new(scope)),
+            list: list.clone(),
+            search: Arc::new(Text::new("  Filter: ", 0, 0)),
+            cwd_text: cwd.to_string_lossy().into_owned(),
+            dir: root.clone(),
+        };
+        let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(state.handle_event(tab).await.unwrap().is_none());
+        assert_eq!(
+            *state.scope.lock().unwrap(),
+            crate::session::SessionScope::All
+        );
+        let selected = list.get_selected_item().expect("All must have a row");
+        assert_eq!(selected.value, foreign_id);
+        assert!(
+            selected
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("another-project"),
+            "All rows must carry their project tag: {selected:?}"
+        );
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.handle_event(enter).await.unwrap(), Some(foreign_id));
+    }
 
     #[test]
     fn modified_age_is_compact_and_stable() {

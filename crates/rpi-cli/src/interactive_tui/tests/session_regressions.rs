@@ -1900,3 +1900,62 @@ async fn review_issue13_session_selector_tab_switches_scope_and_resets_on_reopen
     assert!(reopened.contains("own project prompt"), "{reopened}");
     assert!(!reopened.contains("foreign project prompt"), "{reopened}");
 }
+
+/// Review #269: a fresh project has zero sessions in Project scope, but the
+/// picker must stay installed so its advertised Tab action can reach the All
+/// view. The old implementation returned before installing the selector.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review269_empty_project_keeps_the_session_selector_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("sessions");
+    let cwd = tmp.path().join("fresh-project");
+    let foreign_cwd = tmp.path().join("another-project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&foreign_cwd).unwrap();
+    let foreign = crate::session::create_jsonl_session(&root, &foreign_cwd.to_string_lossy())
+        .await
+        .unwrap();
+    foreign
+        .append_message(user_message_with_images("foreign project prompt", vec![]))
+        .await
+        .unwrap();
+    drop(foreign);
+
+    let state = state_with_root_and_cwd(&root, &cwd);
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let editor_container = Arc::new(Container::new());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    open_session_selector(&state, &editor_container, &state.editor, &tui, &tx);
+    assert!(
+        state.selector_open(),
+        "the empty Project view must keep the picker installed"
+    );
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    assert!(
+        selector_owns_key(&state, &tab),
+        "a bare Tab must be claimed by the empty picker"
+    );
+    assert_eq!(
+        *state.session_scope.lock().unwrap(),
+        crate::session::SessionScope::All
+    );
+    let (view, _) = state
+        .active_selector
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let all_view = match view {
+        SelectorView::Searchable(searchable) => strip_ansi(&searchable.render(160).join("\n")),
+        _ => panic!("session selector must be searchable"),
+    };
+    assert!(
+        all_view.contains("foreign project prompt"),
+        "Tab must populate the All rows: {all_view}"
+    );
+}
