@@ -152,6 +152,7 @@ impl AgentTool for PowerShellTool {
         } else {
             PathBuf::from("powershell.exe")
         };
+        let staged_path_text = staged_path.to_string_lossy().into_owned();
         let capture = execute_shell_with_capture(
             &self.env,
             &command,
@@ -178,6 +179,19 @@ impl AgentTool for PowerShellTool {
         )
         .await
         .map_err(|e| AgentError::Tool(e.to_string()))?;
+        // The wrapper dot-sources this file synchronously; remove the staged
+        // script (and its isolated temp dir) after the child exits so repeated
+        // tool calls do not leave caller scripts behind in the OS temp dir.
+        let _ = self
+            .env
+            .remove(&staged_path_text, false, true, Some(&signal))
+            .await;
+        if let Some(dir) = staged_path.parent() {
+            let _ = self
+                .env
+                .remove(&dir.to_string_lossy(), false, true, Some(&signal))
+                .await;
+        }
         let mut output = capture.output;
         if capture.cancelled {
             return Err(AgentError::Tool("PowerShell command aborted".into()));
