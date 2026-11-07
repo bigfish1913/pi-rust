@@ -94,7 +94,7 @@ rpi dev                                        # build + watch a local extension
 
 `rpi install <name>` installs or upgrades an extension without `--force`. An already installed version is skipped; use `--force` to reinstall the same version or allow a downgrade. These rules also apply to explicit Cargo builds and local installs.
 
-`rpi extension update` updates all project-linked extensions and globally installed registry/prebuilt extensions; `rpi extension update <name>` selects one extension by name. Updates retain the original Cargo build backend or explicit GitHub source. Global development installs made with `--path` are excluded. The old `rpi package update [name]` remains compatible, but `rpi extension update [name]` is recommended for extension updates. Project linking commands remain `rpi package link`, `rpi package list`, and `rpi package unlink`.
+`rpi extension update` updates all project-linked extensions and globally installed registry/prebuilt extensions; `rpi extension update <name>` selects one extension by name. Add `--cdn <URL>` to download prebuilt archives through an HTTPS CDN; manifests remain on GitHub, CDN failures fall back to GitHub, and project-linked/Cargo-built extensions are unchanged. Updates retain the original Cargo build backend or explicit GitHub source. Global development installs made with `--path` are excluded. The old `rpi package update [name]` remains compatible, but `rpi extension update [name]` is recommended for extension updates. Project linking commands remain `rpi package link`, `rpi package list`, and `rpi package unlink`.
 
 ## Remote mode
 

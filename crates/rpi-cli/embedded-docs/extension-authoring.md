@@ -17,7 +17,9 @@
 | 适用场景 | 本地工具、系统集成、性能敏感或纯 Rust 项目 |
 
 推荐用 `rpi extension update [name]` 更新扩展：省略名称时更新全部项目链接扩展和
-全局 registry/prebuilt 扩展，指定名称时只更新匹配项。更新保留原来的 Cargo 构建
+全局 registry/prebuilt 扩展，指定名称时只更新匹配项。预编译扩展可追加
+`--cdn <URL>` 通过 HTTPS CDN 下载归档；清单仍从 GitHub 获取，CDN 失败会回退到
+GitHub。该选项不影响项目链接扩展或 Cargo 构建扩展。更新保留原来的 Cargo 构建
 后端或显式 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
 旧命令 `rpi package update [name]` 仍兼容；项目链接管理命令仍为
 `rpi package link`、`rpi package list`、`rpi package unlink`，不改名。
