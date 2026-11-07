@@ -377,14 +377,34 @@ fn update(args: &[String]) -> i32 {
 fn update_at(
     cwd: &Path,
     args: &[String],
-    mut update_global: impl FnMut(&crate::install::InstalledNativePackage, &[String]) -> bool,
+    mut update_global: impl FnMut(
+        &crate::install::InstalledNativePackage,
+        &[String],
+        Option<&str>,
+    ) -> bool,
 ) -> i32 {
     let mut name = None;
+    let mut cdn = None;
     let mut link_args = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--debug" | "--locked" => link_args.push(args[i].clone()),
+            "--cdn" => {
+                i += 1;
+                let value = match args.get(i).filter(|value| !value.starts_with('-')) {
+                    Some(value) => value,
+                    None => {
+                        eprintln!("error: --cdn requires a value");
+                        return 2;
+                    }
+                };
+                if let Err(error) = crate::cdn::resolve_base(Some(value)) {
+                    eprintln!("error: {error}");
+                    return 2;
+                }
+                cdn = Some(value.clone());
+            }
             "--help" | "-h" => {
                 print_update_help();
                 return 0;
@@ -492,7 +512,7 @@ fn update_at(
     }
     for package in global_packages {
         eprintln!("extension: updating global extension `{}`...", package.name);
-        if !update_global(&package, &link_args) {
+        if !update_global(&package, &link_args, cdn.as_deref()) {
             status = 1;
         }
     }
@@ -503,6 +523,7 @@ fn update_at(
 fn global_update_args(
     package: &crate::install::InstalledNativePackage,
     args: &[String],
+    cdn: Option<&str>,
 ) -> Vec<String> {
     let mut install_args = vec!["install".into(), package.name.clone()];
     if let Some(source) = &package.prebuilt {
@@ -515,12 +536,18 @@ fn global_update_args(
     if package.prebuilt.is_none() && args.iter().any(|arg| arg == "--locked") {
         install_args.push("--locked".into());
     }
+    if package.prebuilt.is_some() {
+        if let Some(cdn) = cdn {
+            install_args.extend(["--cdn".into(), cdn.into()]);
+        }
+    }
     install_args
 }
 
 fn update_global_package(
     package: &crate::install::InstalledNativePackage,
     args: &[String],
+    cdn: Option<&str>,
 ) -> bool {
     let name = &package.name;
     let executable = match std::env::current_exe() {
@@ -531,7 +558,7 @@ fn update_global_package(
         }
     };
     let mut command = std::process::Command::new(executable);
-    command.args(global_update_args(package, args));
+    command.args(global_update_args(package, args, cdn));
     match command.status() {
         Ok(exit) if exit.success() => true,
         Ok(exit) => {
@@ -868,17 +895,17 @@ pub fn active_project_package_artifacts(cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 fn print_extension_help() {
-    println!("Usage: rpi extension <command>\n\nCommands:\n  update [name] [--debug] [--locked]  Update project and global installed extensions\n\nSee `rpi extension update --help` for options.");
+    println!("Usage: rpi extension <command>\n\nCommands:\n  update [name] [--debug] [--locked] [--cdn <URL>]  Update project and global installed extensions\n\nSee `rpi extension update --help` for options.");
 }
 
 pub fn print_help() {
-    println!("Usage: rpi package <command>\n\nCommands:\n  link [name] [--path <dir>] [--package <name>] [--force]  Build and link a project-local Rust extension\n  list                                                   List project packages\n  update [name] [--debug] [--locked]                    Legacy compatibility alias for `rpi extension update`\n  unlink <name>                                          Remove a project package");
+    println!("Usage: rpi package <command>\n\nCommands:\n  link [name] [--path <dir>] [--package <name>] [--force]  Build and link a project-local Rust extension\n  list                                                   List project packages\n  update [name] [--debug] [--locked] [--cdn <URL>]      Legacy compatibility alias for `rpi extension update`\n  unlink <name>                                          Remove a project package");
 }
 fn print_link_help() {
     println!("Usage: rpi package link [name] [options]\n\nOptions:\n  --path <dir>       Extension source directory (default: current directory)\n  --package, -P <n>  Select a Cargo cdylib package\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --force, -f        Replace an existing package");
 }
 fn print_update_help() {
-    println!("Usage: rpi extension update [name] [options]\n\nOptions:\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --help, -h         Show this help\n\nWithout a name, all project and global installed extensions are updated.\nLegacy compatibility alias: rpi package update [name] [options]");
+    println!("Usage: rpi extension update [name] [options]\n\nOptions:\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --cdn <URL>        Download prebuilt extensions from this HTTPS CDN; manifests remain on GitHub\n  --help, -h         Show this help\n\nWithout a name, all project and global installed extensions are updated.\n`--cdn` affects prebuilt global extensions; project-linked and Cargo-built extensions are unchanged.\nLegacy compatibility alias: rpi package update [name] [options]");
 }
 
 #[cfg(test)]
@@ -945,8 +972,8 @@ mod tests {
             // hide an installed remote package.
             let mut commands = Vec::new();
             assert_eq!(
-                update_at(cwd, &[], |package, args| {
-                    commands.push(global_update_args(package, args));
+                update_at(cwd, &[], |package, args, cdn| {
+                    commands.push(global_update_args(package, args, cdn));
                     true
                 }),
                 0
@@ -962,10 +989,14 @@ mod tests {
             for wanted in ["rpi-im-message", "cargo-extension"] {
                 commands.clear();
                 assert_eq!(
-                    update_at(cwd, &[wanted.into(), "--locked".into()], |package, args| {
-                        commands.push(global_update_args(package, args));
-                        true
-                    }),
+                    update_at(
+                        cwd,
+                        &[wanted.into(), "--locked".into()],
+                        |package, args, cdn| {
+                            commands.push(global_update_args(package, args, cdn));
+                            true
+                        }
+                    ),
                     0
                 );
                 assert_eq!(commands.len(), 1);
@@ -977,7 +1008,7 @@ mod tests {
             }
             for wanted in ["local-extension", "missing-extension"] {
                 assert_eq!(
-                    update_at(cwd, &[wanted.into()], |_, _| {
+                    update_at(cwd, &[wanted.into()], |_, _, _| {
                         panic!("local or unknown packages must not trigger a remote install")
                     }),
                     1
@@ -992,8 +1023,8 @@ mod tests {
         with_registry(&serde_json::to_vec(&[record]).unwrap(), |cwd| {
             let mut commands = Vec::new();
             assert_eq!(
-                update_at(cwd, &[], |package, args| {
-                    commands.push(global_update_args(package, args));
+                update_at(cwd, &[], |package, args, cdn| {
+                    commands.push(global_update_args(package, args, cdn));
                     true
                 }),
                 0
@@ -1011,6 +1042,40 @@ mod tests {
     }
 
     #[test]
+    fn update_forwards_cdn_only_to_prebuilt_global_extensions() {
+        let records = vec![
+            prebuilt_package(false),
+            native_package("cargo-extension", None),
+        ];
+        with_registry(&serde_json::to_vec(&records).unwrap(), |cwd| {
+            let mut commands = Vec::new();
+            assert_eq!(
+                update_at(
+                    cwd,
+                    &["--cdn".into(), "https://assets.example.test/mirror".into()],
+                    |package, args, cdn| {
+                        commands.push(global_update_args(package, args, cdn));
+                        true
+                    },
+                ),
+                0
+            );
+            assert_eq!(
+                commands,
+                [
+                    vec![
+                        "install",
+                        "rpi-im-message",
+                        "--cdn",
+                        "https://assets.example.test/mirror"
+                    ],
+                    vec!["install", "cargo-extension", "--build"],
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn update_continues_after_a_failed_package_and_returns_failure() {
         let records = vec![
             prebuilt_package(false),
@@ -1019,7 +1084,7 @@ mod tests {
         with_registry(&serde_json::to_vec(&records).unwrap(), |cwd| {
             let mut visited = Vec::new();
             assert_eq!(
-                update_at(cwd, &[], |package, _| {
+                update_at(cwd, &[], |package, _, _| {
                     visited.push(package.name.clone());
                     package.name != "rpi-im-message"
                 }),
@@ -1045,7 +1110,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(update_at(cwd, &[], |_, _| panic!("invalid registry")), 1);
+            assert_eq!(update_at(cwd, &[], |_, _, _| panic!("invalid registry")), 1);
             assert!(!cwd.join(".rpi/packages/project-extension").exists());
         });
     }

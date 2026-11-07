@@ -275,8 +275,10 @@ rpi install my-extension --path ../my-rpi-extension --force
 
 Use `rpi extension update` to update all project-linked extensions and globally
 installed registry/prebuilt extensions, or `rpi extension update <name>` to select
-one by name. Updates preserve the original Cargo build backend or explicit GitHub
-source. Global development installs made with `--path` are excluded. The old
+one by name. Add `--cdn <URL>` to download prebuilt archives through an HTTPS CDN;
+manifests remain on GitHub and failed CDN requests fall back to GitHub. The option
+does not affect project-linked or Cargo-built extensions. Updates preserve the
+original Cargo build backend or explicit GitHub source. Global development installs made with `--path` are excluded. The old
 `rpi package update [name]` remains compatible; prefer `extension update` for
 extension updates. Project linking commands remain `rpi package link`,
 `rpi package list`, and `rpi package unlink`.
