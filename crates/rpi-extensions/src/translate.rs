@@ -1125,7 +1125,6 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         // Lifecycle only: the `turn_end` payload rides under
         // `TurnEndPayload`, so this tag owns no allocation.
         | T::TurnEnd
-        | T::ModelSelect
         | T::ThinkingLevelSelect
         | T::UserBash
         | T::BeforeTuiStart
@@ -1139,6 +1138,7 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         T::BeforeProviderRequest
         | T::BeforeProviderHeaders
         | T::AfterProviderResponse
+        | T::ModelSelect
         | T::Input
         | T::EditorChange
         // `turn_end` carries `{outcome, stopReason, toolResultCount,

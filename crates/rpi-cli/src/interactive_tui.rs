@@ -3076,6 +3076,9 @@ pub async fn interactive_tui(
     {
         tracing::warn!("[rpi] extension vetoed SessionStart (advisory): {reason}");
     }
+    if let Ok(model) = lane.get_model().await {
+        selectors::dispatch_model_select(&state, &model);
+    }
 
     // ---- Initial prompts (run before reading from the channel) ----
     let mut prompts: Vec<String> = Vec::new();
