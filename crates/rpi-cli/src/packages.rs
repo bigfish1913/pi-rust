@@ -292,9 +292,7 @@ fn link(args: &[String]) -> i32 {
         // macOS: the copy carries the artifact's build-time signature but a new
         // mtime, and the kernel kills any host that maps such a page. See
         // `install::resign_staged_native`.
-        .and_then(|()| {
-            crate::install::resign_staged_native(&tmp).map_err(std::io::Error::other)
-        });
+        .and_then(|()| crate::install::resign_staged_native(&tmp).map_err(std::io::Error::other));
     drop(staged);
     if let Err(error) = copied {
         let _ = std::fs::remove_file(&tmp);

@@ -392,3 +392,45 @@ fn legacy_target_aliases_cannot_bypass_owned_windows_paths() {
     assert!(legacy_unowned_targets(&root, &[link.join("anything.dll")]).is_err());
     fs::remove_dir(link).unwrap();
 }
+
+/// A snapshot copy of a native artifact must be loadable, and the recorded
+/// inventory must describe the copy rather than the source.
+///
+/// On macOS an unre-signed copy is refused by the kernel at first code-page
+/// fault and the whole host is killed (no stderr, exit 137), so signing has to
+/// happen while staging, before publication. Re-signing rewrites bytes, so the
+/// receipt has to be built from the post-signing inventory — otherwise every
+/// later ownership check reports "content changed" against a good install.
+#[cfg(target_os = "macos")]
+#[test]
+fn staged_native_snapshot_is_signed_and_inventory_describes_the_copy() {
+    let (_dir, root, _) = fixture();
+    // `tempfile` lands under /var on macOS, which is a symlink to /private/var;
+    // resource paths reject links, so address the real tree.
+    let base = fs::canonicalize(_dir.path()).unwrap();
+    // Any signed Mach-O works: only the signature/bytes relationship matters.
+    let source = base.join("source/extensions/plugin.dylib");
+    put(&source, fs::read("/bin/echo").unwrap());
+    let observed = inventory(&source).unwrap();
+    let staged = base.join("staged");
+    let copied = copy_snapshot(&source, &staged, &observed).unwrap();
+    assert_ne!(
+        copied.files[0].sha256, observed.files[0].sha256,
+        "the staged artifact was not re-signed"
+    );
+    assert_eq!(
+        copied,
+        inventory(&staged).unwrap(),
+        "the returned inventory must describe the staged bytes"
+    );
+    let out = std::process::Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=4"])
+        .arg(&staged)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("linker-signed"),
+        "the staged artifact kept its build-time signature"
+    );
+    let _ = root;
+}

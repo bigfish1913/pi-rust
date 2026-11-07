@@ -771,7 +771,13 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .map_err(err)?;
     f.write_all(bytes).and_then(|_| f.sync_all()).map_err(err)
 }
-fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<()> {
+/// Copy a resource snapshot into `target` and return the inventory of the copy.
+///
+/// The returned inventory can differ from `observed` on macOS: native artifacts
+/// are re-signed after copying (see `resign_snapshot_native`), which rewrites
+/// their bytes. Callers must record the **returned** inventory, not the source
+/// one, or every later ownership check fails.
+fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<Inventory> {
     fn copy_file(source: &Path, target: &Path, expected: u64) -> Result<()> {
         checked_path(source)?;
         let input = File::open(source).map_err(err)?;
@@ -822,8 +828,84 @@ fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<(
             copy_file(&source.join(&f.path), &to, f.bytes)?;
         }
     }
-    if inventory(target)? != *observed || inventory(source)? != *observed {
+    if inventory(source)? != *observed {
         return Err("resource source changed during snapshot copy".into());
+    }
+    // Native artifacts are decided by the source shape, once, up front: a
+    // single-file source has inventory path `.` with no extension, so keying off
+    // inventory paths alone would miss `resource install extension …`.
+    let native: std::collections::BTreeSet<PathBuf> = if source.is_file() {
+        observed.files.iter().map(|f| f.path.clone()).collect()
+    } else {
+        observed
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .filter(|p| is_native_artifact(p))
+            .collect()
+    };
+    let artifacts: Vec<PathBuf> = native.iter().map(|p| target.join(p)).collect();
+    resign_snapshot_native(&artifacts)?;
+    let copied = inventory(target)?;
+    // Every byte outside the re-signed artifacts must still match the source.
+    let comparable = |inv: &Inventory| Inventory {
+        files: inv
+            .files
+            .iter()
+            .filter(|f| !native.contains(&f.path))
+            .cloned()
+            .collect(),
+        directories: inv.directories.clone(),
+        sha256: String::new(),
+    };
+    if comparable(&copied) != comparable(observed) {
+        return Err("resource snapshot copy does not match the source".into());
+    }
+    Ok(copied)
+}
+
+/// Whether a resource file is a loadable native artifact for this platform.
+fn is_native_artifact(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some(std::env::consts::DLL_EXTENSION)
+}
+
+/// macOS only: re-sign copied native artifacts so the kernel will map them.
+///
+/// A signed Mach-O carries a code directory whose hashes must match the bytes
+/// the kernel maps. Copying is byte-exact, so a well-formed copy stays valid —
+/// but a plain `io::copy` of a freshly linked cargo `cdylib` can also carry a
+/// linker signature the kernel refuses. When it refuses, it does not return an
+/// error: it kills the host that touched the page.
+///
+/// ```text
+/// CODE SIGNING: process 20087[rpi]: rejecting invalid page at address 0x…
+///   in file "~/.pidd/rpi-agent/extensions/librpi_superagent.dylib"
+///   (cs_mtime:1794052202.55 != mtime:1794056571.77)
+/// CODE SIGNING: cs_invalid_page(0x…): denying page sending SIGKILL
+/// ```
+///
+/// No stderr reaches the caller and the only exit status is 137, so the symptom
+/// reads as "rpi cannot start at all". `codesign -v` also reports these copies
+/// as valid, so verifying first is not a substitute for signing.
+///
+/// Only native artifacts are re-signed; text resources are left untouched.
+fn resign_snapshot_native(artifacts: &[PathBuf]) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    for path in artifacts {
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(path)
+            .output()
+            .map_err(|e| format!("could not run codesign on {}: {e}", path.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not re-sign {} (the kernel will refuse to load it): {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
     }
     Ok(())
 }
@@ -1156,13 +1238,18 @@ fn mutate(root: &Path, o: &Options) -> Result<Value> {
             .version
             .clone()
             .or_else(|| previous.as_ref().and_then(|r| r.version.clone()));
+        // Copy before building the receipt: on macOS the staged native artifacts
+        // are re-signed, so the copy's inventory (which is what gets installed and
+        // later re-verified against) differs from the source's.
+        let staged = stage.path().join("snapshot");
+        let copied = copy_snapshot(&source, &staged, &inv)?;
         let receipt = Receipt {
             kind,
             name: name.into(),
             source,
             version,
             target: target.clone(),
-            inventory: inv,
+            inventory: copied,
         };
         if o.op == "install" {
             if let Some(old) = &previous {
@@ -1177,8 +1264,6 @@ fn mutate(root: &Path, o: &Options) -> Result<Value> {
                 return Err("already installed; use update or reinstall with --path".into());
             }
         }
-        let staged = stage.path().join("snapshot");
-        copy_snapshot(&receipt.source, &staged, &receipt.inventory)?;
         next = Some((receipt, staged));
     }
     r.resources.retain(|r| !(r.kind == kind && r.name == name));
