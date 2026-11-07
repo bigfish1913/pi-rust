@@ -35,7 +35,7 @@ mod backend;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::AgentHarness;
@@ -504,6 +504,7 @@ pub fn prepare_extensions(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
+    crate::native_durable::experimental_epoch::policy(args).map_err(BuildError::HarnessCreate)?;
     let native_store =
         crate::native_store::root(args, cwd).map_err(BuildError::NativeStorePolicy)?;
     let resource_leases =
@@ -523,11 +524,11 @@ pub fn prepare_extensions(
                     let meta = resolve_restore_target(&session_selection, &cwd.to_string_lossy()).await?
                         .ok_or_else(|| BuildError::SessionOpen("transition session disappeared".into()))?;
                     let path = std::fs::canonicalize(&meta.path).map_err(|e| BuildError::SessionOpen(e.to_string()))?;
-                    claim_session_lock_inner(&path.to_string_lossy(), false).map_err(BuildError::SessionOpen)?;
                     let storage = rpi_harness::session::jsonl::JsonlSessionStorage::load_for_resource_transition(
                         Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())), &path.to_string_lossy(),
                         Arc::new(SystemClock), Arc::new(DefaultIdGenerator::new()),
                     ).await.map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                    storage.acquire_writer_lease().await.map_err(|e| BuildError::SessionOpen(e.to_string()))?;
                     let session = Session::new(Arc::new(storage), None);
                     crate::resource_selection::bind_session(&session, resource_selection.as_ref()).await.map_err(BuildError::SessionOpen)?;
                     Ok::<_, BuildError>(session)
@@ -581,7 +582,8 @@ pub fn prepare_extensions(
     let action_host = Arc::new(
         action_host
             .with_session_dir(session_dir.clone())
-            .with_fresh_session_only(native_store.is_some()),
+            .with_fresh_session_only(native_store.is_some())
+            .with_native_durable(args.native_durable),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = action_host.clone();
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
@@ -650,6 +652,8 @@ pub fn prepare_extensions(
     }
     crate::native_store::validate_stdio(native_store.is_some(), extension_session.owns_stdio())
         .map_err(BuildError::NativeStorePolicy)?;
+    validate_native_durable_extensions(args, &extension_session)
+        .map_err(BuildError::HarnessCreate)?;
     // Publish the extension registry so `ListCommands` can enumerate slash
     // commands. Done here rather than at host construction because the registry
     // only exists after extensions load; `/reload` republishes the new snapshot
@@ -723,6 +727,8 @@ pub async fn build_prepared(
     ),
     BuildError,
 > {
+    let experimental_policy = crate::native_durable::experimental_epoch::policy(args)
+        .map_err(BuildError::HarnessCreate)?;
     let native_store =
         crate::native_store::root(args, cwd).map_err(BuildError::NativeStorePolicy)?;
     if native_store != prepared.native_store {
@@ -773,7 +779,10 @@ pub async fn build_prepared(
     let ctx =
         ExecutionToolContext::new(env_dyn.clone(), Some(mut_env)).with_file_io(file_io.clone());
 
-    let mut tools = build_tools(&ctx, args);
+    validate_native_durable_extensions(args, &extension_session)
+        .map_err(BuildError::HarnessCreate)?;
+    let durable_binding = Arc::new(std::sync::OnceLock::new());
+    let mut tools = build_tools_bound(&ctx, args, durable_binding.clone());
 
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools
@@ -1218,6 +1227,7 @@ pub async fn build_prepared(
                 | SessionSelection::ByExactId { .. }
                 | SessionSelection::Fork { .. }
         ),
+        require_native_durable: args.native_durable,
         stream_options: AgentHarnessStreamOptions {
             timeout: args.timeout,
             stream_idle_timeout: args.stream_idle_timeout.or_else(|| {
@@ -1252,11 +1262,14 @@ pub async fn build_prepared(
         agent_emitter: Some(emitter),
         // B3b loop hooks. `before_tool_call` dispatches the pi `on("tool_call")`
         // extension event and honors a veto (a permission gate can block a tool
-        // before it runs). `after_tool_call`/`transform_context` remain `None`
-        // (their host-side adapters are not wired yet).
+        // before it runs). Extension after-tool/context adapters remain unwired.
+        // Native durable observes the committed service per model request, using
+        // the same weak binding as its tool, even when model tools are filtered.
         before_tool_call,
         after_tool_call: None,
-        transform_context: None,
+        transform_context: args
+            .native_durable
+            .then(|| crate::native_durable::context_hook(Arc::clone(&durable_binding))),
         entry_transforms: Vec::new(),
         // Extension provider hooks (B4): plugins subscribing to the
         // BeforeProviderRequest / BeforeProviderHeaders / AfterProviderResponse
@@ -1267,9 +1280,25 @@ pub async fn build_prepared(
             .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
     };
 
-    let harness = AgentHarness::create(options)
+    let harness = match experimental_policy {
+        Some(policy) => AgentHarness::create_experimental(options, policy).await,
+        None => AgentHarness::create(options).await,
+    }
+    .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
+
+    if args.native_durable {
+        // Validate legacy/corrupt branch state before sealing resources or ready.
+        rpi_harness::durable::DurableService::bind(
+            &harness,
+            rpi_harness::durable::DurableActor::owner("native-cli")
+                .map_err(|e| BuildError::HarnessCreate(e.to_string()))?,
+        )
+        .snapshot()
         .await
         .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
+        // Populate the weak tool binding before resource selection is published.
+        let _ = durable_binding.set(harness.downgrade());
+    }
 
     // Retain read leases even for resource-only/--no-extensions hosts.
     let harness_leases = resource_leases.clone();
@@ -1313,19 +1342,13 @@ pub async fn build_prepared(
                 .ok_or_else(|| {
                     BuildError::SessionOpen("transition session disappeared before commit".into())
                 })?;
-            let path = std::fs::canonicalize(&meta.path)
-                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
-            let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-            if !SESSION_LOCK_PATHS
-                .get_or_init(|| Mutex::new(HashSet::new()))
-                .lock()
-                .unwrap()
-                .contains(&lock_path)
-            {
+            if !harness.session().storage().writer_lease_held() {
                 return Err(BuildError::SessionOpen(
-                    "resource transition lost canonical writer ownership".into(),
+                    "resource transition lost storage-level writer ownership".into(),
                 ));
             }
+            let path = std::fs::canonicalize(&meta.path)
+                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
             let facts =
                 rpi_harness::session::jsonl::JsonlSessionStorage::read_resource_transition_facts(
                     Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())),
@@ -1781,6 +1804,17 @@ async fn reload_extension_resources_inner<F>(
 where
     F: FnOnce() + Send,
 {
+    if ctx.args.native_durable {
+        return ReloadOutcome {
+            summary:
+                "Native durable prototype is restart-required; reload/dev hot apply unsupported"
+                    .into(),
+            had_warnings: true,
+            details: Vec::new(),
+            had_errors: true,
+            project_trusted: None,
+        };
+    }
     if harness.has_exact_resources()
         || ctx.args.resource_config.is_some()
         || ctx.args.resource_transition.is_some()
@@ -1888,7 +1922,8 @@ where
             Arc::new(
                 action_host
                     .with_session_dir(ctx.session_dir())
-                    .with_fresh_session_only(ctx.fresh_session_only),
+                    .with_fresh_session_only(ctx.fresh_session_only)
+                    .with_native_durable(ctx.args.native_durable),
             )
         }
     };
@@ -2161,7 +2196,12 @@ where
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env))
         .with_file_io(ctx.file_io.clone());
-    let mut tools = build_tools(&tool_ctx, &effective_args);
+    // Native durable reload is rejected above; this binding cannot be used.
+    let mut tools = build_tools_bound(
+        &tool_ctx,
+        &effective_args,
+        Arc::new(std::sync::OnceLock::new()),
+    );
     merge_extension_tools(
         &mut tools,
         &extension_session,
@@ -2592,11 +2632,50 @@ fn load_extensions_from_dirs(
     )
 }
 
-/// Merge the loaded extension tools into the built-in set. An extension tool
-/// overrides a same-named built-in; first-extension-wins across plugins is
-/// already guaranteed by the registry (`register_tool` keeps the prior). The
-/// explicit `--tools` allowlist / `--exclude-tools` denylist apply to the
-/// merged set (the built-ins were already filtered in [`build_tools`]).
+/// Native durable reserves both public names even when model tools are filtered.
+/// Refuse rather than override/fallback/dual-write a loaded legacy implementation.
+fn validate_native_durable_extensions(
+    args: &Args,
+    session: &ExtensionSession,
+) -> Result<(), String> {
+    if !args.native_durable {
+        return Ok(());
+    }
+    if session.owns_stdio() {
+        return Err(
+            "--native-durable requires the native host; stdio-owning extensions are unsupported"
+                .into(),
+        );
+    }
+    if let Some(snapshot) = session.snapshot() {
+        if native_durable_conflict(
+            snapshot.tools().iter().map(|tool| tool.tool.name.as_str()),
+            snapshot
+                .commands()
+                .iter()
+                .map(|command| command.name.as_str()),
+        ) {
+            return Err("--native-durable conflicts with an extension durable tool or /durable command; explicitly exclude that extension (or use --no-extensions), no automatic legacy import".into());
+        }
+    }
+    Ok(())
+}
+
+fn native_durable_conflict<'a>(
+    mut tools: impl Iterator<Item = &'a str>,
+    mut commands: impl Iterator<Item = &'a str>,
+) -> bool {
+    tools.any(|name| name == "durable")
+        || commands.any(|name| name.trim_start_matches('/') == "durable")
+}
+
+#[cfg(test)]
+#[path = "native_durable/session_tests.rs"]
+mod native_durable_session_tests;
+
+/// Merge extension tools into the built-ins. Ordinarily extensions override
+/// same-named built-ins (first extension wins); opted-in native durable names
+/// were already checked above. Both tool filters still apply to the merged set.
 fn merge_extension_tools(
     tools: &mut Vec<HarnessTool>,
     session: &ExtensionSession,
@@ -2646,7 +2725,16 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     }
 }
 
+#[cfg(test)]
 fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
+    build_tools_bound(ctx, args, Arc::new(std::sync::OnceLock::new()))
+}
+
+fn build_tools_bound(
+    ctx: &ExecutionToolContext,
+    args: &Args,
+    durable_binding: Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>,
+) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
     }
@@ -2683,6 +2771,16 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
             HarnessTool::new(create_docs_tool()).with_replay(ToolReplay::Safe),
         ),
     ];
+
+    if args.native_durable {
+        // Mixed read/write tool is NEVER safe for automatic replay.
+        all.push((
+            "durable",
+            HarnessTool::new(Arc::new(crate::native_durable::NativeDurableTool::new(
+                durable_binding,
+            ))),
+        ));
+    }
 
     // Add PowerShell tool on Windows
     #[cfg(target_os = "windows")]
@@ -2994,7 +3092,10 @@ async fn fork_session_at_launch(
         )
         .await
         .map_err(|e| BuildError::SessionDir(format!("fork {}: {e}", source_meta.path)))?;
-    claim_session_lock(&fork_storage.jsonl_metadata().path).map_err(BuildError::SessionOpen)?;
+    fork_storage
+        .acquire_writer_lease()
+        .await
+        .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(fork_storage);
     Ok(Session::new(storage_arc, None))
 }
@@ -3470,7 +3571,10 @@ pub(crate) async fn fork_session_storage(
         )
         .await
         .map_err(|e| e.to_string())?;
-    claim_session_lock(&fork_storage.jsonl_metadata().path)?;
+    fork_storage
+        .acquire_writer_lease()
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(Session::new(Arc::new(fork_storage), None))
 }
 
@@ -3498,17 +3602,7 @@ pub(crate) async fn import_session_file(
     // for previously opened sessions, so its own copies additionally verify a
     // stable history around the sidecar snapshot (bind/entry before retirement).
     let source_progress = PathBuf::from(format!("{}.progress.jsonl", source.display()));
-    let source_lock_path = PathBuf::from(format!("{}.lock", source.display()));
-    let canonical_lock = std::fs::canonicalize(&source_lock_path).ok();
-    let owned_here = SESSION_LOCK_PATHS.get().is_some_and(|paths| {
-        paths.lock().unwrap().iter().any(|path| {
-            path == &source_lock_path
-                || canonical_lock.as_ref().is_some_and(|canonical| {
-                    std::fs::canonicalize(path).ok().as_ref() == Some(canonical)
-                })
-        })
-    });
-    let _source_lock = if !owned_here && source_progress.try_exists().map_err(|e| e.to_string())? {
+    let _source_lock = if source_progress.try_exists().map_err(|e| e.to_string())? {
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -3613,10 +3707,10 @@ pub(crate) async fn import_session_file(
         .map_err(|e| e.to_string())?;
     let path = destination.jsonl_metadata().path.clone();
     drop(destination);
-    if let Err(error) = claim_session_lock(&path) {
-        // Another process owns this destination; leave its file intact.
-        return Err(error);
-    }
+    // Do not claim the session-level `.lock` here. The destination storage
+    // opened below owns the same OS lease; claiming it first would make this
+    // process conflict with itself. The JSONL storage lease is the
+    // authoritative writer fence for the imported session.
     let destination_progress = format!("{path}.progress.jsonl");
     let publish = (|| -> std::io::Result<()> {
         if has_progress {
@@ -3635,57 +3729,6 @@ pub(crate) async fn import_session_file(
         .await
         .map_err(|e| e.to_string())?;
     Ok(Session::new(Arc::new(storage), None))
-}
-
-/// Session logs this process has claimed, so re-claiming is a no-op.
-static SESSION_LOCK_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-/// The held lock handles. Kept alive for the process lifetime — dropping the
-/// `File` would release the OS lock, so the guard is parked here.
-static SESSION_LOCKS: OnceLock<Mutex<Vec<std::fs::File>>> = OnceLock::new();
-
-/// Claim the exclusive lock for a session log.
-///
-/// Two rpi processes appending to one JSONL diverge their `sequence` counters
-/// (duplicate / gapped seqs) and corrupt it. The lock is an OS advisory lock on
-/// `<path>.lock`: the second process gets a clear "already open" error instead
-/// of corrupting the log, and the OS releases it automatically when the holder
-/// exits (no stale-lock cleanup). Re-claiming a path this process already holds
-/// is a no-op, so the TUI's session hot-switch can re-open freely.
-fn claim_session_lock(session_path: &str) -> Result<(), String> {
-    claim_session_lock_inner(session_path, true)
-}
-fn claim_session_lock_inner(session_path: &str, allow_reentry: bool) -> Result<(), String> {
-    let canonical =
-        std::fs::canonicalize(session_path).unwrap_or_else(|_| PathBuf::from(session_path));
-    let lock_path = PathBuf::from(format!("{}.lock", canonical.display()));
-    let mut paths = SESSION_LOCK_PATHS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap();
-    if paths.contains(&lock_path) {
-        return if allow_reentry {
-            Ok(())
-        } else {
-            Err("transition session already has a writer in this process".into())
-        };
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| format!("open session lock {}: {e}", lock_path.display()))?;
-    if fs2::FileExt::try_lock_exclusive(&file).is_err() {
-        return Err(format!(
-            "session {session_path} is already open in another rpi process"
-        ));
-    }
-    SESSION_LOCKS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(file);
-    paths.insert(lock_path);
-    Ok(())
 }
 
 /// A restored session together with the working directory it was created in.
@@ -3727,11 +3770,14 @@ async fn open_session(
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
-    claim_session_lock(&meta.path).map_err(BuildError::SessionOpen)?;
     let storage = repo
         .open_by_jsonl_metadata(meta)
         .await
         .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?;
+    storage
+        .acquire_writer_lease()
+        .await
+        .map_err(|e| BuildError::SessionOpen(format!("lock {}: {e}", meta.path)))?;
     // Native saved sessions predating progressFormat remain read-only to plain
     // storage loaders. Only this locked, not-yet-shared restore opts into writes.
     let storage = storage
@@ -3810,9 +3856,8 @@ pub(crate) async fn create_jsonl_session_with_id(
         .create_typed(&opts)
         .await
         .map_err(|e| format!("create session: {e}"))?;
-    claim_session_lock(&storage.jsonl_metadata().path)
-        .map_err(|e| format!("create session: {e}"))?;
-    // `JsonlSessionStorage` implements `SessionStorage`; wrap in the facade.
+    // `JsonlSessionStorage` acquires the storage-level lease during create;
+    // wrap it in the facade without a second CLI-owned lock table.
     let storage_arc: Arc<dyn rpi_harness::session::types::SessionStorage> = Arc::new(storage);
     Ok(Session::new(storage_arc, None))
 }
@@ -5573,3 +5618,10 @@ mod tests {
         assert!(resolve_project_trust(&args, &launch));
     }
 }
+
+#[cfg(test)]
+#[path = "session/experimental_dialog_continuity_tests.rs"]
+mod experimental_dialog_continuity_tests;
+#[cfg(test)]
+#[path = "session/experimental_reload_continuity_tests.rs"]
+mod experimental_reload_continuity_tests;

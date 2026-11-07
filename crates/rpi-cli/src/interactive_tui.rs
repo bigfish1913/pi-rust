@@ -50,6 +50,7 @@ mod rendering;
 use rendering::*;
 mod panels;
 mod pet;
+mod settlement;
 mod side_questions;
 
 #[cfg(test)]
@@ -313,6 +314,11 @@ trait SlashCommand: Send + Sync {
     fn description_owned(&self) -> String {
         self.description().to_string()
     }
+    /// Structured command payloads must not collapse whitespace inside JSON
+    /// strings. Legacy commands keep their existing normalized argument policy.
+    fn preserve_args_whitespace(&self) -> bool {
+        false
+    }
     /// Execute the command. Only invoked for inputs starting with `/` whose
     /// first token matches `name()` or an alias. `args` is the whitespace-
     /// trimmed remainder after the command token ("" when none). Must stay
@@ -328,8 +334,8 @@ trait SlashCommand: Send + Sync {
 /// command registry itself is TUI-private, and reaching into it from the
 /// extension host would mean exposing `Arc<dyn SlashCommand>` (whose `execute`
 /// needs a `CommandContext`) across the ABI.
-pub(crate) fn build_builtin_commands_for_abi() -> Vec<(String, String)> {
-    build_builtin_registry()
+pub(crate) fn build_builtin_commands_for_abi(native_durable: bool) -> Vec<(String, String)> {
+    build_session_command_registry(native_durable)
         .visible_entries()
         .into_iter()
         .map(|entry| (entry.name, entry.description))
@@ -344,8 +350,8 @@ pub(crate) fn build_builtin_commands_for_abi() -> Vec<(String, String)> {
 /// `/q` or `/context` is unreachable in the terminal (the built-in wins
 /// dispatch), yet without this it would still be advertised as
 /// `source:"extension"`.
-pub(crate) fn builtin_reserved_names() -> Vec<String> {
-    let registry = build_builtin_registry();
+pub(crate) fn builtin_reserved_names(native_durable: bool) -> Vec<String> {
+    let registry = build_session_command_registry(native_durable);
     let mut out: Vec<String> = Vec::new();
     for command in &registry.commands {
         out.push(command.name().to_string());
@@ -404,6 +410,16 @@ impl CommandRegistry {
         }
         out
     }
+}
+
+/// Session-owned opt-ins must drive both TUI dispatch and remote discovery.
+/// Never infer native enablement from tool selection, extension flags or names.
+fn build_session_command_registry(native_durable: bool) -> CommandRegistry {
+    let mut registry = build_builtin_registry();
+    if native_durable {
+        registry.register(Arc::new(NativeDurableCommand));
+    }
+    registry
 }
 
 /// Dispatch a ui_prompt_start event to extensions.
@@ -552,13 +568,21 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
 /// `/skill:name` intact so the model can still handle it; it must not be
 /// converted into a local error before input handlers or the agent see it.
 /// Returns `true` only when a registered slash command handled the input.
-fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) -> bool {
+fn slash_arguments(text: &str, command: &dyn SlashCommand) -> String {
     let mut parts = text.split_whitespace();
     let token = parts.next().unwrap_or("");
-    let args = parts.collect::<Vec<_>>().join(" ");
+    if command.preserve_args_whitespace() {
+        text.trim_start()[token.len()..].trim_start().to_owned()
+    } else {
+        parts.collect::<Vec<_>>().join(" ")
+    }
+}
+
+fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) -> bool {
+    let token = text.split_whitespace().next().unwrap_or("");
     match registry.find(token) {
         Some(cmd) => {
-            cmd.execute(ctx, &args);
+            cmd.execute(ctx, &slash_arguments(text, cmd.as_ref()));
             true
         }
         None => false,
@@ -739,6 +763,7 @@ enum TuiMessage {
     ExportSessionWithFormat(crate::export::ExportFormat),
     /// Show live usage/context stats (from `/usage` and `/context`).
     ShowUsage,
+    NativeDurable(String),
     /// Fork the current session into a new one and switch to it (from `/fork`).
     ForkSession,
     /// Rename the current session (from `/name <name>`).
@@ -1082,7 +1107,12 @@ pub async fn interactive_tui(
     // of returning a fabricated answer. The mailbox is session-scoped (held in
     // `ReloadContext`) so in-flight prompts survive a `/reload`.
     let ask_user_bridge = AskUserBridge::new(reload_context.ui_dialog.clone());
-    ask_user_bridge.attach();
+    if !ask_user_bridge.attach() {
+        eprintln!(
+            "[rpi] interactive dialog bridge attachment was rejected; refusing to start the TUI"
+        );
+        return 1;
+    }
     tui.set_main_screen_mode(matches!(args.tui_mode, crate::args::TuiMode::Regular));
 
     let chat_container = Arc::new(Container::new());
@@ -1260,7 +1290,7 @@ pub async fn interactive_tui(
     // prompt-template commands are merged into the autocomplete list separately
     // (they dispatch via template expansion, not the registry); built-ins come
     // first so they win on a fuzzy tie.
-    let mut command_registry = build_builtin_registry();
+    let mut command_registry = build_session_command_registry(reload_context.args.native_durable);
     register_extension_commands(
         &mut command_registry,
         reload_context.extension_session.clone(),
@@ -1285,7 +1315,8 @@ pub async fn interactive_tui(
         .get_as::<bool>("display.tool_outputs_expanded")
         .unwrap_or(false);
     let state = Arc::new(TuiState {
-        history_page: history::HistoryUi::default(),
+        session_write_tasks: settlement::SessionWriteTasks::new(args.native_durable),
+        history_page: history::HistoryUi::with_native_durable(args.native_durable),
         session_dir: reload_context.session_dir(),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1355,6 +1386,10 @@ pub async fn interactive_tui(
     state.history_page.mount_active(&chat_container);
     if launch_restores_history(args) {
         history::restore(harness, &state, &chat_container).await;
+    } else {
+        // Do not restore foreign history on a fresh launch merely to observe
+        // durable state. This read-only component also respects --no-tools.
+        history::refresh_native_durable_notice(harness, &state, &chat_container).await;
     }
 
     let _compaction_watcher = harness.watch({
@@ -1562,7 +1597,7 @@ pub async fn interactive_tui(
             let chat = ctx_for_cb.chat.clone();
             let tui = ctx_for_cb.tui.clone();
             let state = ctx_for_cb.state.clone();
-            tokio::spawn(async move {
+            state.session_write_tasks.clone().spawn(async move {
                 // Queue immediately while the agent loop is still running.
                 // Routing this through the TUI's main channel delayed it until
                 // `prompt_text()` returned, after the loop's drain points had
@@ -2503,7 +2538,7 @@ pub async fn interactive_tui(
                 let expanded = state_for_key.toggle_tool_outputs();
                 // Persist per-session so a later `-c`/`-r` restores it.
                 let session = ctx_for_key.session.clone();
-                tokio::spawn(async move {
+                ctx_for_key.state.session_write_tasks.spawn(async move {
                     let _ = session
                         .set_value("display.tool_outputs_expanded", serde_json::json!(expanded))
                         .await;
@@ -2521,7 +2556,7 @@ pub async fn interactive_tui(
                 let hide = state_for_key.toggle_thinking();
                 // Persist per-session so a later `-c`/`-r` restores it.
                 let session = ctx_for_key.session.clone();
-                tokio::spawn(async move {
+                ctx_for_key.state.session_write_tasks.spawn(async move {
                     let _ = session
                         .set_value("display.hide_thinking", serde_json::json!(hide))
                         .await;
@@ -2551,7 +2586,7 @@ pub async fn interactive_tui(
                 let lane = lane_for_key.clone();
                 let state = state_for_key.clone();
                 let tui = tui_for_key.clone();
-                tokio::spawn(async move {
+                state.session_write_tasks.clone().spawn(async move {
                     match cycle_model(&lane, &catalog, cycle_backward).await {
                         Ok(Some(model)) => {
                             report_model_selection(&lane, &state, &tui, model, false).await;
@@ -2579,7 +2614,7 @@ pub async fn interactive_tui(
                     .unwrap_or_else(|error| error.into_inner())
                     .clone();
                 let state = state_for_key.clone();
-                tokio::spawn(async move {
+                state.session_write_tasks.clone().spawn(async move {
                     let Ok(current_model) = lane.get_model().await else {
                         return;
                     };
@@ -2836,7 +2871,7 @@ pub async fn interactive_tui(
                 // Routed through `handle_dequeue` (not the raw restore) so the
                 // `Restored N queued message(s)` status note fires, mirroring
                 // upstream's `handleDequeue`.
-                tokio::spawn(handle_dequeue(
+                state_for_key.session_write_tasks.spawn(handle_dequeue(
                     lane_for_key.clone(),
                     editor_for_key.clone(),
                     state_for_key.clone(),
@@ -2882,7 +2917,7 @@ pub async fn interactive_tui(
                     let chat = state_for_key.chat_container.clone();
                     let tui = tui_for_key.clone();
                     let state = state_for_key.clone();
-                    tokio::spawn(async move {
+                    state.session_write_tasks.clone().spawn(async move {
                         if let Err(error) = lane.follow_up(message).await {
                             state.restore_pending_images(images);
                             add_error_message(&chat, &format!("Could not queue message: {error}"));
@@ -3397,6 +3432,15 @@ pub async fn interactive_tui(
                 }
                 tui.request_render(false);
             }
+            Some(TuiMessage::NativeDurable(args)) => {
+                match crate::native_durable::interactive_command(agent_session.harness(), &args)
+                    .await
+                {
+                    Ok(text) => add_note_message(&chat_container, &text),
+                    Err(text) => add_error_message(&chat_container, &text),
+                }
+                tui.request_render(false);
+            }
             Some(TuiMessage::ShowUsage) => {
                 let stats = agent_session.usage_stats().await.ok();
                 let total = agent_session.total_usage().await.ok();
@@ -3715,13 +3759,35 @@ pub async fn interactive_tui(
 
     // ---- Shutdown ----
     state.history_page.invalidate();
-    // Let anything the lane has already committed to writing reach the disk
-    // before the tasks that carry those writes are aborted. A turn's entries are
-    // appended by the harness rather than by the drain task, but the drain task
-    // is what acknowledges them to the UI, so aborting it first can leave a turn
-    // the user saw with no durable counterpart.
-    let _ = lane.wait_for_idle().await;
-    lane.drain_session().await;
+    let mut key_handle = Some(key_handle);
+    let mut exit_code = 0;
+    if args.native_durable {
+        // Stop/join the built-in input producer before sealing its accepted
+        // background session writers. Dialog cancellation can unblock key work;
+        // the streaming event consumer stays live through producer settlement.
+        *running.lock().unwrap() = false;
+        ask_user_bridge.shutdown();
+        if key_handle.take().unwrap().await.is_err() {
+            exit_code = 1;
+        }
+        // Native shutdown is an explicit cooperative runtime boundary: settle
+        // an active prompt before the producer join/core barrier. Idle lanes
+        // return an error here, which is intentionally ignored just like RPC
+        // shutdown; the subsequent settlement still owns accepted writers.
+        let _ = lane.abort_and_reconcile().await;
+        if !settlement::settle_native(harness, state.session_write_tasks.seal()).await {
+            eprintln!("[rpi] native TUI settlement failed");
+            exit_code = 1;
+        }
+    } else {
+        // Let anything the lane has already committed to writing reach the disk
+        // before the tasks that carry those writes are aborted. A turn's entries are
+        // appended by the harness rather than by the drain task, but the drain task
+        // is what acknowledges them to the UI, so aborting it first can leave a turn
+        // the user saw with no durable counterpart.
+        let _ = lane.wait_for_idle().await;
+        lane.drain_session().await;
+    }
 
     ask_user_bridge.shutdown();
     *running.lock().unwrap() = false;
@@ -3731,7 +3797,9 @@ pub async fn interactive_tui(
     }
     // The input worker checks `running` at least every 50ms. Join it before
     // restoring cooked mode so no late event read races terminal cleanup.
-    let _ = key_handle.await;
+    if let Some(key_handle) = key_handle {
+        let _ = key_handle.await;
+    }
     tick_handle.abort();
     if let Some(handle) = drain_handle {
         handle.abort();
@@ -3751,9 +3819,8 @@ pub async fn interactive_tui(
         println!("\x1b[2mTo resume this session:\x1b[0m {command}");
     }
     println!("\nGoodbye!");
-    let _ = args;
 
-    0
+    exit_code
 }
 
 // ===========================================================================
@@ -3768,3 +3835,28 @@ pub fn is_tui_supported() -> bool {
 // Keep the `Color` import used (theme accent rendering in autocomplete).
 #[allow(unused_imports)]
 use rpi_tui::Color as _Color;
+
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_failed_attach_tests.rs"]
+mod experimental_dialog_failed_attach_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_generation_tests.rs"]
+mod experimental_dialog_generation_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_reattachment_tests.rs"]
+mod experimental_dialog_reattachment_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_retirement_tests.rs"]
+mod experimental_dialog_retirement_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_startup_tests.rs"]
+mod experimental_dialog_startup_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_durable_tests.rs"]
+mod experimental_durable_shutdown_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_event_retirement_tests.rs"]
+mod experimental_event_retirement_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_reload_bridge_tests.rs"]
+mod experimental_reload_bridge_tests;

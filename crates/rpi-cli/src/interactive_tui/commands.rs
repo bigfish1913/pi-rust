@@ -160,7 +160,7 @@ impl SlashCommand for ModelCommand {
                 let lane = ctx.lane.clone();
                 let state = ctx.state.clone();
                 let tui = ctx.tui.clone();
-                tokio::spawn(async move {
+                state.session_write_tasks.clone().spawn(async move {
                     report_model_selection(&lane, &state, &tui, model, false).await;
                 });
                 return;
@@ -241,7 +241,7 @@ impl SlashCommand for ThinkingCommand {
             };
             let lane = ctx.lane.clone();
             let footer = ctx.state.footer.clone();
-            tokio::spawn(async move {
+            ctx.state.session_write_tasks.spawn(async move {
                 let _ = lane.set_thinking_level(level).await;
             });
             footer.set_thinking_level(Some(thinking_level_name(level)));
@@ -834,7 +834,7 @@ impl SlashCommand for SkillsCommand {
         let name = name.to_string();
         let additional = additional.map(str::to_string);
         let streaming = ctx.streaming;
-        tokio::spawn(async move {
+        state.session_write_tasks.clone().spawn(async move {
             run_skill_streaming(&lane, &name, additional.as_deref(), &tui, &state, streaming).await;
         });
     }
@@ -947,6 +947,23 @@ pub(super) fn build_builtin_registry() -> CommandRegistry {
     r.register(Arc::new(LogoutCommand));
     r.register(Arc::new(ReloadCommand));
     r
+}
+
+/// Only registered by an explicitly opted-in host; legacy remains untouched.
+pub(super) struct NativeDurableCommand;
+impl SlashCommand for NativeDurableCommand {
+    fn name(&self) -> &'static str {
+        "/durable"
+    }
+    fn description(&self) -> &'static str {
+        crate::native_durable::COMMAND_DESCRIPTION
+    }
+    fn preserve_args_whitespace(&self) -> bool {
+        true
+    }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let _ = ctx.tx.send(TuiMessage::NativeDurable(args.to_owned()));
+    }
 }
 
 pub(super) fn register_extension_commands(

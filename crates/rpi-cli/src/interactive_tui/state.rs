@@ -155,6 +155,7 @@ pub(super) fn auto_send_step(
 }
 
 pub(super) struct TuiState {
+    pub(super) session_write_tasks: super::settlement::SessionWriteTasks,
     pub(super) history_page: history::HistoryUi,
     /// The root selected at startup, retained across session switches/reloads.
     pub(super) session_dir: std::path::PathBuf,

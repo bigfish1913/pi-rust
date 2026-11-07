@@ -1,0 +1,146 @@
+// Appended to the exact synthetic-host helper prefix from runtime_contract.rs.
+// One integration process, one global plugin registration. No real tool executes.
+fn observed(revision: u64) -> Value {
+    let (entries, reads) = {
+        let host = host().lock().unwrap();
+        (host.entries.clone(), host.read_requests.len())
+    };
+    let reply = action(json!({"action":"status"})).unwrap();
+    let mut state = reply["details"].clone();
+    assert!(state.get("error").is_none(), "{reply}");
+    assert_eq!(state.as_object_mut().unwrap().remove("action"), Some(json!("status")));
+    assert_eq!(state["revision"], revision);
+    let decoded = rpi_durable_core::DurableState::try_from_branch(&entries).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), state);
+    let after = host().lock().unwrap();
+    assert_eq!(after.entries, entries, "status must not append");
+    assert_eq!(after.read_requests.len(), reads, "no implicit re-restore");
+    state
+}
+fn control(state: &Value, workflow_status: &str) {
+    assert_eq!(state["workflow"], json!({"name":"Synthetic", "status":workflow_status,
+        "steps":[{"id":"check", "title":"Check", "status":"completed", "note":"verified"}]}));
+    assert_eq!(state["nextQueueId"], 1);
+    assert_eq!(state["queue"], json!([{"id":"item-1","text":"manual", "status":"completed",
+        "createdRevision":2,"updatedRevision":4,"note":"done"}]));
+}
+fn mutate(params: Value) {
+    let reply = action(params).unwrap();
+    assert!(reply["details"].get("error").is_none(), "{reply}");
+}
+fn tool_start(id: &str) -> i32 {
+    let event = StablePluginEvent::tool_call(EventTag::ToolExecutionStart,
+        StbString::from_string(id.into()), StbString::from_string("synthetic".into()),
+        StbString::from_string("{}".into()));
+    let rc = dispatch(event);
+    // SAFETY: this helper constructed the tool_call union variant and retains
+    // ownership while synchronous callbacks borrow it. Free once after dispatch.
+    unsafe {
+        event.payload.tool_call.tool_call_id.free_with(Some(free_string));
+        event.payload.tool_call.tool_name.free_with(Some(free_string));
+        event.payload.tool_call.params.free_with(Some(free_string));
+    }
+    rc
+}
+fn tool_end(tag: EventTag, id: &str, text: &str, failed: bool) -> i32 {
+    let event = StablePluginEvent::tool_result(tag, StbString::from_string(id.into()),
+        StbString::from_string("synthetic".into()),StbString::from_string(text.into()),failed);
+    let rc = dispatch(event);
+    // SAFETY: constructors restrict these tags to the tool_result union variant;
+    // the host owns all three allocated strings, callback borrows synchronously.
+    unsafe {
+        event.payload.tool_result.tool_call_id.free_with(Some(free_string));
+        event.payload.tool_result.tool_name.free_with(Some(free_string));
+        event.payload.tool_result.result.free_with(Some(free_string));
+    }
+    rc
+}
+#[test]
+fn registered_callbacks_preserve_control_and_record_legacy_run_semantics() {
+    let api = PluginApi {
+        abi_version:rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+        struct_size:std::mem::size_of::<PluginApi>() as u32, free_string,
+        register_tool:Some(register_tool),register_command:Some(register_command),
+        register_shortcut:None,register_flag:None,register_provider:None,
+        register_message_renderer:None,register_markdown_transformer:None,
+        register_entry_renderer:None,register_event_handler:Some(register_event),
+        register_resources_discover:None,runtime_action:runtime,dispatch_event:None,
+        user_data:std::ptr::null_mut(),declare:None,register_before_agent_start:None,
+        register_oauth_provider:None,
+    };
+    assert_eq!(rpi_durable::rpi_plugin_register(&api),0);
+    assert!(host().lock().unwrap().tool.is_some());
+    assert_eq!(host().lock().unwrap().events.len(),8);
+    assert_eq!(empty(EventTag::SessionStart),0);
+    assert!(host().lock().unwrap().entries.is_empty());
+    let initial = observed(0);
+    assert!(initial["run"].is_null());
+    mutate(json!({"action":"start","name":" Synthetic ","steps":[{"id":"check","title":"Check"}]}));
+    observed(1);
+    // Actual plugin emits a revision-1 first snapshot; this is deliberately NOT
+    // a zero-root anchored control-inspection candidate from the preceding slice.
+    assert_eq!(host().lock().unwrap().entries[0]["data"]["kind"],"snapshot");
+    assert_eq!(host().lock().unwrap().entries[0]["data"]["revision"],1);
+    mutate(json!({"action":"enqueue","text":"manual"}));observed(2);
+    mutate(json!({"action":"claim","item":"item-1"}));
+    let claimed = observed(3);
+    assert_eq!(claimed["queue"][0]["status"],"claimed");
+    assert!(claimed["queue"][0].get("claimedBy").is_none());
+    mutate(json!({"action":"finish","item":"item-1","status":"completed","note":"done"}));observed(4);
+    mutate(json!({"action":"checkpoint","step":"check","status":"completed","note":"verified"}));
+    control(&observed(5),"running");
+    mutate(json!({"action":"complete"}));control(&observed(6),"completed");
+    assert_eq!(empty(EventTag::AgentStart),0);
+    let started=observed(7);control(&started,"completed");
+    assert_eq!(started["run"]["id"],"run-1");assert_eq!(started["nextRunId"],1);
+    assert_eq!(started["run"]["startedRevision"],7);
+    assert_eq!(tool_start("call-a"),0);observed(8);
+    assert_eq!(tool_end(EventTag::ToolExecutionEnd,"call-a","ok",false),0);
+    let completed=observed(9);
+    assert_eq!(completed["run"]["tools"][0]["status"],"completed");
+    assert_eq!(completed["run"]["tools"][0]["result"],"ok");
+    let entries=host().lock().unwrap().entries.clone();
+    assert_eq!(tool_end(EventTag::ToolResult,"call-a","ok",false),0);
+    assert_eq!(tool_end(EventTag::ToolResult,"call-a","contradictory",true),0);
+    assert_eq!(observed(9),completed);assert_eq!(host().lock().unwrap().entries,entries);
+    assert_eq!(tool_start("call-b"),0);observed(10);
+    assert_eq!(empty(EventTag::AgentSettled),0);
+    let settled=observed(11);control(&settled,"completed");
+    assert_eq!(settled["run"]["status"],"settled");assert_eq!(settled["run"]["outcome"],"settled");
+    assert_eq!(settled["run"]["tools"][1]["status"],"interrupted");
+    assert_eq!(settled["run"]["tools"][1]["result"],"run settled without a durable tool result");
+    assert_eq!(empty(EventTag::AgentStart),0);assert_eq!(observed(12)["run"]["id"],"run-2");
+    assert_eq!(tool_start("call-c"),0);observed(13);
+    assert_eq!(empty(EventTag::SessionShutdown),0);
+    let interrupted=observed(14);control(&interrupted,"completed");
+    assert_eq!(interrupted["run"]["status"],"interrupted");
+    assert_eq!(interrupted["run"]["tools"][0]["status"],"interrupted");
+    assert_eq!(interrupted["run"]["tools"][0]["result"],"execution did not reach a durable result");
+    mutate(json!({"action":"recover"}));
+    let recovery=observed(15);control(&recovery,"completed");
+    assert_eq!(recovery["run"]["status"],"queued");assert_eq!(recovery["run"]["id"],"run-3");
+    assert_eq!(recovery["run"]["recoveryOf"],"run-2");
+    assert_eq!(recovery["run"]["tools"],interrupted["run"]["tools"]);
+    assert_eq!(recovery["nextRunId"],3);
+    let before=host().lock().unwrap().entries.clone();
+    assert_eq!(empty(EventTag::SessionStart),0);assert_eq!(observed(15),recovery);
+    assert_eq!(host().lock().unwrap().entries,before);
+    assert_eq!(empty(EventTag::AgentStart),0);
+    let new_run=observed(16);
+    assert_eq!(new_run["run"]["id"],"run-4");assert_eq!(new_run["nextRunId"],4);
+    assert_eq!(new_run["run"]["recoveryOf"],"run-3");
+    assert_eq!(new_run["run"]["tools"],json!([]));
+    mutate(json!({"action":"forget_run"}));
+    let forgotten=observed(17);control(&forgotten,"completed");
+    assert!(forgotten["run"].is_null());assert_eq!(forgotten["nextRunId"],4);
+    let before=host().lock().unwrap().entries.clone();
+    assert_eq!(empty(EventTag::SessionTree),0);assert_eq!(observed(17),forgotten);
+    assert_eq!(host().lock().unwrap().entries,before);
+    host().lock().unwrap().fail_append=true;
+    assert_ne!(empty(EventTag::AgentStart),0);
+    assert_eq!(observed(17),forgotten);assert_eq!(host().lock().unwrap().entries,before);
+    assert_eq!(empty(EventTag::AgentStart),0);
+    let retry=observed(18);control(&retry,"completed");
+    assert_eq!(retry["run"]["id"],"run-5");assert_eq!(retry["nextRunId"],5);
+    assert_eq!(host().lock().unwrap().entries.len(),18);
+}

@@ -272,6 +272,50 @@ impl DerefMut for ResidentState {
     }
 }
 impl ResidentState {
+    /// Rehydrate a resident JSONL reducer from a validated checkpoint. The
+    /// checkpoint may intentionally omit old physical entries, so the log's
+    /// sequence can begin after a gap; the checkpoint sequence remains the
+    /// authority for subsequent appends.
+    pub(super) fn from_checkpoint(
+        checkpoint: crate::session::state::SessionState,
+    ) -> SessionResult<Self> {
+        let mut resident = Self::default();
+        for item in checkpoint.get_log(&LogOptions::default())? {
+            let mutation = match item {
+                LogItem::Entry { seq, entry } => SessionMutation::Entry {
+                    seq,
+                    timestamp: entry.base().timestamp,
+                    lane: None,
+                    entry,
+                },
+                LogItem::Record { record, .. } => SessionMutation::Record { record },
+                LogItem::Lane { seq, lane, leaf_id } => {
+                    SessionMutation::Lane { seq, lane, leaf_id }
+                }
+                LogItem::FactName { seq, name } => SessionMutation::FactName { seq, name },
+                LogItem::FactLabel {
+                    seq,
+                    target_id,
+                    label,
+                } => SessionMutation::FactLabel {
+                    seq,
+                    target_id,
+                    label,
+                },
+            };
+            if mutation.seq() > resident.next_sequence() {
+                resident.reducer.resync_sequence(mutation.seq() - 1);
+            }
+            resident.apply_mutation(mutation)?;
+        }
+        if resident.sequence() != checkpoint.sequence() {
+            return Err(SessionError::invalid_entry(
+                "history checkpoint rehydration sequence mismatch",
+            ));
+        }
+        Ok(resident)
+    }
+
     #[cfg(test)]
     pub(super) fn assert_cold_shared(&self, ids: &[String]) -> Arc<dyn ReadFile> {
         assert!(

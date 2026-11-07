@@ -88,6 +88,9 @@ struct UiDialogEntry {
 
 struct UiDialogState {
     attached: bool,
+    /// Monotonic local attachment generation used to retire stale UI bridges
+    /// without allowing them to detach a newer bridge.
+    attachment_generation: u64,
     /// An external UI (a relay) has taken over dialog delivery.
     ///
     /// While set, the local TUI must not take requests: both consumers draw
@@ -119,6 +122,7 @@ impl UiDialogMailbox {
         Self {
             state: Arc::new(Mutex::new(UiDialogState {
                 attached: false,
+                attachment_generation: 0,
                 external_takeover: false,
                 pending: VecDeque::new(),
                 active: HashMap::new(),
@@ -127,12 +131,35 @@ impl UiDialogMailbox {
         }
     }
 
-    /// Mark an interactive consumer as available. Re-attaching is idempotent.
+    /// Mark an interactive consumer as available. Re-attaching starts a new
+    /// local generation so stale bridge shutdown cannot retire its successor.
     pub fn attach(&self) {
+        let _ = self.try_attach_with_generation();
+    }
+
+    /// Attach and return the local generation owned by this consumer.
+    ///
+    /// Generation exhaustion is a fail-closed condition: do not reuse the
+    /// final generation, because a stale bridge could then retire a newer
+    /// consumer with the same identity.
+    pub fn try_attach_with_generation(&self) -> Option<u64> {
+        // Attachment is an admission boundary. A poisoned mailbox cannot
+        // safely publish either the generation or the attached bit, so refuse
+        // rather than panic or partially admit an interactive consumer.
+        let mut state = self.state.lock().ok()?;
+        let generation = state.attachment_generation.checked_add(1)?;
+        state.attachment_generation = generation;
+        state.attached = true;
+        Some(generation)
+    }
+
+    /// Return the current local attachment generation, if the mailbox state
+    /// can be read safely.
+    pub fn attachment_generation(&self) -> Option<u64> {
         self.state
             .lock()
-            .expect("ui dialog mailbox poisoned")
-            .attached = true;
+            .ok()
+            .map(|state| state.attachment_generation)
     }
 
     /// Hand dialog delivery to an external UI (or take it back).
@@ -163,7 +190,31 @@ impl UiDialogMailbox {
     /// Detach the consumer and cancel every outstanding request. This prevents
     /// a TUI restart/reload from leaving plugin polls blocked forever.
     pub fn detach(&self) {
-        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        // Compatibility retirement has no success channel. If the mailbox
+        // state is poisoned, refuse without claiming that ownership changed.
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        Self::detach_locked(&mut state);
+    }
+
+    /// Detach only if this consumer still owns the current local generation.
+    /// A stale bridge is a no-op and cannot cancel a newer TUI's dialogs.
+    pub fn detach_if_generation(&self, generation: u64) -> bool {
+        // Retirement is also an ownership boundary. A poisoned mailbox cannot
+        // prove that this generation is current, so report no detachment
+        // instead of panicking or claiming that a live owner was retired.
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.attachment_generation != generation {
+            return false;
+        }
+        Self::detach_locked(&mut state);
+        true
+    }
+
+    fn detach_locked(state: &mut UiDialogState) {
         state.attached = false;
         // Release ownership with the consumer. A stale takeover flag would make
         // the TUI refuse every later dialog, so losing the relay client would
@@ -207,10 +258,7 @@ impl UiDialogMailbox {
     }
 
     pub fn is_attached(&self) -> bool {
-        self.state
-            .lock()
-            .expect("ui dialog mailbox poisoned")
-            .attached
+        self.state.lock().ok().is_some_and(|state| state.attached)
     }
 
     /// Remove and return the next request for presentation by the TUI.
@@ -2130,6 +2178,91 @@ mod tests {
         let mailbox = UiDialogMailbox::new();
         let error = mailbox.handle(open_args("r1", "c1")).unwrap_err();
         assert!(error.contains("interactive UI"), "got: {error}");
+    }
+
+    #[test]
+    fn ui_dialog_attachment_generation_exhaustion_fails_closed() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox
+            .state
+            .lock()
+            .expect("ui dialog mailbox poisoned")
+            .attachment_generation = u64::MAX;
+
+        assert_eq!(mailbox.try_attach_with_generation(), None);
+        assert_eq!(mailbox.attachment_generation(), Some(u64::MAX));
+        assert!(!mailbox.is_attached());
+
+        // The compatibility attach API also refuses to reuse the terminal
+        // generation rather than silently reopening the mailbox.
+        mailbox.attach();
+        assert!(!mailbox.is_attached());
+    }
+
+    #[test]
+    fn ui_dialog_attachment_lock_poison_fails_closed_without_panicking() {
+        let mailbox = UiDialogMailbox::new();
+        let state = mailbox.state.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison synthetic dialog mailbox state");
+        })
+        .join()
+        .is_err());
+
+        assert_eq!(mailbox.try_attach_with_generation(), None);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The compatibility API must also refuse rather than panic.
+            mailbox.attach();
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn ui_dialog_observation_lock_poison_fails_closed_without_panicking() {
+        let mailbox = UiDialogMailbox::new();
+        let state = mailbox.state.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison synthetic dialog observation state");
+        })
+        .join()
+        .is_err());
+
+        assert_eq!(mailbox.attachment_generation(), None);
+        assert!(!mailbox.is_attached());
+    }
+
+    #[test]
+    fn ui_dialog_detach_generation_lock_poison_fails_closed_without_panicking() {
+        let mailbox = UiDialogMailbox::new();
+        let state = mailbox.state.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison synthetic dialog retirement state");
+        })
+        .join()
+        .is_err());
+
+        assert!(!mailbox.detach_if_generation(1));
+    }
+
+    #[test]
+    fn ui_dialog_compat_detach_lock_poison_fails_closed_without_panicking() {
+        let mailbox = UiDialogMailbox::new();
+        let state = mailbox.state.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison synthetic dialog compatibility retirement state");
+        })
+        .join()
+        .is_err());
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mailbox.detach();
+        }))
+        .is_ok());
+        assert_eq!(mailbox.try_attach_with_generation(), None);
     }
 
     #[test]

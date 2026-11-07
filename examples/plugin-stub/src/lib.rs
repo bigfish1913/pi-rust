@@ -580,6 +580,15 @@ rpi_plugin_sdk::string_handler! {
 // The register entrypoint
 // ---------------------------------------------------------------------------
 
+// Opt-in command fixture for real native/extension namespace acceptance. No
+// command is registered unless RPI_PLUGIN_STUB_COMMAND_NAME is set by a host.
+rpi_plugin_sdk::string_handler! {
+    fn fixture_command(_args, out, _user_data) {
+        out.write(r#"{"fixture":true}"#.to_string());
+        0
+    }
+}
+
 // The SDK macro exports the unified `rpi_plugin_register` symbol and applies
 // the version/null checks before running our registration body. Return 0 on
 // success; nonzero means the host logs and skips this plugin.
@@ -604,8 +613,10 @@ rpi_plugin_sdk::export_plugin!(|api| {
     // Register the echo tool. Build an owning StableToolSchema (name +
     // description + parameters-as-JSON); the host frees the schema's strings
     // via our `plugin_free_string` after copying them out.
+    // Per-child fixture override; ordinary SDK smoke hosts still register echo.
+    let tool_name = std::env::var("RPI_PLUGIN_STUB_TOOL_NAME").unwrap_or_else(|_| "echo".into());
     let schema = Box::new(StableToolSchema {
-        name: StbString::from_string("echo".to_string()),
+        name: StbString::from_string(tool_name.clone()),
         description: StbString::from_string(
             "Echoes back the provided text (a B2 ABI smoke-test tool).".to_string(),
         ),
@@ -642,10 +653,24 @@ rpi_plugin_sdk::export_plugin!(|api| {
     // Older hosts lack this appended slot; echo still works without a summary.
     if let Some(register_tool_prompt) = api.register_tool_prompt {
         let rc = register_tool_prompt(
-            StbStringRef::from_str("echo"),
+            StbStringRef::from_str(&tool_name),
             StbStringRef::from_str(
                 r#"{"promptSnippet":"Echo the supplied text","promptGuidelines":["Use echo only when an echo is requested"]}"#,
             ),
+        );
+        if rc != 0 {
+            return rc;
+        }
+    }
+
+    if let Ok(command_name) = std::env::var("RPI_PLUGIN_STUB_COMMAND_NAME") {
+        let Some(register_command) = api.register_command else {
+            return 3;
+        };
+        let rc = register_command(
+            StbStringRef::from_str(&command_name),
+            StbStringRef::from_str("Opt-in namespace acceptance fixture"),
+            fixture_command,
         );
         if rc != 0 {
             return rc;

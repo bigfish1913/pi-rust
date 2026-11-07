@@ -5,6 +5,7 @@ mod autocomplete_flicker;
 #[cfg(all(feature = "clipboard", not(target_os = "android")))]
 mod clipboard_persistence;
 mod enter_completion;
+mod native_durable;
 mod session_regressions;
 mod updown_cursor;
 
@@ -442,6 +443,7 @@ fn markdown_flag_only_comes_from_an_explicit_true() {
 /// the explicit literals other tests build, but keeps one copy in sync.
 pub(super) fn test_tui_state() -> Arc<TuiState> {
     Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
@@ -1790,6 +1792,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
     };
 
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
@@ -3420,6 +3423,7 @@ fn test_autocomplete_slash_suggestions_render() {
     // The autocomplete container should render at least one suggestion
     // line when the editor holds a `/` prefix, and clear when it doesn't.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
@@ -3519,6 +3523,7 @@ fn test_select_list_swap_restores_editor() {
     // child; closing restores it. Verify the container child count + the
     // active_selector flag round-trip.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
@@ -3621,6 +3626,7 @@ fn test_message_history_browse_restores_draft() {
     // messages, browse older → newer → back past the newest restores the
     // draft the user was typing.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
@@ -3726,6 +3732,7 @@ fn test_message_history_browse_restores_draft() {
 fn test_accept_top_suggestion_replaces_prefix() {
     // `/he` + Tab → `/help ` (slash command provider inserts a space).
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
@@ -3817,6 +3824,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
 /// installed by each test).
 fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
     Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
@@ -4496,8 +4504,8 @@ fn ask_user_prompt_parser_supports_flat_and_questions_shapes() {
 #[test]
 fn ask_user_bridge_answers_and_cancels_by_request_id() {
     let mailbox = rpi_extensions::UiDialogMailbox::new();
-    mailbox.attach();
     let bridge = AskUserBridge::new(mailbox.clone());
+    assert!(bridge.attach());
 
     // Two concurrent requests must not cross answers.
     mailbox

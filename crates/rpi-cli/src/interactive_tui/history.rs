@@ -38,8 +38,17 @@ pub(super) struct HistoryUi {
     pub(super) active: Arc<Container>,
     pub(super) panels: Arc<Container>,
     pub(super) header: Arc<Container>,
+    // An ephemeral component, not a durable state cache or persisted transcript.
+    native_durable_enabled: bool,
+    native_durable_notice: Arc<Container>,
 }
 impl HistoryUi {
+    pub(super) fn with_native_durable(enabled: bool) -> Self {
+        Self {
+            native_durable_enabled: enabled,
+            ..Default::default()
+        }
+    }
     pub(super) fn invalidate(&self) {
         if let Some(worker) = self.worker.lock().unwrap().take() {
             worker.abort();
@@ -58,6 +67,7 @@ impl HistoryUi {
         self.active.clear();
         self.panels.clear();
         self.header.clear();
+        self.native_durable_notice.clear();
     }
     pub(super) fn bind(&self, harness: &AgentHarness) {
         self.invalidate();
@@ -70,6 +80,7 @@ impl HistoryUi {
             .is_some_and(|bound| Arc::ptr_eq(bound, &storage))
         {
             resident.page = None;
+            self.native_durable_notice.clear();
         }
         resident.storage = Some(storage);
     }
@@ -112,6 +123,18 @@ impl HistoryUi {
         {
             chat.add_child(panels);
         }
+        self.mount_native_notice(chat);
+    }
+    fn mount_native_notice(&self, chat: &Arc<Container>) {
+        let notice: Arc<dyn Component> = self.native_durable_notice.clone();
+        if self.native_durable_notice.child_count() > 0
+            && !chat
+                .get_children()
+                .iter()
+                .any(|child| Arc::ptr_eq(child, &notice))
+        {
+            chat.add_child(notice);
+        }
     }
 }
 
@@ -133,6 +156,52 @@ pub(super) fn apply_overview(footer: &FooterComponent, overview: &BranchOverview
 pub(super) async fn restore(harness: &AgentHarness, state: &Arc<TuiState>, chat: &Arc<Container>) {
     state.history_page.bind(harness);
     restore_bound(state, chat).await;
+    refresh_native_durable_notice(harness, state, chat).await;
+}
+
+/// Once per explicit view entry, not per history page or render tick. Restore is
+/// shared by switch/import/fork/new/tree. Paging only remounts the same component.
+/// The host invalidates this generation before replacing a session/branch, so a
+/// late observation cannot be installed in a newer view. No lock spans the read.
+pub(super) async fn refresh_native_durable_notice(
+    harness: &AgentHarness,
+    state: &Arc<TuiState>,
+    chat: &Arc<Container>,
+) {
+    refresh_notice_from(
+        harness,
+        state,
+        chat,
+        crate::native_durable::lifecycle_notice(harness, true),
+    )
+    .await;
+}
+
+async fn refresh_notice_from(
+    harness: &AgentHarness,
+    state: &Arc<TuiState>,
+    chat: &Arc<Container>,
+    read: impl std::future::Future<Output = Option<String>>,
+) {
+    if !state.history_page.native_durable_enabled {
+        return;
+    }
+    let (generation, storage) = {
+        let resident = state.history_page.resident.lock().unwrap();
+        (resident.generation, resident.storage.clone())
+    };
+    let Some(storage) = storage else { return };
+    let text = read.await;
+    let active_storage = harness.session().storage();
+    let resident = state.history_page.resident.lock().unwrap();
+    if !current(&resident, generation, &storage) || !Arc::ptr_eq(&storage, &active_storage) {
+        return;
+    }
+    state.history_page.native_durable_notice.clear();
+    if let Some(text) = text {
+        add_note_message(&state.history_page.native_durable_notice, &text);
+    }
+    state.history_page.mount_active(chat);
 }
 
 async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
@@ -307,6 +376,9 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
                 state
                     .chat_container
                     .add_child(state.history_page.panels.clone());
+                state
+                    .history_page
+                    .mount_native_notice(&state.chat_container);
                 if let Some(scroll) = tui.get_primary_scroll_view() {
                     scroll.invalidate();
                 }
@@ -434,3 +506,11 @@ mod tests {
 #[cfg(test)]
 #[path = "history/tests.rs"]
 mod paging_tests;
+
+#[cfg(test)]
+#[path = "history/native_durable_tests.rs"]
+mod native_durable_tests;
+
+#[cfg(test)]
+#[path = "history/experimental_durable_tests.rs"]
+mod experimental_durable_tests;

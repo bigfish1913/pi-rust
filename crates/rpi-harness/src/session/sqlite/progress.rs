@@ -8,21 +8,57 @@ fn failure(error: impl std::fmt::Display) -> SessionError {
 impl SqliteSessionStorage {
     pub(super) async fn prune_completed_progress_sql(&self) -> SessionResult<usize> {
         let _gate = self.gate.lock().await;
-        let db = self.db.lock().map_err(failure)?;
+        let mut db = self.db.lock().map_err(failure)?;
+        let transaction = db.transaction().map_err(failure)?;
+        let session_id = self.inner.metadata().id;
+        let writer_epoch: i64 = transaction
+            .query_row(
+                "SELECT writer_epoch FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(failure)?;
+        if writer_epoch < 0 {
+            return Err(SessionError::storage("SQLite writer epoch is negative"));
+        }
         // One authoritative database statement: no stale Memory mirror, no
         // progress-row-times-history scan, and no state_json rewrite.
-        db.execute(
-            "WITH finished AS MATERIALIZED (
-                SELECT json_extract(r.value, '$.lane') AS lane,
-                       json_extract(r.value, '$.runId') AS run_id
-                FROM sessions AS s, json_each(s.state_json, '$.records') AS r
-                WHERE s.id = ?1 AND json_extract(r.value, '$.type') = 'operation_finished'
-             )
-             DELETE FROM progress_frames WHERE session_id = ?1
-             AND (lane, run_id) IN (SELECT lane, run_id FROM finished)",
-            params![self.inner.metadata().id],
-        )
-        .map_err(failure)
+        let removed = transaction
+            .execute(
+                "WITH finished AS MATERIALIZED (
+                    SELECT json_extract(r.value, '$.lane') AS lane,
+                           json_extract(r.value, '$.runId') AS run_id
+                    FROM sessions AS s, json_each(s.state_json, '$.records') AS r
+                    WHERE s.id = ?1 AND json_extract(r.value, '$.type') = 'operation_finished'
+                 )
+                 DELETE FROM progress_frames WHERE session_id = ?1
+                 AND (lane, run_id) IN (SELECT lane, run_id FROM finished)",
+                params![session_id],
+            )
+            .map_err(failure)?;
+        if removed > 0 {
+            let changed = transaction
+                .execute(
+                    "UPDATE sessions SET writer_epoch = writer_epoch + 1 WHERE id = ?1 AND writer_epoch = ?2",
+                    params![session_id, writer_epoch],
+                )
+                .map_err(failure)?;
+            if changed != 1 {
+                return Err(SessionError::storage(
+                    "SQLite progress prune writer epoch conflict",
+                ));
+            }
+        }
+        transaction.commit().map_err(failure)?;
+        if removed > 0 {
+            self.writer_epoch.store(
+                u64::try_from(writer_epoch)
+                    .map_err(|_| SessionError::storage("SQLite writer epoch exceeds u64"))?
+                    + 1,
+                Ordering::Release,
+            );
+        }
+        Ok(removed)
     }
 
     pub(super) async fn append_progress_sql(
@@ -33,6 +69,16 @@ impl SqliteSessionStorage {
         let mut db = self.db.lock().map_err(failure)?;
         let transaction = db.transaction().map_err(failure)?;
         let session_id = self.inner.metadata().id;
+        let writer_epoch: i64 = transaction
+            .query_row(
+                "SELECT writer_epoch FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(failure)?;
+        if writer_epoch < 0 {
+            return Err(SessionError::storage("SQLite writer epoch is negative"));
+        }
         for record in &records {
             let found: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM sessions, json_each(sessions.state_json, '$.lanes') WHERE sessions.id = ?1 AND json_each.key = ?2)",params![session_id,record.base.lane],|row| row.get(0)).map_err(failure)?;
             if !found {
@@ -90,8 +136,27 @@ impl SqliteSessionStorage {
                     params![last.base.seq, session_id],
                 )
                 .map_err(failure)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE sessions SET writer_epoch = writer_epoch + 1 WHERE id = ?1 AND writer_epoch = ?2",
+                    params![session_id, writer_epoch],
+                )
+                .map_err(failure)?;
+            if changed != 1 {
+                return Err(SessionError::storage(
+                    "SQLite progress append writer epoch conflict",
+                ));
+            }
         }
         transaction.commit().map_err(failure)?;
+        if stamped.last().is_some() {
+            self.writer_epoch.store(
+                u64::try_from(writer_epoch)
+                    .map_err(|_| SessionError::storage("SQLite writer epoch exceeds u64"))?
+                    + 1,
+                Ordering::Release,
+            );
+        }
         Ok(stamped)
     }
     pub(super) async fn read_progress_sql(

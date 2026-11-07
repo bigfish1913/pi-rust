@@ -16,6 +16,8 @@ use std::{
 use tokio::sync::Mutex as AsyncMutex;
 
 type Result<T> = engine::Result<T>;
+#[path = "branch_stream.rs"]
+mod branch_stream;
 #[derive(Clone)]
 pub struct ExperimentalNativeStorage {
     pub(super) metadata: SessionMetadata,
@@ -616,6 +618,11 @@ impl SessionStorage for ExperimentalNativeStorage {
         let (q, bounds, start) = (q.clone(), bounds.clone(), start.to_owned());
         self.run(move |s, _| {
             let tx = s.connection.transaction()?;
+            if q.limit.is_some() {
+                let result = branch_stream::entries(&tx, &s.identity, &q, &start, &bounds)?;
+                tx.commit()?;
+                return Ok(result);
+            }
             let mut keys = path(&tx, &s.identity, &start, &bounds)?;
             // Preserve SessionState's inclusive-bound behavior in oldest-first scans.
             if q.order == Some(EntryOrder::OldestFirst)

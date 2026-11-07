@@ -7,6 +7,7 @@
 //! atomically after the in-memory mutation succeeds.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -16,9 +17,10 @@ use crate::error::{SessionError, SessionResult};
 use crate::session::memory::{Clock, InMemorySessionStorage, SystemClock};
 use crate::session::state::SessionState;
 use crate::session::types::{
-    BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator, LanePointer, LaneRecord, LogItem,
-    LogOptions, OperationStartedRecord, ProvisionedEntry, RecordQuery, SessionCreateOptions,
-    SessionMetadata, SessionRepo, SessionStats, SessionStorage,
+    BranchBounds, Entry, EntryQuery, ForkOptions, HistoryCheckpoint, HistoryIdentity,
+    HistoryReplacement, IdGenerator, LanePointer, LaneRecord, LogItem, LogOptions,
+    OperationStartedRecord, ProvisionedEntry, RecordQuery, SessionCreateOptions, SessionMetadata,
+    SessionRepo, SessionStats, SessionStorage,
 };
 
 #[derive(Clone)]
@@ -26,6 +28,8 @@ pub struct SqliteSessionStorage {
     db: Arc<Mutex<Connection>>,
     inner: InMemorySessionStorage,
     gate: Arc<tokio::sync::Mutex<()>>,
+    /// Persisted per-session mutation fence observed by this binding.
+    writer_epoch: Arc<AtomicU64>,
 }
 
 impl SqliteSessionStorage {
@@ -41,6 +45,7 @@ impl SqliteSessionStorage {
             db,
             inner: InMemorySessionStorage::from_state(metadata, state, clock, ids),
             gate,
+            writer_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -48,15 +53,19 @@ impl SqliteSessionStorage {
         let metadata = self.inner.metadata();
         let state = serde_json::to_string(&self.inner.snapshot_state())
             .map_err(|e| SessionError::storage(format!("serialize SQLite session: {e}")))?;
+        let expected_epoch = self.writer_epoch.load(Ordering::Acquire);
         let changed = self
             .db
             .lock()
             .map_err(|_| SessionError::storage("SQLite connection poisoned"))?
             .execute(
-                "UPDATE sessions SET state_json = ?1 WHERE id = ?2 AND state_json = ?3",
-                params![state, metadata.id, previous],
+                "UPDATE sessions SET state_json = ?1, writer_epoch = writer_epoch + 1 WHERE id = ?2 AND state_json = ?3 AND writer_epoch = ?4",
+                params![state, metadata.id, previous, i64::try_from(expected_epoch).map_err(|_| SessionError::storage("SQLite writer epoch exceeds INTEGER"))?],
             )
             .map_err(|e| SessionError::storage(format!("persist SQLite session: {e}")))?;
+        if changed == 1 {
+            self.writer_epoch.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(changed == 1)
     }
 
@@ -100,19 +109,22 @@ impl SqliteSessionStorage {
 
     fn refresh_unlocked(&self) -> SessionResult<String> {
         let id = self.inner.metadata().id;
-        let state_json: String = self
+        let (state_json, writer_epoch): (String, i64) = self
             .db
             .lock()
             .map_err(|_| SessionError::storage("SQLite connection poisoned"))?
             .query_row(
-                "SELECT state_json FROM sessions WHERE id = ?1",
+                "SELECT state_json, writer_epoch FROM sessions WHERE id = ?1",
                 params![id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| SessionError::storage(format!("refresh SQLite session: {e}")))?;
+        let writer_epoch = u64::try_from(writer_epoch)
+            .map_err(|_| SessionError::storage("SQLite writer epoch is negative"))?;
         let state = serde_json::from_str(&state_json)
             .map_err(|e| SessionError::storage(format!("decode SQLite session: {e}")))?;
         self.inner.replace_state(state);
+        self.writer_epoch.store(writer_epoch, Ordering::Release);
         Ok(state_json)
     }
 
@@ -184,6 +196,262 @@ impl SessionStorage for SqliteSessionStorage {
     async fn history_revision(&self) -> SessionResult<u64> {
         let _gate = self.refresh_read().await?;
         self.inner.history_revision().await
+    }
+
+    async fn history_generation(&self) -> SessionResult<u64> {
+        let _gate = self.gate.clone().lock_owned().await;
+        let id = self.inner.metadata().id;
+        let generation: i64 = self
+            .db
+            .lock()
+            .map_err(|_| SessionError::storage("SQLite connection poisoned"))?
+            .query_row(
+                "SELECT history_generation FROM sessions WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| SessionError::storage(format!("read SQLite history generation: {e}")))?;
+        u64::try_from(generation)
+            .map_err(|_| SessionError::storage("SQLite history generation is negative"))
+    }
+
+    async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+        let _gate = self.gate.clone().lock_owned().await;
+        let id = self.inner.metadata().id;
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| SessionError::storage("SQLite connection poisoned"))?;
+        let (state_json, generation): (String, i64) = db
+            .query_row(
+                "SELECT state_json, history_generation FROM sessions WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| SessionError::storage(format!("read SQLite history identity: {e}")))?;
+        let state: SessionState = serde_json::from_str(&state_json)
+            .map_err(|e| SessionError::storage(format!("decode SQLite history identity: {e}")))?;
+        Ok(HistoryIdentity {
+            revision: state.sequence(),
+            generation: u64::try_from(generation)
+                .map_err(|_| SessionError::storage("SQLite history generation is negative"))?,
+        })
+    }
+
+    async fn history_checkpoint(&self) -> SessionResult<Option<HistoryCheckpoint>> {
+        let _gate = self.gate.clone().lock_owned().await;
+        let id = self.inner.metadata().id;
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| SessionError::storage("SQLite connection poisoned"))?;
+        let (state_json, generation, checkpoint_published, archive_json):
+            (String, i64, i64, Option<String>) = db
+            .query_row(
+                "SELECT state_json, history_generation, checkpoint_published, checkpoint_archive_json FROM sessions WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|e| SessionError::storage(format!("read SQLite history checkpoint: {e}")))?;
+        let state: SessionState = serde_json::from_str(&state_json).map_err(|e| {
+            SessionError::storage(format!("decode SQLite history checkpoint state: {e}"))
+        })?;
+        let generation = u64::try_from(generation)
+            .map_err(|_| SessionError::storage("SQLite history generation is negative"))?;
+        if checkpoint_published == 0 {
+            return Ok(None);
+        }
+        let archive = archive_json
+            .map(|archive_json| serde_json::from_str(&archive_json))
+            .transpose()
+            .map_err(|e| SessionError::storage(format!("decode SQLite receipt archive: {e}")))?;
+        let checkpoint = HistoryCheckpoint::new(
+            HistoryIdentity {
+                revision: state.sequence(),
+                generation,
+            },
+            state,
+        )?;
+        let checkpoint = match archive {
+            Some(archive) => checkpoint.with_receipt_archive(archive)?,
+            None => checkpoint,
+        };
+        Ok(Some(checkpoint))
+    }
+
+    async fn replace_history_with_checkpoint_if_revision_and_generation(
+        &self,
+        expected_revision: u64,
+        expected_generation: u64,
+        checkpoint: HistoryCheckpoint,
+    ) -> SessionResult<HistoryIdentity> {
+        checkpoint.validate()?;
+        if checkpoint.history_identity
+            != (HistoryIdentity {
+                revision: expected_revision,
+                generation: expected_generation,
+            })
+        {
+            return Err(SessionError::storage(
+                "history checkpoint identity does not match replacement CAS",
+            ));
+        }
+        let replacement_revision = checkpoint.state.sequence();
+        let replacement_json = serde_json::to_string(&checkpoint.state)
+            .map_err(|e| SessionError::storage(format!("serialize SQLite checkpoint: {e}")))?;
+        let archive_json = checkpoint
+            .receipt_archive
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| SessionError::storage(format!("serialize SQLite receipt archive: {e}")))?;
+        let next_generation = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| SessionError::storage("history replacement generation exhausted"))?;
+        let next_generation_sql = i64::try_from(next_generation)
+            .map_err(|_| SessionError::storage("SQLite history generation exceeds INTEGER"))?;
+        let expected_generation_sql = i64::try_from(expected_generation)
+            .map_err(|_| SessionError::storage("SQLite history generation exceeds INTEGER"))?;
+        let id = self.inner.metadata().id;
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| SessionError::storage("SQLite connection poisoned"))?;
+        let tx = db.transaction().map_err(|e| {
+            SessionError::storage(format!("begin SQLite checkpoint replacement: {e}"))
+        })?;
+        let (current_json, current_generation, current_writer_epoch): (String, i64, i64) = tx
+            .query_row(
+                "SELECT state_json, history_generation, writer_epoch FROM sessions WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| SessionError::storage(format!("read SQLite checkpoint identity: {e}")))?;
+        let current_state: SessionState = serde_json::from_str(&current_json)
+            .map_err(|e| SessionError::storage(format!("decode SQLite checkpoint state: {e}")))?;
+        let current_generation = u64::try_from(current_generation)
+            .map_err(|_| SessionError::storage("SQLite history generation is negative"))?;
+        if current_writer_epoch < 0 {
+            return Err(SessionError::storage("SQLite writer epoch is negative"));
+        }
+        if current_state.sequence() != expected_revision
+            || current_generation != expected_generation
+        {
+            return Err(SessionError::storage(format!(
+                "history checkpoint identity conflict: expected revision {expected_revision}, generation {expected_generation}; actual revision {}, generation {current_generation}",
+                current_state.sequence()
+            )));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE sessions SET state_json = ?1, history_generation = ?2, writer_epoch = writer_epoch + 1, checkpoint_published = 1, checkpoint_archive_json = ?3 WHERE id = ?4 AND state_json = ?5 AND history_generation = ?6 AND writer_epoch = ?7",
+                params![
+                    replacement_json,
+                    next_generation_sql,
+                    archive_json,
+                    id,
+                    current_json,
+                    expected_generation_sql,
+                    current_writer_epoch
+                ],
+            )
+            .map_err(|e| SessionError::storage(format!("publish SQLite checkpoint: {e}")))?;
+        if changed != 1 {
+            return Err(SessionError::storage(
+                "history checkpoint identity conflict during publish",
+            ));
+        }
+        tx.commit()
+            .map_err(|e| SessionError::storage(format!("commit SQLite checkpoint: {e}")))?;
+        drop(db);
+        self.inner.replace_state(checkpoint.state);
+        self.writer_epoch.store(
+            u64::try_from(current_writer_epoch).unwrap() + 1,
+            Ordering::Release,
+        );
+        Ok(HistoryIdentity {
+            revision: replacement_revision,
+            generation: next_generation,
+        })
+    }
+
+    async fn replace_history_if_revision_and_generation(
+        &self,
+        expected_revision: u64,
+        expected_generation: u64,
+        replacement: HistoryReplacement,
+    ) -> SessionResult<HistoryIdentity> {
+        let _gate = self.gate.clone().lock_owned().await;
+        let replacement_revision = replacement.state.sequence();
+        let replacement_json = serde_json::to_string(&replacement.state)
+            .map_err(|e| SessionError::storage(format!("serialize SQLite replacement: {e}")))?;
+        let next_generation = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| SessionError::storage("history replacement generation exhausted"))?;
+        let next_generation_sql = i64::try_from(next_generation)
+            .map_err(|_| SessionError::storage("SQLite history generation exceeds INTEGER"))?;
+        let expected_generation_sql = i64::try_from(expected_generation)
+            .map_err(|_| SessionError::storage("SQLite history generation exceeds INTEGER"))?;
+        let id = self.inner.metadata().id;
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| SessionError::storage("SQLite connection poisoned"))?;
+        let tx = db
+            .transaction()
+            .map_err(|e| SessionError::storage(format!("begin SQLite replacement: {e}")))?;
+        let (current_json, current_generation, current_writer_epoch): (String, i64, i64) = tx
+            .query_row(
+                "SELECT state_json, history_generation, writer_epoch FROM sessions WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| SessionError::storage(format!("read SQLite replacement identity: {e}")))?;
+        let current_state: SessionState = serde_json::from_str(&current_json)
+            .map_err(|e| SessionError::storage(format!("decode SQLite replacement state: {e}")))?;
+        let current_generation = u64::try_from(current_generation)
+            .map_err(|_| SessionError::storage("SQLite history generation is negative"))?;
+        if current_writer_epoch < 0 {
+            return Err(SessionError::storage("SQLite writer epoch is negative"));
+        }
+        if current_state.sequence() != expected_revision
+            || current_generation != expected_generation
+        {
+            return Err(SessionError::storage(format!(
+                "history replacement identity conflict: expected revision {expected_revision}, generation {expected_generation}; actual revision {}, generation {current_generation}",
+                current_state.sequence()
+            )));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE sessions SET state_json = ?1, history_generation = ?2, writer_epoch = writer_epoch + 1, checkpoint_published = 0, checkpoint_archive_json = NULL WHERE id = ?3 AND state_json = ?4 AND history_generation = ?5 AND writer_epoch = ?6",
+                params![
+                    replacement_json,
+                    next_generation_sql,
+                    id,
+                    current_json,
+                    expected_generation_sql,
+                    current_writer_epoch
+                ],
+            )
+            .map_err(|e| SessionError::storage(format!("publish SQLite replacement: {e}")))?;
+        if changed != 1 {
+            return Err(SessionError::storage(
+                "history replacement identity conflict during publish",
+            ));
+        }
+        tx.commit()
+            .map_err(|e| SessionError::storage(format!("commit SQLite replacement: {e}")))?;
+        drop(db);
+        self.inner.replace_state(replacement.state);
+        self.writer_epoch.store(
+            u64::try_from(current_writer_epoch).unwrap() + 1,
+            Ordering::Release,
+        );
+        Ok(HistoryIdentity {
+            revision: replacement_revision,
+            generation: next_generation,
+        })
     }
 
     async fn append_entry_if_revision(
@@ -375,7 +643,11 @@ impl SqliteSessionRepo {
                  id TEXT PRIMARY KEY,
                  created_at INTEGER NOT NULL,
                  parent_session_id TEXT,
-                 state_json TEXT NOT NULL
+                 state_json TEXT NOT NULL,
+                 writer_epoch INTEGER NOT NULL DEFAULT 0,
+                 history_generation INTEGER NOT NULL DEFAULT 0,
+                 checkpoint_published INTEGER NOT NULL DEFAULT 0,
+                 checkpoint_archive_json TEXT
              );
              CREATE TABLE IF NOT EXISTS progress_heads (
                  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
@@ -391,6 +663,72 @@ impl SqliteSessionRepo {
              PRAGMA foreign_keys = ON;",
         )
         .map_err(|e| SessionError::storage(format!("initialize SQLite database: {e}")))?;
+        let has_writer_epoch: Option<String> = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('sessions') WHERE name = 'writer_epoch'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| {
+                SessionError::storage(format!("inspect SQLite writer epoch schema: {e}"))
+            })?;
+        if has_writer_epoch.is_none() {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN writer_epoch INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| {
+                SessionError::storage(format!("upgrade SQLite writer epoch schema: {e}"))
+            })?;
+        }
+        let has_generation: Option<String> = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('sessions') WHERE name = 'history_generation'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| SessionError::storage(format!("inspect SQLite generation schema: {e}")))?;
+        if has_generation.is_none() {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN history_generation INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| SessionError::storage(format!("upgrade SQLite generation schema: {e}")))?;
+        }
+        let has_checkpoint: Option<String> = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('sessions') WHERE name = 'checkpoint_published'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| SessionError::storage(format!("inspect SQLite checkpoint schema: {e}")))?;
+        if has_checkpoint.is_none() {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN checkpoint_published INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| SessionError::storage(format!("upgrade SQLite checkpoint schema: {e}")))?;
+        }
+        let has_checkpoint_archive: Option<String> = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('sessions') WHERE name = 'checkpoint_archive_json'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| SessionError::storage(format!("inspect SQLite checkpoint archive schema: {e}")))?;
+        if has_checkpoint_archive.is_none() {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN checkpoint_archive_json TEXT",
+                [],
+            )
+            .map_err(|e| {
+                SessionError::storage(format!("upgrade SQLite checkpoint archive schema: {e}"))
+            })?;
+        }
         Ok(Self {
             path,
             db: Arc::new(Mutex::new(conn)),
@@ -558,8 +896,13 @@ impl SessionRepo for SqliteSessionRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "experimental-native-store")]
+    use crate::session::experimental_native::ExperimentalNativeRepo;
     use crate::session::memory::{CounterIdGenerator, FakeClock};
-    use crate::session::types::{EntryOrder, EntryQuery, ForkOptions, ProvisionedKind};
+    use crate::session::types::{
+        AssistantFrameOp, AssistantFrameRecord, EntryOrder, EntryQuery, ForkOptions,
+        ProvisionedKind, RecordBase,
+    };
     use rpi_agent::message::AgentMessage;
 
     fn repo() -> (SqliteSessionRepo, tempfile::TempDir) {
@@ -571,6 +914,42 @@ mod tests {
         )
         .unwrap();
         (repo, dir)
+    }
+
+    #[cfg(feature = "experimental-native-store")]
+    #[tokio::test]
+    async fn legacy_sqlite_repo_rejects_experimental_native_artifact_before_initialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = ExperimentalNativeRepo::new(dir.path().to_owned())
+            .await
+            .unwrap();
+        let storage = native
+            .create(&SessionCreateOptions {
+                id: Some("format-isolation".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let metadata = storage.metadata();
+        drop(storage);
+
+        let path = dir.path().join("format-isolation.rpinative");
+        let before = std::fs::read(&path).unwrap();
+        let error = match SqliteSessionRepo::open(&path) {
+            Ok(_) => panic!("legacy SQLite must reject native artifacts"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("experimental native artifact cannot be opened"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            !std::path::PathBuf::from(format!("{}-wal", path.display())).exists(),
+            "rejection must occur before legacy WAL initialization"
+        );
+
+        let reopened = native.open(&metadata).await.unwrap();
+        assert_eq!(reopened.metadata(), metadata);
     }
 
     #[tokio::test]
@@ -629,6 +1008,261 @@ mod tests {
         let expected = crate::session::context::build_session_context(&path, &Default::default());
         assert_eq!(actual.messages, expected.messages);
         assert_eq!(actual.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn replacement_cas_persists_generation_and_rejects_stale_handles() {
+        let (repo, _dir) = repo();
+        let session = repo
+            .create(&SessionCreateOptions {
+                id: Some("replacement".into()),
+                parent_session_id: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        session
+            .append_entry(
+                ProvisionedEntry {
+                    id: "before".into(),
+                    kind: ProvisionedKind::Message {
+                        message: AgentMessage::from(rpi_ai::types::UserMessage::new("before", 1)),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT writer_epoch FROM sessions WHERE id = 'replacement'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let progress = session
+            .append_progress(vec![AssistantFrameRecord {
+                base: RecordBase {
+                    id: "replacement-progress".into(),
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                run_id: "replacement-run".into(),
+                stream_index: 0,
+                op: AssistantFrameOp::Append,
+                frame: Some(serde_json::json!({"text":"pending"})),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT writer_epoch FROM sessions WHERE id = 'replacement'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        let replacement_state = session.inner.snapshot_state();
+        let stale_handle = repo.open(&session.metadata()).await.unwrap();
+
+        let checkpoint = replacement_state
+            .history_checkpoint(HistoryIdentity {
+                revision: 1,
+                generation: 0,
+            })
+            .unwrap()
+            .with_receipt_archive(
+                crate::durable::experimental_ledger::archive::ReceiptArchive::empty(),
+            )
+            .unwrap();
+        let identity = session
+            .replace_history_with_checkpoint_if_revision_and_generation(1, 0, checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(identity.revision, 1);
+        assert_eq!(identity.generation, 1);
+        assert_eq!(
+            session
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT writer_epoch FROM sessions WHERE id = 'replacement'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+
+        let reopened = repo.open(&session.metadata()).await.unwrap();
+        assert_eq!(
+            reopened.history_identity().await.unwrap(),
+            HistoryIdentity {
+                revision: 1,
+                generation: 1
+            }
+        );
+        assert_eq!(reopened.history_revision().await.unwrap(), 1);
+        assert_eq!(reopened.history_generation().await.unwrap(), 1);
+        assert_eq!(
+            reopened.read_progress("replacement-run").await.unwrap(),
+            progress
+        );
+        let persisted = reopened.history_checkpoint().await.unwrap().unwrap();
+        assert_eq!(persisted.history_identity, identity);
+        assert!(persisted.receipt_archive.is_some());
+        assert!(reopened.get_entry("before").await.unwrap().is_some());
+        let stale = stale_handle
+            .replace_history_if_revision_and_generation(
+                1,
+                0,
+                HistoryReplacement {
+                    state: replacement_state,
+                    canonical_mutations: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("identity conflict"));
+        assert_eq!(reopened.history_generation().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_with_archive_round_trips_after_reopen() {
+        let (repo, _dir) = repo();
+        let session = repo
+            .create(&SessionCreateOptions {
+                id: Some("archive-roundtrip".into()),
+                parent_session_id: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let checkpoint = SessionState::new()
+            .history_checkpoint(HistoryIdentity {
+                revision: 0,
+                generation: 0,
+            })
+            .unwrap()
+            .with_receipt_archive(
+                crate::durable::experimental_ledger::archive::ReceiptArchive::empty(),
+            )
+            .unwrap();
+        let published = session
+            .replace_history_with_checkpoint_if_revision_and_generation(0, 0, checkpoint)
+            .await
+            .unwrap();
+        let persisted = session.history_checkpoint().await.unwrap().unwrap();
+        assert_eq!(persisted.history_identity, published);
+        assert!(persisted.receipt_archive.is_some());
+
+        let reopened = repo.open(&session.metadata()).await.unwrap();
+        let persisted = reopened.history_checkpoint().await.unwrap().unwrap();
+        assert_eq!(persisted.history_identity, published);
+        assert!(persisted.receipt_archive.is_some());
+    }
+
+    #[tokio::test]
+    async fn old_sqlite_schema_migrates_checkpoint_archive_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old-schema.db");
+        let connection = Connection::open(&path).unwrap();
+        let state = serde_json::to_string(&SessionState::new()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, parent_session_id TEXT, state_json TEXT NOT NULL, history_generation INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (id, created_at, parent_session_id, state_json) VALUES (?1, ?2, NULL, ?3)",
+                rusqlite::params!["legacy-schema", 0i64, state],
+            )
+            .unwrap();
+        drop(connection);
+
+        let repo = SqliteSessionRepo::with_clock_ids(
+            &path,
+            Arc::new(FakeClock::new()),
+            Arc::new(CounterIdGenerator::new()),
+        )
+        .unwrap();
+        let session = repo
+            .open(&SessionMetadata {
+                id: "legacy-schema".into(),
+                created_at: 0,
+                parent_session_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(session.history_checkpoint().await.unwrap().is_none());
+        let checkpoint = SessionState::new()
+            .history_checkpoint(HistoryIdentity {
+                revision: 0,
+                generation: 0,
+            })
+            .unwrap()
+            .with_receipt_archive(
+                crate::durable::experimental_ledger::archive::ReceiptArchive::empty(),
+            )
+            .unwrap();
+        session
+            .replace_history_with_checkpoint_if_revision_and_generation(0, 0, checkpoint)
+            .await
+            .unwrap();
+        assert!(session.history_checkpoint().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_archive_corruption_fails_closed_without_rewriting_state() {
+        let (repo, _dir) = repo();
+        let session = repo
+            .create(&SessionCreateOptions {
+                id: Some("archive-corruption".into()),
+                parent_session_id: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let checkpoint = SessionState::new()
+            .history_checkpoint(HistoryIdentity {
+                revision: 0,
+                generation: 0,
+            })
+            .unwrap()
+            .with_receipt_archive(
+                crate::durable::experimental_ledger::archive::ReceiptArchive::empty(),
+            )
+            .unwrap();
+        let published = session
+            .replace_history_with_checkpoint_if_revision_and_generation(0, 0, checkpoint)
+            .await
+            .unwrap();
+        let id = session.metadata().id;
+        repo.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET checkpoint_archive_json = ?1 WHERE id = ?2",
+                rusqlite::params!["{}", id],
+            )
+            .unwrap();
+        assert!(session.history_checkpoint().await.is_err());
+        assert_eq!(session.history_identity().await.unwrap(), published);
     }
 
     #[tokio::test]

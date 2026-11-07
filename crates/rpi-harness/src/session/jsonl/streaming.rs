@@ -154,7 +154,28 @@ impl JsonlSessionStorage {
             clock,
             ids,
         );
+        // A sibling staging file is never authoritative. Only a writable
+        // restore may remove it, and ownership is acquired before mutation.
+        if allow_repair {
+            let staged_path = format!("{path}.tmp");
+            if file_result(
+                fs.exists(&staged_path, None).await,
+                "check staged history recovery artifact",
+            )? {
+                storage.ensure_writer_lease().await?;
+                file_result(
+                    storage.fs.remove(&staged_path, false, true, None).await,
+                    "remove stale staged history recovery artifact",
+                )?;
+            }
+        }
         storage.progress.required = header.progress_format.is_some();
+        if let Some(checkpoint) =
+            history_checkpoint(&header).map_err(|error| invalid_file(path, 1, &error))?
+        {
+            let resident = ResidentState::from_checkpoint(checkpoint.state)?;
+            *storage.state.lock().await = resident;
+        }
         let mut spans = vec![(0u64, header_raw.len() as u64)];
         let mut seen: HashMap<u64, (u64, usize)> = HashMap::new();
         let mut repair = false;
@@ -236,6 +257,7 @@ impl JsonlSessionStorage {
             }
         }
         if repair && allow_repair {
+            storage.ensure_writer_lease().await?;
             let digest = Arc::new(std::sync::Mutex::new(None));
             let output = digest.clone();
             publish_file_atomically(&fs, path, move |fs, temp| {
@@ -261,19 +283,24 @@ impl JsonlSessionStorage {
             })
             .await?;
             if !storage.progress.required {
-                storage.legacy_history_digest = *digest.lock().unwrap();
+                *storage.legacy_history_digest.lock().unwrap() = *digest.lock().unwrap();
             }
         } else {
             if !terminated && allow_repair {
+                storage.ensure_writer_lease().await?;
                 file_result(
                     fs.append_file(path, FileContent::Text("\n".into()), None)
                         .await,
                     "repair unterminated session tail",
                 )?;
+                file_result(
+                    fs.sync_file(path, true, None).await,
+                    "sync repaired unterminated session tail",
+                )?;
                 scan.hash.update(b"\n");
             }
             if !storage.progress.required {
-                storage.legacy_history_digest = Some(scan.hash.finalize().into());
+                *storage.legacy_history_digest.lock().unwrap() = Some(scan.hash.finalize().into());
             }
         }
         policy.check((line_no - 1) as usize)?;
@@ -372,7 +399,7 @@ impl JsonlSessionStorage {
         })
         .await?;
         self.progress = progress;
-        self.legacy_history_digest = None;
+        *self.legacy_history_digest.lock().unwrap() = None;
         Ok(true)
     }
 }

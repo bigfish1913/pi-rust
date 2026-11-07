@@ -316,7 +316,27 @@ mod tests {
 #[cfg(test)]
 mod retirement_tests {
     use super::*;
-    use crate::session::types::{AssistantFrameRecord, RecordBase};
+    use crate::session::types::{
+        AssistantFrameRecord, HistoryCheckpoint, HistoryIdentity, RecordBase,
+    };
+
+    #[test]
+    fn history_checkpoint_round_trips_reducer_state_and_identity() {
+        let state = SessionState::new();
+        let checkpoint = state
+            .history_checkpoint(HistoryIdentity {
+                revision: 0,
+                generation: 7,
+            })
+            .unwrap();
+        checkpoint.validate().unwrap();
+        let encoded = serde_json::to_value(&checkpoint).unwrap();
+        let restored: HistoryCheckpoint = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.history_identity.generation, 7);
+        assert_eq!(restored.state.sequence(), 0);
+        restored.validate().unwrap();
+    }
+
     #[test]
     fn old_snapshot_retires_only_prior_bodies_and_remaps_record_log_atomically() {
         let records: Vec<_> = [

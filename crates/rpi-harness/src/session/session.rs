@@ -166,6 +166,8 @@ pub struct Session {
 #[derive(Clone)]
 struct SessionBinding {
     storage: Arc<dyn SessionStorage>,
+    // Rotates on replacement, even when session ID and sequence happen to match.
+    binding_token: String,
     volatile_progress: Option<crate::frame_progress::SharedVolatileProgress>,
     entry_commit_publisher: Option<broadcast::Sender<SessionEntryCommit>>,
 }
@@ -189,6 +191,7 @@ impl Session {
         Self {
             binding: Arc::new(RwLock::new(SessionBinding {
                 storage,
+                binding_token: Uuid::now_v7().to_string(),
                 volatile_progress: None,
                 entry_commit_publisher: None,
             })),
@@ -235,6 +238,7 @@ impl Session {
         let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
         *self.binding.write().unwrap() = SessionBinding {
             storage,
+            binding_token: Uuid::now_v7().to_string(),
             volatile_progress: None,
             entry_commit_publisher: publisher,
         };
@@ -264,6 +268,7 @@ impl Session {
     pub(crate) fn rebind_to(&self, target: &Self) {
         let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
         let mut binding = target.binding.read().unwrap().clone();
+        binding.binding_token = Uuid::now_v7().to_string();
         if binding.entry_commit_publisher.is_none() {
             binding.entry_commit_publisher = publisher;
         }
@@ -293,6 +298,11 @@ impl Session {
     /// lock guard itself is not `Send`).
     fn storage_arc(&self) -> Arc<dyn SessionStorage> {
         Arc::clone(&self.binding.read().unwrap().storage)
+    }
+
+    /// Identity for in-process conditional control writes, not durable fencing.
+    pub(crate) fn binding_token(&self) -> String {
+        self.binding.read().unwrap().binding_token.clone()
     }
 
     /// The shared id generator. Mirrors TS `readonly idGenerator`.

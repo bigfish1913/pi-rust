@@ -94,6 +94,23 @@ async fn failed_initialization_does_not_publish_a_partial_schema_or_overwrite_it
     assert_eq!(std::fs::read(path).unwrap(), bytes);
 }
 #[tokio::test]
+async fn catalog_rejects_a_directory_with_the_native_suffix_without_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("directory.rpinative");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("sentinel"), b"do not inspect").unwrap();
+
+    let repo = ExperimentalNativeRepo::new(dir.path().to_owned())
+        .await
+        .unwrap();
+    assert!(repo.list().await.is_err());
+    assert_eq!(
+        std::fs::read(nested.join("sentinel")).unwrap(),
+        b"do not inspect"
+    );
+}
+
+#[tokio::test]
 async fn catalog_rejects_a_misnamed_or_foreign_experimental_artifact() {
     let dir = tempfile::tempdir().unwrap();
     let repo = ExperimentalNativeRepo::new(dir.path().to_owned())

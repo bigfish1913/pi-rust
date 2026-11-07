@@ -143,6 +143,9 @@ pub struct HarnessActionHost {
     cwd: PathBuf,
     session_dir: PathBuf,
     fresh_session_only: bool,
+    /// Host-owned startup choice, independent of model tools and plugin flags.
+    /// Immutable after construction, including while the registry is published.
+    native_durable: bool,
     /// Parsed unknown long flags retained for extension consumption.
     cli_flags: BTreeMap<String, serde_json::Value>,
     /// The session's plugin-tool context (`cwd` + session id). The session
@@ -186,6 +189,7 @@ impl HarnessActionHost {
                 catalog: RwLock::new(catalog),
                 session_dir: default_session_dir(&cwd),
                 fresh_session_only: false,
+                native_durable: false,
                 cwd,
                 cli_flags,
                 tool_context,
@@ -207,6 +211,10 @@ impl HarnessActionHost {
 
     pub(crate) fn with_fresh_session_only(mut self, locked: bool) -> Self {
         self.fresh_session_only = locked;
+        self
+    }
+    pub(crate) fn with_native_durable(mut self, enabled: bool) -> Self {
+        self.native_durable = enabled;
         self
     }
     fn allow_session_routing(&self) -> Result<(), String> {
@@ -562,7 +570,7 @@ impl RuntimeActionHost for HarnessActionHost {
         self.set_catalog(models);
     }
     async fn list_commands(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
-        let builtin = crate::interactive_tui::build_builtin_commands_for_abi();
+        let builtin = crate::interactive_tui::build_builtin_commands_for_abi(self.native_durable);
         let extension: Vec<(String, String)> = self
             .registry_snapshot()
             .as_deref()
@@ -602,7 +610,7 @@ impl RuntimeActionHost for HarnessActionHost {
                 builtin,
                 extension,
                 templates,
-                crate::interactive_tui::builtin_reserved_names(),
+                crate::interactive_tui::builtin_reserved_names(self.native_durable),
             )
         }))
     }
@@ -1083,6 +1091,10 @@ mod send_message_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "extensions_actions/native_durable_inventory_tests.rs"]
+mod native_durable_inventory_tests;
 
 #[cfg(test)]
 mod list_commands_tests {

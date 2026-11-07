@@ -500,7 +500,7 @@ pub(super) fn open_settings_model_selector(
         let lane = lane_sel.clone();
         let state = state_sel.clone();
         let tui = tui_sel.clone();
-        tokio::spawn(async move {
+        state.session_write_tasks.clone().spawn(async move {
             report_model_selection(&lane, &state, &tui, model, true).await;
         });
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
@@ -1921,7 +1921,7 @@ pub(super) fn open_settings_thinking_selector(
         };
         let lane = lane_sel.clone();
         let footer_sel = state_sel.footer.clone();
-        tokio::spawn(async move {
+        state_sel.session_write_tasks.spawn(async move {
             let _ = lane.set_thinking_level(level).await;
         });
         footer_sel.set_thinking_level(Some(thinking_level_name(level)));

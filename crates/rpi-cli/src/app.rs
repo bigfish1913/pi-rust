@@ -83,6 +83,10 @@ async fn run_inner() -> i32 {
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(error) = crate::native_durable::experimental_epoch::early_check(&argv) {
+        eprintln!("error: {error}");
+        return EXIT_USAGE;
+    }
     if let Err(error) = crate::native_store::early_check(&argv) {
         eprintln!("error: {error}");
         return EXIT_USAGE;
@@ -461,7 +465,6 @@ async fn run_inner() -> i32 {
             }
         };
     reload_context.dev_extension = dev_extension;
-
     // ---- post-load stdin claim + initial message ----
     // Extensions are loaded by `build()` (above). A plugin may have declared
     // `{"ownsStdio":true}`: this process's stdio belongs to it (an ACP/MCP stdio
@@ -677,13 +680,14 @@ async fn run_inner() -> i32 {
                         let session = reload_context.extension_session.lock().unwrap();
                         session.snapshot_arc()
                     };
-                    crate::modes::rpc(
+                    crate::modes::rpc_with_durable(
                         &harness,
                         Some(event_rx),
                         model_catalog,
                         reload_context.ui_dialog.clone(),
                         oauth_snapshot,
                         parsed.rpc_message_updates,
+                        parsed.native_durable,
                     )
                     .await
                 };

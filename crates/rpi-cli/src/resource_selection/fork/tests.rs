@@ -17,7 +17,10 @@ fn files(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBu
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_dir() {
                 collect(&entry.path(), output);
-            } else {
+            } else if entry.path().extension().and_then(|ext| ext.to_str()) != Some("lock") {
+                // `.lock` is live lease metadata and may be opened exclusively
+                // by the active storage binding on Windows; it is not part of
+                // the logical fork artifact comparison.
                 output.insert(entry.path(), std::fs::read(entry.path()).unwrap());
             }
         }

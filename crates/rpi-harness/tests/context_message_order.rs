@@ -213,6 +213,7 @@ async fn harness_with_compaction(
         drive: Default::default(),
         session,
         allow_existing_session: restore,
+        require_native_durable: false,
         models: vec![provider.clone() as Arc<dyn Provider>],
         to_provider_messages: None,
         entry_projectors: Default::default(),
