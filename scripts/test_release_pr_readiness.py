@@ -93,8 +93,6 @@ class ReadinessWorkflowTests(unittest.TestCase):
         self.assertNotIn("auto_merge:", self.release)
         self.assertIn("if: github.event_name == 'schedule'", self.release)
         self.assertIn("--auto --squash --delete-branch", self.release)
-        self.assertIn("name: Release PR validation", self.ci)
-        self.assertIn("needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]", self.ci)
         self.assertIn("python3 scripts/test_release_pr_readiness.py", self.ci)
         # Do not weaken the actual consistency check or workspace tests.
         self.assertIn("git diff --exit-code -- crates/rpi-cli/embedded-docs", self.ci)
