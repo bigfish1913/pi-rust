@@ -10,10 +10,8 @@ struct Scanner {
     fetched: u64,
     offset: u64,
     buffer: Vec<u8>,
-    recycled_line: Vec<u8>,
     cursor: usize,
     hash: Sha256,
-    hash_enabled: bool,
     policy: ReadPolicy,
 }
 impl Scanner {
@@ -24,24 +22,14 @@ impl Scanner {
             fetched: 0,
             offset: 0,
             buffer: Vec::new(),
-            recycled_line: Vec::new(),
             cursor: 0,
             hash: Sha256::new(),
-            hash_enabled: true,
             policy: ReadPolicy::Restore,
-        }
-    }
-    fn recycle(&mut self, mut line: Vec<u8>) {
-        // One unusually large row must not become a permanently retained
-        // scratch allocation for the rest of the history.
-        if line.capacity() <= CHUNK {
-            line.clear();
-            self.recycled_line = line;
         }
     }
     async fn next(&mut self) -> SessionResult<Option<(u64, Vec<u8>, bool, bool)>> {
         let offset = self.offset;
-        let mut line = std::mem::take(&mut self.recycled_line);
+        let mut line = Vec::new();
         loop {
             self.policy.check(0)?;
             if self.cursor < self.buffer.len() {
@@ -69,9 +57,7 @@ impl Scanner {
             if self.buffer.len() != count {
                 return Err(SessionError::storage("short session history scan"));
             }
-            if self.hash_enabled {
-                self.hash.update(&self.buffer);
-            }
+            self.hash.update(&self.buffer);
             self.fetched += count as u64;
             self.cursor = 0;
         }
@@ -134,7 +120,6 @@ impl JsonlSessionStorage {
         length: u64,
         policy: ReadPolicy,
     ) -> SessionResult<Self> {
-        let diagnostics = crate::session::diagnostics::RecoveryPhase::start("history_streaming");
         policy.check(0)?;
         let allow_repair = policy.repairs();
         let strict = policy.strict();
@@ -154,13 +139,6 @@ impl JsonlSessionStorage {
             ));
         }
         let header = parse_header(header_line).map_err(|e| invalid_file(path, 1, &e))?;
-        // This whole-file digest is ONLY the guard for a future legacy format
-        // upgrade, not a persisted checksum of the source. Modern histories do
-        // not upgrade, and FactsOnly exports no writable storage capability.
-        // All retained cold rows still keep their per-location SHA-256 checks.
-        let needs_legacy_digest =
-            header.progress_format.is_none() && !matches!(policy, ReadPolicy::FactsOnly);
-        scan.hash_enabled = needs_legacy_digest;
         if header.progress_format.is_some()
             && !file_result(
                 fs.exists(&format!("{path}.progress.jsonl"), None).await,
@@ -176,7 +154,28 @@ impl JsonlSessionStorage {
             clock,
             ids,
         );
+        // A sibling staging file is never authoritative. Only a writable
+        // restore may remove it, and ownership is acquired before mutation.
+        if allow_repair {
+            let staged_path = format!("{path}.tmp");
+            if file_result(
+                fs.exists(&staged_path, None).await,
+                "check staged history recovery artifact",
+            )? {
+                storage.ensure_writer_lease().await?;
+                file_result(
+                    storage.fs.remove(&staged_path, false, true, None).await,
+                    "remove stale staged history recovery artifact",
+                )?;
+            }
+        }
         storage.progress.required = header.progress_format.is_some();
+        if let Some(checkpoint) =
+            history_checkpoint(&header).map_err(|error| invalid_file(path, 1, &error))?
+        {
+            let resident = ResidentState::from_checkpoint(checkpoint.state)?;
+            *storage.state.lock().await = resident;
+        }
         let mut spans = vec![(0u64, header_raw.len() as u64)];
         let mut seen: HashMap<u64, (u64, usize)> = HashMap::new();
         let mut repair = false;
@@ -193,38 +192,6 @@ impl JsonlSessionStorage {
             }
             let line = std::str::from_utf8(&raw)
                 .map_err(|_| SessionError::invalid_entry("invalid session UTF-8"))?;
-            if let Some(frame) = super::super::cold_decode::parse_cold_frame(line) {
-                let mut state = storage.state.lock().await;
-                // Stale sequences must still take the canonical full-decode
-                // semantic comparison below (key order/whitespace may differ).
-                if frame.seq > state.sequence() {
-                    if frame.seq > state.next_sequence() {
-                        state.resync_sequence(frame.seq - 1);
-                    }
-                    let seq = frame.seq;
-                    // FactsOnly never escapes read_facts as a storage handle.
-                    // Keep ID/sequence/lane validation and frame retirement,
-                    // but there is no frame-read capability to index or hash.
-                    // Stale seqs and unrecognized rows still use the unchanged
-                    // full decoder/reducer path below.
-                    let applied = if matches!(policy, ReadPolicy::FactsOnly) {
-                        state.reserve_loaded_frame(frame)
-                    } else {
-                        state.apply_loaded_frame(frame, &reader, offset, &raw)
-                    };
-                    applied.map_err(|error| {
-                        if error.code == SessionErrorCode::InvalidEntry {
-                            invalid_file(path, line_no, &error)
-                        } else {
-                            error
-                        }
-                    })?;
-                    seen.insert(seq, (offset, raw.len()));
-                    spans.push((offset, raw.len() as u64));
-                    scan.recycle(raw);
-                    continue;
-                }
-            }
             match parse_mutation(line) {
                 Ok(mutation) => {
                     let mut state = storage.state.lock().await;
@@ -249,7 +216,6 @@ impl JsonlSessionStorage {
                                 ));
                             }
                             repair = true;
-                            scan.recycle(raw);
                             continue;
                         }
                         return Err(invalid_file(
@@ -289,9 +255,9 @@ impl JsonlSessionStorage {
                 }
                 Err(error) => return Err(invalid_file(path, line_no, &error)),
             }
-            scan.recycle(raw);
         }
         if repair && allow_repair {
+            storage.ensure_writer_lease().await?;
             let digest = Arc::new(std::sync::Mutex::new(None));
             let output = digest.clone();
             publish_file_atomically(&fs, path, move |fs, temp| {
@@ -316,24 +282,28 @@ impl JsonlSessionStorage {
                 })
             })
             .await?;
-            if needs_legacy_digest {
-                storage.legacy_history_digest = *digest.lock().unwrap();
+            if !storage.progress.required {
+                *storage.legacy_history_digest.lock().unwrap() = *digest.lock().unwrap();
             }
         } else {
             if !terminated && allow_repair {
+                storage.ensure_writer_lease().await?;
                 file_result(
                     fs.append_file(path, FileContent::Text("\n".into()), None)
                         .await,
                     "repair unterminated session tail",
                 )?;
+                file_result(
+                    fs.sync_file(path, true, None).await,
+                    "sync repaired unterminated session tail",
+                )?;
                 scan.hash.update(b"\n");
             }
-            if needs_legacy_digest {
-                storage.legacy_history_digest = Some(scan.hash.finalize().into());
+            if !storage.progress.required {
+                *storage.legacy_history_digest.lock().unwrap() = Some(scan.hash.finalize().into());
             }
         }
         policy.check((line_no - 1) as usize)?;
-        diagnostics.finish(length as usize, (line_no - 1) as usize);
         Ok(storage)
     }
 
@@ -429,7 +399,7 @@ impl JsonlSessionStorage {
         })
         .await?;
         self.progress = progress;
-        self.legacy_history_digest = None;
+        *self.legacy_history_digest.lock().unwrap() = None;
         Ok(true)
     }
 }

@@ -11,6 +11,44 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.21.1](https://github.com/bigfish1913/pi-rust/compare/v0.21.0...v0.21.1) - 2026-11-07
+
+### Added
+
+- *(cli)* allow service extensions to start without an agent ([#278](https://github.com/bigfish1913/pi-rust/pull/278))
+
+### Fixed
+
+- *(cli)* support CDN for extension updates
+- *(cli)* emit model_select on startup and model switch
+
+### Other
+
+- Merge branch 'main' into fix/model-select-event-v0.21
+- Revert "feat(cli): allow service extensions to start without an agent ([#278](https://github.com/bigfish1913/pi-rust/pull/278))" ([#279](https://github.com/bigfish1913/pi-rust/pull/279))
+
+## [0.21.0](https://github.com/bigfish1913/pi-rust/compare/v0.20.0...v0.21.0) - 2026-11-06
+
+### Added
+
+- *(plugin-sdk)* tool_result transforms can rewrite a finished tool result ([#240](https://github.com/bigfish1913/pi-rust/pull/240))
+- allow configuring release CDN in settings
+- add optional release CDN mirror
+- version native extension artifacts for hot reload
+- *(release)* support x86_64 musl binaries
+
+### Fixed
+
+- *(tui)* keep runtime notices in transcript order ([#275](https://github.com/bigfish1913/pi-rust/pull/275))
+- *(cli)* tokenize docs queries and fall back across topics ([#272](https://github.com/bigfish1913/pi-rust/pull/272))
+- *(tools)* classify bash command failures in tool details ([#271](https://github.com/bigfish1913/pi-rust/pull/271))
+- *(tui)* gate file autocomplete on path appearance ([#264](https://github.com/bigfish1913/pi-rust/pull/264))
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/cdn-rustfs
+- *(read)* resize images with fast_image_resize ([#241](https://github.com/bigfish1913/pi-rust/pull/241))
+
 ## [0.20.0](https://github.com/bigfish1913/pi-rust/compare/v0.19.0...v0.20.0) - 2026-11-05
 
 ### Added

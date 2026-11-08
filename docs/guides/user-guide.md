@@ -425,8 +425,10 @@ rpi install my-extension --path ../my-rpi-extension --force
 ```
 
 推荐用 `rpi extension update` 更新全部项目链接扩展和全局 registry/prebuilt 扩展，
-或用 `rpi extension update <name>` 按名称更新。更新保留原来的 Cargo 构建后端或
-显式指定的 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
+或用 `rpi extension update <name>` 按名称更新。预编译扩展可以用
+`rpi extension update --cdn <URL>` 通过 HTTPS CDN 下载归档；清单仍从 GitHub
+获取，CDN 失败会回退到 GitHub。该选项不影响项目链接扩展或 Cargo 构建扩展。
+更新保留原来的 Cargo 构建后端或显式指定的 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
 旧命令 `rpi package update [name]` 仍兼容，但扩展更新推荐使用
 `rpi extension update [name]`。项目链接管理仍使用 `rpi package link`、
 `rpi package list`、`rpi package unlink`，这些命令名称不变。

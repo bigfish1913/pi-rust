@@ -37,7 +37,8 @@ pub use tools::{
 };
 
 pub use env::{
-    ExecutionEnv, FileContent, FileInfo, FileKind, FileSystem, Shell, ShellExecOptions, ShellOutput,
+    ExecutionEnv, FileContent, FileInfo, FileKind, FileSystem, Shell, ShellExecOptions,
+    ShellOutput, WriterLease,
 };
 pub use error::{
     io_to_file_code, io_to_file_error, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode,

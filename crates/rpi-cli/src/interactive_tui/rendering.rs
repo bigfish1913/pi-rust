@@ -554,10 +554,17 @@ pub(super) fn add_note_message(container: &Arc<Container>, text: &str) {
 /// so without the repaint a background reload (or its parse error) stays
 /// invisible until the next interaction repaints the screen.
 pub(super) fn theme_watch_notify(
-    chat: Arc<Container>,
+    state: &Arc<TuiState>,
     tui: Arc<TuiAltScreen>,
 ) -> impl Fn(Result<String, String>) + Send + Sync + 'static {
+    // The watcher lives in TuiState; a weak reference avoids a cycle and lets
+    // each callback resolve the visible page after history/session navigation.
+    let state = Arc::downgrade(state);
     move |result| {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let chat = state.notice_container();
         match result {
             Ok(message) => add_note_message(&chat, &message),
             Err(message) => add_error_message(&chat, &message),

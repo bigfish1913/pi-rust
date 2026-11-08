@@ -8,6 +8,15 @@ fn state_with_root(root: &std::path::Path) -> Arc<TuiState> {
     state
 }
 
+fn is_session_locked(path: &str) -> bool {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(format!("{path}.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).is_err()
+}
+
 fn assert_session_locked(path: &str) {
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -52,8 +61,14 @@ async fn tui_fork_locks_the_copy_and_keeps_the_selected_root_for_switch_and_pick
         .await
         .unwrap();
     assert_eq!(metadata.len(), 2);
+    // The storage binding owns the writer lease. After the fork switch only
+    // the active fork remains writable; the source is intentionally released.
     for row in &metadata {
-        assert_session_locked(&row.path);
+        if row.id == fork_id {
+            assert_session_locked(&row.path);
+        } else {
+            assert!(!is_session_locked(&row.path));
+        }
     }
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     assert!(
@@ -128,6 +143,7 @@ async fn tui_import_preserves_identity_history_and_source_across_cwds() {
     let expected = source.storage().metadata().id.clone();
     let source_path = crate::session::list_session_files_sync(&source_root).remove(0);
     let original = std::fs::read(&source_path).unwrap();
+    drop(source);
     let harness = AgentHarness::create(Default::default()).await.unwrap();
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     let state = state_with_root(&root);
@@ -156,6 +172,9 @@ async fn tui_import_preserves_identity_history_and_source_across_cwds() {
     assert_eq!(metadata.len(), 1);
     assert_eq!(metadata[0].cwd, old_cwd.to_string_lossy());
     assert_session_locked(&metadata[0].path);
+    harness.session().storage().release_writer_lease();
+    drop(lane);
+    drop(harness);
     let restored =
         crate::session::open_session_by_id_in_dir(&expected, &cwd.to_string_lossy(), &root)
             .await
@@ -168,6 +187,7 @@ async fn tui_import_preserves_identity_history_and_source_across_cwds() {
     );
     let imported = std::fs::read(&metadata[0].path).unwrap();
     assert_eq!(imported, original);
+    drop(restored);
     // Both repeated imports and importing a repository's own log must fail
     // without touching either saved history or the original source.
     for path in [&source_path, &std::path::PathBuf::from(&metadata[0].path)] {
@@ -237,6 +257,10 @@ async fn session_switch_banner_reports_real_capabilities() {
         .append_message(user_message_with_images("first session history", vec![]))
         .await
         .unwrap();
+    // A fresh JSONL binding owns the writer lease until its storage binding is
+    // dropped; the switch below must open the first session after this fixture
+    // releases its original owner.
+    drop(first);
     let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -577,6 +601,7 @@ async fn switching_back_to_a_session_restores_its_model() {
         ))
         .await
         .unwrap();
+    drop(first);
     let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -692,6 +717,7 @@ async fn switching_back_to_a_session_restores_its_footer_usage() {
         ))
         .await
         .unwrap();
+    drop(first);
     let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -759,6 +785,7 @@ async fn unknown_session_model_leaves_the_current_model_in_place() {
         ))
         .await
         .unwrap();
+    drop(first);
     let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -842,6 +869,7 @@ async fn review_pr104_replay_preserves_the_live_cache_hit_rate() {
     for message in &messages {
         source.append_message(message.clone()).await.unwrap();
     }
+    drop(source);
     let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -917,6 +945,7 @@ async fn review_pr104_restore_model_must_follow_the_selected_branch() {
         .unwrap();
     // This is the move made by /tree before leaving/reopening the session.
     source.move_lane("main", Some(&selected)).await.unwrap();
+    drop(source);
     let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -985,6 +1014,7 @@ async fn review_pr104_restore_model_must_ignore_a_child_lane() {
         ))
         .await
         .unwrap();
+    drop(source);
     let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -1095,6 +1125,7 @@ async fn rereview_pr104_context_must_not_come_from_a_child_lane() {
         .append_message(review_084_context_turn("child-model", 190_000))
         .await
         .unwrap();
+    drop(source);
     let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -1159,6 +1190,7 @@ async fn rereview_pr104_compaction_must_invalidate_pre_compaction_context() {
         )
         .await
         .unwrap();
+    drop(source);
     let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -1782,13 +1814,14 @@ fn review_pr202_theme_watch_notify_repaints_idle_session() {
     tui.start_readerless();
     let before = frames.load(Ordering::SeqCst);
 
+    let state = test_tui_state();
     // Both callback outcomes must leave the old palette behind.
-    let notify_ok = theme_watch_notify(Arc::new(Container::new()), tui.clone());
+    let notify_ok = theme_watch_notify(&state, tui.clone());
     notify_ok(Ok("Theme reloaded.".into()));
     let after_ok = frames.load(Ordering::SeqCst);
     assert!(after_ok > before, "success notice must schedule a repaint");
 
-    let notify_err = theme_watch_notify(Arc::new(Container::new()), tui.clone());
+    let notify_err = theme_watch_notify(&state, tui.clone());
     notify_err(Err("cannot load theme: bad value".into()));
     assert!(
         frames.load(Ordering::SeqCst) > after_ok,

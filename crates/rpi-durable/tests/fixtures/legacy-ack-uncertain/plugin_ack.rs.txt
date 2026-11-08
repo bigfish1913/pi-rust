@@ -1,0 +1,102 @@
+// Exact pinned upstream old-SDK runtime-contract helper prefix is prepended.
+#[test]
+fn export_actual_post_append_missing_and_malformed_ack_reconciliation() {
+    let api=PluginApi {
+        abi_version:rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+        struct_size:std::mem::size_of::<PluginApi>() as u32,free_string,
+        register_tool:Some(register_tool),register_command:Some(register_command),
+        register_shortcut:None,register_flag:None,register_provider:None,
+        register_message_renderer:None,register_markdown_transformer:None,
+        register_entry_renderer:None,register_event_handler:Some(register_event),
+        register_resources_discover:None,runtime_action:runtime,dispatch_event:None,
+        user_data:std::ptr::null_mut(),declare:None,register_before_agent_start:None,
+        register_oauth_provider:None,
+    };
+    assert_eq!(rpi_durable::rpi_plugin_register(&api),0);
+    assert_eq!(empty(EventTag::SessionStart),0);
+    let cases:Value=serde_json::from_str(include_str!("cases.json")).unwrap();
+    assert_eq!(cases["schema"],"rpi-synthetic-ack-uncertain-cases-v1");
+    assert_eq!(cases["frames"].as_array().unwrap().len(),10);
+    let mut frames=Vec::new();
+    for frame in cases["frames"].as_array().unwrap() {
+        let index=frame["index"].as_u64().unwrap();
+        let kind=frame["kind"].as_str().unwrap();
+        let before=host().lock().unwrap().entries.clone();
+        if kind=="missingAck" {host().lock().unwrap().missing_ack=true;}
+        if kind=="malformedAck" {host().lock().unwrap().invalid_json_ack=true;}
+        let (channel,result,error)=if kind=="reload" {
+            assert!(frame["action"].is_null());
+            assert_eq!(empty(EventTag::SessionTree),0);
+            ("event-ok",None,None)
+        }else{
+            match action(frame["action"].clone()) {
+                Ok(value)=>{
+                    let error=value["details"]["error"].as_str().map(str::to_owned);
+                    (if error.is_some(){"details-error"}else{"done"},Some(value),error)
+                },
+                Err(error)=>("tool-error",None,Some(error)),
+            }
+        };
+        let entries=host().lock().unwrap().entries.clone();
+        assert_eq!(entries.len() as u64,frame["oldEntries"].as_u64().unwrap());
+        let replayed=serde_json::to_value(rpi_durable_core::DurableState::try_from_branch(&entries).unwrap()).unwrap();
+        let expected:rpi_durable_core::DurableState=serde_json::from_value(frame["expected"].clone()).unwrap();
+        assert_eq!(replayed,serde_json::to_value(expected).unwrap(),"persisted case {index}");
+        match kind {
+            "commit"=>{assert_eq!(channel,"done");assert_eq!(entries.len(),before.len()+1);},
+            "missingAck"|"malformedAck"=>{
+                assert_eq!(channel,"tool-error");
+                assert!(error.as_ref().unwrap().starts_with("durable append acknowledgement is unknown:"));
+                assert_eq!(entries.len(),before.len()+1,"host DID commit, never report rollback");
+                assert!(!host().lock().unwrap().missing_ack);
+                assert!(!host().lock().unwrap().invalid_json_ack);
+            },
+            "retry"=>{
+                assert_eq!(channel,"details-error");
+                assert!(error.as_ref().unwrap().contains("durable append acknowledgement is unknown:"));
+                assert_eq!(entries,before,"no blind retry against stale anchor");
+                let retry=frame["retryOf"].as_u64().unwrap() as usize;
+                assert_eq!(frame["action"],cases["frames"][retry]["action"]);
+            },
+            "reload"=>{assert_eq!(channel,"event-ok");assert_eq!(entries,before);},
+            "read"=>{assert_eq!(channel,"done");assert_eq!(entries,before);},
+            _=>panic!("unknown fixed case"),
+        }
+        let status=action(json!({"action":"status"})).unwrap();
+        let blocked=frame["oldBlocked"].as_bool().unwrap();
+        let visible=if blocked {
+            assert!(status["details"]["error"].as_str().unwrap().contains("durable append acknowledgement is unknown:"));
+            let details=status["details"].as_object().unwrap();
+            assert_eq!(details.len(),2,"blocked status must not leak stale control fields");
+            assert_eq!(details["action"],"status");
+            assert!(details.contains_key("error"));
+            None
+        }else{
+            let mut state=status["details"].clone();
+            state.as_object_mut().unwrap().remove("action").unwrap();
+            assert_eq!(state,replayed,"readable case {index}");
+            Some(state)
+        };
+        assert_eq!(host().lock().unwrap().entries,entries,"status never reconciles by writing");
+        let reads=host().lock().unwrap().read_requests.len();
+        assert_eq!(reads as u64,frame["oldReads"].as_u64().unwrap(),"only explicit reload reads branch");
+        frames.push(json!({"index":index,"label":frame["label"],"kind":kind,"action":frame["action"],
+            "oldChannel":channel,"oldResult":result,"oldError":error,"oldBlocked":blocked,
+            "oldVisible":visible,"persisted":replayed,"entryCount":entries.len(),
+            "entryId":entries.last().map(|entry|entry["id"].clone()),"oldReads":reads}));
+    }
+    let entries=host().lock().unwrap().entries.clone();
+    assert_eq!(entries.len(),4);
+    assert_eq!(entries[0]["data"]["kind"],"snapshot");
+    assert_eq!(entries[0]["data"]["revision"],1);
+    let artifact=json!({"schema":"rpi-synthetic-legacy-ack-uncertain-export-v1",
+        "legacyCommit":"041c981b21ac42348feee371757f5ef26ecbdcab",
+        "pluginSha256":"0f4be632b1f5dab5dfa0ac9cf55bb9119b1a37ec3ac195f08161dca9480fdaac",
+        "casesSha256":"2db451f05628e51f75b08795c91cc9d715f866064623846f1da9a2f25ef2c791",
+        "frames":frames,"entries":entries});
+    // Runner-owned synthetic TempDir only, no real journal/config/data import.
+    let path=std::env::var_os("RPI_SYNTHETIC_LEGACY_ACK_UNCERTAIN_EXPORT").expect("explicit synthetic export path");
+    use std::io::Write;
+    let mut file=std::fs::OpenOptions::new().create_new(true).write(true).open(path).unwrap();
+    file.write_all(serde_json::to_string(&artifact).unwrap().as_bytes()).unwrap();
+}

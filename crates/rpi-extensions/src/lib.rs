@@ -100,6 +100,7 @@ pub use registry::{
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
+pub use tool_result_transform::{emit_tool_result, with_tool_result_transform};
 mod panel;
 pub use panel::{ExtensionPanel, PanelAnchor, PanelHighlight, PanelHighlightColor, PanelLayout};
 pub use tool::{PluginToolAdapter, PluginToolHandle, ToolCallContext};
@@ -124,6 +125,7 @@ mod stdio;
 mod tool;
 #[cfg(test)]
 mod tool_prompt_tests;
+mod tool_result_transform;
 mod translate;
 
 /// A diagnostics/event sink the host wires so the loader + adapter can report
@@ -331,6 +333,7 @@ impl HostApi {
             register_oauth_provider_cancellable: Some(
                 trampoline_register_oauth_provider_cancellable,
             ),
+            register_tool_result: Some(trampoline_register_tool_result),
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
@@ -985,6 +988,27 @@ extern "C" fn trampoline_register_resources_discover(
             Some(_) => true,
             None => false,
         }
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// `register_tool_result` trampoline. Same shape as
+/// [`trampoline_register_before_agent_start`].
+extern "C" fn trampoline_register_tool_result(
+    handler: rpi_plugin_sdk::ToolResultFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    let ok = with_current_api(|api| {
+        api.with_registry(|reg| reg.register_tool_result(handler, plugin_free_string, user_data))
+            .is_some()
     });
     if ok == Some(true) {
         0

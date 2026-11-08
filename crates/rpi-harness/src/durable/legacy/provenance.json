@@ -1,0 +1,10 @@
+{
+  "sourceCommit": "041c981b21ac42348feee371757f5ef26ecbdcab",
+  "sourcePath": "packages/rpi-durable-core/src/lib.rs",
+  "sourceSha256": "3de38799116a5a7be960d9b630d6676107b43375841fadda6b27d2bacadff352",
+  "operation": "Exact byte prefix before first #[cfg(test)], removing only upstream unit-test module",
+  "decoderBytes": 19568,
+  "decoderSha256": "09e48831346e7e10aa9659cbc7dd4e35947d744928f580a0955a0b95f4ddb560",
+  "licenseSha256": "d8d2baef7d67248adf749511d7ee59b4e960e8a56d0a921a9f7b0867b716e8b2",
+  "scope": "Private read-only legacy decoder; never native state authority, execution proof or import permit"
+}

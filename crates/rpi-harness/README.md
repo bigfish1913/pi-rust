@@ -172,7 +172,7 @@ remain visible. Explicit generic history/export reads still include archives.
 `SessionStorage`/`SessionTree` add default `branch_ancestry()` methods returning
 `EntryAncestry` identities; existing implementers compile, but their fallback can
 hydrate full entries until a metadata-only override is provided. Native metadata
-walks are O(history), ordinary SQLite/memory remain eager, and no RSS guarantee is
+walks are O(history), and memory/JSONL storage remains eager where applicable; no RSS guarantee is
 made. Default journaling additionally requires real `history_revision()` and
 atomic conditional-entry appends from custom storage implementations/wrappers.
 Ordinary native facade mutations share per-binding admission; journal CAS/body

@@ -29,6 +29,8 @@ struct Resident {
     // Entries belong to rendered components, not a second retained payload copy.
     page: Option<BranchEntryPage>,
     error: Option<Arc<Container>>,
+    // Page-local notices retire with the page, including late callbacks.
+    notices: Arc<Container>,
 }
 #[derive(Default)]
 pub(super) struct HistoryUi {
@@ -38,12 +40,19 @@ pub(super) struct HistoryUi {
     pub(super) active: Arc<Container>,
     pub(super) panels: Arc<Container>,
     pub(super) header: Arc<Container>,
-    /// Startup notices must stay before the live transcript slot. If they are
-    /// appended to `chat` directly, streamed output (which belongs to `active`)
-    /// renders above the notice box.
+    // An ephemeral component, not a durable state cache or persisted transcript.
+    native_durable_enabled: bool,
+    native_durable_notice: Arc<Container>,
+    /// Startup/update notices stay before the live transcript slot.
     pub(super) updates: Arc<Container>,
 }
 impl HistoryUi {
+    pub(super) fn with_native_durable(enabled: bool) -> Self {
+        Self {
+            native_durable_enabled: enabled,
+            ..Default::default()
+        }
+    }
     pub(super) fn invalidate(&self) {
         if let Some(worker) = self.worker.lock().unwrap().take() {
             worker.abort();
@@ -56,6 +65,7 @@ impl HistoryUi {
         resident.generation += 1;
         resident.page = None;
         resident.error = None;
+        resident.notices = Arc::new(Container::new());
         resident.storage = None;
         self.unsaved
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -63,6 +73,7 @@ impl HistoryUi {
         self.panels.clear();
         self.header.clear();
         self.updates.clear();
+        self.native_durable_notice.clear();
     }
     pub(super) fn bind(&self, harness: &AgentHarness) {
         self.invalidate();
@@ -75,11 +86,27 @@ impl HistoryUi {
             .is_some_and(|bound| Arc::ptr_eq(bound, &storage))
         {
             resident.page = None;
+            resident.notices = Arc::new(Container::new());
+            self.native_durable_notice.clear();
         }
         resident.storage = Some(storage);
     }
     pub(super) fn is_bound(&self) -> bool {
         self.resident.lock().unwrap().storage.is_some()
+    }
+    pub(super) fn notice_container(&self, root: &Arc<Container>) -> Arc<Container> {
+        let resident = self.resident.lock().unwrap();
+        if resident.storage.is_none() {
+            root.clone()
+        } else if resident
+            .page
+            .as_ref()
+            .is_some_and(|page| page.has_more_after)
+        {
+            resident.notices.clone()
+        } else {
+            self.active.clone()
+        }
     }
     pub(super) fn is_latest(&self) -> bool {
         self.resident
@@ -100,8 +127,8 @@ impl HistoryUi {
             chat.add_child(header);
         }
     }
-    // Reserve this slot even while empty: the background update check may
-    // complete after assistant streaming has already begun.
+    /// Reserve the update slot even while empty so late background notices do
+    /// not render after the live transcript.
     pub(super) fn mount_updates(&self, chat: &Arc<Container>) {
         let updates: Arc<dyn Component> = self.updates.clone();
         if !chat
@@ -131,6 +158,18 @@ impl HistoryUi {
         {
             chat.add_child(panels);
         }
+        self.mount_native_notice(chat);
+    }
+    fn mount_native_notice(&self, chat: &Arc<Container>) {
+        let notice: Arc<dyn Component> = self.native_durable_notice.clone();
+        if self.native_durable_notice.child_count() > 0
+            && !chat
+                .get_children()
+                .iter()
+                .any(|child| Arc::ptr_eq(child, &notice))
+        {
+            chat.add_child(notice);
+        }
     }
 }
 
@@ -152,11 +191,58 @@ pub(super) fn apply_overview(footer: &FooterComponent, overview: &BranchOverview
 pub(super) async fn restore(harness: &AgentHarness, state: &Arc<TuiState>, chat: &Arc<Container>) {
     state.history_page.bind(harness);
     restore_bound(state, chat).await;
+    refresh_native_durable_notice(harness, state, chat).await;
+}
+
+/// Once per explicit view entry, not per history page or render tick. Restore is
+/// shared by switch/import/fork/new/tree. Paging only remounts the same component.
+/// The host invalidates this generation before replacing a session/branch, so a
+/// late observation cannot be installed in a newer view. No lock spans the read.
+pub(super) async fn refresh_native_durable_notice(
+    harness: &AgentHarness,
+    state: &Arc<TuiState>,
+    chat: &Arc<Container>,
+) {
+    refresh_notice_from(
+        harness,
+        state,
+        chat,
+        crate::native_durable::lifecycle_notice(harness, true),
+    )
+    .await;
+}
+
+async fn refresh_notice_from(
+    harness: &AgentHarness,
+    state: &Arc<TuiState>,
+    chat: &Arc<Container>,
+    read: impl std::future::Future<Output = Option<String>>,
+) {
+    if !state.history_page.native_durable_enabled {
+        return;
+    }
+    let (generation, storage) = {
+        let resident = state.history_page.resident.lock().unwrap();
+        (resident.generation, resident.storage.clone())
+    };
+    let Some(storage) = storage else { return };
+    let text = read.await;
+    let active_storage = harness.session().storage();
+    let resident = state.history_page.resident.lock().unwrap();
+    if !current(&resident, generation, &storage) || !Arc::ptr_eq(&storage, &active_storage) {
+        return;
+    }
+    state.history_page.native_durable_notice.clear();
+    if let Some(text) = text {
+        add_note_message(&state.history_page.native_durable_notice, &text);
+    }
+    state.history_page.mount_active(chat);
 }
 
 async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
     // Even an empty or unreadable session must have a visible live-operation slot.
     state.history_page.mount_header(chat);
+    state.history_page.mount_updates(chat);
     state.history_page.mount_active(chat);
     let (generation, storage) = {
         let resident = state.history_page.resident.lock().unwrap();
@@ -181,6 +267,8 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
         return;
     }
     let page_chat = render_page(state, &page.entries);
+    resident.notices = Arc::new(Container::new());
+    page_chat.add_child(resident.notices.clone());
     clear_settled_active(state);
     chat.clear();
     state.history_page.mount_header(chat);
@@ -313,6 +401,8 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
         match result {
             Ok(Some(page)) => {
                 let page_chat = render_page(&state, &page.entries);
+                resident.notices = Arc::new(Container::new());
+                page_chat.add_child(resident.notices.clone());
                 clear_settled_active(&state);
                 resident.error = None;
                 // Drop every reference to the old page (including image components).
@@ -328,6 +418,9 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
                 state
                     .chat_container
                     .add_child(state.history_page.panels.clone());
+                state
+                    .history_page
+                    .mount_native_notice(&state.chat_container);
                 if let Some(scroll) = tui.get_primary_scroll_view() {
                     scroll.invalidate();
                 }
@@ -455,3 +548,11 @@ mod tests {
 #[cfg(test)]
 #[path = "history/tests.rs"]
 mod paging_tests;
+
+#[cfg(test)]
+#[path = "history/native_durable_tests.rs"]
+mod native_durable_tests;
+
+#[cfg(test)]
+#[path = "history/experimental_durable_tests.rs"]
+mod experimental_durable_tests;

@@ -558,6 +558,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "document-features"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
+dependencies = [
+ "litrs",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -652,6 +661,20 @@ dependencies = [
  "bit-set",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "fast_image_resize"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbc7fe45cf92b43817ff62a3723e862b85bd1d06288f63007f7645d1d2f7a060"
+dependencies = [
+ "bytemuck",
+ "cfg-if",
+ "document-features",
+ "image",
+ "num-traits",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1381,6 +1404,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ee93343901ab17bd981295f2cf0026d4ad018c7c31ba84549a4ddbb47a45104"
 
 [[package]]
+name = "litrs"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2074,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-agent"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -2091,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -2114,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-cli"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
  "arboard",
  "async-trait",
@@ -2141,7 +2170,6 @@ dependencies = [
  "rpi-telemetry",
  "rpi-tools",
  "rpi-tui",
- "rusqlite",
  "schemars",
  "semver",
  "serde",
@@ -2160,16 +2188,19 @@ dependencies = [
 
 [[package]]
 name = "rpi-durable"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
+ "fs2",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "rpi-extensions"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
  "async-trait",
  "dirs",
@@ -2190,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-harness"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -2200,7 +2231,6 @@ dependencies = [
  "rpi-durable",
  "rpi-telemetry",
  "rpi-tools",
- "rusqlite",
  "schemars",
  "serde",
  "serde_json",
@@ -2216,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-plugin-sdk"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
  "ciborium",
  "libc",
@@ -2230,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-runtime"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
  "async-trait",
  "indexmap 2.11.4",
@@ -2245,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-telemetry"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -2255,13 +2285,15 @@ dependencies = [
 
 [[package]]
 name = "rpi-tools"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
  "async-trait",
  "base64",
  "codepage",
  "dirs",
  "encoding_rs",
+ "fast_image_resize",
+ "fs2",
  "futures",
  "globset",
  "image",
@@ -2289,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tui"
-version = "0.20.0"
+version = "0.21.1"
 dependencies = [
  "base64",
  "crossterm",

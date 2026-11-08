@@ -106,6 +106,7 @@ async fn extension_and_legacy_help_are_available_before_provider_startup() {
         assert!(out.contains("Usage: rpi extension update [name]"));
         assert!(out.contains("--debug"));
         assert!(out.contains("--locked"));
+        assert!(out.contains("--cdn <URL>"));
         assert!(out.contains("rpi package update"));
         assert!(err.is_empty());
     }
@@ -127,6 +128,7 @@ async fn update_aliases_match_for_empty_registries_and_arguments() {
             vec!["--debug"],
             vec!["--locked"],
             vec!["--locked", "--debug"],
+            vec!["--cdn", "https://assets.example.test/mirror"],
         ] {
             let (out, err) = cli.both(&args, 0).await;
             assert_eq!(out.trim(), "no project or global extensions to update");
@@ -144,6 +146,8 @@ async fn update_aliases_match_for_empty_registries_and_arguments() {
             vec!["--build"],
             vec!["--github", "owner/repo"],
             vec!["--offline"],
+            vec!["--cdn"],
+            vec!["--cdn", "http://assets.example.test"],
         ] {
             let (out, err) = cli.both(&args, 2).await;
             assert!(out.is_empty());

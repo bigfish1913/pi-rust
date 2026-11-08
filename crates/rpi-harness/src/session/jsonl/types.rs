@@ -44,6 +44,13 @@ impl JsonlSourceFormat {
     }
 }
 
+/// Reserved metadata key for the persistent whole-history replacement generation.
+/// Existing v4 files omit it and therefore report generation zero.
+pub const HISTORY_GENERATION_METADATA_KEY: &str = "rpiNativeDurableHistoryGeneration";
+/// Reserved v4 metadata key for an explicit bounded reducer checkpoint.
+/// Existing files omit it and continue to replay ordinary mutations.
+pub const HISTORY_CHECKPOINT_METADATA_KEY: &str = "rpiNativeDurableHistoryCheckpoint";
+
 /// Mirrors TS `JsonlV4Header`. Serialized camelCase to match the on-disk v4
 /// wire shape exactly (so Rust-written files are interchangeable with the TS
 /// impl). `parentSessionId` / `legacyParentSessionPath` are mutually exclusive
@@ -69,6 +76,17 @@ pub struct JsonlV4Header {
     pub metadata: Option<serde_json::Map<String, JsonValue>>,
 }
 
+impl JsonlV4Header {
+    /// Read the optional replacement generation from reserved metadata.
+    pub fn history_generation(&self) -> u64 {
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(HISTORY_GENERATION_METADATA_KEY))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    }
+}
+
 /// Mirrors TS `JsonlSessionMetadata` (extends `SessionMetadata` with JSONL-
 /// specific filesystem fields). Carries the on-disk `path` + `cwd` +
 /// `modified_at` so the repo/storage can locate and append to the file without
@@ -91,6 +109,17 @@ pub struct JsonlSessionMetadata {
 }
 
 impl JsonlSessionMetadata {
+    /// Read the optional replacement generation without changing the v4 wire
+    /// header shape. Ordinary appends never update this metadata; successful
+    /// JSONL replacement publishes the next value here.
+    pub fn history_generation(&self) -> u64 {
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(HISTORY_GENERATION_METADATA_KEY))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    }
+
     /// Project to the shared base [`SessionMetadata`] (the subset the
     /// [`SessionStorage`] trait exposes).
     pub fn to_base(&self) -> SessionMetadata {

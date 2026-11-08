@@ -1,0 +1,53 @@
+{
+  "scope": "synthetic canonical encoding only; no production digest or journal",
+  "node": {
+    "address": {
+      "entryId": "entry-1",
+      "ordinal": 1,
+      "slot": 0
+    },
+    "key": "request-1",
+    "value": {
+      "entryId": "entry-1",
+      "ordinal": 1,
+      "digest": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ]
+    },
+    "left": null,
+    "right": null
+  },
+  "canonicalHex": "7270692d64757261626c652d6c65646765722d6e6f64652d6578706572696d656e74616c2d31000007656e7472792d31000000000000000100000009726571756573742d310007656e7472792d310000000000000001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0000",
+  "canonicalBytes": 120
+}

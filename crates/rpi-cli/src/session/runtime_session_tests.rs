@@ -145,7 +145,11 @@ async fn selected_root_survives_build_runtime_actions_and_both_reload_host_paths
                 .write(true)
                 .open(format!("{}.lock", meta.path))
                 .unwrap();
-            assert!(fs2::FileExt::try_lock_exclusive(&lock).is_err());
+            if meta.id == fork_id {
+                assert!(fs2::FileExt::try_lock_exclusive(&lock).is_err());
+            } else {
+                assert!(fs2::FileExt::try_lock_exclusive(&lock).is_ok());
+            }
         }
         assert!(
             !changed_root.exists(),
@@ -184,6 +188,9 @@ async fn importing_a_torn_tail_repairs_only_the_private_copy() {
     let mut content = std::fs::read(&path).unwrap();
     content.extend_from_slice(b"{\"kind\":");
     std::fs::write(&path, &content).unwrap();
+    // Import opens a fresh writer binding for the copied artifact; release the
+    // fixture's original storage lease first.
+    drop(session);
     let root = temporary.path().join("destination");
     let imported = import_session_file(&path, &cwd, &root).await.unwrap();
     assert_eq!(

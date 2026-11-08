@@ -14,8 +14,8 @@ keywords = ["agent", "llm", "ai", "claude", "harness"]
 categories = ["api-bindings", "asynchronous", "artificial-intelligence"]
 
 [features]
-# Explicit construction only; no CLI/Web routing or migration.
-experimental-native-store = ["rusqlite/hooks"]
+# Opt-in only: enables the durable crate's SQLite journal backend for explicit integrations.
+durable-sqlite = ["rpi-durable/sqlite"]
 
 [dependencies]
 rpi-telemetry = { workspace = true }
@@ -35,12 +35,9 @@ schemars = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-rusqlite = { workspace = true }
 sha2 = "0.10.9"
 
 [dev-dependencies]
-# Test-only SQL authorization probe for the managed-layout experiment.
-rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rpi-telemetry = { workspace = true }

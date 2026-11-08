@@ -132,6 +132,21 @@ impl<'a> ShellExecOptions<'a> {
     }
 }
 
+/// A process-local capability proving exclusive ownership of a file-backed
+/// writer. Backends that cannot provide an OS/process boundary return `None`
+/// from [`FileSystem::try_acquire_writer_lease`]; those backends retain their
+/// existing in-process semantics and must not be described as cross-process
+/// fenced.
+///
+/// A backend may also persist a monotonic fence value in the lease record and
+/// verify it before a mutation. This is an additional stale-binding check, not
+/// by itself a complete crash/fencing proof.
+pub trait WriterLease: Send + Sync {
+    fn verify_fence(&self) -> Result<(), FileError> {
+        Ok(())
+    }
+}
+
 /// A completed append range bound to the file generation actually written.
 /// The reader remains valid if the journal path is subsequently replaced.
 #[derive(Clone)]
@@ -239,6 +254,42 @@ pub trait FileSystem: Send + Sync {
         _path: &str,
     ) -> Result<Option<Box<dyn AppendFile>>, FileError> {
         Ok(None)
+    }
+
+    /// Try to acquire an exclusive writer lease for one addressed journal.
+    ///
+    /// `Some` is a held capability whose lifetime owns the backend lock;
+    /// `None` means this backend has no process-level lease primitive (for
+    /// example the in-memory test backend). Contention is an error, not a
+    /// successful `None`, so callers fail closed when a real backend refuses
+    /// ownership.
+    async fn try_acquire_writer_lease(
+        &self,
+        _path: &str,
+    ) -> Result<Option<Box<dyn WriterLease>>, FileError> {
+        Ok(None)
+    }
+
+    /// Flush a staged file's contents through the backend's durability boundary.
+    /// The default is a deliberate no-op for memory/Faux backends; callers must
+    /// not treat it as evidence of physical persistence.
+    async fn sync_file(
+        &self,
+        _path: &str,
+        _data_only: bool,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        Ok(())
+    }
+
+    /// Flush the directory metadata needed to make a completed rename durable.
+    /// The default is a deliberate no-op for backends without physical files.
+    async fn sync_directory(
+        &self,
+        _path: &str,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        Ok(())
     }
 
     /// Optional stable-generation reader. Unsupported backends retain eager

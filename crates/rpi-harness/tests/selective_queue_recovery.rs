@@ -5,7 +5,7 @@ use rpi_harness::session::jsonl::{JsonlSessionStorage, JsonlV4Header};
 use rpi_harness::{
     agent_harness::{AgentHarness, AgentLane},
     error::{SessionError, SessionResult},
-    session::{types::*, DefaultIdGenerator, Session, SqliteSessionRepo, SystemClock},
+    session::{types::*, DefaultIdGenerator, Session, SystemClock},
     types::AgentHarnessOptions,
 };
 use rpi_tools::{FileSystem, OsExecutionEnv};
@@ -377,13 +377,6 @@ async fn check(store: Arc<dyn SessionStorage>) {
 #[tokio::test]
 async fn restore_memory_selects_only_pending_payloads() {
     check(AgentHarnessOptions::default().session.storage()).await;
-}
-#[tokio::test]
-async fn restore_sqlite_selects_only_pending_payloads() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = SqliteSessionRepo::open(dir.path().join("sessions.db")).unwrap();
-    let store = repo.create(&SessionCreateOptions::default()).await.unwrap();
-    check(Arc::new(store)).await;
 }
 #[tokio::test]
 async fn restore_jsonl_selects_only_pending_payloads() {

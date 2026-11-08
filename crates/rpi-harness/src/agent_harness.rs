@@ -213,6 +213,19 @@ pub struct AbortResult {
     pub follow_up: Vec<AgentMessage>,
 }
 
+/// Result of the explicit cooperative abort-and-reconcile boundary.
+/// `settled` means the in-process active-run guard and backend write drain have
+/// completed; `terminal` is only the durable result that was actually read.
+/// `None` never fabricates an `Aborted` result and requires the host to inspect
+/// the journal or retry its read. This boundary does not cover a process kill,
+/// forced runtime destruction, or cross-process ownership.
+#[derive(Debug, Clone)]
+pub struct AbortReconciliation {
+    pub abort: AbortResult,
+    pub settled: bool,
+    pub terminal: Option<RunResult>,
+}
+
 /// Result of `record_usage`. Mirrors TS `RecordUsageResult` (`Result<void, Closed>`).
 #[derive(Debug, Clone, Default)]
 pub struct RecordUsageResult;
@@ -462,6 +475,26 @@ pub trait AgentLane: Send + Sync {
     ) -> HarnessResult<NavigationResult>;
 
     async fn abort(&self) -> HarnessResult<AbortResult>;
+
+    /// Cooperatively abort, wait for the run's in-process finalization, drain
+    /// backend writes, and read the exact durable terminal result if present.
+    /// This is intentionally separate from `abort`: callers choosing a runtime
+    /// shutdown boundary must opt into the stronger wait/read contract.
+    async fn abort_and_reconcile(&self) -> HarnessResult<AbortReconciliation> {
+        let abort = self.abort().await?;
+        let terminal = if abort.run_id.is_empty() {
+            None
+        } else {
+            self.wait_for_idle().await?;
+            self.drain_session().await;
+            self.get_result(&abort.run_id).await?
+        };
+        Ok(AbortReconciliation {
+            abort,
+            settled: true,
+            terminal,
+        })
+    }
 
     async fn steer(&self, message: AgentMessage) -> HarnessResult<QueueResult>;
     async fn follow_up(&self, message: AgentMessage) -> HarnessResult<QueueResult>;
@@ -733,6 +766,11 @@ struct HarnessInner {
     thinking_level: ThinkingLevel,
     active_tool_names: Vec<String>,
     exact_resources: bool,
+    require_native_durable: bool,
+    experimental_durable: Option<crate::durable::ExperimentalDurablePolicy>,
+    /// Harness-wide durable admission seal. It is volatile lifecycle state;
+    /// reopening a provider creates a fresh harness and starts unsealed.
+    durable_sealed: bool,
     tools: Vec<HarnessTool>,
     resources: AgentHarnessResources,
     stream_options: AgentHarnessStreamOptions,
@@ -875,6 +913,10 @@ pub const MAX_WRITE_FAILURES: usize = 16;
 
 mod child;
 pub use child::ChildHarness;
+mod durable_control;
+mod durable_execution;
+mod durable_ledger;
+pub(crate) use durable_execution::NativeExecutionStorage;
 mod queue_writes;
 pub(crate) use queue_writes::QueueReservation;
 mod run_results;
@@ -1012,6 +1054,46 @@ impl AgentHarness {
 
     /// Construct from options. Existing sessions require explicit restore opt-in.
     pub async fn create(options: AgentHarnessOptions) -> HarnessResult<Self> {
+        Self::create_with_durable_policy(options, None).await
+    }
+
+    /// Explicit experimental v2 epoch; never inferred from persisted records.
+    /// This policy is immutable for this harness and its lane/service views.
+    /// Native admission must also be enabled; tools are not enabled here.
+    pub async fn create_experimental(
+        options: AgentHarnessOptions,
+        policy: crate::durable::ExperimentalDurablePolicy,
+    ) -> HarnessResult<Self> {
+        if !options.require_native_durable {
+            return Err(HarnessError::io(
+                "experimental durable requires native admission",
+            ));
+        }
+        Self::create_with_durable_policy(options, Some(policy)).await
+    }
+
+    async fn create_with_durable_policy(
+        options: AgentHarnessOptions,
+        experimental_durable: Option<crate::durable::ExperimentalDurablePolicy>,
+    ) -> HarnessResult<Self> {
+        if options.require_native_durable {
+            // Admission is read-only and precedes progress retirement/recovery.
+            // Reuse the same control decoder; never validate by constructing a
+            // second harness or by adopting/re-writing foreign receipts.
+            for lane in options
+                .session
+                .get_lanes()
+                .await
+                .map_err(session_to_harness_err)?
+            {
+                durable_control::validate_session(
+                    &options.session,
+                    &lane.lane,
+                    experimental_durable.as_ref(),
+                )
+                .await?;
+            }
+        }
         if !options.allow_existing_session {
             let existing = options
                 .session
@@ -1103,6 +1185,9 @@ impl AgentHarness {
             thinking_level: options.thinking_level,
             active_tool_names: options.active_tool_names,
             exact_resources: false,
+            require_native_durable: options.require_native_durable,
+            experimental_durable,
+            durable_sealed: false,
             tools: options.tools,
             resources: options.resources,
             stream_options: options.stream_options,
@@ -1408,7 +1493,9 @@ impl AgentHarness {
             harness: self,
             run_id: admission.0.clone(),
         };
-        // A rejected admission leaves the marker intact for a later attempt.
+        // Validate under the admission gate before consuming the marker or
+        // writing a resume notice. Rejection/caller drop leaves it retryable.
+        self.validate_native_durable_current_locked(&gate).await?;
         let pending = self.inner.lock().unwrap().pending_resume.take().unwrap();
         drop(gate);
         if pending.attempt >= MAX_RESUME_ATTEMPTS {
@@ -1614,6 +1701,17 @@ impl AgentHarness {
             max_turns: self.max_turns,
             stop_round: Arc::clone(&self.stop_round),
         })
+    }
+
+    /// Immutable host-selected experimental epoch, for capability metadata only.
+    /// This observation is not journal admission or an authority token.
+    pub fn experimental_durable_epoch(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .experimental_durable
+            .as_ref()
+            .map(|policy| policy.epoch_id().to_owned())
     }
 
     /// The harness's bound lane name ("main" for a top-level harness).
@@ -2192,6 +2290,11 @@ impl AgentHarness {
         custom_type: &str,
         data: Option<JsonValue>,
     ) -> HarnessResult<String> {
+        if crate::durable::reserved_control_type(custom_type) {
+            return Err(HarnessError::io(
+                "native durable control entries are reserved",
+            ));
+        }
         let _gate = self.message_writes.lock().await;
         self.view()
             .append_custom_entry(custom_type, data)
@@ -2497,6 +2600,9 @@ impl AgentHarness {
             harness: self,
             run_id: run_id.clone(),
         };
+        // Do not establish an imported operation or poll the provider until
+        // the same current-branch decoder admits this suspended continuation.
+        self.validate_native_durable_current_locked(&gate).await?;
         drop(gate);
         if parked_run_id.is_none() {
             // Public session APIs can import a deferred message without its
@@ -2678,10 +2784,15 @@ impl AgentHarness {
     /// otherwise this rejects with `LaneBusy` and leaves the old session intact.
     pub async fn set_session(&self, session: Session) -> HarnessResult<()> {
         let _gate = self.message_writes.lock().await;
-        {
+        let require_native_durable = {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
                 return Err(HarnessError::closed());
+            }
+            if inner.durable_sealed {
+                return Err(HarnessError::io(
+                    "durable lifecycle is sealed; restart the harness to rebind",
+                ));
             }
             if inner.exact_resources {
                 return Err(HarnessError::io(
@@ -2696,7 +2807,8 @@ impl AgentHarness {
                     "Wait for the active operation to finish before switching sessions",
                 ));
             }
-        }
+            inner.require_native_durable
+        };
         // Prepare everything against a pinned target before publishing the swap.
         // A failed read must leave the old session and its queues untouched.
         let target = session.pin(Arc::clone(self.session.id_generator()));
@@ -2706,6 +2818,24 @@ impl AgentHarness {
                 "Target session does not contain the bound lane",
             ));
         }
+        let native_identity = if require_native_durable {
+            let identity = target
+                .storage()
+                .history_identity()
+                .await
+                .map_err(session_to_harness_err)?;
+            for lane in &lanes {
+                durable_control::validate_session(
+                    &target,
+                    &lane.lane,
+                    self.durable_experimental_policy().as_ref(),
+                )
+                .await?;
+            }
+            Some(identity)
+        } else {
+            None
+        };
         target
             .prune_completed_progress()
             .await
@@ -2713,6 +2843,19 @@ impl AgentHarness {
         let mut rebuilt = Vec::new();
         for lane in lanes {
             rebuilt.extend(Self::rebuild_queues(&target, &lane.lane).await?);
+        }
+        if let Some(identity) = native_identity {
+            if target
+                .storage()
+                .history_identity()
+                .await
+                .map_err(session_to_harness_err)?
+                != identity
+            {
+                return Err(HarnessError::io(
+                    "Native durable target changed during session preparation; session was not activated",
+                ));
+            }
         }
         let mut inner = self.inner.lock().unwrap();
         // Keep the queue handles: existing lane handles share these Arcs.
@@ -4444,6 +4587,10 @@ impl AgentHarness {
             run_id: run_id.clone(),
         };
 
+        // Check before queue reservation, recovery or prompt/context writes.
+        // Automatic compaction checks again at its later threshold boundaries.
+        self.validate_native_durable_current().await?;
+
         // `nextRun` messages are consumed when a new run starts, before the
         // caller's prompt. This matches pi's ordering and keeps them durable
         // through the normal prompt persistence path below.
@@ -4648,7 +4795,9 @@ impl AgentHarness {
                 }
             } else {
                 // Only materialize the full entry path when the cheap context
-                // check says compaction may actually be necessary.
+                // check says compaction may actually be necessary. Run admission
+                // precedes prompt persistence; recheck this later boundary too.
+                self.validate_native_durable_current().await?;
                 let path = self.branch_path_oldest_first().await?;
                 let mut compaction_applied = false;
                 if let Ok(Some(prep)) = prepare_compaction(&path, snap.compaction) {
@@ -4907,6 +5056,7 @@ impl AgentHarness {
                     .cloned();
                 let compaction_signal = signal.clone();
                 let compaction_run_id = run_id.clone();
+                let compaction_error = Arc::clone(&context_write_error);
                 if enabled && model.context_window > 0 && provider.is_some() {
                     let cut_for_hook = Arc::clone(&post_compaction_cut);
                     Some(Arc::new(move |ctx: ShouldStopAfterTurnContext<'_>| -> BoxFuture<'static, Option<rpi_agent::AgentLoopTurnUpdate>> {
@@ -4917,11 +5067,20 @@ impl AgentHarness {
                         let compaction_signal = compaction_signal.clone();
                         let stream_options = stream_options.clone();
                         let compaction_run_id = compaction_run_id.clone();
+                        let compaction_error = Arc::clone(&compaction_error);
                         let context = ctx.context.clone();
                         let new_messages_len = ctx.new_messages.len();
                         Box::pin(async move {
                             let tokens = estimate_context_tokens(&context.messages).tokens;
                             if !should_compact(tokens, model.context_window as i64, &settings) {
+                                return None;
+                            }
+                            if let Err(error) = harness.validate_native_durable_current().await {
+                                // None alone means "no compaction" to the loop.
+                                // Use its existing fail-closed boundary so this
+                                // rejection cannot silently call the next model.
+                                compaction_error.lock().unwrap().get_or_insert_with(|| error.to_string());
+                                compaction_signal.cancel();
                                 return None;
                             }
                             let entries: Vec<Entry> = context.messages.iter().enumerate().map(|(i, message)| Entry::Message(crate::session::types::MessageEntry {
@@ -5310,8 +5469,38 @@ impl AgentHarness {
         Ok(RunResult { run_id, outcome })
     }
 
+    // The immutable opt-in policy never enables a tool/context surface. Copy it
+    // before awaiting; no synchronous inner guard may live across a backend read.
+    async fn validate_native_durable_current(&self) -> HarnessResult<()> {
+        let required = self.inner.lock().unwrap().require_native_durable;
+        if required {
+            let gate = self.message_writes.lock().await;
+            self.validate_native_durable_current_locked(&gate).await?;
+        }
+        Ok(())
+    }
+
+    // The caller must hold this harness's message_writes gate. Borrowing it
+    // retains that guard across validation without trying to acquire it again.
+    async fn validate_native_durable_current_locked(
+        &self,
+        _gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> HarnessResult<()> {
+        let required = self.inner.lock().unwrap().require_native_durable;
+        if required {
+            durable_control::validate_session(
+                &self.session,
+                &self.lane,
+                self.durable_experimental_policy().as_ref(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Explicit compaction. Drives `prepare_compaction` + `compact` and
-    /// persists the result entry.
+    /// persists the result entry. Opted-in journal validation happens under the
+    /// active-run lease, before native recovery, intent writes or provider calls.
     async fn compact_core(
         &self,
         custom_instructions: Option<String>,
@@ -5321,6 +5510,7 @@ impl AgentHarness {
             harness: self,
             run_id: run_id.clone(),
         };
+        self.validate_native_durable_current().await?;
         let recovery_tools = self.recovery_tools();
         // `true`: a run starting here retries through its own retry loop, so a
         // leftover failed attempt is settled the ordinary way.
@@ -5641,7 +5831,7 @@ impl AgentLane for AgentHarness {
         _label: Option<&str>,
     ) -> HarnessResult<NavigationResult> {
         let _gate = self.message_writes.lock().await;
-        {
+        let require_native_durable = {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
                 return Err(HarnessError::closed());
@@ -5654,10 +5844,34 @@ impl AgentLane for AgentHarness {
                     "Wait for the active operation to finish before navigating",
                 ));
             }
-        }
+            inner.require_native_durable
+        };
         let run_id = self.session.id_generator().next();
         let target = target_id.filter(|id| !id.is_empty());
-        match self.session.move_lane(&self.lane, target).await {
+        // Read the candidate branch before moving the live pointer. A failed or
+        // cancelled validation must not need a compensating move/rollback.
+        // This shares the harness gate, not cross-process storage fencing.
+        let admission = if require_native_durable {
+            durable_control::validate_navigation(
+                &self.session,
+                &self.lane,
+                target,
+                self.durable_experimental_policy().as_ref(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        };
+        let movement = match admission {
+            Ok(()) => self
+                .session
+                .move_lane(&self.lane, target)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        match movement {
             Ok(()) => {
                 let leaf = self
                     .session
@@ -6343,10 +6557,7 @@ impl AgentLane for LaneHandle {
         custom_type: &str,
         data: Option<JsonValue>,
     ) -> HarnessResult<String> {
-        self.view
-            .append_custom_entry(custom_type, data)
-            .await
-            .map_err(session_to_harness_err)
+        self.runner().append_custom_entry(custom_type, data).await
     }
 
     async fn get_name(&self) -> HarnessResult<Option<String>> {
@@ -6615,7 +6826,9 @@ fn session_to_harness_err(e: SessionError) -> HarnessError {
         // The backend refused the write. Kept distinct from `Io` so the host can
         // tell the user to export their transcript instead of retrying a request
         // that was never the problem.
-        SessionErrorCode::Storage => HarnessError::session_storage(e.message),
+        SessionErrorCode::Storage
+        | SessionErrorCode::DurableConflict
+        | SessionErrorCode::DurableUnsupported => HarnessError::session_storage(e.message),
         _ => HarnessError::io(e.message),
     }
 }
@@ -6701,6 +6914,7 @@ mod session_switch_tests {
                 None,
             ),
             allow_existing_session: true,
+            require_native_durable: false,
             models: Vec::new(),
             to_provider_messages: None,
             entry_projectors: Default::default(),

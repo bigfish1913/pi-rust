@@ -116,6 +116,9 @@ impl AgentHarness {
                 "thinkingLevel":snap.thinking_level,
                 "tools":tools.iter().map(|tool| tool.tool.schema().name.clone()).collect::<Vec<_>>(),
                 "childAgent":false,
+                // Host identity, never accepted from tool parameters. Shared parent
+                // durable tools use this restricted actor rather than owner rights.
+                "nativeDurableActor":format!("child-{}", uuid::Uuid::now_v7()),
             })),
         );
         for tool in &mut tools {
@@ -132,32 +135,37 @@ impl AgentHarness {
         let parent_signal = snap.parent_signal;
         let steering_mode = snap.steering_queue.lock().unwrap().mode;
         let follow_up_mode = snap.follow_up_queue.lock().unwrap().mode;
-        let mut child = Self::create(AgentHarnessOptions {
-            model: snap.model,
-            thinking_level: snap.thinking_level,
-            tools,
-            active_tool_names,
-            system_prompt: snap.system_prompt,
-            resources: snap.resources,
-            stream_options: snap.stream_options,
-            retry: snap.retry,
-            compaction: snap.compaction,
-            tool_execution: snap.tool_execution,
-            drive: snap.driving,
-            steering_mode,
-            follow_up_mode,
-            models: snap.models,
-            to_provider_messages: snap.to_provider_messages,
-            entry_projectors: snap.entry_projectors,
-            entry_transforms: snap.entry_transforms,
-            before_tool_call: snap.before_tool_call,
-            after_tool_call: snap.after_tool_call,
-            transform_context: snap.transform_context,
-            provider_hooks: snap.provider_hooks,
-            agent_emitter: Some(emitter),
-            session,
-            ..Default::default()
-        })
+        let experimental_durable = self.durable_experimental_policy();
+        let mut child = Self::create_with_durable_policy(
+            AgentHarnessOptions {
+                model: snap.model,
+                thinking_level: snap.thinking_level,
+                tools,
+                active_tool_names,
+                system_prompt: snap.system_prompt,
+                resources: snap.resources,
+                stream_options: snap.stream_options,
+                retry: snap.retry,
+                compaction: snap.compaction,
+                tool_execution: snap.tool_execution,
+                drive: snap.driving,
+                steering_mode,
+                follow_up_mode,
+                models: snap.models,
+                to_provider_messages: snap.to_provider_messages,
+                entry_projectors: snap.entry_projectors,
+                entry_transforms: snap.entry_transforms,
+                before_tool_call: snap.before_tool_call,
+                after_tool_call: snap.after_tool_call,
+                transform_context: snap.transform_context,
+                provider_hooks: snap.provider_hooks,
+                agent_emitter: Some(emitter),
+                session,
+                require_native_durable: experimental_durable.is_some(),
+                ..Default::default()
+            },
+            experimental_durable,
+        )
         .await?;
         child.is_child = true;
         child.max_turns = Some(max_turns);
@@ -210,7 +218,8 @@ impl AgentHarness {
                 serde_json::json!({"childAgent":false,"tools":[]}),
             ),
         );
-        let mut child = Self::create(AgentHarnessOptions {
+        let experimental_durable = self.durable_experimental_policy();
+        let mut child = Self::create_with_durable_policy(AgentHarnessOptions {
             model: snap.model,
             thinking_level: snap.thinking_level,
             models: snap.models,
@@ -225,8 +234,9 @@ impl AgentHarness {
             provider_hooks: snap.provider_hooks,
             agent_emitter: Some(emitter),
             session,
+            require_native_durable: experimental_durable.is_some(),
             ..Default::default()
-        }).await?;
+        }, experimental_durable).await?;
         child.is_child = true;
         child.max_turns = Some(1);
         child.inner.lock().unwrap().execution_scope = Some(execution_scope.clone());
