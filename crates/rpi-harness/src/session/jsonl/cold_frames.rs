@@ -454,6 +454,9 @@ impl ResidentState {
         raw: &[u8],
     ) -> SessionResult<()> {
         self.reserve_frame_metadata(&metadata)?;
+        // Cold frames still consume the journal sequence even though their
+        // discarded payload is not reduced into a resident record.
+        self.reducer.resync_sequence(metadata.seq);
         fn symbol(slot: &mut Option<Arc<str>>, value: &str) -> Arc<str> {
             if let Some(current) = slot.as_ref().filter(|current| current.as_ref() == value) {
                 return current.clone();

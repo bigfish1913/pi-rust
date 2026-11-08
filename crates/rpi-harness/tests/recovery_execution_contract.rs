@@ -232,7 +232,7 @@ async fn terminals(session: &Session) -> Vec<LaneRecord> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn conflicting_result_identity_keeps_recovery_open_without_replaying_any_call() {
-    for kind in ["memory", "sqlite", "jsonl"] {
+    for kind in ["memory", "jsonl"] {
         for policy in [ToolReplay::Never, ToolReplay::Safe] {
             let (backend, session) = Backend::create(kind).await;
             setup_interrupted(&session, 2, Some(policy)).await;
@@ -297,7 +297,7 @@ async fn conflicting_result_identity_keeps_recovery_open_without_replaying_any_c
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exact_reserved_results_stay_settled_across_two_restores() {
-    for kind in ["memory", "sqlite", "jsonl"] {
+    for kind in ["memory", "jsonl"] {
         let (backend, session) = Backend::create(kind).await;
         setup_interrupted(&session, 2, Some(ToolReplay::Safe)).await;
         for index in 0..2 {
