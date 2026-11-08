@@ -82,9 +82,9 @@ impl JsonlBackend {
 
     fn read_frames(&self) -> Result<Vec<JournalFrame>, BackendError> {
         let lock = self.open_lock()?;
-        lock.lock_shared()?;
+        FileExt::lock_shared(&lock)?;
         let result = self.read_frames_unlocked();
-        let unlock_result = lock.unlock();
+        let unlock_result = FileExt::unlock(&lock);
         match (result, unlock_result) {
             (Ok(frames), Ok(())) => Ok(frames),
             (Err(error), _) => Err(error),
@@ -107,7 +107,7 @@ impl DurableBackend for JsonlBackend {
         // append. Without this, two processes can both observe the same head
         // and publish duplicate journal sequences.
         let lock = self.open_lock()?;
-        lock.lock_exclusive()?;
+        FileExt::lock_exclusive(&lock)?;
         let result = (|| {
             let current = self
                 .read_frames_unlocked()?
@@ -124,7 +124,7 @@ impl DurableBackend for JsonlBackend {
             file.flush()?;
             Ok(frame)
         })();
-        let unlock_result = lock.unlock();
+        let unlock_result = FileExt::unlock(&lock);
         match (result, unlock_result) {
             (Ok(frame), Ok(())) => Ok(frame),
             (Err(error), _) => Err(error),
@@ -138,7 +138,7 @@ impl DurableBackend for JsonlBackend {
         expected_sequence: Option<u64>,
     ) -> Result<Vec<JournalFrame>, BackendError> {
         let lock = self.open_lock()?;
-        lock.lock_exclusive()?;
+        FileExt::lock_exclusive(&lock)?;
         let result = (|| {
             let current = self
                 .read_frames_unlocked()?
@@ -166,7 +166,7 @@ impl DurableBackend for JsonlBackend {
             file.flush()?;
             Ok(frames)
         })();
-        let unlock_result = lock.unlock();
+        let unlock_result = FileExt::unlock(&lock);
         match (result, unlock_result) {
             (Ok(frames), Ok(())) => Ok(frames),
             (Err(error), _) => Err(error),

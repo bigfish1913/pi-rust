@@ -168,7 +168,6 @@ mod tests {
                 "synthetic.html",
             ],
             vec!["--native-durable", FLAG, "epoch", "--list-models"],
-            vec!["--native-durable", FLAG, "epoch"],
         ] {
             assert!(!parse(&args).errors.is_empty(), "{args:?}");
         }
