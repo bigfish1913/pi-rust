@@ -81,7 +81,7 @@ fn copy_is_bounded_and_failure_preserves_old_install() {
         "changed and larger than the previously inventoried input",
     );
     let temp = tempfile::tempdir_in(&root).unwrap();
-    assert!(copy_snapshot(&source, &temp.path().join("copy"), &expected).is_err());
+    assert!(copy_snapshot(Kind::Skill, &source, &temp.path().join("copy"), &expected).is_err());
     assert_eq!(old, inventory(&root.join("skills/demo")).unwrap());
     assert_eq!(receipt, fs::read(root.join(RECEIPTS)).unwrap());
     fs::remove_file(source.join("SKILL.md")).unwrap();
@@ -413,7 +413,7 @@ fn staged_native_snapshot_is_signed_and_inventory_describes_the_copy() {
     put(&source, fs::read("/bin/echo").unwrap());
     let observed = inventory(&source).unwrap();
     let staged = base.join("staged");
-    let copied = copy_snapshot(&source, &staged, &observed).unwrap();
+    let copied = copy_snapshot(Kind::Extension, &source, &staged, &observed).unwrap();
     assert_ne!(
         copied.files[0].sha256, observed.files[0].sha256,
         "the staged artifact was not re-signed"
@@ -473,11 +473,51 @@ fn repeated_native_install_is_idempotent() {
     let observed = inventory(&source).unwrap();
     fs::create_dir_all(base.join("txn-a")).unwrap();
     fs::create_dir_all(base.join("txn-b")).unwrap();
-    let first = copy_snapshot(&source, &base.join("txn-a/one"), &observed).unwrap();
-    let second = copy_snapshot(&source, &base.join("txn-b/two"), &observed).unwrap();
+    let first =
+        copy_snapshot(Kind::Extension, &source, &base.join("txn-a/one"), &observed).unwrap();
+    let second =
+        copy_snapshot(Kind::Extension, &source, &base.join("txn-b/two"), &observed).unwrap();
     assert_eq!(
         first.files[0].sha256, second.files[0].sha256,
         "signing the same source twice produced different bytes"
     );
     assert_eq!(first, second);
+}
+
+/// A Skill directory never has native artifacts signed.
+///
+/// `validate_source` for `Kind::Skill` only requires `SKILL.md`; it does not
+/// reserve an `extensions/` subtree. A skill may therefore legitimately carry an
+/// ordinary asset such as `extensions/example.dylib`, and that file is content.
+/// Signing it would rewrite a file the host never loads as a library.
+#[cfg(target_os = "macos")]
+#[test]
+fn skill_directory_never_resigns_same_suffix_assets() {
+    let (_dir, _root, _) = fixture();
+    let base = fs::canonicalize(_dir.path()).unwrap();
+    let source = base.join("skill");
+    put(source.join("SKILL.md"), "---\nname: demo\n---\nbody");
+    // Non-Mach-O data that happens to use the library suffix, in a path that a
+    // Package would have treated as an artifact.
+    put(source.join("extensions/example.dylib"), b"plain data\n");
+    let observed = inventory(&source).unwrap();
+    let copied = copy_snapshot(Kind::Skill, &source, &base.join("skill-copy"), &observed).unwrap();
+    assert_eq!(
+        copied, observed,
+        "a Skill snapshot must be byte-identical to its source"
+    );
+    assert_eq!(
+        fs::read(base.join("skill-copy/extensions/example.dylib")).unwrap(),
+        b"plain data\n"
+    );
+}
+
+/// The same path *is* an artifact when the source is a Package.
+#[cfg(target_os = "macos")]
+#[test]
+fn package_artifact_selection_differs_from_skill() {
+    assert!(is_package_artifact(Path::new("extensions/example.dylib")));
+    // Skill selection is empty regardless of path, which the kind match encodes;
+    // this guards the helper boundary the reviewer called out.
+    assert!(!is_package_artifact(Path::new("assets/example.dylib")));
 }

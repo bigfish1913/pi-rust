@@ -777,7 +777,12 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 /// are re-signed after copying (see `resign_snapshot_native`), which rewrites
 /// their bytes. Callers must record the **returned** inventory, not the source
 /// one, or every later ownership check fails.
-fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<Inventory> {
+fn copy_snapshot(
+    kind: Kind,
+    source: &Path,
+    target: &Path,
+    observed: &Inventory,
+) -> Result<Inventory> {
     fn copy_file(source: &Path, target: &Path, expected: u64) -> Result<()> {
         checked_path(source)?;
         let input = File::open(source).map_err(err)?;
@@ -831,23 +836,23 @@ fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<I
     if inventory(source)? != *observed {
         return Err("resource source changed during snapshot copy".into());
     }
-    // Which copied files are loadable native artifacts is decided from the source
-    // shape, and only from paths that the validator already accepts as such:
-    //   - a single-file source (`resource install extension …`) is the artifact,
-    //     even though its inventory path is `.` with no extension
-    //   - a Package may only carry native artifacts as direct children of
-    //     `extensions/` (see `validate_source`), so a `.dylib` under
-    //     `skills/`, `prompts/` or `themes/` is ordinary data and must be left
-    //     alone
-    let native: std::collections::BTreeSet<PathBuf> = if source.is_file() {
-        observed.files.iter().map(|f| f.path.clone()).collect()
-    } else {
-        observed
+    // Which copied files are loadable native artifacts is decided by the resource
+    // KIND, because only the kind's validator reserves a place for one:
+    //   - Extension: the single-file source is the artifact, even though its
+    //     inventory path is `.` with no extension
+    //   - Package: only direct children of `extensions/` (see `validate_source`),
+    //     so a `.dylib` under `skills/`, `prompts/` or `themes/` is data
+    //   - Skill: nothing. A skill only has to contain SKILL.md, so a same-suffix
+    //     asset means nothing and must never be handed to `codesign`
+    let native: std::collections::BTreeSet<PathBuf> = match kind {
+        Kind::Extension => observed.files.iter().map(|f| f.path.clone()).collect(),
+        Kind::Package => observed
             .files
             .iter()
             .map(|f| f.path.clone())
             .filter(|p| is_package_artifact(p))
-            .collect()
+            .collect(),
+        Kind::Skill => std::collections::BTreeSet::new(),
     };
     let artifacts: Vec<PathBuf> = native.iter().map(|p| target.join(p)).collect();
     resign_snapshot_native(&artifacts)?;
@@ -1258,7 +1263,7 @@ fn mutate(root: &Path, o: &Options) -> Result<Value> {
         // are re-signed, so the copy's inventory (which is what gets installed and
         // later re-verified against) differs from the source's.
         let staged = stage.path().join("snapshot");
-        let copied = copy_snapshot(&source, &staged, &inv)?;
+        let copied = copy_snapshot(kind, &source, &staged, &inv)?;
         let receipt = Receipt {
             kind,
             name: name.into(),
