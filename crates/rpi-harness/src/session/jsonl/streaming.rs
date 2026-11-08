@@ -192,6 +192,23 @@ impl JsonlSessionStorage {
             }
             let line = std::str::from_utf8(&raw)
                 .map_err(|_| SessionError::invalid_entry("invalid session UTF-8"))?;
+            // Historical assistant frames do not need their discarded payloads
+            // during cold startup. Recognize their indexed metadata directly;
+            // duplicate/backward sequences still fall through to the canonical
+            // codec so recovery keeps its exact-equivalence checks.
+            if let Some(metadata) = super::super::cold_decode::parse_cold_frame(line) {
+                let mut state = storage.state.lock().await;
+                if metadata.seq > state.sequence() {
+                    if metadata.seq > state.next_sequence() {
+                        state.resync_sequence(metadata.seq - 1);
+                    }
+                    let seq = metadata.seq;
+                    state.apply_loaded_frame(metadata, &reader, offset, &raw)?;
+                    seen.insert(seq, (offset, raw.len()));
+                    spans.push((offset, raw.len() as u64));
+                    continue;
+                }
+            }
             match parse_mutation(line) {
                 Ok(mutation) => {
                     let mut state = storage.state.lock().await;
