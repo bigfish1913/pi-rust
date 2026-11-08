@@ -29,7 +29,7 @@ impl AgentHarness {
         self.durable_check_owner()?;
         // Role mismatch and owner-only action denials precede even replay.
         config.check_actor(&actor)?;
-        if !actor.may_replace_workflow
+        if !actor.may_replace_workflow()
             && matches!(
                 request.action,
                 ControlAction::Start { .. }
@@ -57,7 +57,7 @@ impl AgentHarness {
         if let Some(receipt) = loaded.receipt(&request.request_id)? {
             // Historical outcome queries remain valid, but only the CURRENT
             // anchor permits an identical retry to report replay success.
-            if receipt.actor != actor.id
+            if receipt.actor != actor.id()
                 || receipt.action != request.action
                 || receipt.expected != request.expected
                 || receipt.run_id != request.run_id
@@ -85,7 +85,7 @@ impl AgentHarness {
                 .records
                 .iter()
                 .map(|item| item.candidate.record().receipt.actor.as_str())
-                .chain(std::iter::once(actor.id.as_str())),
+                .chain(std::iter::once(actor.id())),
         )?;
         if let ControlAction::Finish { item, .. } | ControlAction::Cancel { item, .. } =
             &request.action
@@ -97,8 +97,8 @@ impl AgentHarness {
                 .find(|item_| item_.id == item.trim())
             {
                 if existing.status == QueueStatus::Claimed
-                    && existing.claimed_by.as_deref() != Some(actor.id.as_str())
-                    && !(actor.may_replace_workflow
+                    && existing.claimed_by.as_deref() != Some(actor.id())
+                    && !(actor.may_replace_workflow()
                         && matches!(request.action, ControlAction::Cancel { .. }))
                 {
                     return Err(DurableError::PermissionDenied);
@@ -153,7 +153,7 @@ impl AgentHarness {
                 .iter_mut()
                 .find(|entry| entry.id == item.trim())
                 .ok_or_else(invalid)?;
-            claimed.claimed_by = Some(actor.id.clone());
+            claimed.claimed_by = Some(actor.id().to_owned());
         }
         let changed =
             candidate != snapshot.state || execution_control != snapshot.execution_control;
@@ -174,7 +174,7 @@ impl AgentHarness {
             .ok_or(DurableError::LimitExceeded)?;
         let receipt = DurableReceipt {
             request_id: request.request_id,
-            actor: actor.id,
+            actor: actor.id().to_owned(),
             expected: request.expected,
             action: request.action,
             run_id: request.run_id,

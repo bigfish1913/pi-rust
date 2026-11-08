@@ -75,8 +75,7 @@ pub(crate) fn policy(args: &Args) -> Result<Option<ExperimentalDurablePolicy>, S
     if !args.errors.is_empty() {
         return Err(format!("{FLAG} cannot start from invalid arguments"));
     }
-    if args.experimental_native_store.is_some()
-        || args.export.is_some()
+    if args.export.is_some()
         || args.list_models.is_some()
         || [
             "connect",
@@ -88,7 +87,7 @@ pub(crate) fn policy(args: &Args) -> Result<Option<ExperimentalDurablePolicy>, S
         .iter()
         .any(|flag| args.unknown_flags.contains_key(*flag))
     {
-        return Err(format!("{FLAG} cannot be combined with experimental-native-store, export, list-models, remote, server, Web or saved-session inspection"));
+        return Err(format!("{FLAG} cannot be combined with export, list-models, remote, server, Web or saved-session inspection"));
     }
     ExperimentalDurablePolicy::new(epoch.clone(), vec![OWNER.to_owned()])
         .map(Some)
@@ -169,13 +168,7 @@ mod tests {
                 "synthetic.html",
             ],
             vec!["--native-durable", FLAG, "epoch", "--list-models"],
-            vec![
-                "--native-durable",
-                FLAG,
-                "epoch",
-                "--experimental-native-store",
-                "synthetic",
-            ],
+            vec!["--native-durable", FLAG, "epoch"],
         ] {
             assert!(!parse(&args).errors.is_empty(), "{args:?}");
         }

@@ -1828,6 +1828,18 @@ impl SessionStorage for JsonlSessionStorage {
         })
     }
 
+    async fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<Vec<crate::session::types::EntryAncestry>> {
+        // Cold JSONL indexes retain the identity/parent metadata needed for
+        // ancestry walks. Do not use SessionStorage's hydration fallback here:
+        // branch summaries must remain readable when archival bodies are
+        // unavailable or intentionally poisoned.
+        self.state.lock().await.branch_ancestry(bounds, start)
+    }
+
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
         let lane = lane.to_string();
         let at = at.map(str::to_string);

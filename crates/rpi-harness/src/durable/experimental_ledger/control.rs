@@ -35,7 +35,7 @@ impl TransitionPolicy {
         }
         let mut ids = HashSet::new();
         for actor in &actors {
-            if !ids.insert(actor.id.as_str()) {
+            if !ids.insert(actor.id()) {
                 return Err(TransitionError::Policy);
             }
         }
@@ -97,7 +97,7 @@ pub fn inspect_control_transitions(
         let actor = policy
             .actors
             .iter()
-            .find(|actor| actor.id == receipt.actor)
+            .find(|actor| actor.id() == receipt.actor)
             .ok_or(TransitionError::Permission)?;
         let mut next = prepare_control_candidate(&state, action, actor)?;
         let changed = next != state;
@@ -127,7 +127,7 @@ fn prepare_control_candidate(
     action: &ControlAction,
     actor: &DurableActor,
 ) -> Result<ControlState, TransitionError> {
-    if !actor.may_replace_workflow
+    if !actor.may_replace_workflow()
         && matches!(action, ControlAction::Start { .. } | ControlAction::Reset)
     {
         return Err(TransitionError::Permission);
@@ -135,8 +135,8 @@ fn prepare_control_candidate(
     if let ControlAction::Finish { item, .. } | ControlAction::Cancel { item, .. } = action {
         if let Some(existing) = state.queue.iter().find(|entry| entry.id == item.trim()) {
             if existing.status == QueueStatus::Claimed
-                && existing.claimed_by.as_deref() != Some(actor.id.as_str())
-                && !(actor.may_replace_workflow && matches!(action, ControlAction::Cancel { .. }))
+                && existing.claimed_by.as_deref() != Some(actor.id())
+                && !(actor.may_replace_workflow() && matches!(action, ControlAction::Cancel { .. }))
             {
                 return Err(TransitionError::Permission);
             }
@@ -151,7 +151,7 @@ fn prepare_control_candidate(
             .iter_mut()
             .find(|entry| entry.id == item.trim())
             .ok_or(TransitionError::Transition)?;
-        claimed.claimed_by = Some(actor.id.clone());
+        claimed.claimed_by = Some(actor.id().to_owned());
     }
     Ok(next)
 }

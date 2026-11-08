@@ -368,15 +368,6 @@ fn safe_early_dispatch_rejections_do_not_read_or_convert_test_owned_files() {
             FLAG,
             EPOCH,
         ],
-        vec![
-            "--native-durable",
-            FLAG,
-            EPOCH,
-            "--experimental-native-store",
-            "synthetic-store",
-            "--print",
-            "hello",
-        ],
     ] {
         let stderr = fixture.raw_rejection(&args, true);
         assert!(stderr.contains(FLAG), "{stderr}");

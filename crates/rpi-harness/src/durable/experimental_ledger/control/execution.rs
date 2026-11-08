@@ -79,11 +79,11 @@ pub fn inspect_execution_transitions(
         let actor = policy
             .actors
             .iter()
-            .find(|actor| actor.id == receipt.actor)
+            .find(|actor| actor.id() == receipt.actor)
             .ok_or(TransitionError::Permission)?;
         let (mut next, next_execution) = match action {
             ControlAction::Recover | ControlAction::ForgetRun => {
-                if !actor.may_replace_workflow {
+                if !actor.may_replace_workflow() {
                     return Err(TransitionError::Permission.into());
                 }
                 let fact = facts.next().ok_or(ExecutionTransitionError::Facts)?;

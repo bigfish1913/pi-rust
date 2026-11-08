@@ -12,17 +12,14 @@ mod admission;
 mod budget;
 #[path = "experimental_ledger_writer/differential.rs"]
 mod differential;
-#[path = "experimental_ledger_writer/jsonl.rs"]
-mod jsonl;
-#[path = "experimental_ledger_writer/memory.rs"]
-mod memory;
-#[path = "experimental_ledger_writer/sqlite.rs"]
-mod sqlite;
-
 #[path = "experimental_ledger_writer/execution.rs"]
 mod execution;
 #[path = "experimental_ledger_writer/fixture.rs"]
 mod fixture;
+#[path = "experimental_ledger_writer/jsonl.rs"]
+mod jsonl;
+#[path = "experimental_ledger_writer/memory.rs"]
+mod memory;
 #[path = "support/durable_control_probe.rs"]
 mod probe;
 #[path = "experimental_ledger_writer/settlement.rs"]
@@ -43,9 +40,9 @@ use rpi_harness::{
         memory::{InMemorySessionStorage, SystemClock},
         types::{
             Entry, EntryOrder, EntryQuery, HistoryCheckpoint, HistoryIdentity, HistoryReplacement,
-            LanePointer, SessionMetadata, SessionRepo, SessionStorage,
+            LanePointer, SessionMetadata, SessionStorage,
         },
-        DefaultIdGenerator, Session, SessionState, SqliteSessionRepo,
+        DefaultIdGenerator, Session, SessionState,
     },
     types::AgentHarnessOptions,
 };

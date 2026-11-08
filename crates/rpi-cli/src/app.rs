@@ -89,11 +89,6 @@ async fn run_inner() -> i32 {
         eprintln!("error: {error}");
         return EXIT_USAGE;
     }
-    if let Err(error) = crate::native_store::early_check(&argv) {
-        eprintln!("error: {error}");
-        return EXIT_USAGE;
-    }
-
     // Safe old-host negotiation: callers discover this flag through --help
     // first. Never fall through to prompts, remote clients, resource commands,
     // trust, migration, leases, credentials, providers or DLL startup.
@@ -246,14 +241,6 @@ async fn run_inner() -> i32 {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
-    match crate::native_store::root(&parsed, &cwd) {
-        Ok(root) => parsed.experimental_native_store = root,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return EXIT_USAGE;
-        }
-    }
-
     // ---- Legacy-layout migration (flat ~/.rpi → ~/.rpi/agent/) ----
     // Best-effort; never blocks startup. Skipped when RPI_CODING_AGENT_DIR is
     // set (an explicit override is its own layout).
@@ -324,9 +311,7 @@ async fn run_inner() -> i32 {
     // adopted cwd belongs to another project's tree. Pinning the resolved root
     // into `args` makes `prepare_extensions` and the build below read one root.
     let session_root = crate::session::configured_session_dir(&parsed, &cwd);
-    if parsed.experimental_native_store.is_none() {
-        parsed.session_dir = Some(session_root.clone());
-    }
+    parsed.session_dir = Some(session_root.clone());
     let mut startup_notices: Vec<String> = Vec::new();
     // The peek and the build both derive their selection from this frozen root,
     // so they can never inspect one session and open another.
@@ -564,13 +549,6 @@ async fn run_inner() -> i32 {
     // otherwise the host would start a TUI/print run that writes to a stream the
     // plugin owns.
     let mode = if stdio_claimed { RunMode::Rpc } else { mode };
-    if let Err(error) =
-        crate::native_store::validate_mode(parsed.experimental_native_store.is_some(), mode)
-    {
-        eprintln!("error: {error}");
-        return EXIT_USAGE;
-    }
-
     // ---- startup notices (restored-session cwd) ----
     // The interactive TUI renders them as transcript notes (they must survive
     // into the alternate screen); headless modes print them to stderr like the

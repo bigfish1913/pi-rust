@@ -53,7 +53,6 @@ pub mod key_trace;
 pub mod model_registry;
 pub mod modes;
 mod native_durable;
-mod native_store;
 pub mod packages;
 pub mod prebuilt_extensions;
 mod prebuilt_release;

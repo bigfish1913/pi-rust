@@ -53,8 +53,8 @@ impl ExperimentalDurablePolicy {
     /// The trusted live actor must agree EXACTLY with configured membership.
     /// In particular, supplying a configured owner as a child is not accepted.
     pub(crate) fn check_actor(&self, actor: &DurableActor) -> Result<(), DurableError> {
-        validate_identity(&actor.id)?;
-        if actor.may_replace_workflow != self.is_owner(&actor.id) {
+        validate_identity(actor.id())?;
+        if actor.may_replace_workflow() != self.is_owner(actor.id()) {
             return Err(DurableError::PermissionDenied);
         }
         Ok(())

@@ -176,8 +176,6 @@ pub struct Args {
     /// scopedModels — the same set /scoped-models edits). Empty = all models.
     pub models: Option<Vec<String>>,
     pub session_dir: Option<PathBuf>,
-    /// Reserved even in feature-off builds; fresh explicit print sessions only.
-    pub experimental_native_store: Option<PathBuf>,
     pub no_session: bool,
     pub name: Option<String>,
 
@@ -486,17 +484,6 @@ pub fn parse_args(args: &[String]) -> Args {
                     result.prompt_template.push(PathBuf::from(v));
                 }
             }
-            "--experimental-native-store" => {
-                if let Some(value) = take_value(&mut result, &flag_key) {
-                    if result.experimental_native_store.is_some() {
-                        result
-                            .errors
-                            .push("--experimental-native-store may be supplied only once".into());
-                    } else {
-                        result.experimental_native_store = Some(PathBuf::from(value));
-                    }
-                }
-            }
             "--session-dir" => {
                 if let Some(v) = take_value(&mut result, "--session-dir") {
                     result.session_dir = Some(PathBuf::from(v));
@@ -618,9 +605,6 @@ pub fn parse_args(args: &[String]) -> Args {
     if let Err(error) = crate::native_durable::experimental_epoch::policy(&result) {
         result.errors.push(error);
     }
-    if let Err(error) = crate::native_store::validate(&result) {
-        result.errors.push(error);
-    }
     result
 }
 
@@ -708,8 +692,6 @@ pub fn print_help() {
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
   --session-dir <dir>            Directory for session storage
-  --experimental-native-store <dir>
-                                Fresh --print text/json only; requires experimental-native-store build feature
   --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
   --tools, -t <list>             Comma-separated allowlist of tool names to enable

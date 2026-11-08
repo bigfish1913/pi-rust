@@ -1,9 +1,6 @@
 //! Integration contracts for the native P2 durable-control API. No provider calls.
 #[path = "durable_control/admission.rs"]
 mod admission;
-#[cfg(feature = "experimental-native-store")]
-#[path = "durable_control/native_store.rs"]
-mod native_store;
 #[path = "support/durable_control_probe.rs"]
 mod probe;
 #[path = "durable_control/lifecycle.rs"]
@@ -19,7 +16,7 @@ use rpi_harness::{
         jsonl::{JsonlSessionStorage, JsonlV4Header},
         memory::{CounterIdGenerator, FakeClock, InMemorySessionStorage},
         types::*,
-        DefaultIdGenerator, Session, SqliteSessionRepo, SystemClock,
+        DefaultIdGenerator, Session, SystemClock,
     },
     types::AgentHarnessOptions,
 };
@@ -180,21 +177,6 @@ async fn lifecycle_jsonl_reopen() {
     .await
     .unwrap();
     reopened(Arc::new(store), expected).await;
-}
-#[tokio::test]
-async fn lifecycle_sqlite_reopen() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("sessions.db");
-    let repo = SqliteSessionRepo::open(&path).unwrap();
-    let store = repo.create(&SessionCreateOptions::default()).await.unwrap();
-    let metadata = store.metadata();
-    let h = harness(Arc::new(store)).await;
-    let expected = lifecycle(&h).await;
-    h.drain_session().await;
-    drop(h);
-    drop(repo);
-    let repo = SqliteSessionRepo::open(&path).unwrap();
-    reopened(Arc::new(repo.open(&metadata).await.unwrap()), expected).await;
 }
 #[tokio::test]
 async fn concurrent_claim_and_actor_permissions() {

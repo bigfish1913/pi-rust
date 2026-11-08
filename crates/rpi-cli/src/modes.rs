@@ -61,7 +61,7 @@ pub fn outcome_exit_code(outcome: &HarnessRunOutcome) -> i32 {
 /// return the exit code. Mirrors TS `runPrintMode` (text).
 pub async fn print(
     harness: &AgentHarness,
-    args: &Args,
+    _args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
     initial_images: Vec<ImageContent>,
@@ -111,7 +111,7 @@ pub async fn print(
         // stderr. Silence here is what let a conversation stop being saved while
         // the run looked fine.
         for failure in lane.take_write_failures() {
-            persistence_failed |= args.experimental_native_store.is_some();
+            persistence_failed = true;
             eprintln!(
                 "session not saved: could not persist {} ({})",
                 failure.what, failure.message
@@ -193,7 +193,7 @@ pub async fn print(
 /// text. Mirrors TS `runPrintMode` (`mode === "json"`) streaming every event.
 pub async fn json(
     harness: &AgentHarness,
-    args: &Args,
+    _args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
     initial_images: Vec<ImageContent>,
@@ -273,16 +273,11 @@ pub async fn json(
                     "error": e.to_string(),
                 });
                 println!("{line}");
-                if args.experimental_native_store.is_some() {
-                    for failure in lane.take_write_failures() {
-                        persistence_failed = true;
-                        println!(
-                            "{}",
-                            serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
-                        );
-                    }
-                    last_exit = 1;
-                    break;
+                for failure in lane.take_write_failures() {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
+                    );
                 }
                 if let Some(task) = agent_event_task {
                     task.abort();
@@ -290,14 +285,12 @@ pub async fn json(
                 return 1;
             }
         }
-        if args.experimental_native_store.is_some() {
-            for failure in lane.take_write_failures() {
-                persistence_failed = true;
-                println!(
-                    "{}",
-                    serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
-                );
-            }
+        for failure in lane.take_write_failures() {
+            persistence_failed = true;
+            println!(
+                "{}",
+                serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
+            );
         }
     }
 
@@ -3252,9 +3245,6 @@ fn session_storage_notice(message: &str) -> String {
 #[cfg(test)]
 #[path = "rpc/native_dispatch_tests.rs"]
 mod native_dispatch_tests;
-#[cfg(all(test, feature = "experimental-native-store"))]
-#[path = "modes/native_persistence_tests.rs"]
-mod native_persistence_tests;
 #[cfg(test)]
 #[path = "modes/transcript_page_tests.rs"]
 mod transcript_page_tests;

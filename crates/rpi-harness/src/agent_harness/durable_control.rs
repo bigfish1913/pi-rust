@@ -441,7 +441,7 @@ fn reconciled_outcome(
     let Some(receipt) = receipt else {
         return Ok(None);
     };
-    if receipt.actor != actor.id
+    if receipt.actor != actor.id()
         || receipt.action != request.action
         || receipt.expected != request.expected
         || receipt.run_id != request.run_id
@@ -492,7 +492,7 @@ impl AgentHarness {
     ) -> Result<DurableSnapshot, DurableError> {
         let _gate = self.message_writes.lock().await;
         self.durable_check_owner()?;
-        if !actor.may_replace_workflow {
+        if !actor.may_replace_workflow() {
             return Err(DurableError::PermissionDenied);
         }
         {
@@ -637,7 +637,7 @@ impl AgentHarness {
         if target.binding_token() != snapshot.scope.binding_token {
             return Err(DurableError::Conflict);
         }
-        if !actor.may_replace_workflow
+        if !actor.may_replace_workflow()
             && matches!(
                 request.action,
                 ControlAction::Start { .. }
@@ -653,7 +653,7 @@ impl AgentHarness {
             .iter()
             .find(|r| r.request_id == request.request_id)
         {
-            if receipt.actor != actor.id
+            if receipt.actor != actor.id()
                 || receipt.action != request.action
                 || receipt.expected != request.expected
                 || receipt.run_id != request.run_id
@@ -678,8 +678,8 @@ impl AgentHarness {
         {
             if let Some(existing) = snapshot.state.queue.iter().find(|q| q.id == item.trim()) {
                 if existing.status == QueueStatus::Claimed
-                    && existing.claimed_by.as_deref() != Some(actor.id.as_str())
-                    && !(actor.may_replace_workflow
+                    && existing.claimed_by.as_deref() != Some(actor.id())
+                    && !(actor.may_replace_workflow()
                         && matches!(request.action, ControlAction::Cancel { .. }))
                 {
                     return Err(DurableError::PermissionDenied);
@@ -717,7 +717,7 @@ impl AgentHarness {
                 .ok_or_else(|| {
                     DurableError::InvalidJournal("claim candidate missing item".into())
                 })?;
-            claimed.claimed_by = Some(actor.id.clone());
+            claimed.claimed_by = Some(actor.id().to_owned());
         }
         let changed = candidate != snapshot.state || execution_control != record.execution_control;
         if changed {
@@ -730,7 +730,7 @@ impl AgentHarness {
         let entry_id = self.next_entry_id();
         let receipt = DurableReceipt {
             request_id: request.request_id,
-            actor: actor.id,
+            actor: actor.id().to_owned(),
             expected: request.expected,
             action: request.action,
             run_id: request.run_id,

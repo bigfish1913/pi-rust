@@ -2,9 +2,6 @@
 //! Synthetic native records are installed only AFTER harness creation (no startup repair).
 #[path = "durable_execution/index.rs"]
 mod index;
-#[cfg(feature = "experimental-native-store")]
-#[path = "durable_execution/native_store.rs"]
-mod native_store;
 #[path = "durable_execution/pages.rs"]
 mod pages;
 #[path = "support/durable_control_probe.rs"]
@@ -26,7 +23,7 @@ use rpi_harness::{
     session::{
         jsonl::{JsonlSessionStorage, JsonlV4Header},
         types::*,
-        DefaultIdGenerator, Session, SqliteSessionRepo, SystemClock,
+        DefaultIdGenerator, Session, SystemClock,
     },
     types::AgentHarnessOptions,
 };
@@ -1035,29 +1032,6 @@ async fn jsonl_reopen_retains_interrupted_recovery_then_forget_without_execution
         .unwrap(),
     ))
     .await;
-    persisted_hidden(&h).await;
-}
-
-#[tokio::test]
-async fn sqlite_reopen_retains_interrupted_recovery_then_forget_without_execution() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("execution.db");
-    let repo = SqliteSessionRepo::open(&path).unwrap();
-    let store = repo.create(&SessionCreateOptions::default()).await.unwrap();
-    let metadata = store.metadata();
-    let h = harness(Arc::new(store)).await;
-    persisted_first(&h).await;
-    h.drain_session().await;
-    drop(h);
-    drop(repo);
-    let repo = SqliteSessionRepo::open(&path).unwrap();
-    let h = harness(Arc::new(repo.open(&metadata).await.unwrap())).await;
-    persisted_recover_then_forget(&h).await;
-    h.drain_session().await;
-    drop(h);
-    drop(repo);
-    let repo = SqliteSessionRepo::open(&path).unwrap();
-    let h = harness(Arc::new(repo.open(&metadata).await.unwrap())).await;
     persisted_hidden(&h).await;
 }
 

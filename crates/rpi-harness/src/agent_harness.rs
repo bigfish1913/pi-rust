@@ -6826,7 +6826,9 @@ fn session_to_harness_err(e: SessionError) -> HarnessError {
         // The backend refused the write. Kept distinct from `Io` so the host can
         // tell the user to export their transcript instead of retrying a request
         // that was never the problem.
-        SessionErrorCode::Storage => HarnessError::session_storage(e.message),
+        SessionErrorCode::Storage
+        | SessionErrorCode::DurableConflict
+        | SessionErrorCode::DurableUnsupported => HarnessError::session_storage(e.message),
         _ => HarnessError::io(e.message),
     }
 }

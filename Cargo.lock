@@ -2170,7 +2170,6 @@ dependencies = [
  "rpi-telemetry",
  "rpi-tools",
  "rpi-tui",
- "rusqlite",
  "schemars",
  "semver",
  "serde",
@@ -2191,8 +2190,11 @@ dependencies = [
 name = "rpi-durable"
 version = "0.21.0"
 dependencies = [
+ "fs2",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -2229,7 +2231,6 @@ dependencies = [
  "rpi-durable",
  "rpi-telemetry",
  "rpi-tools",
- "rusqlite",
  "schemars",
  "serde",
  "serde_json",
