@@ -254,7 +254,7 @@ async fn pending_poststartup_damage_preserves_recovered_marker_and_every_fact() 
             let queues = f.h.queued_messages().await.unwrap();
             let error = resume(&f.h, true).await.unwrap_err();
             assert!(
-                error.contains("explicit native import")
+                error.contains("Unsupported durable journal format")
                     || error.contains("Invalid native durable journal")
             );
             assert!(!error.contains("NEVER-REFLECT"));
@@ -310,7 +310,7 @@ async fn deferred_poststartup_damage_preserves_parked_and_imported_handles_witho
                 for _ in 0..2 {
                     let error = resume(&f.h, false).await.unwrap_err();
                     assert!(
-                        error.contains("explicit native import")
+                        error.contains("Unsupported durable journal format")
                             || error.contains("Invalid native durable journal")
                     );
                     assert!(!error.contains("NEVER-REFLECT"));
@@ -461,42 +461,6 @@ async fn pending_control_read_failure_revision_race_and_abort_release_gate_and_l
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deferred_control_read_failure_revision_race_and_abort_release_gate_and_lease() {
     bounded(barrier_cases(false)).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn default_false_resumes_legacy_without_a_new_control_validation_read() {
-    bounded(async {
-        assert!(!AgentHarnessOptions::default().require_native_durable);
-        for pending in [true, false] {
-            for kind in ["durable-state", "rpi-durable-runtime"] {
-                let base = memory();
-                let probe = probe::Probe::new(base.storage());
-                let f = fixture(Session::new(probe.clone(), None), pending, true, false).await;
-                custom(&base, "main", "opaque-legacy", kind, Some(json!("opaque"))).await;
-                // If a CONTROL validation is accidentally introduced, this real
-                // barrier blocks and the bounded resume fails rather than passes.
-                probe.pause_branch_reads.store(true, Ordering::SeqCst);
-                let result = bounded(resume(&f.h, pending)).await.unwrap();
-                assert!(matches!(
-                    result.outcome,
-                    HarnessRunOutcome::Completed { .. }
-                ));
-                assert!(probe.pause_branch_reads.load(Ordering::SeqCst));
-                assert_eq!(f.provider.calls(), usize::from(pending));
-                assert_eq!(
-                    f.provider.polls.load(Ordering::SeqCst),
-                    usize::from(!pending)
-                );
-                assert_eq!(f.tool.calls.load(Ordering::SeqCst), 0);
-                assert_eq!(notices(&f.h).await, usize::from(pending));
-                assert!(f.h.pending_resume().is_none());
-                if !pending {
-                    assert_eq!(result.run_id, "open-run");
-                }
-            }
-        }
-    })
-    .await;
 }
 
 async fn positive(disk: bool) {

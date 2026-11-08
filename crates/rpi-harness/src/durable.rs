@@ -8,7 +8,6 @@
 pub mod experimental_ledger;
 mod experimental_policy;
 pub use experimental_policy::ExperimentalDurablePolicy;
-pub mod legacy;
 pub mod protocol;
 use crate::agent_harness::{AgentHarness, WeakAgentHarness};
 use crate::session::types::{HistoryCheckpoint, HistoryIdentity};
@@ -33,7 +32,7 @@ pub const MAX_EXECUTION_INDEX_STARTS: usize = 64;
 pub const MAX_EXECUTION_PAGE_RECORDS: usize = 64;
 
 /// Reserved control types cannot be authored by public custom-entry APIs.
-/// Legacy plugin records remain writable until the coordinated P8/P9 cutover.
+/// Durable control records are owned by the latest native durable protocol.
 pub(crate) fn reserved_control_type(custom_type: &str) -> bool {
     custom_type.starts_with("rpi.durable.")
 }

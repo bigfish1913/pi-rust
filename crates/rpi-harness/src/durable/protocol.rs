@@ -101,7 +101,7 @@ impl From<DurableError> for Failure {
             DurableError::PermissionDenied => ("permission_denied", "Durable actor is not authorized"),
             DurableError::InvalidRequest(_) => ("invalid_request", "Invalid native durable request"),
             DurableError::InvalidJournal(_) => ("invalid_journal", "Invalid native durable journal"),
-            DurableError::LegacyJournalPresent => ("legacy_journal_present", "Legacy durable journal requires explicit native import"),
+            DurableError::UnsupportedJournalFormat => ("unsupported_journal", "Unsupported durable journal format"),
             DurableError::LimitExceeded => ("limit_exceeded", "Durable bounded budget exceeded"),
             DurableError::ReadFailure(_) => ("read_failure", "Durable observation failed"),
             DurableError::CommitUncertain(_) => ("commit_uncertain", "Commit may have completed; inspect the receipt or retry the identical guarded request"),

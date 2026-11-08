@@ -1076,23 +1076,22 @@ impl AgentHarness {
         options: AgentHarnessOptions,
         experimental_durable: Option<crate::durable::ExperimentalDurablePolicy>,
     ) -> HarnessResult<Self> {
-        if options.require_native_durable {
-            // Admission is read-only and precedes progress retirement/recovery.
-            // Reuse the same control decoder; never validate by constructing a
-            // second harness or by adopting/re-writing foreign receipts.
-            for lane in options
-                .session
-                .get_lanes()
-                .await
-                .map_err(session_to_harness_err)?
-            {
-                durable_control::validate_session(
-                    &options.session,
-                    &lane.lane,
-                    experimental_durable.as_ref(),
-                )
-                .await?;
-            }
+        // Admission is read-only and precedes progress retirement/recovery.
+        // Reuse the same control decoder for every session open: legacy durable
+        // journals are unsupported even when native durable is not enabled.
+        // Unknown ordinary custom entries remain opaque to this validator.
+        for lane in options
+            .session
+            .get_lanes()
+            .await
+            .map_err(session_to_harness_err)?
+        {
+            durable_control::validate_session(
+                &options.session,
+                &lane.lane,
+                experimental_durable.as_ref(),
+            )
+            .await?;
         }
         if !options.allow_existing_session {
             let existing = options
@@ -2784,7 +2783,7 @@ impl AgentHarness {
     /// otherwise this rejects with `LaneBusy` and leaves the old session intact.
     pub async fn set_session(&self, session: Session) -> HarnessResult<()> {
         let _gate = self.message_writes.lock().await;
-        let require_native_durable = {
+        {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
                 return Err(HarnessError::closed());
@@ -2807,8 +2806,7 @@ impl AgentHarness {
                     "Wait for the active operation to finish before switching sessions",
                 ));
             }
-            inner.require_native_durable
-        };
+        }
         // Prepare everything against a pinned target before publishing the swap.
         // A failed read must leave the old session and its queues untouched.
         let target = session.pin(Arc::clone(self.session.id_generator()));
@@ -2818,24 +2816,19 @@ impl AgentHarness {
                 "Target session does not contain the bound lane",
             ));
         }
-        let native_identity = if require_native_durable {
-            let identity = target
-                .storage()
-                .history_identity()
-                .await
-                .map_err(session_to_harness_err)?;
-            for lane in &lanes {
-                durable_control::validate_session(
-                    &target,
-                    &lane.lane,
-                    self.durable_experimental_policy().as_ref(),
-                )
-                .await?;
-            }
-            Some(identity)
-        } else {
-            None
-        };
+        let target_identity = target
+            .storage()
+            .history_identity()
+            .await
+            .map_err(session_to_harness_err)?;
+        for lane in &lanes {
+            durable_control::validate_session(
+                &target,
+                &lane.lane,
+                self.durable_experimental_policy().as_ref(),
+            )
+            .await?;
+        }
         target
             .prune_completed_progress()
             .await
@@ -2844,18 +2837,16 @@ impl AgentHarness {
         for lane in lanes {
             rebuilt.extend(Self::rebuild_queues(&target, &lane.lane).await?);
         }
-        if let Some(identity) = native_identity {
-            if target
-                .storage()
-                .history_identity()
-                .await
-                .map_err(session_to_harness_err)?
-                != identity
-            {
-                return Err(HarnessError::io(
-                    "Native durable target changed during session preparation; session was not activated",
-                ));
-            }
+        if target
+            .storage()
+            .history_identity()
+            .await
+            .map_err(session_to_harness_err)?
+            != target_identity
+        {
+            return Err(HarnessError::io(
+                "Target session changed during session preparation; session was not activated",
+            ));
         }
         let mut inner = self.inner.lock().unwrap();
         // Keep the queue handles: existing lane handles share these Arcs.

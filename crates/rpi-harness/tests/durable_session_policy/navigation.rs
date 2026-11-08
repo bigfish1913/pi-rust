@@ -162,61 +162,6 @@ async fn validates_candidate_not_current_before_moving() {
 }
 
 #[tokio::test]
-async fn default_keeps_legacy_and_native_empty_does_not_read_current() {
-    let session = memory();
-    custom(&session, "main", "legacy", "durable-state", None).await;
-    let h = AgentHarness::create(AgentHarnessOptions {
-        session,
-        allow_existing_session: true,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    for target in [None, Some("legacy")] {
-        assert!(matches!(
-            h.navigate_tree(target, false, None, None)
-                .await
-                .unwrap()
-                .outcome,
-            NavigationOutcome::Completed { .. }
-        ));
-    }
-    let strict_h = strict(memory()).await;
-    // Inject a legacy current tip outside the harness API. A safe explicit empty
-    // target must not re-read current via bounds.start=None and reject the move.
-    custom(
-        strict_h.session(),
-        "main",
-        "injected-current",
-        "durable-state",
-        None,
-    )
-    .await;
-    assert!(matches!(
-        strict_h
-            .navigate_tree(None, false, None, None)
-            .await
-            .unwrap()
-            .outcome,
-        NavigationOutcome::Completed { .. }
-    ));
-    assert!(service(&strict_h)
-        .snapshot()
-        .await
-        .unwrap()
-        .state
-        .workflow
-        .is_none());
-    failed(
-        strict_h
-            .navigate_tree(Some("injected-current"), false, None, None)
-            .await
-            .unwrap(),
-    );
-    assert_eq!(strict_h.view().get_leaf_id().await.unwrap(), None);
-}
-
-#[tokio::test]
 async fn read_failure_race_and_pre_move_cancellation_keep_old_state() {
     let base = memory();
     let probe = probe::Probe::new(base.storage());

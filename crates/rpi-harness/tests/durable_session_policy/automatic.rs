@@ -116,7 +116,7 @@ async fn initial_run_guard_precedes_recovery_reservation_prompt_and_provider() {
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("explicit native import")
+                error.contains("Unsupported durable journal format")
                     || error.contains("Invalid native durable journal")
             );
             assert!(!error.contains("NEVER-REFLECT"));
@@ -361,7 +361,7 @@ async fn invalid_mid_loop_journal_refuses_summary_and_next_provider_without_fake
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("explicit native import")
+            error.contains("Unsupported durable journal format")
                 || error.contains("Invalid native durable journal")
         );
         assert!(!error.contains("NEVER-REFLECT"));
@@ -514,62 +514,6 @@ async fn mid_loop_read_failure_race_and_caller_cancel_keep_admitted_facts_withou
             .iter()
             .any(|r| matches!(r, LaneRecord::OperationFinished(_))));
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn default_legacy_mid_loop_and_current_lane_selection_keep_their_behavior() {
-    let session = memory();
-    let tool = Inflate::new(session.clone(), Some("durable-state"));
-    let script = FauxScript::new();
-    script.set_responses(vec![
-        FauxStep::tool_call("inflate", json!({})),
-        FauxStep::text("## Goal\nLegacy summary"),
-        FauxStep::text("done"),
-    ]);
-    let p = FauxProvider::new(script);
-    let h = AgentHarness::create(with_tool(configured(session, p.clone(), false), tool))
-        .await
-        .unwrap();
-    assert!(matches!(
-        bounded(h.prompt_text("inflate", vec![]))
-            .await
-            .unwrap()
-            .outcome,
-        HarnessRunOutcome::Completed { .. }
-    ));
-    assert_eq!(calls(&p), 3);
-    assert_eq!(
-        entries(&h)
-            .await
-            .iter()
-            .filter(|e| matches!(e, Entry::Compaction(_)))
-            .count(),
-        1
-    );
-    let p = FauxProvider::new(FauxScript::new().with_text("main succeeds"));
-    let h = AgentHarness::create(configured(memory(), p.clone(), true))
-        .await
-        .unwrap();
-    h.session()
-        .storage()
-        .create_lane("side", None)
-        .await
-        .unwrap();
-    custom(h.session(), "side", "side-bad", "durable-state", None).await;
-    assert!(matches!(
-        h.prompt_text("main", vec![]).await.unwrap().outcome,
-        HarnessRunOutcome::Completed { .. }
-    ));
-    let before = image(h.session()).await;
-    assert!(h
-        .lane("side")
-        .prompt_text("not persisted", vec![])
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("explicit native import"));
-    assert_eq!(image(h.session()).await, before);
-    assert_eq!(calls(&p), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

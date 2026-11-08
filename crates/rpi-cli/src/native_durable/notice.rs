@@ -56,7 +56,7 @@ fn error_code(error: &DurableError) -> &'static str {
         DurableError::PermissionDenied => "permission_denied",
         DurableError::InvalidRequest(_) => "invalid_request",
         DurableError::InvalidJournal(_) => "invalid_journal",
-        DurableError::LegacyJournalPresent => "legacy_journal_present",
+        DurableError::UnsupportedJournalFormat => "unsupported_journal",
         DurableError::LimitExceeded => "limit_exceeded",
         DurableError::ReadFailure(_) => "read_failure",
         DurableError::CommitUncertain(_) => "commit_uncertain",
@@ -76,7 +76,7 @@ fn unavailable(code: &str) -> String {
         | "permission_denied"
         | "invalid_request"
         | "invalid_journal"
-        | "legacy_journal_present"
+        | "unsupported_journal"
         | "limit_exceeded"
         | "commit_uncertain"
         | "execution_unavailable"

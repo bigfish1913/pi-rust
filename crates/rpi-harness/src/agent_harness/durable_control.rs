@@ -258,7 +258,7 @@ async fn load_branch(
                         "experimental durable requires explicit epoch mode".into(),
                     ));
                 }
-                return Err(DurableError::LegacyJournalPresent);
+                return Err(DurableError::UnsupportedJournalFormat);
             }
         }
         // Read the complete bounded canonical control chain, oldest first.
@@ -415,8 +415,8 @@ fn admission_error(error: DurableError) -> HarnessError {
     // Session policy diagnostics are fixed: do not reflect storage paths or
     // arbitrary journal payloads across the host boundary.
     let message = match error {
-        DurableError::LegacyJournalPresent => {
-            "legacy durable journal requires explicit native import"
+        DurableError::UnsupportedJournalFormat => {
+            "Unsupported durable journal format; session was not activated"
         }
         DurableError::InvalidJournal(_) => {
             "Invalid native durable journal; session was not activated"

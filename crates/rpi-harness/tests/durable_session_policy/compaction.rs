@@ -65,7 +65,7 @@ async fn invalid_journal_rejects_before_recovery_intent_or_provider_and_releases
         let error = bounded(h.compact(None)).await.unwrap_err().to_string();
         assert!(!error.contains("MUST-NOT-REFLECT"));
         assert!(
-            error.contains("explicit native import")
+            error.contains("Unsupported durable journal format")
                 || error.contains("Invalid native durable journal")
         );
         assert_eq!(image(h.session()).await, before);
@@ -162,57 +162,6 @@ async fn read_failure_revision_race_and_cancel_before_execution_leave_no_compact
         CompactionOutcome::Declined { .. }
     ));
     assert_eq!(calls(&provider), 0);
-}
-
-#[tokio::test]
-async fn default_legacy_compaction_and_native_decline_retain_existing_behavior() {
-    for required in [false, true] {
-        let session = memory();
-        if !required {
-            custom(&session, "main", "opaque", "durable-state", None).await;
-        }
-        let provider = FauxProvider::new(FauxScript::new().with_text("unused"));
-        let mut opts = configured(session, provider.clone(), required);
-        opts.models.clear();
-        let h = AgentHarness::create(opts).await.unwrap();
-        let result = bounded(h.compact(None)).await.unwrap();
-        let terminal = if required {
-            assert!(matches!(result.outcome, CompactionOutcome::Declined { .. }));
-            OperationOutcome::Declined
-        } else {
-            // Default policy permits the opaque legacy branch to reach ordinary
-            // compaction preparation/provider resolution, not native validation.
-            assert!(
-                matches!(result.outcome, CompactionOutcome::Failed { ref error, .. } if error.code == "no_provider")
-            );
-            OperationOutcome::Failed
-        };
-        let records = h
-            .session()
-            .find_records(&RecordQuery::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            records
-                .iter()
-                .filter(
-                    |r| matches!(r, LaneRecord::OperationStarted(s) if s.base.id == result.run_id)
-                )
-                .count(),
-            1
-        );
-        assert_eq!(records.iter().filter(|r| matches!(r, LaneRecord::OperationFinished(f) if f.run_id == result.run_id && f.outcome == terminal)).count(), 1);
-        assert!(h.snapshot().await.unwrap().active.is_none());
-        assert_eq!(calls(&provider), 0);
-        h.close().await.unwrap();
-        let before = image(h.session()).await;
-        assert!(bounded(h.compact(None))
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("closed"));
-        assert_eq!(image(h.session()).await, before);
-    }
 }
 
 async fn control_entries(h: &AgentHarness) -> Value {
