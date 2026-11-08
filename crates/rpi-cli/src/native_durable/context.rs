@@ -99,7 +99,7 @@ fn unavailable(error: &Failure) -> String {
         "permission_denied" => "permission_denied",
         "invalid_request" => "invalid_request",
         "invalid_journal" => "invalid_journal",
-        "legacy_journal_present" => "legacy_journal_present",
+        "unsupported_journal" => "unsupported_journal",
         "limit_exceeded" => "limit_exceeded",
         "commit_uncertain" => "commit_uncertain",
         "execution_unavailable" => "execution_unavailable",

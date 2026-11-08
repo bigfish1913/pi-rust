@@ -710,7 +710,7 @@ async fn drain_needs_only_a_live_owner_not_open_state_readable_journal_or_receip
             let s = service(&h);
             assert!(matches!(
                 s.snapshot().await,
-                Err(DurableError::LegacyJournalPresent | DurableError::InvalidJournal(_))
+                Err(DurableError::UnsupportedJournalFormat | DurableError::InvalidJournal(_))
             ));
             let before_entries =
                 serde_json::to_value(p.inner.find_entries(&EntryQuery::default()).await.unwrap())

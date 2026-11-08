@@ -92,7 +92,7 @@ fn session_bytes(fixture: &Fixture) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_durable_refuses_real_extension_tool_and_command_even_when_filtered() {
+async fn host_reserved_durable_names_reject_real_extensions_even_when_filtered() {
     let built = resource_fixture::Fixture::build().await;
     for command_case in [false, true] {
         let fixture = Fixture::new();
@@ -116,40 +116,20 @@ async fn native_durable_refuses_real_extension_tool_and_command_even_when_filter
             }
             cmd
         };
-        let (mut legacy, event) = ready(&mut configure(false), false);
-        assert_eq!(event["resourceState"]["enabled"], false, "{event}");
-        if command_case {
-            assert!(has_name(
-                &legacy.data("get_commands", json!({})),
-                "commands",
-                "durable"
-            ));
-            assert_eq!(
-                legacy.data("execute_command", json!({"command":"durable","args":""})),
-                json!({"fixture":true})
-            );
-        } else {
-            assert!(has_name(
-                &legacy.data("get_available_tools", json!({})),
-                "tools",
-                "durable"
-            ));
-        }
-        drop(legacy);
-        assert_eq!(built.assert_registrations(&log).lines().count(), 1);
-        for (index, filter) in [
-            &[][..],
-            &["--no-tools"][..],
-            &["--exclude-tools", "durable"][..],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            rejected(
-                configure(true).args(filter),
-                "--native-durable conflicts with an extension durable tool or /durable command",
-            );
-            assert_eq!(built.assert_registrations(&log).lines().count(), index + 2);
+        let mut index = 0;
+        for enabled in [false, true] {
+            for filter in [
+                &[][..],
+                &["--no-tools"][..],
+                &["--exclude-tools", "durable"][..],
+            ] {
+                rejected(
+                    configure(enabled).args(filter),
+                    "extension durable tool or /durable command uses a host-reserved name",
+                );
+                index += 1;
+                assert_eq!(built.assert_registrations(&log).lines().count(), index);
+            }
         }
         fixture.assert_no_provider_calls();
     }
@@ -442,7 +422,7 @@ fn exact_resource_tool_filters_preserve_explicit_manual_native_control() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_durable_journals_require_explicit_import_and_remain_legacy_without_flag() {
+async fn legacy_durable_journals_are_rejected_without_rewriting() {
     for kind in ["durable-state", "rpi-durable-runtime"] {
         let fixture = Fixture::new();
         let mut legacy = fixture.start(false, &["--session-id", "legacy-durable", "--no-tools"]);
@@ -452,41 +432,32 @@ async fn legacy_durable_journals_require_explicit_import_and_remain_legacy_witho
         drop(legacy);
         let path = fixture.session_file();
         let before = session_bytes(&fixture);
-        let error = rejected(
-            &mut fixture.command(
-                true,
-                &[
-                    "--session",
-                    path.to_str().unwrap(),
-                    "--no-extensions",
-                    "--no-skills",
-                    "--no-context-files",
-                    "--no-prompt-templates",
-                    "--no-tools",
-                ],
-            ),
-            "legacy durable journal requires explicit native import",
-        );
-        assert!(error.contains("explicit native import"), "{error}");
-        assert_eq!(
-            session_bytes(&fixture),
-            before,
-            "legacy rejection modified session bytes"
-        );
-        let mut reopened =
-            fixture.start(false, &["--session", path.to_str().unwrap(), "--no-tools"]);
-        assert_eq!(
-            reopened.data("get_session_branch", json!({"customTypes":[kind]})),
-            entry
-        );
-        let disabled = reopened.request("get_durable_state", json!({"version":1}));
-        assert_error(&disabled, "disabled");
-        drop(reopened);
-        assert_eq!(
-            session_bytes(&fixture),
-            before,
-            "legacy resume imported or rewrote the journal"
-        );
+        for enabled in [false, true] {
+            let error = rejected(
+                &mut fixture.command(
+                    enabled,
+                    &[
+                        "--session",
+                        path.to_str().unwrap(),
+                        "--no-extensions",
+                        "--no-skills",
+                        "--no-context-files",
+                        "--no-prompt-templates",
+                        "--no-tools",
+                    ],
+                ),
+                "Unsupported durable journal format",
+            );
+            assert!(
+                error.contains("Unsupported durable journal format"),
+                "{error}"
+            );
+            assert_eq!(
+                session_bytes(&fixture),
+                before,
+                "legacy rejection modified session bytes"
+            );
+        }
         fixture.assert_no_provider_calls();
     }
 }

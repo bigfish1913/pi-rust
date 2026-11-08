@@ -126,6 +126,12 @@ impl SessionStorage for Probe {
         }
         self.inner.history_revision().await
     }
+    async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+        if self.fail_revision.load(Ordering::SeqCst) {
+            return Err(SessionError::storage("injected revision failure"));
+        }
+        self.inner.history_identity().await
+    }
     async fn append_entry_if_revision(
         &self,
         entry: ProvisionedEntry,

@@ -392,7 +392,7 @@ async fn native_branch_navigation_refreshes_without_leaking_the_previous_queue()
     assert_eq!(error.code, "navigation_failed");
     crate::interactive_tui::add_error_message(&state.chat_container, &error.message);
     assert_eq!(count(&state), 1);
-    assert!(text(&state).contains("explicit native import"));
+    assert!(text(&state).contains("Unsupported durable journal format"));
     assert!(!text(&state).contains("PRIVATE-legacy"));
     assert!(!text(&state).contains("unavailable"));
     assert_eq!(service(&h).snapshot().await.unwrap(), before);

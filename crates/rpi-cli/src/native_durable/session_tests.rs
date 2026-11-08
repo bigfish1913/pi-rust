@@ -1,20 +1,20 @@
 use super::*;
 
 #[test]
-fn native_durable_names_are_reserved_even_when_model_tools_are_disabled() {
-    assert!(native_durable_conflict(
+fn host_durable_names_are_reserved_even_when_native_durable_is_disabled() {
+    assert!(reserved_durable_name(
         ["read", "durable"].into_iter(),
         [].into_iter()
     ));
-    assert!(native_durable_conflict(
+    assert!(reserved_durable_name(
         [].into_iter(),
         ["/durable"].into_iter()
     ));
-    assert!(native_durable_conflict(
+    assert!(reserved_durable_name(
         [].into_iter(),
         ["durable"].into_iter()
     ));
-    assert!(!native_durable_conflict(
+    assert!(!reserved_durable_name(
         ["read"].into_iter(),
         ["durable-other"].into_iter()
     ));
@@ -38,16 +38,17 @@ fn native_durable_names_are_reserved_even_when_model_tools_are_disabled() {
         vec![],
         None,
     );
-    assert!(validate_native_durable_extensions(&Args::default(), &session).is_ok());
+    let default_error = validate_durable_extensions(&Args::default(), &session).unwrap_err();
+    assert!(default_error.contains("host-reserved"));
     let args = Args {
         native_durable: true,
         no_tools: true,
         ..Default::default()
     };
-    assert!(validate_native_durable_extensions(&args, &session)
+    assert!(validate_durable_extensions(&args, &session)
         .unwrap_err()
-        .contains("conflicts"));
-    assert!(validate_native_durable_extensions(&args, &ExtensionSession::none()).is_ok());
+        .contains("host-reserved"));
+    assert!(validate_durable_extensions(&Args::default(), &ExtensionSession::none()).is_ok());
 }
 
 #[test]
@@ -157,7 +158,9 @@ async fn native_durable_reload_refuses_before_preparing_or_publishing() {
     let plugin_id = context.tool_context.session_id();
     let rejected = set_active_session(&harness, foreign.clone(), Some(&context.tool_context)).await;
     assert!(
-        rejected.unwrap_err().contains("explicit native import"),
+        rejected
+            .unwrap_err()
+            .contains("Unsupported durable journal format"),
         "CLI opt-in must enforce core admission"
     );
     assert_eq!(service.snapshot().await.unwrap(), before);

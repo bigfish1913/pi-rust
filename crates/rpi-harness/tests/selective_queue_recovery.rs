@@ -32,6 +32,9 @@ impl SessionStorage for Probe {
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
         self.inner.get_lanes().await
     }
+    async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+        self.inner.history_identity().await
+    }
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
         self.inner.create_lane(lane, at).await
     }

@@ -290,42 +290,6 @@ async fn required_create_rejects_both_legacy_types_before_prune_or_recovery() {
 }
 
 #[tokio::test]
-async fn default_policy_still_accepts_opaque_legacy_on_create_and_switch() {
-    assert!(!AgentHarnessOptions::default().require_native_durable);
-    for kind in ["durable-state", "rpi-durable-runtime"] {
-        let session = memory();
-        custom(
-            &session,
-            "main",
-            "opaque",
-            kind,
-            Some(json!("not a native payload")),
-        )
-        .await;
-        let before = image(&session).await;
-        let h = bounded(AgentHarness::create(AgentHarnessOptions {
-            session: session.clone(),
-            allow_existing_session: true,
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-        assert_eq!(image(&session).await, before);
-        let target = memory();
-        custom(&target, "main", "other-opaque", kind, None).await;
-        bounded(h.set_session(target.clone())).await.unwrap();
-        assert_eq!(h.session_id(), target.storage().metadata().id);
-        assert!(h
-            .session()
-            .storage()
-            .get_entry("other-opaque")
-            .await
-            .unwrap()
-            .is_some());
-    }
-}
-
-#[tokio::test]
 async fn rejected_targets_preserve_binding_queues_receipts_and_child_scope_on_every_lane() {
     let seed = seeded().await;
     let payload = seed

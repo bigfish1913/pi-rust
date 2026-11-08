@@ -633,8 +633,7 @@ pub fn prepare_extensions(
         }
         report_deferred_renderers(&extension_session);
     }
-    validate_native_durable_extensions(args, &extension_session)
-        .map_err(BuildError::HarnessCreate)?;
+    validate_durable_extensions(args, &extension_session).map_err(BuildError::HarnessCreate)?;
     // Publish the extension registry so `ListCommands` can enumerate slash
     // commands. Done here rather than at host construction because the registry
     // only exists after extensions load; `/reload` republishes the new snapshot
@@ -746,8 +745,7 @@ pub async fn build_prepared(
     let ctx =
         ExecutionToolContext::new(env_dyn.clone(), Some(mut_env)).with_file_io(file_io.clone());
 
-    validate_native_durable_extensions(args, &extension_session)
-        .map_err(BuildError::HarnessCreate)?;
+    validate_durable_extensions(args, &extension_session).map_err(BuildError::HarnessCreate)?;
     let durable_binding = Arc::new(std::sync::OnceLock::new());
     let mut tools = build_tools_bound(&ctx, args, durable_binding.clone());
 
@@ -2586,36 +2584,32 @@ fn load_extensions_from_dirs(
     )
 }
 
-/// Native durable reserves both public names even when model tools are filtered.
-/// Refuse rather than override/fallback/dual-write a loaded legacy implementation.
-fn validate_native_durable_extensions(
-    args: &Args,
-    session: &ExtensionSession,
-) -> Result<(), String> {
-    if !args.native_durable {
-        return Ok(());
-    }
-    if session.owns_stdio() {
+/// The host permanently owns both durable public names.
+/// Refuse rather than override, fall back to, or dual-write a legacy extension
+/// implementation. The core native durable feature may still be disabled; that
+/// does not make the reserved names available to extensions.
+fn validate_durable_extensions(args: &Args, session: &ExtensionSession) -> Result<(), String> {
+    if args.native_durable && session.owns_stdio() {
         return Err(
             "--native-durable requires the native host; stdio-owning extensions are unsupported"
                 .into(),
         );
     }
     if let Some(snapshot) = session.snapshot() {
-        if native_durable_conflict(
+        if reserved_durable_name(
             snapshot.tools().iter().map(|tool| tool.tool.name.as_str()),
             snapshot
                 .commands()
                 .iter()
                 .map(|command| command.name.as_str()),
         ) {
-            return Err("--native-durable conflicts with an extension durable tool or /durable command; explicitly exclude that extension (or use --no-extensions), no automatic legacy import".into());
+            return Err("extension durable tool or /durable command uses a host-reserved name; remove the legacy extension durable implementation (no automatic import or fallback)".into());
         }
     }
     Ok(())
 }
 
-fn native_durable_conflict<'a>(
+fn reserved_durable_name<'a>(
     mut tools: impl Iterator<Item = &'a str>,
     mut commands: impl Iterator<Item = &'a str>,
 ) -> bool {
@@ -2628,7 +2622,7 @@ fn native_durable_conflict<'a>(
 mod native_durable_session_tests;
 
 /// Merge extension tools into the built-ins. Ordinarily extensions override
-/// same-named built-ins (first extension wins); opted-in native durable names
+/// same-named built-ins (first extension wins); host-reserved durable names
 /// were already checked above. Both tool filters still apply to the merged set.
 fn merge_extension_tools(
     tools: &mut Vec<HarnessTool>,

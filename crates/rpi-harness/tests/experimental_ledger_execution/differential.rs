@@ -7,7 +7,9 @@ use rpi_ai::{
 };
 use rpi_durable::execution::{ExecutionError, ToolStatus};
 use rpi_harness::{
-    durable::{DurableError, DurableMutation, DurableOutcome, DurableService},
+    durable::{
+        DurableError, DurableMutation, DurableOutcome, DurableService, ExperimentalDurablePolicy,
+    },
     session::{
         jsonl::{JsonlSessionStorage, JsonlV4Header},
         DefaultIdGenerator, Session, SystemClock,
@@ -32,6 +34,19 @@ async fn harness(s: Arc<dyn SessionStorage>) -> AgentHarness {
         allow_existing_session: true,
         ..Default::default()
     })
+    .await
+    .unwrap()
+}
+async fn experimental_harness(s: Arc<dyn SessionStorage>) -> AgentHarness {
+    AgentHarness::create_experimental(
+        AgentHarnessOptions {
+            session: Session::new(s, None),
+            allow_existing_session: true,
+            require_native_durable: true,
+            ..Default::default()
+        },
+        ExperimentalDurablePolicy::new(EPOCH, vec![OWNER.into()]).unwrap(),
+    )
     .await
     .unwrap()
 }
@@ -73,13 +88,13 @@ impl Pair {
             let fs: Arc<dyn FileSystem> = Arc::new(OsExecutionEnv::with_cwd(dir.path().into()));
             (
                 harness(jsonl(fs.clone(), "left.jsonl", "synthetic-service").await).await,
-                harness(jsonl(fs, "right.jsonl", "synthetic-v2").await).await,
+                experimental_harness(jsonl(fs, "right.jsonl", "synthetic-v2").await).await,
                 Some(dir),
             )
         } else {
             (
                 harness(memory_store("synthetic-service")).await,
-                harness(memory_store("synthetic-v2")).await,
+                experimental_harness(memory_store("synthetic-v2")).await,
                 None,
             )
         };
@@ -541,7 +556,7 @@ async fn mirrored_jsonl_trace_preserves_exact_bytes_audits_and_reopens_with_new_
             .unwrap(),
         ))
         .await;
-        let b = harness(Arc::new(
+        let b = experimental_harness(Arc::new(
             JsonlSessionStorage::load(
                 fs,
                 "right.jsonl",

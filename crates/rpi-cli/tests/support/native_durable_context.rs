@@ -462,7 +462,7 @@ async fn native_context_is_fresh_ephemeral_and_restored_without_selected_tools()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_journal_without_native_flag_never_becomes_provider_context() {
+async fn legacy_marker_added_after_start_never_becomes_provider_context() {
     let fixture = Fixture::new();
     let mut server = context_server(&fixture, 1);
     let mut host = fixture.start(
@@ -509,7 +509,7 @@ async fn legacy_journal_without_native_flag_never_becomes_provider_context() {
     );
     assert_eq!(
         after["entries"], legacy["entries"],
-        "legacy journal was imported or rewritten"
+        "legacy marker was imported or rewritten"
     );
     assert_eq!(control_entries(&mut host), json!([]));
     assert_error(

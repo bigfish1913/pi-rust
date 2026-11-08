@@ -380,7 +380,7 @@ async fn malformed_legacy_and_control_payloads_fail_closed() {
                 );
             } else {
                 assert!(
-                    matches!(error, DurableError::LegacyJournalPresent),
+                    matches!(error, DurableError::UnsupportedJournalFormat),
                     "{error:?}"
                 );
             }

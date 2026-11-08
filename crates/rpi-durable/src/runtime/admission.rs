@@ -31,8 +31,8 @@ pub enum DurableError {
     InvalidRequest(String),
     #[error("invalid durable control journal: {0}")]
     InvalidJournal(String),
-    #[error("legacy durable journal requires explicit native import (P8)")]
-    LegacyJournalPresent,
+    #[error("unsupported durable journal format")]
+    UnsupportedJournalFormat,
     #[error("durable bounded journal/request budget exhausted")]
     LimitExceeded,
     #[error("durable observation failed: {0}")]

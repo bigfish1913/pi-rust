@@ -1747,8 +1747,8 @@ mod resume_admission {
     use super::*;
     use rpi_harness::error::SessionResult;
     use rpi_harness::session::types::{
-        BranchBounds, LanePointer, LaneRecord, LogItem, LogOptions, OperationIntent,
-        OperationStartedRecord, ProvisionedEntry, SessionStats, SessionStorage,
+        BranchBounds, HistoryIdentity, LanePointer, LaneRecord, LogItem, LogOptions,
+        OperationIntent, OperationStartedRecord, ProvisionedEntry, SessionStats, SessionStorage,
     };
 
     struct PausedStorage {
@@ -1781,6 +1781,9 @@ mod resume_admission {
         }
         async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
             self.inner.get_lanes().await
+        }
+        async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+            self.inner.history_identity().await
         }
         async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
             self.inner.create_lane(lane, at).await
