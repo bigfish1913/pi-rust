@@ -11,6 +11,20 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.21.2](https://github.com/bigfish1913/pi-rust/compare/v0.21.1...v0.21.2) - 2026-11-08
+
+### Fixed
+
+- *(tui)* preserve todo transcript order
+- *(resource)* re-sign staged native artifacts on macOS ([#284](https://github.com/bigfish1913/pi-rust/pull/284))
+
+### Other
+
+- Merge branch 'main' into perf/offline-retired-frame-gc
+- Merge branch 'main' into perf/offline-retired-frame-gc
+- *(harness)* compact stream frames a clear_run already retired
+- *(harness)* pin GC generation contract for existing append handles
+
 ## [0.21.1](https://github.com/bigfish1913/pi-rust/compare/v0.21.0...v0.21.1) - 2026-11-07
 
 ### Added
