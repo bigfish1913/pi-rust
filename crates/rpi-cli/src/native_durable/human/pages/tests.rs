@@ -1,7 +1,7 @@
 //! TUI page contracts. Oversize/control fixtures below exercise only formatting,
 //! not native fact validation (in particular, not the 512-character ID domain).
-use super::super::super as native;
 use super::*;
+use crate::native_durable as native;
 use rpi_agent::AgentMessage;
 use rpi_ai::types::UserMessage;
 use rpi_harness::{

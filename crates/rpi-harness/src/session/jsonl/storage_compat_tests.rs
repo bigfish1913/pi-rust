@@ -14,7 +14,7 @@ use rpi_tools::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::AtomicUsize,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -82,11 +82,18 @@ struct MemoryFs {
     rename_failures: AtomicUsize,
 }
 fn consume_failure(counter: &AtomicUsize) -> bool {
-    counter
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            count.checked_sub(1)
-        })
-        .is_ok()
+    loop {
+        let current = counter.load(Ordering::SeqCst);
+        let Some(next) = current.checked_sub(1) else {
+            return false;
+        };
+        if counter
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+    }
 }
 
 impl MemoryFs {
