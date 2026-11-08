@@ -3966,7 +3966,7 @@ async fn check_crash_before_first_request(with_custom_entries: bool) {
     if with_custom_entries {
         for _ in 0..2 {
             session
-                .append_custom_entry("durable-state", Some(serde_json::json!({"running": true})))
+                .append_custom_entry("plugin-state", Some(serde_json::json!({"running": true})))
                 .await
                 .expect("append AgentStart journal");
         }
@@ -3990,7 +3990,7 @@ async fn check_crash_before_first_request(with_custom_entries: bool) {
         recovered
             .session()
             .append_custom_entry(
-                "durable-state",
+                "plugin-state",
                 Some(serde_json::json!({"interrupted": true})),
             )
             .await
@@ -4553,6 +4553,9 @@ mod native_identity_bind_failure {
         }
         async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
             self.inner.get_lanes().await
+        }
+        async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+            self.inner.history_identity().await
         }
         async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
             self.inner.create_lane(lane, at).await
