@@ -434,3 +434,50 @@ fn staged_native_snapshot_is_signed_and_inventory_describes_the_copy() {
     );
     let _ = root;
 }
+
+/// Only `extensions/` artifacts are native; a same-suffix data file elsewhere in
+/// a Package is not.
+///
+/// The kernel only ever maps the direct children of `extensions/` (that is what
+/// `validate_source` accepts), so `skills/x/assets/data.dylib` is ordinary data.
+/// Re-signing it would rewrite a file the host treats as content.
+#[cfg(target_os = "macos")]
+#[test]
+fn package_resigns_only_direct_extension_artifacts() {
+    assert!(is_package_artifact(Path::new("extensions/plugin.dylib")));
+    assert!(is_package_artifact(Path::new("extensions/nested.dylib")));
+    assert!(!is_package_artifact(Path::new(
+        "skills/demo/assets/data.dylib"
+    )));
+    assert!(!is_package_artifact(Path::new("prompts/foo.dylib")));
+    assert!(!is_package_artifact(Path::new("themes/bar.dylib")));
+    assert!(!is_package_artifact(Path::new("extensions/plugin.txt")));
+    assert!(!is_package_artifact(Path::new("extensions/a/b.dylib")));
+}
+
+/// Re-signing must be stable: two installs of the same source have to leave the
+/// same bytes behind, so the second one reports `unchanged` instead of
+/// "already installed".
+///
+/// `codesign --sign -` would otherwise derive the ad-hoc identifier from the file
+/// NAME, so the same bytes staged under two different names sign to different
+/// bytes — an unchanged install would then look changed. The identifier is pinned
+/// for exactly that reason; this stages under two different names to prove it.
+#[cfg(target_os = "macos")]
+#[test]
+fn repeated_native_install_is_idempotent() {
+    let (_dir, _root, _) = fixture();
+    let base = fs::canonicalize(_dir.path()).unwrap();
+    let source = base.join("source/extensions/plugin.dylib");
+    put(&source, fs::read("/bin/echo").unwrap());
+    let observed = inventory(&source).unwrap();
+    fs::create_dir_all(base.join("txn-a")).unwrap();
+    fs::create_dir_all(base.join("txn-b")).unwrap();
+    let first = copy_snapshot(&source, &base.join("txn-a/one"), &observed).unwrap();
+    let second = copy_snapshot(&source, &base.join("txn-b/two"), &observed).unwrap();
+    assert_eq!(
+        first.files[0].sha256, second.files[0].sha256,
+        "signing the same source twice produced different bytes"
+    );
+    assert_eq!(first, second);
+}

@@ -1448,7 +1448,9 @@ pub(crate) fn resign_staged_native(path: &Path) -> Result<(), String> {
         return Ok(());
     }
     let out = std::process::Command::new("/usr/bin/codesign")
-        .args(["--force", "--sign", "-"])
+        // Pin the identifier: `--sign -` otherwise derives it from the file NAME,
+        // so the same bytes staged under different names sign to different bytes.
+        .args(["--force", "--sign", "-", "--identifier", "com.rpi.native"])
         .arg(path)
         .output()
         .map_err(|error| format!("could not run codesign on {}: {error}", path.display()))?;

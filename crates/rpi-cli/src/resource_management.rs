@@ -831,9 +831,14 @@ fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<I
     if inventory(source)? != *observed {
         return Err("resource source changed during snapshot copy".into());
     }
-    // Native artifacts are decided by the source shape, once, up front: a
-    // single-file source has inventory path `.` with no extension, so keying off
-    // inventory paths alone would miss `resource install extension …`.
+    // Which copied files are loadable native artifacts is decided from the source
+    // shape, and only from paths that the validator already accepts as such:
+    //   - a single-file source (`resource install extension …`) is the artifact,
+    //     even though its inventory path is `.` with no extension
+    //   - a Package may only carry native artifacts as direct children of
+    //     `extensions/` (see `validate_source`), so a `.dylib` under
+    //     `skills/`, `prompts/` or `themes/` is ordinary data and must be left
+    //     alone
     let native: std::collections::BTreeSet<PathBuf> = if source.is_file() {
         observed.files.iter().map(|f| f.path.clone()).collect()
     } else {
@@ -841,7 +846,7 @@ fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<I
             .files
             .iter()
             .map(|f| f.path.clone())
-            .filter(|p| is_native_artifact(p))
+            .filter(|p| is_package_artifact(p))
             .collect()
     };
     let artifacts: Vec<PathBuf> = native.iter().map(|p| target.join(p)).collect();
@@ -864,11 +869,18 @@ fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<I
     Ok(copied)
 }
 
-/// Whether a resource file is a loadable native artifact for this platform.
+/// Whether a Package file is a native artifact: a direct child of `extensions/`
+/// with the platform library extension. This mirrors what `validate_source`
+/// accepts, so data files that merely use the same suffix elsewhere in the tree
+/// are never handed to `codesign`.
+fn is_package_artifact(path: &Path) -> bool {
+    is_native_artifact(path) && path.components().count() == 2 && path.starts_with("extensions")
+}
+
+/// Whether a path uses this platform's native library extension.
 fn is_native_artifact(path: &Path) -> bool {
     path.extension().and_then(|s| s.to_str()) == Some(std::env::consts::DLL_EXTENSION)
 }
-
 /// macOS only: re-sign copied native artifacts so the kernel will map them.
 ///
 /// A signed Mach-O carries a code directory whose hashes must match the bytes
@@ -894,8 +906,11 @@ fn resign_snapshot_native(artifacts: &[PathBuf]) -> Result<()> {
         return Ok(());
     }
     for path in artifacts {
+        // Pin the ad-hoc identifier: `codesign --sign -` otherwise derives it from
+        // the file NAME, so the same bytes staged under two different names sign
+        // to different bytes. That would make an unchanged install look changed.
         let output = std::process::Command::new("/usr/bin/codesign")
-            .args(["--force", "--sign", "-"])
+            .args(["--force", "--sign", "-", "--identifier", "com.rpi.native"])
             .arg(path)
             .output()
             .map_err(|e| format!("could not run codesign on {}: {e}", path.display()))?;
@@ -909,6 +924,7 @@ fn resign_snapshot_native(artifacts: &[PathBuf]) -> Result<()> {
     }
     Ok(())
 }
+
 /// Small same-filesystem transaction; injection is unit-test-only, never an env backdoor.
 fn publish(
     root: &Path,
