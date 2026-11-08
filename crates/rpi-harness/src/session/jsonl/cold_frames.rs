@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! JSONL-private payload references. Query plans own only selected sources; no
 //! warm cache and no published plan holds or clones the resident history index.
 use super::{codec::parse_mutation, errors::file_result};

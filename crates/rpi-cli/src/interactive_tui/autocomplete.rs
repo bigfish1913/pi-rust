@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Completion suggestions and editor cursor operations.
 
 use std::any::Any;

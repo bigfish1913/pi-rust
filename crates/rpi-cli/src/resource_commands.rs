@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Resource-backed slash commands shared by terminal and RPC discovery.
 
 use rpi_harness::types::AgentHarnessResources;
