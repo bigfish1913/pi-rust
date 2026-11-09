@@ -327,7 +327,7 @@ pub(super) async fn handle_agent_event(
             // renders that bubble instead.
             AgentMessage::User(user) => {
                 state.transcript_view().add_user(&user_message_text(&user));
-                add_user_images(&state.chat_container, &user, state.images_visible());
+                add_user_images(&state.transcript_container(), &user, state.images_visible());
                 // A consumed entry must drop out of the pending display.
                 refresh_pending_messages(state, lane).await;
                 tui.request_render(false);
@@ -491,7 +491,7 @@ pub(super) async fn handle_agent_event(
                 tui.width(),
             );
             add_tool_images(
-                &state.chat_container,
+                &state.transcript_container(),
                 &result.content,
                 state.images_visible(),
             );
