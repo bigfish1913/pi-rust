@@ -1386,6 +1386,10 @@ impl SessionStorage for JsonlSessionStorage {
         self.metadata.to_base()
     }
 
+    fn session_log_path(&self) -> Option<String> {
+        Some(self.metadata.path.clone())
+    }
+
     async fn get_metadata(&self) -> SessionMetadata {
         self.metadata.to_base()
     }

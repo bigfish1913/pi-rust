@@ -32,7 +32,7 @@
 
 mod backend;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -3626,6 +3626,26 @@ pub(crate) async fn set_active_session(
     session: Session,
     tool_context: Option<&rpi_extensions::ToolCallContext>,
 ) -> Result<(), String> {
+    // Release the outgoing session's writer lock before the swap. This process
+    // stops appending to that log the moment `set_session` replaces it, so the
+    // lock it holds would only keep the file closed to other processes (the
+    // same-session hot-switch is exempt: it re-claims its own lock as a
+    // no-op). The storage handle stays alive on any `Arc` clones, but none of
+    // them write again through the harness.
+    let previous = harness.session().storage();
+    match (
+        previous.session_log_path(),
+        session.storage().session_log_path(),
+    ) {
+        // Different logs (or a swap to/from an ephemeral session): the old
+        // writer claim is released. Same log = reentry, keep the lock held.
+        (Some(old), Some(new)) if old == new => {}
+        (old, _) => {
+            if let Some(path) = old {
+                release_session_lock(&path);
+            }
+        }
+    }
     let metadata = session.get_metadata().await.ok();
     harness
         .set_session(session)
@@ -3709,9 +3729,10 @@ pub(crate) async fn import_session_file(
         Path::new(cwd).join(dir)
     };
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // External writers must be closed. This process deliberately retains locks
-    // for previously opened sessions, so its own copies additionally verify a
-    // stable history around the sidecar snapshot (bind/entry before retirement).
+    // External writers must be closed. This process holds a lock only for its
+    // active session; a source opened earlier and switched away from is no
+    // longer claimed here, so its copies additionally verify a stable history
+    // around the sidecar snapshot (bind/entry before retirement).
     let source_progress = PathBuf::from(format!("{}.progress.jsonl", source.display()));
     let source_lock_path = PathBuf::from(format!("{}.lock", source.display()));
     let canonical_lock = std::fs::canonicalize(&source_lock_path).ok();
@@ -3854,9 +3875,11 @@ pub(crate) async fn import_session_file(
 
 /// Session logs this process has claimed, so re-claiming is a no-op.
 static SESSION_LOCK_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-/// The held lock handles. Kept alive for the process lifetime — dropping the
-/// `File` would release the OS lock, so the guard is parked here.
-static SESSION_LOCKS: OnceLock<Mutex<Vec<std::fs::File>>> = OnceLock::new();
+/// The held lock handles, keyed by canonical lock path. Kept alive for as long
+/// as the session is the process's active one — dropping the `File` releases
+/// the OS lock, so a session that stops being active must be removed here via
+/// [`release_session_lock`] or its log stays locked against other processes.
+static SESSION_LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::fs::File>>> = OnceLock::new();
 
 /// Claim the exclusive lock for a session log.
 ///
@@ -3895,12 +3918,36 @@ fn claim_session_lock_inner(session_path: &str, allow_reentry: bool) -> Result<(
         ));
     }
     SESSION_LOCKS
-        .get_or_init(|| Mutex::new(Vec::new()))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap()
-        .push(file);
+        .insert(lock_path.clone(), file);
     paths.insert(lock_path);
     Ok(())
+}
+
+/// Release the writer lock held for a session log.
+///
+/// Called when a session stops being the process's active one (`/new`, a
+/// `/session` hot-switch, a fork, a plugin `SwitchSession`): the process no
+/// longer appends to that log, so holding the exclusive lock would freeze the
+/// file against every other rpi process until this process exits — with an
+/// error message that wrongly blames "another rpi process". Dropping the
+/// parked `File` releases the OS lock; the claim record is removed so a later
+/// re-open re-runs the real `try_lock_exclusive` instead of short-circuiting.
+///
+/// A path this process never claimed (including an already-released one) is a
+/// no-op, so callers can release unconditionally.
+fn release_session_lock(session_path: &str) {
+    let canonical =
+        std::fs::canonicalize(session_path).unwrap_or_else(|_| PathBuf::from(session_path));
+    let lock_path = PathBuf::from(format!("{}.lock", canonical.display()));
+    if let Some(paths) = SESSION_LOCK_PATHS.get() {
+        paths.lock().unwrap().remove(&lock_path);
+    }
+    if let Some(locks) = SESSION_LOCKS.get() {
+        locks.lock().unwrap().remove(&lock_path);
+    }
 }
 
 /// A restored session together with the working directory it was created in.

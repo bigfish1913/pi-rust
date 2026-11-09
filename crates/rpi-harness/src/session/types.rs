@@ -1543,6 +1543,14 @@ pub trait SessionStorage: Send + Sync {
         false
     }
 
+    /// The durable log file this storage appends to, when the backend has one.
+    /// The host uses it to scope per-session writer locks: the lock held for a
+    /// session is released when that session stops being the active one.
+    /// Ephemeral backends return `None`.
+    fn session_log_path(&self) -> Option<String> {
+        None
+    }
+
     // Lanes
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>>;
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()>;

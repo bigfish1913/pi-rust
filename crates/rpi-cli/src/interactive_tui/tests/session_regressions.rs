@@ -52,8 +52,22 @@ async fn tui_fork_locks_the_copy_and_keeps_the_selected_root_for_switch_and_pick
         .await
         .unwrap();
     assert_eq!(metadata.len(), 2);
+    // The fork is now the active writer; the source it was copied from is no
+    // longer served by this process and its log is released (hot-switch lock
+    // scoping). Only the active session's lock must stay held.
     for row in &metadata {
-        assert_session_locked(&row.path);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(format!("{}.lock", row.path))
+            .unwrap();
+        let locked = fs2::FileExt::try_lock_exclusive(&lock).is_err();
+        assert_eq!(
+            locked,
+            row.path.contains(&fork_id),
+            "only the active session's log stays locked, got {locked} for {}",
+            row.path
+        );
     }
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     assert!(
