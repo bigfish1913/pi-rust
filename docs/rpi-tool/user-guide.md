@@ -191,6 +191,7 @@ ANTHROPIC_AUTH_TOKEN=token
 ```text
 rpi auth login|check|logout
 rpi events path|tail    检查扩展事件日志（需 RPI_EVENT_LOG=1）
+rpi session gc [path...] [--dry-run]  离线剥离已被 clear_run 退役的流式帧负载
 rpi install <crate>
 rpi uninstall <crate>
 rpi extension update [name] # 更新全部符合条件的扩展，或按名称更新
