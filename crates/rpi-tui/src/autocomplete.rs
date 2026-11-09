@@ -10,6 +10,83 @@ use super::fuzzy::fuzzy_filter;
 /// Path delimiters for parsing.
 const PATH_DELIMITERS: &[char] = &[' ', '\t', '"', '\'', '='];
 
+/// Characters that separate prose from an attachment/path token in native Pi.
+/// CJK punctuation is included so references can follow natural-language text.
+fn is_path_delimiter(c: char) -> bool {
+    PATH_DELIMITERS.contains(&c)
+        || matches!(
+            c,
+            '，' | '．'
+                | '：'
+                | '；'
+                | '！'
+                | '？'
+                | '（'
+                | '）'
+                | '［'
+                | '］'
+                | '｛'
+                | '｝'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '…'
+                | '—'
+        )
+}
+
+/// Opening wrappers which native Pi permits immediately before a path.
+fn is_path_wrapper(c: char) -> bool {
+    matches!(c, '(' | '[' | '{' | '<' | '`')
+}
+
+/// Remove an unmatched opening wrapper from a token, e.g. `(@src` -> `@src`.
+fn strip_leading_path_wrappers(token: &str) -> (&str, usize) {
+    let mut offset = 0;
+    loop {
+        let Some(character) = token[offset..].chars().next() else {
+            break;
+        };
+        if !is_path_wrapper(character) {
+            break;
+        }
+        let closing = match character {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '<' => '>',
+            '`' => '`',
+            _ => unreachable!(),
+        };
+        let character_end = offset + character.len_utf8();
+        if token[character_end..].contains(closing) {
+            break;
+        }
+        offset = character_end;
+    }
+    (&token[offset..], offset)
+}
+
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn expand_home_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if text == "~" {
+        return home_directory().unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")) {
+        if let Some(home) = home_directory() {
+            return home.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Greatest char-boundary byte index in `s` that is `<= idx` (clamped to
 /// `s.len()`). Callers receive a `cursor` that may be a *character* count or a
 /// byte offset handed back from the editor; either way, slicing
@@ -155,98 +232,146 @@ impl FilePathAutocompleteProvider {
         // Snap to a char boundary so the slices below can never land inside a
         // multibyte char (callers may pass a char count, not a byte offset).
         let cursor = snap_cursor(input, cursor);
-        // Find the start of the current path token
         let before_cursor = &input[..cursor];
 
-        // Find the last path delimiter before cursor
+        // Native Pi treats CJK punctuation as a token boundary. Opening
+        // wrappers are stripped separately, so
+        // `(@src` and `` `@src `` retain their wrapper in the editor text.
         let mut start = 0;
-        for (i, c) in before_cursor.char_indices().rev() {
-            if PATH_DELIMITERS.contains(&c) {
-                start = i + 1;
+        for (index, character) in before_cursor.char_indices().rev() {
+            // The quote in an @-reference (`@"src/ma`) belongs to the token;
+            // ordinary quoted paths still use the quote as their delimiter.
+            let is_at_quote =
+                character == '"' && index > 0 && before_cursor[..index].ends_with('@');
+            if is_path_delimiter(character) && !is_at_quote {
+                start = index + character.len_utf8();
                 break;
             }
         }
 
-        // Check for @file reference
-        let token = &input[start..cursor];
+        let raw_token = &input[start..cursor];
+        let (token, wrapper_len) = strip_leading_path_wrappers(raw_token);
+        let token_start = start + wrapper_len;
+
+        // Check for an @file reference. Return the position after `@` so the
+        // prefix itself is replaced while `@`, parentheses, and backticks are
+        // preserved in the editor text.
         if token.starts_with('@') {
-            // Return start AFTER the @ so the @ is preserved in text[..start]
-            return Some((token[1..].to_string(), start + 1));
-        } else if token.starts_with('"') {
-            // Quoted path
-            return Some((token[1..].to_string(), start + 1));
+            let path = &token[1..];
+            if let Some(path) = path.strip_prefix('"') {
+                // Keep the opening quote out of the replacement span, while
+                // retaining enough information for the caller to close it.
+                return Some((path.to_string(), token_start + 2));
+            }
+            return Some((path.to_string(), token_start + 1));
+        }
+        if token.starts_with('"') {
+            // Quoted path (the opening quote is kept in the editor text).
+            return Some((token[1..].to_string(), token_start + 1));
         }
 
-        // Native pi's `extractPathPrefix` only hands a token to the file
-        // provider when it actually looks like a path: a separator anywhere
-        // in the token, or a leading `.` / `~/`. A bare word in prose (`c`,
-        // `hhhh`) must not trigger a cwd `read_dir` on every caret move.
-        // The `@` branch above is the explicit opt-in; a token right after
-        // a `"` keeps the port's pre-existing quoted-path channel (`"` is
-        // itself a delimiter, so `start` points past it).
+        // Native pi only opens a regular path panel when the token looks like
+        // a path. A bare word in prose must not cause a directory scan on
+        // every cursor movement.
         let looks_like_path = token.contains('/')
             || token.contains('\\')
             || token.starts_with('.')
             || token.starts_with("~/");
-        let quoted = start > 0 && input[..start].ends_with('"');
+        let quoted = token_start > 0 && input[..token_start].ends_with('"');
         if !looks_like_path && !quoted {
             return None;
         }
 
-        Some((token.to_string(), start))
+        Some((token.to_string(), token_start))
     }
 
     /// Get completions for a path prefix.
     fn get_path_completions(&self, prefix: &str) -> Vec<AutocompleteItem> {
-        let mut items = Vec::new();
+        let quoted = prefix.starts_with('"');
+        let prefix = prefix.strip_prefix('"').unwrap_or(prefix);
+        let prefix = prefix.strip_suffix('"').unwrap_or(prefix);
+        let has_separator = prefix.contains('/') || prefix.contains('\\');
 
-        // Determine the directory to search
-        let (dir, partial) = if prefix.ends_with(['/', '\\']) {
-            // A prefix that ENDS at a separator (`…/nested/`) asks for the
-            // contents of that directory. `Path::parent`/`file_name` ignore a
-            // trailing separator, so splitting there would search the parent
-            // for an entry named after the directory itself: the text
-            // `…/nested/` would be offered `nested/` again, and inserting it
-            // manufactures `…/nested/nested/`, a path that does not exist.
+        // Determine the directory to search. Relative paths are scoped to the
+        // provider root, just like native Pi's basePath; `~` is expanded only
+        // for lookup and is kept in the text inserted by the caller.
+        let (raw_dir, partial) = if prefix == "~" {
             (PathBuf::from(prefix), String::new())
-        } else if prefix.contains('/') || prefix.contains('\\') {
+        } else if prefix.ends_with(['/', '\\']) {
+            (PathBuf::from(prefix), String::new())
+        } else if has_separator {
             let path = Path::new(prefix);
             let parent = path.parent().unwrap_or(Path::new("."));
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             (parent.to_path_buf(), file_name.to_string())
         } else {
-            (
-                self.root_path.clone().unwrap_or_else(|| PathBuf::from(".")),
-                prefix.to_string(),
-            )
+            (PathBuf::from("."), prefix.to_string())
+        };
+        let raw_dir = expand_home_path(&raw_dir);
+        let dir = if raw_dir.is_absolute() {
+            raw_dir
+        } else {
+            self.root_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(raw_dir)
         };
 
-        // Read directory
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.take(self.max_results) {
-                if let Ok(entry) = entry {
-                    let name = entry.file_name().to_string_lossy().to_string();
-
-                    // Filter by prefix
-                    if !partial.is_empty()
-                        && !name.to_lowercase().starts_with(&partial.to_lowercase())
-                    {
-                        continue;
-                    }
-
-                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    let text = if is_dir { format!("{}/", name) } else { name };
-
-                    items.push(
-                        AutocompleteItem::new(&text)
-                            .as_directory()
-                            .with_insert_space(!is_dir),
-                    );
+        let partial_lower = partial.to_lowercase();
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(&dir) {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !partial_lower.is_empty() && !name.to_lowercase().starts_with(&partial_lower) {
+                    continue;
                 }
+                // Follow directory symlinks, matching native Pi's Dirent /
+                // stat fallback instead of treating every symlink as a file.
+                let is_dir =
+                    entry.file_type().map(|t| t.is_dir()).unwrap_or(false) || entry.path().is_dir();
+                entries.push((name, is_dir));
             }
         }
 
-        items
+        // Native Pi presents directories first and then sorts alphabetically.
+        entries.sort_by(|(left_name, left_dir), (right_name, right_dir)| {
+            right_dir
+                .cmp(left_dir)
+                .then_with(|| left_name.to_lowercase().cmp(&right_name.to_lowercase()))
+                .then_with(|| left_name.cmp(right_name))
+        });
+        entries.truncate(self.max_results);
+
+        let display_base = if prefix.ends_with(['/', '\\']) {
+            prefix.to_string()
+        } else {
+            prefix
+                .rfind(['/', '\\'])
+                .map(|index| prefix[..index + 1].to_string())
+                .unwrap_or_default()
+        };
+
+        entries
+            .into_iter()
+            .map(|(name, is_dir)| {
+                let display_path = format!("{display_base}{name}");
+                let mut text = if is_dir {
+                    format!("{name}/")
+                } else {
+                    name.clone()
+                };
+                if quoted && !is_dir {
+                    text.push('"');
+                }
+                let mut item = AutocompleteItem::new(&text)
+                    .with_description(&display_path)
+                    .with_insert_space(!is_dir);
+                if is_dir {
+                    item = item.as_directory();
+                }
+                item
+            })
+            .collect()
     }
 }
 
@@ -260,12 +385,22 @@ impl AutocompleteProvider for FilePathAutocompleteProvider {
     fn get_suggestions(&self, input: &str, cursor: usize) -> Option<AutocompleteSuggestions> {
         let cursor = snap_cursor(input, cursor);
         let (prefix, start) = self.extract_path_prefix(input, cursor)?;
+        let quoted_at = start >= 2 && input[..start].ends_with("@\"");
+        let is_at_reference = quoted_at || start > 0 && input[..start].ends_with('@');
 
-        if prefix.is_empty() && !input[start..cursor].starts_with('@') {
+        if prefix.is_empty() && !is_at_reference {
             return None;
         }
 
-        let items = self.get_path_completions(&prefix);
+        // The provider keeps the opening quote outside the replacement span,
+        // but the path lookup still needs to know that this is a quoted @
+        // reference so a closing quote can be inserted for files.
+        let lookup_prefix = if quoted_at {
+            format!("\"{prefix}")
+        } else {
+            prefix.clone()
+        };
+        let items = self.get_path_completions(&lookup_prefix);
         if items.is_empty() {
             return None;
         }
@@ -686,5 +821,71 @@ mod tests {
             .get_suggestions(&absolute, absolute.len())
             .expect("an absolute @ path completes its basename");
         assert_eq!(suggestions.items[0].text, "report.txt");
+
+        let relative = "@nested/rep";
+        let suggestions = provider
+            .get_suggestions(relative, relative.len())
+            .expect("a relative @ path is scoped to the provider root");
+        assert_eq!(suggestions.items[0].text, "report.txt");
+        assert_eq!(
+            suggestions.items[0].description.as_deref(),
+            Some("nested/report.txt")
+        );
+    }
+
+    #[test]
+    fn at_references_follow_native_token_boundaries_and_wrappers() {
+        let scratch = Scratch::new("at-boundaries");
+        std::fs::write(scratch.0.join("notes.txt"), "fixture").unwrap();
+        let provider = FilePathAutocompleteProvider::with_root(scratch.0.clone());
+
+        for input in ["查看，@not", "(@not", "`@not"] {
+            let suggestions = provider
+                .get_suggestions(input, input.len())
+                .unwrap_or_else(|| panic!("{input:?} should open @ completion"));
+            assert_eq!(suggestions.items[0].text, "notes.txt", "input: {input:?}");
+            assert!(
+                input[..suggestions.start].ends_with('@'),
+                "the replacement span must begin after @: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_at_references_close_the_quote_for_files() {
+        let scratch = Scratch::new("at-quoted");
+        std::fs::write(scratch.0.join("notes.txt"), "fixture").unwrap();
+        let provider = FilePathAutocompleteProvider::with_root(scratch.0.clone());
+        let input = "@\"not";
+        let suggestions = provider
+            .get_suggestions(input, input.len())
+            .expect("a quoted @ reference should complete");
+
+        assert_eq!(suggestions.start, 2, "replace only the text after @\"");
+        assert_eq!(suggestions.items[0].text, "notes.txt\"");
+    }
+
+    #[test]
+    fn file_items_are_not_marked_as_directories() {
+        let scratch = Scratch::new("file-kind");
+        std::fs::write(scratch.0.join("notes.txt"), "fixture").unwrap();
+        std::fs::create_dir(scratch.0.join("src")).unwrap();
+        let provider = FilePathAutocompleteProvider::with_root(scratch.0.clone());
+        let suggestions = provider
+            .get_suggestions("@", 1)
+            .expect("bare @ should list root entries");
+
+        let file = suggestions
+            .items
+            .iter()
+            .find(|item| item.text == "notes.txt")
+            .expect("file suggestion");
+        let directory = suggestions
+            .items
+            .iter()
+            .find(|item| item.text == "src/")
+            .expect("directory suggestion");
+        assert!(!file.is_directory);
+        assert!(directory.is_directory);
     }
 }

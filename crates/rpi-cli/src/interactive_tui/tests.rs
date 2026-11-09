@@ -5358,6 +5358,28 @@ fn final_review_pr106_enter_path_completion_must_preserve_the_parent_directory()
     );
 }
 
+#[test]
+fn final_review_pr106_quoted_at_completion_closes_the_quote() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("notes.txt");
+    std::fs::write(&path, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let input = "@\"not";
+    editor.set_text(input);
+    set_editor_cursor_offset(&editor, input, input.len());
+
+    let completion = resolve_enter_completion(&state, &editor).expect("a quoted @ decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyOnly);
+    assert!(completion.apply(&state, &editor));
+    assert_eq!(editor.get_text(), "@\"notes.txt\" ");
+}
+
 /// A path candidate that disappears between the decision and the apply must
 /// not turn the decided `ApplyOnly` into a submit of the unfinished prompt:
 /// the snapshot is applied as decided, and an `@`-path decision consumes the
