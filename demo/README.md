@@ -6,6 +6,7 @@ re-shot.
 | File | What it is |
 | --- | --- |
 | [`sdk.tape`](sdk.tape) | [VHS](https://github.com/charmbracelet/vhs) script → `docs/images/rpi-sdk-demo.gif` |
+| [`tui.tape`](tui.tape) | Isolated, offline TUI startup and `/help` → `docs/images/rpi-tui-demo.gif` and the startup screenshot |
 | [`rpi.tape`](rpi.tape) | VHS script for the interactive TUI → `docs/images/rpi-demo.gif` (needs a model) |
 | [`transcript.txt`](transcript.txt) | Real stdout of the two offline examples, embedded in the README |
 
@@ -14,9 +15,22 @@ re-shot.
 ```bash
 task demo-transcript   # demo/transcript.txt  (offline, deterministic)
 task demo              # docs/images/rpi-sdk-demo.gif
+
+cargo build -p rpi-cli --bin rpi --locked
+vhs demo/tui.tape       # docs/images/rpi-tui-demo.gif (no API key needed)
+ffmpeg -i docs/images/rpi-tui-demo.gif -ss 1 -frames:v 1 -update 1 docs/images/rpi-interactive.png
 ```
 
-`task demo` needs `vhs`, `ttyd` and `ffmpeg`:
+The SDK recording runs the prebuilt `target/debug/minimal` and
+`target/debug/tools-example` binaries so compilation and Cargo wrapper logs do
+not obscure the output. `task demo` builds them before recording. The TUI tape
+uses a temporary agent directory and disables session persistence and resource
+discovery; it does not load your credentials, extensions, or conversation history.
+Its placeholder API key only permits startup; `/help` does not call a provider.
+[`tui.sh`](tui.sh) prepares the isolated configuration, including native Windows
+path conversion when recording in Git Bash.
+
+Both recordings need `vhs`, `ttyd` and `ffmpeg`:
 
 ```bash
 scoop install vhs ttyd ffmpeg     # Windows
