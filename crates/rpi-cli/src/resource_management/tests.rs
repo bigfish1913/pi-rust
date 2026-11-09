@@ -81,7 +81,7 @@ fn copy_is_bounded_and_failure_preserves_old_install() {
         "changed and larger than the previously inventoried input",
     );
     let temp = tempfile::tempdir_in(&root).unwrap();
-    assert!(copy_snapshot(&source, &temp.path().join("copy"), &expected).is_err());
+    assert!(copy_snapshot(Kind::Skill, &source, &temp.path().join("copy"), &expected).is_err());
     assert_eq!(old, inventory(&root.join("skills/demo")).unwrap());
     assert_eq!(receipt, fs::read(root.join(RECEIPTS)).unwrap());
     fs::remove_file(source.join("SKILL.md")).unwrap();
@@ -391,4 +391,133 @@ fn legacy_target_aliases_cannot_bypass_owned_windows_paths() {
     assert!(status.success());
     assert!(legacy_unowned_targets(&root, &[link.join("anything.dll")]).is_err());
     fs::remove_dir(link).unwrap();
+}
+
+/// A snapshot copy of a native artifact must be loadable, and the recorded
+/// inventory must describe the copy rather than the source.
+///
+/// On macOS an unre-signed copy is refused by the kernel at first code-page
+/// fault and the whole host is killed (no stderr, exit 137), so signing has to
+/// happen while staging, before publication. Re-signing rewrites bytes, so the
+/// receipt has to be built from the post-signing inventory — otherwise every
+/// later ownership check reports "content changed" against a good install.
+#[cfg(target_os = "macos")]
+#[test]
+fn staged_native_snapshot_is_signed_and_inventory_describes_the_copy() {
+    let (_dir, root, _) = fixture();
+    // `tempfile` lands under /var on macOS, which is a symlink to /private/var;
+    // resource paths reject links, so address the real tree.
+    let base = fs::canonicalize(_dir.path()).unwrap();
+    // Any signed Mach-O works: only the signature/bytes relationship matters.
+    let source = base.join("source/extensions/plugin.dylib");
+    put(&source, fs::read("/bin/echo").unwrap());
+    let observed = inventory(&source).unwrap();
+    let staged = base.join("staged");
+    let copied = copy_snapshot(Kind::Extension, &source, &staged, &observed).unwrap();
+    assert_ne!(
+        copied.files[0].sha256, observed.files[0].sha256,
+        "the staged artifact was not re-signed"
+    );
+    assert_eq!(
+        copied,
+        inventory(&staged).unwrap(),
+        "the returned inventory must describe the staged bytes"
+    );
+    let out = std::process::Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=4"])
+        .arg(&staged)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("linker-signed"),
+        "the staged artifact kept its build-time signature"
+    );
+    let _ = root;
+}
+
+/// Only `extensions/` artifacts are native; a same-suffix data file elsewhere in
+/// a Package is not.
+///
+/// The kernel only ever maps the direct children of `extensions/` (that is what
+/// `validate_source` accepts), so `skills/x/assets/data.dylib` is ordinary data.
+/// Re-signing it would rewrite a file the host treats as content.
+#[cfg(target_os = "macos")]
+#[test]
+fn package_resigns_only_direct_extension_artifacts() {
+    assert!(is_package_artifact(Path::new("extensions/plugin.dylib")));
+    assert!(is_package_artifact(Path::new("extensions/nested.dylib")));
+    assert!(!is_package_artifact(Path::new(
+        "skills/demo/assets/data.dylib"
+    )));
+    assert!(!is_package_artifact(Path::new("prompts/foo.dylib")));
+    assert!(!is_package_artifact(Path::new("themes/bar.dylib")));
+    assert!(!is_package_artifact(Path::new("extensions/plugin.txt")));
+    assert!(!is_package_artifact(Path::new("extensions/a/b.dylib")));
+}
+
+/// Re-signing must be stable: two installs of the same source have to leave the
+/// same bytes behind, so the second one reports `unchanged` instead of
+/// "already installed".
+///
+/// `codesign --sign -` would otherwise derive the ad-hoc identifier from the file
+/// NAME, so the same bytes staged under two different names sign to different
+/// bytes — an unchanged install would then look changed. The identifier is pinned
+/// for exactly that reason; this stages under two different names to prove it.
+#[cfg(target_os = "macos")]
+#[test]
+fn repeated_native_install_is_idempotent() {
+    let (_dir, _root, _) = fixture();
+    let base = fs::canonicalize(_dir.path()).unwrap();
+    let source = base.join("source/extensions/plugin.dylib");
+    put(&source, fs::read("/bin/echo").unwrap());
+    let observed = inventory(&source).unwrap();
+    fs::create_dir_all(base.join("txn-a")).unwrap();
+    fs::create_dir_all(base.join("txn-b")).unwrap();
+    let first =
+        copy_snapshot(Kind::Extension, &source, &base.join("txn-a/one"), &observed).unwrap();
+    let second =
+        copy_snapshot(Kind::Extension, &source, &base.join("txn-b/two"), &observed).unwrap();
+    assert_eq!(
+        first.files[0].sha256, second.files[0].sha256,
+        "signing the same source twice produced different bytes"
+    );
+    assert_eq!(first, second);
+}
+
+/// A Skill directory never has native artifacts signed.
+///
+/// `validate_source` for `Kind::Skill` only requires `SKILL.md`; it does not
+/// reserve an `extensions/` subtree. A skill may therefore legitimately carry an
+/// ordinary asset such as `extensions/example.dylib`, and that file is content.
+/// Signing it would rewrite a file the host never loads as a library.
+#[cfg(target_os = "macos")]
+#[test]
+fn skill_directory_never_resigns_same_suffix_assets() {
+    let (_dir, _root, _) = fixture();
+    let base = fs::canonicalize(_dir.path()).unwrap();
+    let source = base.join("skill");
+    put(source.join("SKILL.md"), "---\nname: demo\n---\nbody");
+    // Non-Mach-O data that happens to use the library suffix, in a path that a
+    // Package would have treated as an artifact.
+    put(source.join("extensions/example.dylib"), b"plain data\n");
+    let observed = inventory(&source).unwrap();
+    let copied = copy_snapshot(Kind::Skill, &source, &base.join("skill-copy"), &observed).unwrap();
+    assert_eq!(
+        copied, observed,
+        "a Skill snapshot must be byte-identical to its source"
+    );
+    assert_eq!(
+        fs::read(base.join("skill-copy/extensions/example.dylib")).unwrap(),
+        b"plain data\n"
+    );
+}
+
+/// The same path *is* an artifact when the source is a Package.
+#[cfg(target_os = "macos")]
+#[test]
+fn package_artifact_selection_differs_from_skill() {
+    assert!(is_package_artifact(Path::new("extensions/example.dylib")));
+    // Skill selection is empty regardless of path, which the kind match encodes;
+    // this guards the helper boundary the reviewer called out.
+    assert!(!is_package_artifact(Path::new("assets/example.dylib")));
 }

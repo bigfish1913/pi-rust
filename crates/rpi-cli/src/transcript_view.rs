@@ -689,8 +689,9 @@ pub(crate) fn update_todo_list(chat: &Arc<Container>, result: &Value) -> bool {
             if component.is_todo_list() {
                 component.set_todo_state(rows);
                 component.set_result(&text, false);
-                chat.remove_child(&child);
-                chat.add_child(child);
+                // Keep the panel at the position where the task list first
+                // appeared. Moving it to the tail makes later transcript rows
+                // render above the current task list on every update.
                 return true;
             }
         }
@@ -1458,6 +1459,80 @@ mod tests {
         assert!(
             plan < findings,
             "plan completion must not move the plan below later transcript output: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn todo_updates_keep_their_transcript_position() {
+        let view = view();
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Text("before tasks".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::AssistantEnd {
+                blocks: vec![AssistantBlock::Text("before tasks".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::ToolEnd {
+                id: "todo-1".into(),
+                name: "todo".into(),
+                result: json!({
+                    "details": {
+                        "todos": [{"text": "first task", "done": false}]
+                    }
+                }),
+                is_error: false,
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Text("later output".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::AssistantEnd {
+                blocks: vec![AssistantBlock::Text("later output".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::ToolEnd {
+                id: "todo-2".into(),
+                name: "todo".into(),
+                result: json!({
+                    "details": {
+                        "todos": [{"text": "first task", "done": true}]
+                    }
+                }),
+                is_error: false,
+            },
+            80,
+        );
+
+        let lines: Vec<_> = view
+            .chat
+            .render(80)
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect();
+        let tasks = lines
+            .iter()
+            .position(|line| line.contains("Tasks  1/1 completed"))
+            .expect("todo panel should render");
+        let later = lines
+            .iter()
+            .position(|line| line.contains("later output"))
+            .expect("later transcript output should render");
+        assert!(
+            tasks < later,
+            "todo update must not move the task panel below later output: {lines:?}"
         );
     }
 
