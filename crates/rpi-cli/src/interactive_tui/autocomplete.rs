@@ -569,7 +569,9 @@ pub(super) fn resolve_enter_completion(
     // Same explicit-context rule as `navigate_autocomplete`: only the `/`
     // token at input start or an `@`-file token counts as a popup the Enter
     // key belongs to.
-    let explicit = text[start..].starts_with('/') || text[..start].ends_with('@');
+    let explicit = text[start..].starts_with('/')
+        || text[..start].ends_with('@')
+        || text[..start].ends_with("@\"");
     if !explicit {
         return None;
     }
@@ -696,9 +698,11 @@ pub(super) fn navigate_autocomplete(
         return false;
     }
     let start = sugg.start.min(text.len());
-    // `/` commands keep the slash at `start`; the path provider keeps `@` by
-    // placing `start` *after* it, so look just before `start` for `@`.
-    let explicit = text[start..].starts_with('/') || text[..start].ends_with('@');
+    // `/` commands keep the slash at `start`; the path provider keeps `@`
+    // (and an optional opening quote) before `start`.
+    let explicit = text[start..].starts_with('/')
+        || text[..start].ends_with('@')
+        || text[..start].ends_with("@\"");
     if !explicit {
         return false;
     }
