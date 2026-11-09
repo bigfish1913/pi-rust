@@ -31,13 +31,13 @@ Sleep 500ms
 Type "# The agent loop, with no API key and no network:"
 Enter
 Sleep 400ms
-Type "cargo run -q -p minimal"
+Type "./target/debug/minimal"
 Enter
 Sleep 2500ms
 
 Type "# Now the same loop driving real fs + shell tools:"
 Enter
 Sleep 400ms
-Type "cargo run -q -p tools-example"
+Type "./target/debug/tools-example"
 Enter
 Sleep 3500ms
