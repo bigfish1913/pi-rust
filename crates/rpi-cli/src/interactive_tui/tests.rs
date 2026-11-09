@@ -446,6 +446,8 @@ pub(super) fn test_tui_state() -> Arc<TuiState> {
     Arc::new(TuiState {
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1853,6 +1855,8 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
     let state = Arc::new(TuiState {
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3483,6 +3487,8 @@ fn test_autocomplete_slash_suggestions_render() {
     let state = Arc::new(TuiState {
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3582,6 +3588,8 @@ fn test_select_list_swap_restores_editor() {
     let state = Arc::new(TuiState {
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3684,6 +3692,8 @@ fn test_message_history_browse_restores_draft() {
     let state = Arc::new(TuiState {
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3789,6 +3799,8 @@ fn test_accept_top_suggestion_replaces_prefix() {
     let state = Arc::new(TuiState {
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3880,6 +3892,8 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
     Arc::new(TuiState {
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
