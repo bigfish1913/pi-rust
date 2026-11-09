@@ -1,0 +1,2 @@
+# Git Bash needs Unix line endings in the reproducible TUI demo launcher.
+/demo/*.sh text eol=lf
