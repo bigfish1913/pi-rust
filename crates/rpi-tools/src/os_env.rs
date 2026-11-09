@@ -49,6 +49,26 @@ const MAX_TIMEOUT_SECONDS: f64 = 2_147_483.647;
 /// `EXIT_STDIO_GRACE_MS`.
 const EXIT_STDIO_GRACE_MS: u64 = 100;
 
+/// Non-interactive defaults for every spawned shell. A tool call has no
+/// terminal the user can answer: `git` with no credential helper opens
+/// `/dev/tty` directly for `Username for 'https://…':`, bypassing the piped
+/// stdin/stdout/stderr (and the deliberate stdin-close in `exec`). That writes
+/// over the TUI frame as text the editor never owned — so it cannot be selected
+/// or deleted — and blocks the child until the timeout. Failing fast instead
+/// turns it into an ordinary, capturable stderr error.
+///
+/// These are *defaults*, not a policy lock: they are applied before the
+/// inherit loop and before `shell_env` / per-call `env`, so an explicit host
+/// export, `with_shell_env`, or `ShellExecOptions::env` still opts back in.
+/// This is deliberately narrower than the managed-install `harden_git_env`
+/// (which also isolated git config): here the user's own git config and
+/// credential helpers must keep working.
+const NON_INTERACTIVE_SHELL_ENV: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GCM_INTERACTIVE", "Never"),
+    ("SSH_ASKPASS_REQUIRE", "never"),
+];
+
 /// How the command is fed to the shell. Mirrors `commandTransport`.
 #[derive(Clone, Copy)]
 enum CommandTransport {
@@ -932,6 +952,12 @@ impl Shell for OsExecutionEnv {
         let mut cmd = tokio::process::Command::new(&shell_cfg.shell);
         cmd.current_dir(&cwd);
         cmd.env_clear();
+        // Non-interactive defaults apply even when `inherit_env` is false: a
+        // caller asking for a clean environment is not asking for a prompt.
+        // They sit before the inherit loop so any explicit value wins.
+        for (k, v) in NON_INTERACTIVE_SHELL_ENV {
+            cmd.env(k, v);
+        }
         // Environment: inherit + shell_env + per-call. The host's own private
         // plumbing (`HOST_PRIVATE_ENV`) is skipped: it describes *this* process,
         // not the shell or anything the shell runs, and inheriting it makes a
