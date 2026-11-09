@@ -488,6 +488,78 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Cache sherpa-onnx archives
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sherpa-onnx-archives
+          key: sherpa-onnx-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rpi-package/Cargo.lock') }}
+
+      - name: Prefetch sherpa-onnx archive
+        shell: bash
+        working-directory: rpi-package
+        run: |
+          set -euo pipefail
+          version="$(python - <<'PY'
+          import tomllib
+
+          with open("Cargo.lock", "rb") as lock_file:
+              lock = tomllib.load(lock_file)
+
+          versions = [
+              package["version"]
+              for package in lock["package"]
+              if package["name"] == "sherpa-onnx-sys"
+          ]
+          if len(versions) != 1:
+              raise SystemExit(f"expected one sherpa-onnx-sys version, found {versions!r}")
+          print(versions[0])
+          PY
+          )"
+
+          case "${RUNNER_OS}:${RUNNER_ARCH}" in
+            Linux:X64)
+              suffix="linux-x64-static-lib"
+              ;;
+            macOS:ARM64)
+              suffix="osx-arm64-static-lib"
+              ;;
+            macOS:X64)
+              suffix="osx-x64-static-lib"
+              ;;
+            Windows:X64)
+              suffix="win-x64-static-MT-Release-lib"
+              ;;
+            *)
+              echo "Unsupported runner: ${RUNNER_OS}:${RUNNER_ARCH}"
+              exit 1
+              ;;
+          esac
+
+          archive="sherpa-onnx-v${version}-${suffix}.tar.bz2"
+          archive_dir="${RUNNER_TEMP}/sherpa-onnx-archives"
+          archive_path="${archive_dir}/${archive}"
+          url="https://github.com/k2-fsa/sherpa-onnx/releases/download/v${version}/${archive}"
+          mkdir -p "$archive_dir"
+
+          if [[ ! -s "$archive_path" ]]; then
+            curl \
+              --fail \
+              --location \
+              --retry 10 \
+              --retry-delay 15 \
+              --retry-connrefused \
+              --retry-max-time 900 \
+              --connect-timeout 30 \
+              --max-time 900 \
+              "$url" \
+              --output "$archive_path"
+          fi
+
+          test -s "$archive_path"
+          echo "SHERPA_ONNX_ARCHIVE_DIR=$archive_dir" >> "$GITHUB_ENV"
+          echo "Using $archive_path"
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
