@@ -24,7 +24,7 @@ pub(super) fn configure_resource_autocomplete(
     // then reserve hidden builtins and aliases against resource commands too.
     let mut seen = std::collections::BTreeSet::new();
     commands.retain(|command| seen.insert(command.name.clone()));
-    seen.extend(super::builtin_reserved_names());
+    seen.extend(super::builtin_reserved_names(false));
     let skills = if enable_skill_commands {
         resources.skills
     } else {
