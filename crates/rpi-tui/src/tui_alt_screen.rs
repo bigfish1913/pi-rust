@@ -21,6 +21,9 @@ use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
 use crate::ansi::{visible_width, CURSOR_MARKER};
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
 use crate::terminal_image::CellDimensions;
+use crate::thinking_region::{
+    collect_regions as collect_thinking_regions, strip_markers as strip_thinking_region_markers,
+};
 
 /// Symbol for ViewportTUI capability check.
 pub const VIEWPORT_TUI: &[u8] = b"rpi-tui/viewport";
@@ -208,6 +211,10 @@ pub struct TuiAltScreen {
     scheduler_thread: Mutex<Option<JoinHandle<()>>>,
     /// Fullscreen text selection (anchor/focus in content coordinates).
     selection: crate::selection::SelectionState,
+    /// Clickable per-message thinking regions resolved from the last painted
+    /// frame (frame-scoped, like the cursor marker protocol). Empty until the
+    /// renderer scans a frame that carries thinking-region markers.
+    thinking_regions: Mutex<Vec<crate::thinking_region::ThinkingRegion>>,
     /// Image payloads this screen's terminal is known to hold. Terminal state,
     /// so it belongs to the screen that owns the terminal — never a process
     /// global, which a second screen, a reconnect, or a terminal restart would
@@ -259,6 +266,7 @@ impl TuiAltScreen {
             scheduler_started: AtomicBool::new(false),
             scheduler_thread: Mutex::new(None),
             selection: crate::selection::SelectionState::new(),
+            thinking_regions: Mutex::new(Vec::new()),
             kitty_uploads: Mutex::new(crate::terminal_image::KittyUploads::new()),
         }
     }
@@ -493,6 +501,25 @@ impl TuiAltScreen {
         }
         self.scroll_to_bottom();
         true
+    }
+
+    /// Resolve a left-button press against the last painted frame's thinking
+    /// click regions. Returns the owning message id when the click lands on a
+    /// thinking label/body row; the host decides what toggling means. Only
+    /// presses (not drags or releases) hit, so a selection drag is never
+    /// mistaken for a toggle; the host must call this BEFORE feeding the
+    /// event to the selection tracker.
+    pub fn thinking_region_hit(&self, event: &crossterm::event::MouseEvent) -> Option<String> {
+        use crossterm::event::MouseButton;
+        if self.uses_main_screen()
+            || self.is_render_suspended()
+            || self.has_overlay()
+            || event.kind != crossterm::event::MouseEventKind::Down(MouseButton::Left)
+        {
+            return None;
+        }
+        let regions = self.thinking_regions.lock().ok()?;
+        crate::thinking_region::hit(&regions, event.column, event.row).map(|r| r.message_id.clone())
     }
 
     /// Feed a left-button mouse event to the fullscreen selection tracker.
@@ -886,6 +913,12 @@ impl TuiAltScreen {
             .into_iter()
             .map(|line| line.replace(CURSOR_MARKER, ""))
             .collect();
+        // Main screen mode deliberately never enables click regions (its rows
+        // belong to native scrollback and cannot be hit-tested), but its
+        // renderer must still strip the markers: an assistant message carries
+        // them on its thinking rows in every mode.
+        let mut lines = lines;
+        strip_thinking_region_markers(&mut lines);
         let previous = self
             .previous_screen
             .lock()
@@ -1206,6 +1239,23 @@ impl TuiAltScreen {
             *line = line.replace(CURSOR_MARKER, "");
         }
 
+        // Thinking click regions follow the same frame-scoped protocol: scan
+        // the composited rows for region markers, record the rectangles for
+        // the input path, then strip them so they never reach the terminal.
+        // Overlays paint above the transcript and own their rows wholly, so
+        // regions behind an overlay must not resolve: the hit path checks
+        // `has_overlay()`, so no masking copy is needed here.
+        // Overlays own their rows wholly: no transcript click region may
+        // resolve while a modal is up, so don't retain any from this frame.
+        let thinking_regions = if self.has_overlay() {
+            Vec::new()
+        } else {
+            collect_thinking_regions(&visible)
+        };
+        if let Ok(mut slot) = self.thinking_regions.lock() {
+            *slot = thinking_regions;
+        }
+        strip_thinking_region_markers(&mut visible);
         // Reverse-video the selected span last, exactly where upstream applies
         // `applySelection`: after overlays so selection stays visible behind a
         // dialog, before the diff so the highlight reaches the terminal.
@@ -1768,7 +1818,10 @@ impl Terminal for TerminalProxy {
 mod tests {
     use super::*;
     use crate::vstack::StackEntryOptions;
-    use crate::{Editor, Focusable, ScrollViewOptions, Text, VStack};
+    use crate::{
+        AssistantBlock, AssistantMessageComponent, AssistantMessageOptions, Editor, Focusable,
+        ScrollViewOptions, Text, VStack,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// A terminal whose size the test controls, so a resize can be replayed
@@ -2969,5 +3022,228 @@ mod tests {
             !frame.contains("d=I"),
             "deleting the image data would blank a later re-place: {frame:?}"
         );
+    }
+
+    // ---- Thinking click-region integration probes ----
+
+    fn thinking_tui() -> (
+        Arc<TuiAltScreen>,
+        Arc<AssistantMessageComponent>,
+        Arc<Mutex<String>>,
+        Arc<Mutex<(usize, usize)>>,
+    ) {
+        let terminal = ResizableTerminal::new(80, 10);
+        let output = terminal.output();
+        let size = terminal.size();
+        let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), false, None));
+        let doc = Arc::new(crate::container::Container::new());
+        let msg = Arc::new(AssistantMessageComponent::new(AssistantMessageOptions {
+            hide_thinking: true,
+            ..Default::default()
+        }));
+        msg.set_message_id("t1");
+        msg.update_blocks(&[
+            AssistantBlock::Thinking("deep reasoning".to_string()),
+            AssistantBlock::Text("visible answer".to_string()),
+        ]);
+        // Enough filler above the message to make the transcript scrollable —
+        // a region can only follow a scroll if the document overflows.
+        doc.add_child(Arc::new(Text::new(
+            (1..=20)
+                .map(|n| format!("filler {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            0,
+            0,
+        )) as Arc<dyn Component>);
+        doc.add_child(msg.clone() as Arc<dyn Component>);
+        let scroll = Arc::new(ScrollView::new(
+            doc.clone() as Arc<dyn Component>,
+            ScrollViewOptions {
+                primary: true,
+                ..Default::default()
+            },
+        ));
+        tui.set_layout_root(Some(scroll as Arc<dyn Component>));
+        tui.start_readerless();
+        (tui, msg, output, size)
+    }
+
+    fn mouse(
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn thinking_label_resolves_to_a_click_region_on_the_painted_frame() {
+        // Axis: frame-scoped geometry. After a real render the collapsed
+        // label row must resolve to a region; a marker-free row must not.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (tui, _msg, _output, _size) = thinking_tui();
+        let rows = tui.current_frame.lock().unwrap().clone().unwrap().height;
+        let mut hit_row = None;
+        for row in 0..rows {
+            if tui
+                .thinking_region_hit(&mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    2,
+                    row as u16,
+                ))
+                .as_deref()
+                == Some("t1")
+            {
+                hit_row = Some(row);
+                break;
+            }
+        }
+        let hit_row = hit_row.expect("collapsed label row must carry a region");
+        // Adjacent rows without a marker must not resolve.
+        for row in 0..rows {
+            if row == hit_row {
+                continue;
+            }
+            assert_ne!(
+                tui.thinking_region_hit(&mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    2,
+                    row as u16
+                ))
+                .as_deref(),
+                Some("t1"),
+                "row {row} resolved to a region without a marker"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_markers_never_reach_the_terminal_output() {
+        // Axis: output purity. The painted frame must strip every region
+        // marker before diffing — the raw terminal bytes must not contain the
+        // APC introducer.
+        let (tui, _msg, output, _size) = thinking_tui();
+        let _ = tui;
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            !frame.contains("\x1b_pi:z"),
+            "region marker leaked into the terminal stream: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn drag_and_release_do_not_hit_thinking_regions() {
+        // Axis: event shape. Only a Down press resolves; Drag/Up never do, so
+        // a text-selection drag across a label row cannot toggle it.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (tui, _msg, _output, _size) = thinking_tui();
+        let rows = tui.current_frame.lock().unwrap().clone().unwrap().height;
+        let mut found = false;
+        for row in 0..rows {
+            for (kind, name) in [
+                (MouseEventKind::Drag(MouseButton::Left), "drag"),
+                (MouseEventKind::Up(MouseButton::Left), "up"),
+                (MouseEventKind::Down(MouseButton::Right), "right"),
+            ] {
+                assert!(
+                    tui.thinking_region_hit(&mouse(kind, 2, row as u16))
+                        .is_none(),
+                    "{name} event must never resolve a region"
+                );
+            }
+            found = found
+                || tui
+                    .thinking_region_hit(&mouse(
+                        MouseEventKind::Down(MouseButton::Left),
+                        2,
+                        row as u16,
+                    ))
+                    .is_some();
+        }
+        assert!(found, "probe fixture lost its label row");
+    }
+
+    #[test]
+    fn regions_follow_the_painted_frame_across_scroll() {
+        // Axis: scroll/clip. Regions are frame-scoped: after scrolling, a
+        // click resolves against the NEW painted frame (the region moves with
+        // the content, and rows the content left never resolve again).
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (tui, _msg, _output, _size) = thinking_tui();
+        let scroll = tui.get_primary_scroll_view().expect("primary scroll");
+        let rows = tui.current_frame.lock().unwrap().clone().unwrap().height;
+        let before: Vec<Option<String>> = (0..rows as u16)
+            .map(|row| {
+                tui.thinking_region_hit(&mouse(MouseEventKind::Down(MouseButton::Left), 2, row))
+            })
+            .collect();
+        let bf = tui.current_frame.lock().unwrap().clone().unwrap();
+        for (i, line) in bf.lines.iter().enumerate() {
+            println!("BF{i}: {:?}", line);
+        }
+        assert!(
+            before.iter().any(|hit| hit.as_deref() == Some("t1")),
+            "no region on initial frame"
+        );
+
+        scroll.scroll_by(-3);
+        tui.request_render(false);
+        let mid: Vec<Option<String>> = (0..rows as u16)
+            .map(|row| {
+                tui.thinking_region_hit(&mouse(MouseEventKind::Down(MouseButton::Left), 2, row))
+            })
+            .collect();
+        scroll.scroll_by(2);
+        tui.request_render(false);
+        let after: Vec<Option<String>> = (0..rows as u16)
+            .map(|row| {
+                tui.thinking_region_hit(&mouse(MouseEventKind::Down(MouseButton::Left), 2, row))
+            })
+            .collect();
+        // The region must still exist somewhere (content scrolled, not
+        // destroyed) and a stale rectangle from the previous frame must not
+        // resolve at its old row.
+        assert!(after.iter().any(|hit| hit.as_deref() == Some("t1")));
+        let row_before = before.iter().position(|hit| hit.is_some()).unwrap();
+        // Frame-scoped invariant: the mid frame's regions differ from the
+        // end-followed frame (the label moved or left the viewport), and a
+        // stale rectangle from BEFORE must not resolve after the scroll.
+        assert_ne!(
+            mid.iter().position(|hit| hit.is_some()),
+            Some(row_before),
+            "region row must follow the scroll, not stay frozen"
+        );
+        assert!(after.iter().any(|hit| hit.as_deref() == Some("t1")));
+    }
+
+    #[test]
+    fn overlay_rows_never_resolve_thinking_regions() {
+        // Self-review probe: a modal overlay paints OVER the transcript. Its
+        // rows must not inherit the underlying region markers (`slice` keeps
+        // APC markers from the base row, so this is a real hazard).
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (tui, _msg, _output, _size) = thinking_tui();
+        let overlay = Arc::new(Text::new("modal content", 0, 0));
+        let _handle = tui.show_overlay(
+            overlay,
+            Some(crate::tui::OverlayOptions {
+                anchor: crate::tui::OverlayAnchor::Center,
+                width: Some(crate::tui::SizeValue::Absolute(40)),
+                ..Default::default()
+            }),
+        );
+        for row in 0..10u16 {
+            assert!(
+                tui.thinking_region_hit(&mouse(MouseEventKind::Down(MouseButton::Left), 2, row))
+                    .is_none(),
+                "row {row} resolved a thinking region while an overlay was open"
+            );
+        }
     }
 }

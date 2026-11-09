@@ -1978,6 +1978,19 @@ pub async fn interactive_tui(
                     tui_for_key.clear_selection();
                     continue;
                 }
+                // A click on a thinking label/body row toggles THAT message's
+                // thinking before the press can anchor a text selection. The
+                // regions are frame-scoped: only rows the last painted frame
+                // actually showed resolve, so a stale rectangle can never fire
+                // after a scroll.
+                if let Some(message_id) = tui_for_key.thinking_region_hit(&m) {
+                    state_for_key
+                        .transcript_view()
+                        .toggle_message_thinking(&message_id);
+                    tui_for_key.clear_selection();
+                    tui_for_key.request_render_reusing_scroll_content();
+                    continue;
+                }
                 use crossterm::event::MouseEventKind;
                 match m.kind {
                     MouseEventKind::ScrollUp => {

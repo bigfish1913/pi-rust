@@ -21,6 +21,7 @@ use super::image::{Image, ImageOptions};
 use super::markdown::Markdown;
 use super::spacer::Spacer;
 use super::text::Text;
+use super::thinking_region::marker as thinking_marker;
 use crate::ansi::italic;
 use crate::theme::theme;
 
@@ -80,6 +81,14 @@ pub struct AssistantMessageComponent {
     is_streaming: Mutex<bool>,
     /// The last blocks rendered (kept so `invalidate`/option changes can rebuild).
     last_blocks: Mutex<Vec<AssistantBlock>>,
+    /// Per-message id for the thinking click region (opaque; assigned by the
+    /// host). `None` renders without region markers — e.g. markdown-style
+    /// extension components that reuse this component for plain text.
+    message_id: Mutex<Option<String>>,
+    /// Per-message thinking visibility. `None` follows the global
+    /// `hide_thinking` option; `Some(true)` expands this message's thinking
+    /// even while the global preference hides every other message's.
+    expand_thinking: Mutex<Option<bool>>,
     /// B5e: an optional markdown transformer applied to the raw assistant text
     /// BEFORE it reaches the [`Markdown`] renderer. The host (`rpi-cli`) injects
     /// a closure wrapping any plugin `register_markdown_transformer` handlers
@@ -90,6 +99,63 @@ pub struct AssistantMessageComponent {
     /// finalize), so the plugin always sees the latest full markdown; the FFI
     /// call is cheap (a bare fn-pointer invocation + one JSON round-trip).
     markdown_transformer: Mutex<Option<Arc<dyn Fn(&str) -> String + Send + Sync>>>,
+}
+
+/// Wrap a thinking row's rendered output with a zero-width click-region
+/// marker on every visible row. Keeping the marker out of the markdown/text
+/// SOURCE preserves block parsing (`#`, lists, fences) and keeps plugin
+/// markdown transformers seeing plain text; the marker only exists in the
+/// frame the renderer scans for hit rectangles.
+struct ThinkingRegionComponent {
+    inner: Arc<dyn Component>,
+    message_id: Option<String>,
+}
+
+impl ThinkingRegionComponent {
+    fn new(inner: Arc<dyn Component>, message_id: Option<String>) -> Self {
+        Self { inner, message_id }
+    }
+
+    fn with_markers(&self, mut lines: Vec<String>) -> Vec<String> {
+        let Some(id) = self.message_id.as_deref() else {
+            return lines;
+        };
+        for line in &mut lines {
+            if line.is_empty()
+                || line.contains(super::thinking_region::THINKING_REGION_MARKER_PREFIX)
+            {
+                continue;
+            }
+            let width = crate::ansi::visible_width(line);
+            line.insert_str(0, &thinking_marker(id, width));
+        }
+        lines
+    }
+}
+
+impl Component for ThinkingRegionComponent {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.with_markers(self.inner.render(width))
+    }
+
+    fn render_document(&self, width: usize) -> RenderedDocument {
+        if self.message_id.is_none() {
+            return self.inner.render_document(width);
+        }
+        // `render_document` is the path the primary ScrollView uses. Materialize
+        // the rows once (the wrapper is per thinking run, so this is small) and
+        // re-share them so viewport slicing sees the same markers as `render`.
+        let lines = self.inner.render(width);
+        RenderedDocument::from_lines(self.with_markers(lines))
+    }
+
+    fn invalidate(&self) {
+        self.inner.invalidate();
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl AssistantMessageComponent {
@@ -105,6 +171,8 @@ impl AssistantMessageComponent {
             has_tool_calls: Mutex::new(false),
             is_streaming: Mutex::new(false),
             last_blocks: Mutex::new(Vec::new()),
+            message_id: Mutex::new(None),
+            expand_thinking: Mutex::new(None),
             markdown_transformer: Mutex::new(None),
         }
     }
@@ -255,13 +323,17 @@ impl AssistantMessageComponent {
                         continue;
                     }
 
-                    if opts.hide_thinking {
-                        // One static dim label per thinking run (TS path).
-                        self.content_container.add_child(Arc::new(Text::new(
-                            italic(&theme().colors.thinking_text.fg(&opts.hidden_thinking_label)),
-                            opts.output_pad,
-                            0,
-                        )));
+                    if !self.thinking_expanded() {
+                        // One static dim label per thinking run (TS path). The
+                        // label row carries the click-region marker so a click
+                        // can expand THIS message's thinking.
+                        let label =
+                            italic(&theme().colors.thinking_text.fg(&opts.hidden_thinking_label));
+                        self.content_container
+                            .add_child(Arc::new(ThinkingRegionComponent::new(
+                                Arc::new(Text::new(label, opts.output_pad, 0)),
+                                self.message_id.lock().unwrap().clone(),
+                            )));
                     } else {
                         // Render the joined thinking as one dim italic markdown
                         // section — the TS `color: thinkingText, italic: true`
@@ -280,7 +352,16 @@ impl AssistantMessageComponent {
                             Markdown::new(transformed, opts.output_pad, 0)
                                 .with_base_style(base_style),
                         );
-                        self.content_container.add_child(md);
+                        // The marker is injected into the RENDERED rows, not
+                        // into the markdown source: a prefix on line 1 would
+                        // turn `# heading` / `- item` / ``` fences into a
+                        // plain paragraph (pulldown-cmark sees the APC bytes
+                        // as inline text).
+                        self.content_container
+                            .add_child(Arc::new(ThinkingRegionComponent::new(
+                                md,
+                                self.message_id.lock().unwrap().clone(),
+                            )));
                     }
 
                     // Spacer before a following visible block (TS
@@ -331,6 +412,60 @@ impl AssistantMessageComponent {
             self.last_blocks.lock().unwrap().clone()
         };
         self.rebuild_content(&blocks);
+    }
+
+    /// Assign this message's opaque id. Once set, thinking rows carry the
+    /// zero-width click-region marker the renderer resolves to hit rectangles.
+    pub fn set_message_id(&self, id: &str) {
+        let changed = {
+            let mut current = self.message_id.lock().unwrap();
+            let changed = current.as_deref() != Some(id);
+            if changed {
+                *current = Some(id.to_string());
+            }
+            changed
+        };
+        if changed {
+            self.rebuild_if_any();
+        }
+    }
+
+    /// This message's id, if the host assigned one.
+    pub fn message_id(&self) -> Option<String> {
+        self.message_id.lock().unwrap().clone()
+    }
+
+    /// Expand this message's thinking regardless of the global hide option
+    /// (`Some(true)`), collapse it back to the global preference (`None`), or
+    /// force-collapse it (`Some(false)`). Rebuilds the content immediately.
+    pub fn set_expand_thinking(&self, expand: Option<bool>) {
+        if *self.expand_thinking.lock().unwrap() == expand {
+            return;
+        }
+        *self.expand_thinking.lock().unwrap() = expand;
+        self.rebuild_if_any();
+    }
+
+    /// The per-message expansion override.
+    pub fn expand_thinking(&self) -> Option<bool> {
+        *self.expand_thinking.lock().unwrap()
+    }
+
+    /// Whether this message renders full thinking bodies right now: the
+    /// global option shows them, or the per-message override expands them.
+    fn thinking_expanded(&self) -> bool {
+        match *self.expand_thinking.lock().unwrap() {
+            Some(expanded) => expanded,
+            None => !self.options.lock().unwrap().hide_thinking,
+        }
+    }
+
+    /// Rebuild from the last blocks when there is anything to rebuild.
+    fn rebuild_if_any(&self) {
+        let blocks = self.last_blocks.lock().unwrap().clone();
+        if !blocks.is_empty() {
+            self.rebuild_content(&blocks);
+        }
     }
 
     pub fn set_show_images(&self, show: bool) {
@@ -648,5 +783,152 @@ mod tests {
         msg.update_blocks(&[AssistantBlock::Text("plain text".to_string())]);
         assert!(msg.markdown_transformer().is_none());
         assert!(strip_ansi(&msg.render(80).join("\n")).contains("plain text"));
+    }
+
+    // ---- Click-to-expand thinking probes ----
+
+    const TEST_ID: &str = "t42";
+
+    fn hidden_message() -> AssistantMessageComponent {
+        let msg = AssistantMessageComponent::new(AssistantMessageOptions {
+            hide_thinking: true,
+            ..Default::default()
+        });
+        msg.set_message_id(TEST_ID);
+        msg.update_blocks(&[
+            AssistantBlock::Thinking("secret reasoning".to_string()),
+            AssistantBlock::Text("Public answer.".to_string()),
+        ]);
+        msg
+    }
+
+    #[test]
+    fn per_message_expand_overrides_global_hide() {
+        // Axis: per-message state vs global preference. A collapsed message
+        // (global hide on) must show its body after the expand override, and
+        // clearing the override must collapse back to the global preference.
+        let msg = hidden_message();
+        let collapsed = strip_ansi(&msg.render(80).join("\n"));
+        assert!(collapsed.contains("Thinking..."));
+        assert!(!collapsed.contains("secret reasoning"));
+
+        msg.set_expand_thinking(Some(true));
+        let expanded = strip_ansi(&msg.render(80).join("\n"));
+        assert!(
+            expanded.contains("secret reasoning"),
+            "override did not expand: {expanded}"
+        );
+        assert!(expanded.contains("Public answer."));
+
+        msg.set_expand_thinking(None);
+        let back = strip_ansi(&msg.render(80).join("\n"));
+        assert!(
+            !back.contains("secret reasoning"),
+            "None must collapse back to the global preference"
+        );
+    }
+
+    #[test]
+    fn thinking_rows_carry_click_region_marker() {
+        // Axis: marker geometry. The marker must exist on the collapsed label
+        // row AND on the expanded body rows, must be zero-width, and must
+        // advertise a width covering the whole rendered line.
+        let msg = hidden_message();
+        let collapsed = msg.render(80);
+        let label_line = collapsed
+            .iter()
+            .find(|l| strip_ansi(l).contains("Thinking..."))
+            .expect("collapsed label row");
+        assert!(label_line.contains(crate::thinking_region::THINKING_REGION_MARKER_PREFIX));
+        assert_eq!(
+            crate::ansi::visible_width(label_line),
+            crate::ansi::visible_width(&strip_ansi(label_line)),
+            "marker is not zero-width"
+        );
+        let prefix = crate::thinking_region::THINKING_REGION_MARKER_PREFIX;
+        let marker_start = label_line.rfind(prefix).expect("marker on the label row");
+        let (_, advertised, _) =
+            crate::thinking_region::parse_marker_public(label_line, marker_start)
+                .expect("wellformed marker on the label row");
+        let label_width = crate::ansi::visible_width(&strip_ansi(label_line));
+        assert!(
+            advertised >= label_width,
+            "marker width {advertised} < label width {label_width}"
+        );
+
+        // Expanded body rows carry the marker too.
+        msg.set_expand_thinking(Some(true));
+        let expanded = msg.render(80);
+        let body_row = expanded
+            .iter()
+            .find(|l| strip_ansi(l).contains("secret reasoning"))
+            .expect("expanded body row");
+        assert!(body_row.contains(prefix));
+    }
+
+    #[test]
+    fn global_toggle_rebuilds_but_keeps_per_message_override() {
+        // Axis: interaction between the global Ctrl+T toggle and the override.
+        // A globally-hidden message expanded by click stays expanded when the
+        // host re-applies the global hide (the rebuild must not clear it).
+        let msg = hidden_message();
+        msg.set_expand_thinking(Some(true));
+        msg.set_hide_thinking(true);
+        let rendered = strip_ansi(&msg.render(80).join("\n"));
+        assert!(
+            rendered.contains("secret reasoning"),
+            "global toggle wiped the per-message expansion: {rendered}"
+        );
+    }
+
+    #[test]
+    fn show_thinking_global_mode_collapses_on_click_too() {
+        // Axis: the other side of the state space. With the global preference
+        // SHOWING thinking, a click must collapse THIS message (Some(false)),
+        // and clearing the override restores the global show.
+        let msg = AssistantMessageComponent::default();
+        msg.set_message_id("t42");
+        msg.update_blocks(&[AssistantBlock::Thinking("loud thinking".to_string())]);
+        assert!(strip_ansi(&msg.render(80).join("\n")).contains("loud thinking"));
+        msg.set_expand_thinking(Some(false));
+        assert!(
+            !strip_ansi(&msg.render(80).join("\n")).contains("loud thinking"),
+            "force-collapse did not hide the body"
+        );
+        msg.set_expand_thinking(None);
+        assert!(strip_ansi(&msg.render(80).join("\n")).contains("loud thinking"));
+    }
+
+    #[test]
+    fn message_without_id_renders_no_marker() {
+        // Extension-reused components (markdown custom messages) never get an
+        // id: their rows must stay marker-free so they can never resolve to a
+        // click region.
+        let msg = AssistantMessageComponent::new(AssistantMessageOptions {
+            hide_thinking: true,
+            ..Default::default()
+        });
+        msg.update_blocks(&[AssistantBlock::Thinking("quiet".to_string())]);
+        let rendered = msg.render(80).join("\n");
+        assert!(!rendered.contains(crate::thinking_region::THINKING_REGION_MARKER_PREFIX));
+    }
+
+    #[test]
+    fn region_marker_does_not_break_thinking_markdown_blocks() {
+        // Regression: prefixing the marker to the markdown SOURCE made a
+        // leading `#` an ordinary paragraph. The marker must live in the
+        // rendered rows only; the heading still renders as a heading.
+        let msg = AssistantMessageComponent::default();
+        msg.set_message_id(TEST_ID);
+        msg.update_blocks(&[AssistantBlock::Thinking("# Heading\n\n- item".to_string())]);
+        let rendered = msg.render(80).join("\n");
+        let stripped = strip_ansi(&rendered);
+        assert!(stripped.contains("Heading"), "heading lost: {stripped}");
+        assert!(stripped.contains("item"), "list item lost: {stripped}");
+        assert!(
+            !stripped.contains("# Heading"),
+            "heading was not parsed: {stripped}"
+        );
+        assert!(rendered.contains(crate::thinking_region::THINKING_REGION_MARKER_PREFIX));
     }
 }

@@ -15,6 +15,7 @@
 //! types into the client.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -95,6 +96,8 @@ pub struct TranscriptView {
     bash_components: Arc<Mutex<HashMap<String, Arc<BashExecutionComponent>>>>,
     /// When true, thinking blocks collapse to a label (toggled by the host).
     hide_thinking: Arc<Mutex<bool>>,
+    /// Monotonic counter backing the per-message ids click regions key on.
+    message_seq: AtomicU64,
     /// Global tool-output expansion preference (toggled by the host).
     expanded: Arc<Mutex<bool>>,
     /// Optional transformer applied to raw assistant markdown before rendering
@@ -144,6 +147,7 @@ impl TranscriptView {
             hide_thinking,
             expanded,
             markdown_transformer,
+            message_seq: AtomicU64::new(1),
         }
     }
 
@@ -264,6 +268,96 @@ impl TranscriptView {
         }
     }
 
+    /// Assign an opaque id to an assistant component so its thinking rows
+    /// carry click-region markers. Every assistant message gets one — the
+    /// marker is zero-width and costs nothing when the host never clicks.
+    fn assign_message_id(comp: &AssistantMessageComponent, seq: u64) -> String {
+        let id = format!("t{seq}");
+        comp.set_message_id(&id);
+        id
+    }
+
+    /// Flip one assistant message's thinking between the collapsed label and
+    /// the full body. `None` when `id` is stale (the message scrolled out of
+    /// the live container and its component is gone) — the click is then
+    /// left for the selection tracker.
+    pub fn toggle_message_thinking(&self, id: &str) -> bool {
+        // Toggle semantics: an override-free message expands (against the
+        // global hide); an expanded override collapses back to the global
+        // preference. A forced-collapsed override also expands.
+        // Toggle against what is ACTUALLY visible: with the global preference
+        // showing thinking, a click on an expanded body must collapse it
+        // (Some(false)), not "expand" a message that is already expanded.
+        // `None` is a special case: it means "follow the global preference",
+        // so the target is the inverse of the global hide flag.
+        let global_show = !*self.hide_thinking.lock().unwrap();
+        let toggle = |comp: &AssistantMessageComponent| {
+            let visible = comp.expand_thinking().unwrap_or(global_show);
+            let target = !visible;
+            // When the target equals the global preference, drop the override
+            // entirely so a later global toggle takes effect on this message.
+            let next = (target != global_show).then_some(target);
+            comp.set_expand_thinking(next);
+        };
+        if self.for_each_assistant(|comp| {
+            if comp.message_id().as_deref() == Some(id) {
+                toggle(comp);
+                true
+            } else {
+                false
+            }
+        }) {
+            return true;
+        }
+        // The in-flight message is mounted by `start_assistant` before any
+        // event drains, so this arm only fires for the not-yet-mounted edge
+        // case (a click racing the first frame).
+        let current = self.current_assistant.lock().unwrap().clone();
+        if let Some(comp) = current.filter(|comp| comp.message_id().as_deref() == Some(id)) {
+            toggle(&comp);
+            return true;
+        }
+        false
+    }
+
+    /// Visit every assistant component in the visible transcript, including
+    /// those nested inside history page containers. Stops on the first match.
+    fn for_each_assistant(
+        &self,
+        mut visit: impl FnMut(&AssistantMessageComponent) -> bool,
+    ) -> bool {
+        fn walk(
+            children: Vec<Arc<dyn rpi_tui::Component>>,
+            visit: &mut impl FnMut(&AssistantMessageComponent) -> bool,
+        ) -> bool {
+            for child in children {
+                if let Some(comp) = child.as_any().downcast_ref::<AssistantMessageComponent>() {
+                    if visit(comp) {
+                        return true;
+                    }
+                }
+                if let Some(container) = child.as_any().downcast_ref::<rpi_tui::Container>() {
+                    if walk(container.get_children(), visit) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        walk(self.chat.get_children(), &mut visit)
+    }
+
+    /// The id every NEW assistant message gets, so the host can route a
+    /// click-region hit before knowing which component backs it.
+    pub fn next_message_id(&self) -> String {
+        format!("t{}", self.message_seq.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Allocate the next sequence number (used with `assign_message_id`).
+    fn next_message_id_seq(&self) -> u64 {
+        self.message_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Flip the thinking-visibility preference; returns the new value.
     pub fn toggle_hide_thinking(&self) -> bool {
         let next = !*self.hide_thinking.lock().unwrap();
@@ -318,6 +412,7 @@ impl TranscriptView {
         let comp = Arc::new(AssistantMessageComponent::new(
             AssistantMessageOptions::default(),
         ));
+        Self::assign_message_id(&comp, self.next_message_id_seq());
         comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
         comp.set_show_images(self.show_images);
         comp.set_trailing_spacing(1);
@@ -338,6 +433,7 @@ impl TranscriptView {
             let comp = Arc::new(AssistantMessageComponent::new(
                 AssistantMessageOptions::default(),
             ));
+            Self::assign_message_id(&comp, self.next_message_id_seq());
             comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
             comp.set_show_images(self.show_images);
             comp.set_trailing_spacing(1);
@@ -1585,5 +1681,159 @@ mod tests {
             80,
         );
         assert_eq!(view.chat.child_count(), 2);
+    }
+
+    // ---- Click-to-expand thinking probes (per-message) ----
+
+    #[test]
+    fn transcript_assigns_ids_and_toggles_per_message() {
+        // Axis: host-side routing. Every streamed assistant message gets an
+        // id; toggling by id flips only THAT message; the toggle round-trips.
+        let view = view();
+        view.set_hide_thinking(true);
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![
+                    AssistantBlock::Thinking("first msg reasoning".into()),
+                    AssistantBlock::Text("answer one".into()),
+                ],
+            },
+            80,
+        );
+        let first = view
+            .current_assistant
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("assistant mounted");
+        let first_id = first.message_id().expect("id assigned");
+        view.apply(&UiEvent::AgentEnd, 80);
+
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Thinking("second msg reasoning".into())],
+            },
+            80,
+        );
+        let second = view
+            .current_assistant
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("assistant mounted");
+        let second_id = second.message_id().expect("id assigned");
+        assert_ne!(first_id, second_id, "ids must be unique per message");
+
+        // Toggle the SECOND message only.
+        assert!(view.toggle_message_thinking(&second_id));
+        let expanded = strip_ansi(&second.render(80).join("\n"));
+        assert!(expanded.contains("second msg reasoning"));
+        let first_render = strip_ansi(&first.render(80).join("\n"));
+        assert!(
+            !first_render.contains("first msg reasoning"),
+            "toggle leaked into another message: {first_render}"
+        );
+
+        // Toggle again collapses back.
+        assert!(view.toggle_message_thinking(&second_id));
+        assert!(!strip_ansi(&second.render(80).join("\n")).contains("second msg reasoning"));
+    }
+
+    #[test]
+    fn toggle_with_stale_id_is_a_noop() {
+        let view = view();
+        assert!(!view.toggle_message_thinking("t999"));
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Thinking("reasoning".into())],
+            },
+            80,
+        );
+        // An unknown id must not disturb the live message.
+        assert!(!view.toggle_message_thinking("h12345"));
+        let comp = view.current_assistant.lock().unwrap().clone().unwrap();
+        assert!(!strip_ansi(&comp.render(80).join("\n")).contains("Thinking..."));
+    }
+
+    #[test]
+    fn global_toggle_keeps_message_level_expansion() {
+        // Axis: Ctrl+T (global) vs click (per message). A click-expanded
+        // message stays expanded across a later global toggle, and a globally
+        // visible transcript still collapses per message.
+        let view = view();
+        view.set_hide_thinking(true);
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Thinking("sticky reasoning".into())],
+            },
+            80,
+        );
+        let comp = view.current_assistant.lock().unwrap().clone().unwrap();
+        let id = comp.message_id().unwrap();
+        assert!(view.toggle_message_thinking(&id));
+        assert!(strip_ansi(&comp.render(80).join("\n")).contains("sticky reasoning"));
+
+        // Global toggle OFF→ON rebuild: override survives.
+        view.set_hide_thinking(false);
+        view.set_hide_thinking(true);
+        assert!(
+            strip_ansi(&comp.render(80).join("\n")).contains("sticky reasoning"),
+            "global toggle wiped the per-message expansion"
+        );
+
+        // The globally-visible case: collapse via toggle, then a global show
+        // must restore it.
+        assert!(view.toggle_message_thinking(&id));
+        view.set_hide_thinking(false);
+        assert!(strip_ansi(&comp.render(80).join("\n")).contains("sticky reasoning"));
+    }
+
+    #[test]
+    fn click_reaches_assistant_components_nested_in_history_pages() {
+        // Self-review probe: a history PAGE is a nested container under the
+        // chat root, not a direct child of the live slot. A click on one of
+        // its thinking rows must still resolve to the owning component.
+        let chat = Arc::new(rpi_tui::Container::new());
+        let page = Arc::new(rpi_tui::Container::new());
+        let comp = Arc::new(AssistantMessageComponent::new(AssistantMessageOptions {
+            hide_thinking: true,
+            ..Default::default()
+        }));
+        comp.set_message_id("h7");
+        comp.update_blocks(&[
+            AssistantBlock::Thinking("old reasoning".into()),
+            AssistantBlock::Text("old answer".into()),
+        ]);
+        page.add_child(comp.clone());
+        chat.add_child(page);
+        let view = TranscriptView::new(chat);
+        view.set_hide_thinking(true);
+        assert!(
+            view.toggle_message_thinking("h7"),
+            "click on a nested history page found no component"
+        );
+        assert!(strip_ansi(&comp.render(80).join("\n")).contains("old reasoning"));
+    }
+
+    #[test]
+    fn click_on_globally_visible_thinking_collapses_then_restores() {
+        // Self-review probe: with Ctrl+T OFF the body is already visible; the
+        // first click must COLLAPSE that message (not silently "expand" it),
+        // and the second click must restore it.
+        let view = view();
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Thinking("shown reasoning".into())],
+            },
+            80,
+        );
+        let comp = view.current_assistant.lock().unwrap().clone().unwrap();
+        let id = comp.message_id().unwrap();
+        let visible = || strip_ansi(&comp.render(80).join("\n")).contains("shown reasoning");
+        assert!(visible());
+        assert!(view.toggle_message_thinking(&id));
+        assert!(!visible(), "first click must collapse a visible body");
+        assert!(view.toggle_message_thinking(&id));
+        assert!(visible(), "second click must restore the global show");
     }
 }

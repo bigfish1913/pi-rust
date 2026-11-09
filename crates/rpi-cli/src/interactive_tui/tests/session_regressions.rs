@@ -1638,6 +1638,7 @@ async fn a_sessions_name_reaches_footer_line_one() {
         Some(state.extension_session.clone()),
         state.images_visible(),
         Some(&state.footer),
+        state.hide_thinking(),
     )
     .await;
 
@@ -1657,6 +1658,7 @@ async fn a_sessions_name_reaches_footer_line_one() {
         Some(state.extension_session.clone()),
         state.images_visible(),
         Some(&state.footer),
+        state.hide_thinking(),
     )
     .await;
     let cleared = footer_text(&state);
@@ -1990,4 +1992,32 @@ async fn review269_empty_project_keeps_the_session_selector_open() {
         all_view.contains("foreign project prompt"),
         "Tab must populate the All rows: {all_view}"
     );
+}
+
+#[test]
+fn global_hide_thinking_toggle_reaches_restored_assistant_components() {
+    // Axis: the global Ctrl+T toggle must cover the WHOLE transcript, not
+    // just the in-flight streaming message. Restored/history assistant
+    // components are ordinary children of the chat container.
+    use rpi_tui::{strip_ansi, AssistantBlock, AssistantMessageComponent, Component};
+    let state = test_tui_state();
+    let comp = Arc::new(AssistantMessageComponent::default());
+    comp.set_message_id("h1");
+    comp.update_blocks(&[
+        AssistantBlock::Thinking("restored reasoning".into()),
+        AssistantBlock::Text("answer".into()),
+    ]);
+    state
+        .chat_container
+        .add_child(comp.clone() as Arc<dyn rpi_tui::Component>);
+
+    let visible = || strip_ansi(&comp.render(80).join("\n"));
+    assert!(visible().contains("restored reasoning"));
+    state.set_hide_thinking(true);
+    assert!(
+        !visible().contains("restored reasoning"),
+        "global hide did not reach a restored message"
+    );
+    state.set_hide_thinking(false);
+    assert!(visible().contains("restored reasoning"));
 }

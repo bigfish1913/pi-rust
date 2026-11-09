@@ -58,6 +58,7 @@ pub mod terminal_image;
 pub mod text;
 pub mod theme;
 pub mod theme_json;
+pub mod thinking_region;
 pub mod tool_execution;
 mod tool_panel;
 pub mod truncated_text;
@@ -149,6 +150,10 @@ pub use text::Text;
 pub use theme::{
     apply_theme_preset, global_theme_manager, theme, theme_revision, Color, Theme, ThemeColors,
     ThemeManager, ThemePreset, ThemeSpacing,
+};
+pub use thinking_region::{
+    collect_regions as collect_thinking_regions, hit as hit_thinking_region,
+    strip_markers as strip_thinking_region_markers, ThinkingRegion,
 };
 pub use tool_execution::{ToolExecutionComponent, ToolStatus};
 pub use truncated_text::TruncatedText;
