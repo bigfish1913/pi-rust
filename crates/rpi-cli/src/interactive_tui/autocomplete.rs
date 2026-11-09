@@ -12,6 +12,7 @@ use rpi_tui::truncate_to_width;
 /// Install one command-discovery snapshot at startup and after successful
 /// resource reloads. Skills expand in the harness's normal input path, not in
 /// slash dispatch, so images and queued messages keep their ordinary behavior.
+#[allow(dead_code)]
 pub(super) fn configure_resource_autocomplete(
     autocomplete: &AutocompleteManager,
     mut commands: Vec<SlashCommandEntry>,
@@ -48,6 +49,7 @@ pub(super) fn configure_resource_autocomplete(
     autocomplete.set_provider(Arc::new(combined));
 }
 
+#[allow(dead_code)]
 pub(super) fn skill_commands_enabled(
     global: &crate::settings::Settings,
     project: &[crate::settings::Settings],
