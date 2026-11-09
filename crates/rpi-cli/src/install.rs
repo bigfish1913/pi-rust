@@ -1424,6 +1424,46 @@ fn adjacent_transaction_path(target: &Path, kind: &str) -> Result<PathBuf, Strin
     ))
 }
 
+/// macOS only: give a freshly copied native artifact an ad-hoc signature.
+///
+/// Why this is mandatory and not cosmetic (2026-11-07, 35 SIGKILLs in one
+/// afternoon): cargo linker-signs a cdylib and that signature records the
+/// file's mtime (`cs_mtime`). Any copy — `io::copy`, `fs::copy`, `rename` of a
+/// rewritten file — gives the copy a **new** mtime, and when the kernel maps a
+/// code page it compares `cs_mtime` against it. On mismatch it refuses the page
+/// and **kills the whole host process**:
+///
+/// ```text
+/// CODE SIGNING: process 20087[rpi]: rejecting invalid page at address 0x…
+///   in file "~/.pidd/rpi-agent/extensions/librpi_superagent.dylib"
+///   (cs_mtime:1794052202.55 != mtime:1794056571.77)
+/// ```
+///
+/// Nothing is printed and no exit code reaches the terminal except 137, so the
+/// symptom reads as "rpi will not start any session any more". `codesign -v`
+/// still reports the copy as valid on disk, so verification is useless here —
+/// only re-signing realigns `cs_mtime` with the file mtime.
+pub(crate) fn resign_staged_native(path: &Path) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let out = std::process::Command::new("/usr/bin/codesign")
+        // Pin the identifier: `--sign -` otherwise derives it from the file NAME,
+        // so the same bytes staged under different names sign to different bytes.
+        .args(["--force", "--sign", "-", "--identifier", "com.rpi.native"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("could not run codesign on {}: {error}", path.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "re-signing {} failed (the kernel will refuse to load it): {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 fn stage_native_artifact(source: &Path, target: &Path) -> Result<StagedNativeFile, String> {
     let stage = adjacent_transaction_path(target, "stage")?;
     let result = (|| {
@@ -1464,7 +1504,8 @@ fn stage_native_artifact(source: &Path, target: &Path) -> Result<StagedNativeFil
                 "could not preserve permissions on staged artifact {}: {error}",
                 stage.display()
             )
-        })
+        })?;
+        resign_staged_native(&stage)
     })();
     if let Err(error) = result {
         let _ = std::fs::remove_file(&stage);
@@ -1927,6 +1968,34 @@ pub(crate) fn is_dynamic_library(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A staged native artifact must not keep the build-time signature.
+    ///
+    /// The copy's mtime no longer matches the `cs_mtime` inside the linker
+    /// signature, and the kernel answers that mismatch by SIGKILLing the host
+    /// that maps the page (2026-11-07: 35 silent deaths of `rpi`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_native_artifact_is_resigned_before_activation() {
+        let dir = std::env::temp_dir().join(format!("rpi-resign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stage = dir.join("libstaged.dylib");
+        // Any real Mach-O: the copy gets a fresh mtime and a stale signature.
+        std::fs::copy("/bin/cp", &stage).unwrap();
+        resign_staged_native(&stage).unwrap();
+        let out = std::process::Command::new("/usr/bin/codesign")
+            .args(["-d", "--verbose=4"])
+            .arg(&stage)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !text.contains("linker-signed"),
+            "the staged artifact stayed linker-signed: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()

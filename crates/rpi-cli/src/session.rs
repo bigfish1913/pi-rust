@@ -63,6 +63,7 @@ use crate::resource_dirs::{
     load_prompt_templates_with_precedence, load_skills_with_precedence, project_extension_dirs,
     project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
 };
+use crate::startup_diagnostics::{Phase, StartupSpan};
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
     PluginDiagnostics, PluginToolAdapter, TeeEmitter, ToolPromptMetadata,
@@ -3092,8 +3093,39 @@ impl std::fmt::Display for OpenError {
     }
 }
 
+/// Which sessions a picker lists. The default is [`Self::Project`]: with a
+/// shared `sessionDir`, a flat list over every cwd directory buries the current
+/// project's history (fork issue DavidHinton-xcpc/pi-rust#13). `All` is an
+/// explicit opt-in and rows carry their project so the list stays traceable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionScope {
+    #[default]
+    Project,
+    All,
+}
+
+impl SessionScope {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Project => Self::All,
+            Self::All => Self::Project,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Project => "this project",
+            Self::All => "all projects",
+        }
+    }
+}
+
 /// List the JSONL session metadata under the default session dir, newest
 /// first. Shared by startup restore and the TUI `/session` hot-switch.
+///
+/// `list_session_metadata` intentionally stays unscoped: it resolves sessions
+/// to *open* (including `--continue`/`-c`), where filtering by cwd would make
+/// a session that the caller named by id unopenable. Only pickers apply a scope.
 pub async fn list_session_metadata(
     cwd: &str,
 ) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
@@ -3104,6 +3136,17 @@ pub async fn list_session_metadata(
 pub(crate) async fn list_session_metadata_in_dir(
     cwd: &str,
     dir: &Path,
+) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
+    list_session_metadata_in_scope_in_dir(cwd, dir, SessionScope::All).await
+}
+
+/// Scope-aware metadata listing for pickers. `Project` passes the cwd to the
+/// repo's typed list API, so the enumeration and the open path agree on which
+/// directory belongs to this project.
+pub(crate) async fn list_session_metadata_in_scope_in_dir(
+    cwd: &str,
+    dir: &Path,
+    scope: SessionScope,
 ) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionListOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
@@ -3118,9 +3161,21 @@ pub(crate) async fn list_session_metadata_in_dir(
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
-    repo.list_typed(&JsonlSessionListOptions::default())
+    let options = JsonlSessionListOptions {
+        cwd: match scope {
+            SessionScope::Project => Some(cwd.to_string()),
+            SessionScope::All => None,
+        },
+    };
+    let metadata_lookup = StartupSpan::start(Phase::MetadataLookup);
+    let result = repo
+        .list_typed(&options)
         .await
-        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))
+        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")));
+    if result.is_ok() {
+        metadata_lookup.finish();
+    }
+    result
 }
 
 /// A cheap, display-oriented summary of one JSONL session file.
@@ -3324,8 +3379,19 @@ pub fn short_session_id(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
+/// One listed session file. `project` is the cwd-encoded directory name when
+/// the row comes from a project subdirectory; `None` for legacy files that sit
+/// directly under the sessions root. The All view renders it so a flat list is
+/// still attributable to a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFileEntry {
+    pub path: PathBuf,
+    pub project: Option<String>,
+}
+
 /// Synchronously list every JSONL session file under `dir`, newest-first by
-/// modification time.
+/// modification time. Kept for callers that explicitly want the full set (e.g.
+/// resolving a session by id); pickers use [`list_session_files_in_scope_sync`].
 ///
 /// The repo's [`list_session_metadata`] is async and scans one cwd-encoded
 /// subdirectory level; the in-TUI `/session` selector runs on the blocking key
@@ -3333,8 +3399,69 @@ pub fn short_session_id(id: &str) -> &str {
 /// `.jsonl` files directly under `dir` and one level of subdirectories are
 /// accepted.
 pub fn list_session_files_sync(dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-    let mut visit = |path: PathBuf| {
+    list_entries_sync(dir, None)
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect()
+}
+
+/// Scope-aware synchronous listing for the `/session` selector.
+///
+/// `Project` resolves the current project's directory with the *same* encoding
+/// the repo uses for create/open (`jsonl_session_directory_name`), rather than
+/// re-deriving it: the old flat walk and the open path disagreed about which
+/// files belong to this project (fork issue #13). `All` keeps the old layout but
+/// tags each row with its project directory.
+pub fn list_session_files_in_scope_sync(
+    cwd: &Path,
+    dir: &Path,
+    scope: SessionScope,
+) -> Vec<SessionFileEntry> {
+    let project_dir = match scope {
+        SessionScope::Project => {
+            let resolved = normalize_cwd(cwd);
+            Some(rpi_harness::session::jsonl::jsonl_session_directory_name(
+                &resolved.to_string_lossy(),
+            ))
+        }
+        SessionScope::All => None,
+    };
+    match project_dir {
+        Some(name) => list_entries_sync(&dir.join(&name), None),
+        None => list_entries_sync(dir, Some(true)),
+    }
+}
+
+/// Mirror the repo's `absolute_path` normalization for a cwd path: the picker
+/// runs on the blocking key thread and cannot await the `FileSystem` trait, so
+/// this is the synchronous equivalent of `OsExecutionEnv::absolute_path`.
+fn normalize_cwd(cwd: &Path) -> PathBuf {
+    let absolute = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(cwd)
+    };
+    // Lexical normalization only (`.` / `..` components), no symlink or FS
+    // access — the repo's normalize_absolute is likewise purely lexical.
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn list_entries_sync(dir: &Path, tag_projects: Option<bool>) -> Vec<SessionFileEntry> {
+    let tag_projects = tag_projects.unwrap_or(false);
+    let mut files: Vec<(SessionFileEntry, std::time::SystemTime)> = Vec::new();
+    let mut visit = |path: PathBuf, project: Option<String>| {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl")
             || path.to_string_lossy().ends_with(".progress.jsonl")
         {
@@ -3343,24 +3470,31 @@ pub fn list_session_files_sync(dir: &Path) -> Vec<PathBuf> {
         let modified = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
-        files.push((path, modified));
+        files.push((SessionFileEntry { path, project }, modified));
     };
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                let project = if tag_projects {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                } else {
+                    None
+                };
                 if let Ok(inner) = std::fs::read_dir(&path) {
                     for child in inner.flatten() {
-                        visit(child.path());
+                        visit(child.path(), project.clone());
                     }
                 }
             } else {
-                visit(path);
+                visit(path, None);
             }
         }
     }
     files.sort_by(|a, b| b.1.cmp(&a.1));
-    files.into_iter().map(|(path, _)| path).collect()
+    files.into_iter().map(|(entry, _)| entry).collect()
 }
 
 /// Pick the session `--continue`/`-c` should open: the newest session that has
@@ -4389,6 +4523,123 @@ mod tests {
         assert!(found.iter().any(|p| p == &file));
         assert!(!found.contains(&sidecar));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Regression for fork issue #13: with a shared session root, the default
+    /// picker scope must show only this project's sessions, and All must show
+    /// every project with its directory tag so a flat list stays traceable.
+    #[test]
+    fn review_issue13_default_scope_is_this_project_and_all_is_tagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("project");
+        let own = root.join(rpi_harness::session::jsonl::jsonl_session_directory_name(
+            &cwd.to_string_lossy(),
+        ));
+        let foreign = root.join("--some-other-project--");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        let own_file = own.join("2026-01-01_own.jsonl");
+        let foreign_file = foreign.join("2026-01-02_foreign.jsonl");
+        std::fs::write(&own_file, "{}\n").unwrap();
+        std::fs::write(&foreign_file, "{}\n").unwrap();
+        // A legacy file directly under the root is not a project subdirectory.
+        let legacy = root.join("2026-01-03_legacy.jsonl");
+        std::fs::write(&legacy, "{}\n").unwrap();
+
+        let project = list_session_files_in_scope_sync(&cwd, &root, SessionScope::Project);
+        assert_eq!(project.len(), 1, "default scope must not flatten projects");
+        assert_eq!(project[0].path, own_file);
+        assert_eq!(project[0].project, None);
+
+        let all = list_session_files_in_scope_sync(&cwd, &root, SessionScope::All);
+        assert_eq!(all.len(), 3);
+        let own_project = own.file_name().unwrap().to_str().unwrap();
+        assert!(all
+            .iter()
+            .any(|e| e.path == own_file && e.project.as_deref() == Some(own_project)));
+        assert!(all
+            .iter()
+            .any(|e| e.path == foreign_file
+                && e.project.as_deref() == Some("--some-other-project--")));
+        assert!(all.iter().any(|e| e.path == legacy && e.project.is_none()));
+
+        assert_eq!(SessionScope::Project.toggled(), SessionScope::All);
+        assert_eq!(SessionScope::All.toggled(), SessionScope::Project);
+        assert_eq!(SessionScope::default(), SessionScope::Project);
+    }
+
+    /// The project directory name must be the repo's own encoding, not a
+    /// re-derivation that drifts from create/open. A relative cwd resolves
+    /// against the process cwd the same way `OsExecutionEnv::absolute_path` does.
+    #[test]
+    fn review_issue13_project_scope_uses_the_repo_directory_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("project");
+        let name =
+            rpi_harness::session::jsonl::jsonl_session_directory_name(&cwd.to_string_lossy());
+        std::fs::create_dir_all(root.join(&name)).unwrap();
+        let file = root.join(&name).join("a.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        // A look-alike directory that a naive "last path component" derivation
+        // would pick instead. The repo encodes the *full* cwd, so this must not
+        // be listed by the Project scope.
+        let lookalike = root.join("--project--");
+        std::fs::create_dir_all(&lookalike).unwrap();
+        let other_file = lookalike.join("b.jsonl");
+        std::fs::write(&other_file, "{}\n").unwrap();
+        let found = list_session_files_in_scope_sync(&cwd, &root, SessionScope::Project);
+        assert_eq!(
+            found,
+            vec![SessionFileEntry {
+                path: file,
+                project: None
+            }]
+        );
+    }
+
+    /// Fork issue #13, async path: the `-r` picker's default scope must use the
+    /// repo's typed list API with an explicit cwd, and the open path must stay
+    /// unscoped so a row chosen from All still resolves by id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_issue13_resume_scope_and_open_path_agree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let foreign_cwd = tmp.path().join("other");
+        std::fs::create_dir_all(&foreign_cwd).unwrap();
+        let cwd_text = cwd.to_string_lossy().into_owned();
+        let own = create_jsonl_session(&root, &cwd_text).await.unwrap();
+        let own_id = own.storage().metadata().id.clone();
+        drop(own);
+        let foreign = create_jsonl_session(&root, &foreign_cwd.to_string_lossy())
+            .await
+            .unwrap();
+        let foreign_id = foreign.storage().metadata().id.clone();
+        drop(foreign);
+
+        let project =
+            list_session_metadata_in_scope_in_dir(&cwd_text, &root, SessionScope::Project)
+                .await
+                .unwrap();
+        assert_eq!(project.len(), 1, "-r default must not flatten projects");
+        assert_eq!(project[0].id, own_id);
+        let all = list_session_metadata_in_scope_in_dir(&cwd_text, &root, SessionScope::All)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|m| m.cwd == foreign_cwd.to_string_lossy()));
+        // `list_session_metadata_in_dir` (the open path) must remain unscoped.
+        let open = list_session_metadata_in_dir(&cwd_text, &root)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 2);
+        let found = find_session_metadata(&foreign_id, &cwd_text, &root)
+            .await
+            .unwrap();
+        assert_eq!(found.unwrap().id, foreign_id);
     }
 
     /// The default CLI tool set plus the `todo` tool its bundled plugins add.
