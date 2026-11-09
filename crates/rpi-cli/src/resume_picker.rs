@@ -1,5 +1,6 @@
 //! Startup session picker used by `-r` / `--resume`.
 
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,60 +20,17 @@ pub async fn select(cwd: &Path) -> Result<Option<String>, String> {
 
 pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<String>, String> {
     let cwd_text = cwd.to_string_lossy().into_owned();
-    let metadata = crate::session::list_session_metadata_in_dir(&cwd_text, dir)
-        .await
-        .map_err(|e| e.to_string())?;
-    if metadata.is_empty() {
-        return Err(format!("no sessions found in {}", dir.display()));
-    }
-
-    // Each summary opens + reads a (bounded) slice of the session file. That is
-    // blocking file I/O over every saved session, so keep it off the async
-    // runtime the TUI will later run on.
-    let metas_for_summary = metadata.clone();
-    let summaries = tokio::task::spawn_blocking(move || {
-        metas_for_summary
-            .iter()
-            .map(|meta| crate::session::summarize_session_file(Path::new(&meta.path)))
-            .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(|e| format!("session summary task failed: {e}"))?;
-
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64;
-    let mut items: Vec<SelectItem> = Vec::new();
-    for (meta, summary) in metadata.iter().zip(summaries.iter()) {
-        // A header-only session has nothing to restore; offering it is how a
-        // resume lands on an empty transcript. Skip them so every listed row is
-        // resumable.
-        if summary.empty {
-            continue;
-        }
-        let file_name = Path::new(&meta.path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&meta.id);
-        let label = crate::session::session_display_label(summary);
-        let short_id = crate::session::short_session_id(&meta.id);
-        let description = format!(
-            "{} · {} · {}",
-            format_modified_age(now_ms, meta.modified_at),
-            crate::session::format_session_bytes(summary.bytes),
-            short_id,
-        );
-        items.push(
-            SelectItem::new(&meta.id, &label)
-                .with_description(&description)
-                .with_search_text(&format!("{label} {short_id} {file_name}")),
-        );
-    }
-    if items.is_empty() {
+    // Same default scope as the in-TUI `/session` picker: current project
+    // first, All is an explicit Tab away (fork issue #13).
+    let scope = crate::session::SessionScope::Project;
+    let items = build_items(&cwd_text, dir, scope).await?;
+    // Keep the picker open with zero rows: it advertises Tab for All, and a
+    // fresh project must be able to reach sessions from other projects.
+    // A non-TTY caller cannot drive the picker; keep the existing error-path
+    // behaviour for tests and headless invocations.
+    if items.is_empty() && !std::io::stdin().is_terminal() {
         return Err(format!(
-            "no resumable sessions with messages in {}",
+            "no resumable sessions with messages for this project in {} (Tab in the picker lists all projects)",
             dir.display()
         ));
     }
@@ -91,7 +49,7 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
     let root = Arc::new(Container::new());
     root.add_child(Arc::new(Text::new("Resume session", 1, 1)));
     root.add_child(Arc::new(Text::new(
-        "  Type to filter, Enter to resume, Esc to cancel",
+        "  Type to filter · Tab: all projects · Enter to resume · Esc to cancel",
         0,
         0,
     )));
@@ -114,8 +72,27 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
     let input_tui = tui.clone();
     let input_list = list.clone();
     let input_search = search.clone();
+    let input_scope = Arc::new(std::sync::Mutex::new(scope));
+    let input_cwd_text = cwd_text.clone();
+    let input_dir = dir.to_path_buf();
     let task = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
-        let mut query = String::new();
+        let mut state = ResumePickerState {
+            cancelled: false,
+            query: String::new(),
+            scope: input_scope,
+            list: input_list,
+            search: input_search,
+            cwd_text: input_cwd_text,
+            dir: input_dir,
+        };
+        // The key loop lives on a blocking task with no runtime of its own;
+        // `build_items` uses `spawn_blocking`, so drive it on a dedicated
+        // current-thread runtime instead of blocking a worker of the caller's
+        // multi-thread runtime.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("session picker runtime: {e}"))?;
         loop {
             match crossterm::event::poll(Duration::from_millis(100)) {
                 Ok(true) => {}
@@ -130,53 +107,16 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
             let event = crossterm::event::read()
                 .map_err(|e| format!("could not read terminal input: {e}"))?;
             match event {
-                Event::Resize(..) => {
-                    input_tui.note_resize();
-                }
-                Event::Mouse(mouse) => {
-                    let code = match mouse.kind {
-                        MouseEventKind::ScrollUp => Some(KeyCode::Up),
-                        MouseEventKind::ScrollDown => Some(KeyCode::Down),
-                        _ => None,
-                    };
-                    if let Some(code) = code {
-                        input_list.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
-                        input_tui.request_render(false);
+                Event::Resize(..) => input_tui.note_resize(),
+                other => {
+                    if let Some(selected) = runtime.block_on(state.handle_event(other))? {
+                        return Ok(Some(selected));
                     }
-                }
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
+                    if state.cancelled {
                         return Ok(None);
                     }
-                    match key.code {
-                        KeyCode::Enter => {
-                            return Ok(input_list.get_selected_item().map(|item| item.value));
-                        }
-                        KeyCode::Esc if query.is_empty() => return Ok(None),
-                        KeyCode::Esc => {
-                            query.clear();
-                            input_list.set_filter("");
-                        }
-                        KeyCode::Backspace => {
-                            query.pop();
-                            input_list.set_filter(&query);
-                        }
-                        KeyCode::Char(ch)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            query.push(ch);
-                            input_list.set_filter(&query);
-                        }
-                        _ => input_list.handle_key(key),
-                    }
-                    input_search.set_text(format!("  Filter: {query}"));
                     input_tui.request_render(false);
                 }
-                _ => {}
             }
         }
     });
@@ -186,6 +126,153 @@ pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<Strin
         .map_err(|e| format!("session picker task failed: {e}"));
     tui.stop(Default::default());
     result?
+}
+
+/// Testable core of the startup picker's key loop (review #269). Keeping the
+/// scope switch here lets a regression drive a bare Tab with real session
+/// fixtures instead of depending on a terminal's global event queue.
+struct ResumePickerState {
+    query: String,
+    scope: Arc<std::sync::Mutex<crate::session::SessionScope>>,
+    list: Arc<SelectList>,
+    search: Arc<Text>,
+    cwd_text: String,
+    dir: std::path::PathBuf,
+    cancelled: bool,
+}
+
+impl ResumePickerState {
+    /// `Ok(Some(id))` confirms a session, `Ok(None)` keeps waiting; `cancelled`
+    /// distinguishes Esc/Ctrl+C from a still-open picker.
+    async fn handle_event(&mut self, event: Event) -> Result<Option<String>, String> {
+        match event {
+            Event::Resize(..) => {}
+            Event::Mouse(mouse) => {
+                let code = match mouse.kind {
+                    MouseEventKind::ScrollUp => Some(KeyCode::Up),
+                    MouseEventKind::ScrollDown => Some(KeyCode::Down),
+                    _ => None,
+                };
+                if let Some(code) = code {
+                    self.list
+                        .handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+                }
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    self.cancelled = true;
+                    return Ok(None);
+                }
+                match key.code {
+                    KeyCode::Enter => {
+                        return Ok(self.list.get_selected_item().map(|item| item.value));
+                    }
+                    KeyCode::Esc if self.query.is_empty() => {
+                        self.cancelled = true;
+                        return Ok(None);
+                    }
+                    KeyCode::Esc => {
+                        self.query.clear();
+                        self.list.set_filter("");
+                    }
+                    KeyCode::Tab if key.modifiers == KeyModifiers::NONE => {
+                        let next = {
+                            let mut current = self.scope.lock().unwrap();
+                            let next = current.toggled();
+                            *current = next;
+                            next
+                        };
+                        let items = build_items(&self.cwd_text, &self.dir, next).await?;
+                        self.list.set_items(items);
+                        self.list.set_filter(&self.query);
+                    }
+                    KeyCode::Backspace => {
+                        self.query.pop();
+                        self.list.set_filter(&self.query);
+                    }
+                    KeyCode::Char(ch)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        self.query.push(ch);
+                        self.list.set_filter(&self.query);
+                    }
+                    _ => self.list.handle_key(key),
+                }
+                self.search.set_text(format!("  Filter: {}", self.query));
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+}
+
+/// Build picker rows for one scope. All rows carry their project cwd so the
+/// All view stays attributable; the Project view lists only this cwd's
+/// directory via the repo's own typed list API.
+async fn build_items(
+    cwd_text: &str,
+    dir: &Path,
+    scope: crate::session::SessionScope,
+) -> Result<Vec<SelectItem>, String> {
+    let metadata = crate::session::list_session_metadata_in_scope_in_dir(cwd_text, dir, scope)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Each summary opens + reads a (bounded) slice of the session file. That is
+    // blocking file I/O over every saved session, so keep it off the async
+    // runtime the TUI will later run on.
+    let metas_for_summary = metadata.clone();
+    let summaries = tokio::task::spawn_blocking(move || {
+        metas_for_summary
+            .iter()
+            .map(|meta| crate::session::summarize_session_file(Path::new(&meta.path)))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("session summary task failed: {e}"))?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let mut items: Vec<SelectItem> = Vec::new();
+    for (meta, summary) in metadata.iter().zip(summaries.iter()) {
+        if summary.empty {
+            continue;
+        }
+        let file_name = Path::new(&meta.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&meta.id);
+        let label = crate::session::session_display_label(summary);
+        let short_id = crate::session::short_session_id(&meta.id);
+        let mut description = format!(
+            "{} · {} · {}",
+            format_modified_age(now_ms, meta.modified_at),
+            crate::session::format_session_bytes(summary.bytes),
+            short_id,
+        );
+        if scope == crate::session::SessionScope::All {
+            description = format!("{} · {}", short_project_name(&meta.cwd), description);
+        }
+        items.push(
+            SelectItem::new(&meta.id, &label)
+                .with_description(&description)
+                .with_search_text(&format!("{label} {short_id} {file_name}")),
+        );
+    }
+    Ok(items)
+}
+
+/// Last path component of a project cwd, for a compact All-view tag.
+fn short_project_name(cwd: &str) -> String {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| cwd.to_string())
 }
 
 fn format_modified_age(now_ms: i64, modified_ms: i64) -> String {
@@ -201,6 +288,64 @@ fn format_modified_age(now_ms: i64, modified_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review #269: the startup `-r` picker must not early-return on an empty
+    /// Project view. Drive the real key handler with a bare Tab against real
+    /// session fixtures and assert the foreign session becomes selectable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review269_empty_project_can_browse_foreign_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("fresh-project");
+        let foreign_cwd = tmp.path().join("another-project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&foreign_cwd).unwrap();
+        let foreign = crate::session::create_jsonl_session(&root, &foreign_cwd.to_string_lossy())
+            .await
+            .unwrap();
+        foreign
+            .append_message(rpi_agent::message::AgentMessage::from(
+                rpi_ai::types::UserMessage::new("foreign project prompt", 42),
+            ))
+            .await
+            .unwrap();
+        let foreign_id = foreign.storage().metadata().id.clone();
+        drop(foreign);
+
+        let scope = crate::session::SessionScope::Project;
+        let items = build_items(&cwd.to_string_lossy(), &root, scope)
+            .await
+            .unwrap();
+        assert!(items.is_empty(), "the fresh project has no sessions");
+        let list = Arc::new(SelectList::new(items, 12));
+        let mut state = ResumePickerState {
+            cancelled: false,
+            query: String::new(),
+            scope: Arc::new(std::sync::Mutex::new(scope)),
+            list: list.clone(),
+            search: Arc::new(Text::new("  Filter: ", 0, 0)),
+            cwd_text: cwd.to_string_lossy().into_owned(),
+            dir: root.clone(),
+        };
+        let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(state.handle_event(tab).await.unwrap().is_none());
+        assert_eq!(
+            *state.scope.lock().unwrap(),
+            crate::session::SessionScope::All
+        );
+        let selected = list.get_selected_item().expect("All must have a row");
+        assert_eq!(selected.value, foreign_id);
+        assert!(
+            selected
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("another-project"),
+            "All rows must carry their project tag: {selected:?}"
+        );
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.handle_event(enter).await.unwrap(), Some(foreign_id));
+    }
 
     #[test]
     fn modified_age_is_compact_and_stable() {
