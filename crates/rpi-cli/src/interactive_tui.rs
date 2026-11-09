@@ -1272,6 +1272,8 @@ pub async fn interactive_tui(
     let state = Arc::new(TuiState {
         history_page,
         session_dir: reload_context.session_dir(),
+        session_cwd: cwd.clone(),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2374,6 +2376,14 @@ pub async fn interactive_tui(
             //    escape to the selector; on done/cancel the selector callbacks
             //    restore the editor and clear `active_selector`.
             if state_for_key.selector_open() {
+                // `/session` uses Tab to switch between this-project and all-
+                // projects. Autocomplete is cleared while a selector is open,
+                // so Tab is free here; consume it before the generic selector
+                // routing (which would send it to the list as a no-op).
+                if selector_owns_key(&state_for_key, &key) {
+                    tui_for_key.request_render_reusing_scroll_content();
+                    continue;
+                }
                 // Esc always cancels the selector (even with modifiers off).
                 // Route through `SelectList::handle_key(Esc)` so the list's
                 // `on_cancel` fires (the `/scoped-models` toggle selector saves
