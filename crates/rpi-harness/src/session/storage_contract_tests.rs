@@ -8,7 +8,6 @@ use serde_json::json;
 
 use super::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
 use super::memory::{CounterIdGenerator, FakeClock, InMemorySessionRepo};
-use super::sqlite::SqliteSessionRepo;
 use super::types::*;
 
 fn options(id: &str) -> SessionCreateOptions {
@@ -334,33 +333,6 @@ async fn os_jsonl_repo_contract() {
         },
         cwd,
     );
-    repo_contract(repo).await;
-    dir.close().unwrap();
-}
-
-#[tokio::test]
-async fn sqlite_repo_contract() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = SqliteSessionRepo::with_clock_ids(
-        dir.path().join("sessions.db"),
-        Arc::new(FakeClock::new()),
-        Arc::new(CounterIdGenerator::new()),
-    )
-    .unwrap();
-    repo_contract(repo).await;
-    dir.close().unwrap();
-}
-
-#[cfg(feature = "experimental-native-store")]
-#[tokio::test]
-async fn experimental_native_repo_contract() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = super::experimental_native::ExperimentalNativeRepo::with_clock(
-        dir.path().to_owned(),
-        Arc::new(FakeClock::new()),
-    )
-    .await
-    .unwrap();
     repo_contract(repo).await;
     dir.close().unwrap();
 }

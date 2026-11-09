@@ -24,12 +24,14 @@ use uuid::Uuid;
 use rpi_agent::message::AgentMessage;
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
+use crate::session::durable_adapter::SessionDurableWriter;
 use crate::session::types::{
     BranchBounds, BranchEntryPage, BranchEntryPageQuery, BranchOverview, Entry, EntryQuery,
     IdGenerator, JsonValue, LanePointer, LaneRecord, LogItem, LogOptions, OperationStartedRecord,
     ProvisionedEntry, ProvisionedKind, RecordQuery, SessionLaneBranch, SessionMetadata,
     SessionStats, SessionStorage, SessionTree,
 };
+use rpi_durable::storage::JournalFrame;
 
 static AGENT_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
 
@@ -211,9 +213,15 @@ struct SessionBinding {
     /// Identity of this live facade binding, not of the durable session. It is
     /// copied by clones/pins and replaced on every storage rebind.
     binding_id: String,
+    // Native durable control uses a separate opaque token for its in-process
+    // conditional-write fence.
+    binding_token: String,
     mutation_gate: Arc<tokio::sync::RwLock<()>>,
     volatile_progress: Option<crate::frame_progress::SharedVolatileProgress>,
     entry_commit_publisher: Option<broadcast::Sender<SessionEntryCommit>>,
+    /// Explicit host-owned durable capability. It is not invoked by the
+    /// compatibility append methods until a backend migration opts in.
+    durable_writer: Option<Arc<dyn SessionDurableWriter>>,
 }
 
 impl Clone for Session {
@@ -236,12 +244,28 @@ impl Session {
             binding: Arc::new(RwLock::new(SessionBinding {
                 storage,
                 binding_id: Uuid::new_v4().to_string(),
+                binding_token: Uuid::now_v7().to_string(),
                 mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
                 volatile_progress: None,
                 entry_commit_publisher: None,
+                durable_writer: None,
             })),
             id_generator: id_generator.unwrap_or_else(|| Arc::new(DefaultIdGenerator::new())),
         }
+    }
+
+    /// Build a Session with an explicit host-mediated durable writer
+    /// capability. Standard Session writes still use `storage`; callers opt
+    /// into the capability through `append_*_to_durable` until the typed
+    /// backends are migrated without a dual-write protocol.
+    pub fn new_with_durable_writer(
+        storage: Arc<dyn SessionStorage>,
+        id_generator: Option<Arc<dyn IdGenerator>>,
+        durable_writer: Arc<dyn SessionDurableWriter>,
+    ) -> Self {
+        let session = Self::new(storage, id_generator);
+        session.set_durable_writer(Some(durable_writer));
+        session
     }
 
     /// Read an authoritative lane leaf and explicit lane-mutation generation
@@ -302,20 +326,129 @@ impl Session {
     /// facade shares its binding, so every existing `Session` clone — the
     /// harness's field, lane handles, the config snapshot — observes the new
     /// storage immediately; no harness rebuild, no field restructure. The
-    /// Raw storage replacement clears volatile recovery; harness session switches
-    /// adopt the target's recovery state instead. The caller is responsible for
-    /// aborting any in-flight run first. Mirrors the
+    /// Raw storage replacement clears volatile recovery and the explicit durable
+    /// writer capability; the host must install a writer belonging to the new
+    /// storage explicitly. Harness session switches adopt the target's recovery
+    /// state instead. The caller is responsible for aborting any in-flight run
+    /// first. Mirrors the
     /// TS `SessionManager.rebind` intent (swap the durable backing without
     /// rebuilding the harness).
     pub fn set_storage(&self, storage: Arc<dyn SessionStorage>) {
         let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
+        // A raw storage rebind may point at another session. Do not silently
+        // keep a capability that can continue appending to the old journal;
+        // the host must explicitly install the writer for the new storage.
         *self.binding.write().unwrap() = SessionBinding {
             storage,
             binding_id: Uuid::new_v4().to_string(),
+            binding_token: Uuid::now_v7().to_string(),
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             volatile_progress: None,
             entry_commit_publisher: publisher,
+            durable_writer: None,
         };
+    }
+
+    /// Install or clear the explicit host-mediated durable writer. This does
+    /// not change the default SessionStorage append path.
+    pub fn set_durable_writer(&self, writer: Option<Arc<dyn SessionDurableWriter>>) {
+        self.binding.write().unwrap().durable_writer = writer;
+    }
+
+    /// Return the installed capability without creating one or changing the
+    /// compatibility storage binding.
+    pub fn durable_writer(&self) -> Option<Arc<dyn SessionDurableWriter>> {
+        self.binding.read().unwrap().durable_writer.clone()
+    }
+
+    fn checked_durable_writer(&self) -> SessionResult<Arc<dyn SessionDurableWriter>> {
+        let (writer, session_id) = {
+            let binding = self.binding.read().unwrap();
+            (
+                binding.durable_writer.clone(),
+                binding.storage.metadata().id,
+            )
+        };
+        let writer = writer
+            .ok_or_else(|| SessionError::storage("durable writer capability is not installed"))?;
+        if let Some(writer_session_id) = writer.session_identity() {
+            if writer_session_id != session_id {
+                return Err(SessionError::storage(format!(
+                    "durable writer is bound to session {writer_session_id}, not {session_id}"
+                )));
+            }
+        }
+        Ok(writer)
+    }
+
+    /// Append one transcript entry through the explicit durable capability.
+    /// This does not update the default SessionState or SessionStorage path.
+    pub fn append_entry_to_durable(&self, entry: &Entry) -> SessionResult<JournalFrame> {
+        self.checked_durable_writer()?.append_entry(entry)
+    }
+
+    /// Append one execution/lane record through the explicit durable
+    /// capability. Transcript and record namespaces remain separate.
+    pub fn append_record_to_durable(&self, record: &LaneRecord) -> SessionResult<JournalFrame> {
+        self.checked_durable_writer()?.append_record(record)
+    }
+
+    /// Append a complete typed SessionMutation through the explicit durable
+    /// capability. Durable sequence assignment remains backend-owned.
+    pub fn append_session_mutation_to_durable(
+        &self,
+        mutation: &crate::session::types::SessionMutation,
+    ) -> SessionResult<JournalFrame> {
+        self.checked_durable_writer()?
+            .append_session_mutation(mutation)
+    }
+
+    /// Explicit opt-in logical batch for the durable migration path. The
+    /// backend receives one expected-sequence check for both mutations.
+    pub fn append_record_and_entry_to_durable(
+        &self,
+        record: &LaneRecord,
+        entry: &Entry,
+    ) -> SessionResult<Vec<JournalFrame>> {
+        self.checked_durable_writer()?
+            .append_record_and_entry(record, entry)
+    }
+
+    /// Load every opaque durable frame, including namespaces this adapter does
+    /// not understand. Projection helpers intentionally do not replace this
+    /// lossless raw read path.
+    pub fn load_durable_frames(&self) -> SessionResult<Vec<JournalFrame>> {
+        self.checked_durable_writer()?.load_frames()
+    }
+
+    /// Project only `session.entry.*` frames into transcript entries.
+    pub fn load_durable_entries(&self) -> SessionResult<Vec<Entry>> {
+        self.checked_durable_writer()?.load_entries()
+    }
+
+    /// Project only `session.record.*` frames into lane/execution records.
+    pub fn load_durable_records(&self) -> SessionResult<Vec<LaneRecord>> {
+        self.checked_durable_writer()?.load_records()
+    }
+
+    /// Project only the complete `session.mutation.*` namespace into typed
+    /// Session mutations; other host-owned frames remain available via raw
+    /// loading.
+    pub fn load_durable_mutations(
+        &self,
+    ) -> SessionResult<Vec<crate::session::types::SessionMutation>> {
+        self.checked_durable_writer()?.load_session_mutations()
+    }
+
+    /// Explicitly refresh the writer's expected durable sequence after an
+    /// external writer changed the backend. No automatic retry is performed.
+    pub fn refresh_durable_writer(&self) -> SessionResult<Option<u64>> {
+        self.checked_durable_writer()?.refresh()
+    }
+
+    /// Read the locally cached expected durable sequence without refreshing it.
+    pub fn durable_expected_sequence(&self) -> SessionResult<Option<u64>> {
+        self.checked_durable_writer()?.expected_sequence()
     }
 
     /// Install or clear the optional publisher for successful entry commits.
@@ -398,6 +531,7 @@ impl Session {
         // A rebind is a new live binding even when it points back to a storage
         // previously used by this facade.
         binding.binding_id = Uuid::new_v4().to_string();
+        binding.binding_token = Uuid::now_v7().to_string();
         if binding.entry_commit_publisher.is_none() {
             binding.entry_commit_publisher = publisher;
         }
@@ -427,6 +561,11 @@ impl Session {
     /// lock guard itself is not `Send`).
     fn storage_arc(&self) -> Arc<dyn SessionStorage> {
         Arc::clone(&self.binding.read().unwrap().storage)
+    }
+
+    /// Identity for native durable conditional control writes.
+    pub(crate) fn binding_token(&self) -> String {
+        self.binding.read().unwrap().binding_token.clone()
     }
 
     /// The shared id generator. Mirrors TS `readonly idGenerator`.

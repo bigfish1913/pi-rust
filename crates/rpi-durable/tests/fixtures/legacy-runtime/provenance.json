@@ -1,0 +1,60 @@
+{
+  "sourceRepository": "https://github.com/pi-rust/rpi-package",
+  "sourceCommit": "041c981b21ac42348feee371757f5ef26ecbdcab",
+  "files": {
+    "plugin.rs.txt": {
+      "sourcePath": "packages/rpi-durable/src/lib.rs",
+      "bytes": 109660,
+      "sha256": "0f4be632b1f5dab5dfa0ac9cf55bb9119b1a37ec3ac195f08161dca9480fdaac"
+    },
+    "runtime_contract.rs.txt": {
+      "sourcePath": "packages/rpi-durable/tests/runtime_contract.rs",
+      "bytes": 17894,
+      "sha256": "8a9c04a88b7421e9544d1591069a7b227fc9e13e815a6ace86ecd02481978c3c"
+    },
+    "plugin.Cargo.toml.txt": {
+      "sourcePath": "packages/rpi-durable/Cargo.toml",
+      "bytes": 638,
+      "sha256": "35668eb351fd26dc65721b9e738145c21acc212ecf0f2fb5c608a102d91b4663"
+    },
+    "core.Cargo.toml.txt": {
+      "sourcePath": "packages/rpi-durable-core/Cargo.toml",
+      "bytes": 404,
+      "sha256": "61136e4c715ba69c7360df3aa7069a774f0676b8b4b3d8b9ac70a055689d984d"
+    },
+    "workspace.Cargo.toml.txt": {
+      "sourcePath": "Cargo.toml",
+      "bytes": 2027,
+      "sha256": "999f15d39cf6a14fa28deb93b6a2606472dcff38a18ba597b4a8936d4d8687ef"
+    },
+    "upstream.Cargo.lock.txt": {
+      "sourcePath": "Cargo.lock",
+      "bytes": 109835,
+      "sha256": "8b1ac3019094c4331e2b45722958bba5f3ac28669d8546bad2c95f3a669ea212"
+    },
+    "LICENSE": {
+      "sourcePath": "LICENSE",
+      "bytes": 1064,
+      "sha256": "d8d2baef7d67248adf749511d7ee59b4e960e8a56d0a921a9f7b0867b716e8b2"
+    }
+  },
+  "sdk": {
+    "name": "rpi-plugin-sdk",
+    "version": "0.3.20",
+    "registryArchiveSha256": "88064b24428c5c5a5d3ee93616a754d171951fb8b31edbc55530433359047d85"
+  },
+  "coreSource": "../legacy-oracle/reference.rs.txt",
+  "scope": "Exact legacy plugin source in isolated offline synthetic SDK host; not a live extension/adaptor or native migration authority",
+  "derivedArtifacts": {
+    "isolated.Cargo.lock.txt": {
+      "bytes": 6184,
+      "sha256": "1ef433c1e5ae9a5590143553094ea2a4f4ca881d1ab3e6b427a8bfada759160b",
+      "operation": "Fixed upstream lock dependency closure for the two original packages, preserving versions/sources/checksums; inactive SDK process/stdio edges and digest subtle edge removed, unique dependency names disambiguated"
+    },
+    "callback_trace.rs.txt": {
+      "bytes": 8432,
+      "sha256": "b8df586cff9bfca946b172a8fdae600ebbc98e81f6e5b2e88734ee59238833b2",
+      "operation": "New synthetic registered-callback test body; prepended with exact upstream runtime_contract helper prefix before its sole #[test]"
+    }
+  }
+}

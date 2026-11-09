@@ -50,6 +50,7 @@ mod rendering;
 use rendering::*;
 mod panels;
 mod pet;
+mod settlement;
 mod side_questions;
 
 #[cfg(test)]
@@ -295,7 +296,7 @@ trait SlashCommand: Send + Sync {
         &[]
     }
     /// Whether the canonical name appears in the `/` autocomplete list. Hidden
-    /// commands (`/name`, …) return `false`.
+    /// commands (`/context`, `/name`, …) return `false`.
     fn visible(&self) -> bool {
         true
     }
@@ -313,6 +314,11 @@ trait SlashCommand: Send + Sync {
     fn description_owned(&self) -> String {
         self.description().to_string()
     }
+    /// Structured command payloads must not collapse whitespace inside JSON
+    /// strings. Legacy commands keep their existing normalized argument policy.
+    fn preserve_args_whitespace(&self) -> bool {
+        false
+    }
     /// Execute the command. Only invoked for inputs starting with `/` whose
     /// first token matches `name()` or an alias. `args` is the whitespace-
     /// trimmed remainder after the command token ("" when none). Must stay
@@ -328,8 +334,8 @@ trait SlashCommand: Send + Sync {
 /// command registry itself is TUI-private, and reaching into it from the
 /// extension host would mean exposing `Arc<dyn SlashCommand>` (whose `execute`
 /// needs a `CommandContext`) across the ABI.
-pub(crate) fn build_builtin_commands_for_abi() -> Vec<(String, String)> {
-    build_builtin_registry()
+pub(crate) fn build_builtin_commands_for_abi(native_durable: bool) -> Vec<(String, String)> {
+    build_session_command_registry(native_durable)
         .visible_entries()
         .into_iter()
         .map(|entry| (entry.name, entry.description))
@@ -344,8 +350,8 @@ pub(crate) fn build_builtin_commands_for_abi() -> Vec<(String, String)> {
 /// `/q` or `/context` is unreachable in the terminal (the built-in wins
 /// dispatch), yet without this it would still be advertised as
 /// `source:"extension"`.
-pub(crate) fn builtin_reserved_names() -> Vec<String> {
-    let registry = build_builtin_registry();
+pub(crate) fn builtin_reserved_names(native_durable: bool) -> Vec<String> {
+    let registry = build_session_command_registry(native_durable);
     let mut out: Vec<String> = Vec::new();
     for command in &registry.commands {
         out.push(command.name().to_string());
@@ -404,6 +410,16 @@ impl CommandRegistry {
         }
         out
     }
+}
+
+/// Session-owned opt-ins must drive both TUI dispatch and remote discovery.
+/// Never infer native enablement from tool selection, extension flags or names.
+fn build_session_command_registry(native_durable: bool) -> CommandRegistry {
+    let mut registry = build_builtin_registry();
+    if native_durable {
+        registry.register(Arc::new(NativeDurableCommand));
+    }
+    registry
 }
 
 /// Dispatch a ui_prompt_start event to extensions.
@@ -552,13 +568,21 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
 /// `/skill:name` intact so the model can still handle it; it must not be
 /// converted into a local error before input handlers or the agent see it.
 /// Returns `true` only when a registered slash command handled the input.
-fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) -> bool {
+fn slash_arguments(text: &str, command: &dyn SlashCommand) -> String {
     let mut parts = text.split_whitespace();
     let token = parts.next().unwrap_or("");
-    let args = parts.collect::<Vec<_>>().join(" ");
+    if command.preserve_args_whitespace() {
+        text.trim_start()[token.len()..].trim_start().to_owned()
+    } else {
+        parts.collect::<Vec<_>>().join(" ")
+    }
+}
+
+fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) -> bool {
+    let token = text.split_whitespace().next().unwrap_or("");
     match registry.find(token) {
         Some(cmd) => {
-            cmd.execute(ctx, &args);
+            cmd.execute(ctx, &slash_arguments(text, cmd.as_ref()));
             true
         }
         None => false,
@@ -739,6 +763,7 @@ enum TuiMessage {
     ExportSessionWithFormat(crate::export::ExportFormat),
     /// Show live usage/context stats (from `/usage` and `/context`).
     ShowUsage,
+    NativeDurable(String),
     /// Fork the current session into a new one and switch to it (from `/fork`).
     ForkSession,
     /// Rename the current session (from `/name <name>`).
@@ -754,16 +779,6 @@ enum TuiMessage {
     /// mailbox) signal the main loop, which awaits
     /// `reload_extension_resources` on the async runtime.
     ReloadExtensions,
-    /// A plugin asked for the model/provider catalog to be re-read from disk
-    /// (`runtime_action(ReloadModels)`, action id 31).
-    ///
-    /// Unlike `ReloadExtensions`, this does **not** rebuild the extension
-    /// session — so an in-flight run keeps receiving plugin events. The main
-    /// loop runs the cheap catalog refresh and answers on the request's reply
-    /// channel.
-    ReloadModels {
-        request: rpi_extensions::ReloadModelsRequest,
-    },
     /// Request an OAuth action. The action itself runs off the main loop because
     /// provider callbacks are synchronous FFI calls and may wait for user
     /// interaction (for example, a browser/device-code exchange).
@@ -1092,16 +1107,18 @@ pub async fn interactive_tui(
     // of returning a fabricated answer. The mailbox is session-scoped (held in
     // `ReloadContext`) so in-flight prompts survive a `/reload`.
     let ask_user_bridge = AskUserBridge::new(reload_context.ui_dialog.clone());
-    ask_user_bridge.attach();
+    if !ask_user_bridge.attach() {
+        eprintln!(
+            "[rpi] interactive dialog bridge attachment was rejected; refusing to start the TUI"
+        );
+        return 1;
+    }
     tui.set_main_screen_mode(matches!(args.tui_mode, crate::args::TuiMode::Regular));
 
-    // Keep startup output in the retained header, not loose chat children:
-    // settling the first reply replaces the chat's history page.
-    let history_page = history::HistoryUi::default();
     let chat_container = Arc::new(Container::new());
     let startup_context = if should_show_startup_listing(args.verbose, quiet_startup) {
         Some(add_welcome_message_with_capabilities(
-            &history_page.header,
+            &chat_container,
             &active_tool_names,
             &skill_names,
             &resources_snapshot.context_files,
@@ -1114,7 +1131,7 @@ pub async fn interactive_tui(
     // stderr: the TUI is already in the alternate screen by the time it draws
     // this, and a stray write would corrupt the layout (issue #115).
     for notice in &reload_context.startup_notices {
-        add_note_message(&history_page.header, notice);
+        add_note_message(&chat_container, notice);
     }
 
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
@@ -1124,14 +1141,14 @@ pub async fn interactive_tui(
     let existing_profile = crate::extras::setup_done()
         || saved_settings.last_changelog_version.is_some()
         || saved_settings.last_rpi_changelog_version.is_some();
-    crate::extras::maybe_first_time_setup(&history_page.header);
+    crate::extras::maybe_first_time_setup(&chat_container);
     let collapse_changelog =
         preferred_project_setting(&project_settings, |settings| settings.collapse_changelog)
             .or(saved_settings.collapse_changelog)
             .unwrap_or(false);
     maybe_add_startup_changelog(
         harness,
-        &history_page.header,
+        &chat_container,
         &saved_settings,
         collapse_changelog,
         existing_profile,
@@ -1243,34 +1260,63 @@ pub async fn interactive_tui(
     let status_container = Arc::new(Container::new());
     let loader = Arc::new(Loader::with_text("Working…"));
 
-    // ---- Autocomplete (built-ins, templates, /skill:name, and @file paths) ----
+    // ---- Autocomplete (slash commands + @file paths, rooted at cwd) ----
+    // Prompt templates discovered at session build (Part A2) are surfaced as
+    // `/`-prefixed entries alongside the built-in slash commands: typing
+    // `/<name>` in the editor expands the template (mirrors pi
+    // `expandPromptTemplate`, `agent-session.ts:1124`). The description carries
+    // the template's frontmatter description (or a fallback) so the autocomplete
+    // popover shows what each template does.
+    //
+    // Build autocomplete from the initial templates. /context shares a resource
+    // snapshot that the async reload handler refreshes, so its blocking command
+    // can list the current files without awaiting the harness accessor.
+    let template_slash_commands: Vec<SlashCommandEntry> = resources_snapshot
+        .prompt_templates
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|t| SlashCommandEntry {
+            name: format!("/{}", t.name),
+            description: t
+                .description
+                .clone()
+                .unwrap_or_else(|| "Expand prompt template".to_string()),
+        })
+        .collect();
     let resources_arc = Arc::new(Mutex::new(resources_snapshot));
     // Build the built-in command registry once — the single source of truth for
     // both dispatch and the built-in autocomplete entries. The discovered
     // prompt-template commands are merged into the autocomplete list separately
     // (they dispatch via template expansion, not the registry); built-ins come
     // first so they win on a fuzzy tie.
-    let mut command_registry = build_builtin_registry();
+    let mut command_registry = build_session_command_registry(reload_context.args.native_durable);
     register_extension_commands(
         &mut command_registry,
         reload_context.extension_session.clone(),
     );
     let registry = Arc::new(command_registry);
+    let mut all_slash_commands = registry.visible_entries();
+    all_slash_commands.extend(template_slash_commands);
     let autocomplete = AutocompleteManager::new();
-    configure_resource_autocomplete(
-        &autocomplete,
-        registry.visible_entries(),
-        &resources_arc.lock().unwrap(),
-        &cwd,
-        skill_commands_enabled(&saved_settings, &project_settings),
-    );
+    {
+        let mut combined = CombinedAutocompleteProvider::new();
+        combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(
+            all_slash_commands,
+        )));
+        combined.add_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            cwd.clone(),
+        )));
+        autocomplete.set_provider(Arc::new(combined));
+    }
     let autocomplete_container = Arc::new(Container::new());
 
     let tool_outputs_expanded = session_values
         .get_as::<bool>("display.tool_outputs_expanded")
         .unwrap_or(false);
     let state = Arc::new(TuiState {
-        history_page,
+        session_write_tasks: settlement::SessionWriteTasks::new(args.native_durable),
+        history_page: history::HistoryUi::with_native_durable(args.native_durable),
         session_dir: reload_context.session_dir(),
         session_cwd: cwd.clone(),
         session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
@@ -1342,6 +1388,10 @@ pub async fn interactive_tui(
     state.history_page.mount_active(&chat_container);
     if launch_restores_history(args) {
         history::restore(harness, &state, &chat_container).await;
+    } else {
+        // Do not restore foreign history on a fresh launch merely to observe
+        // durable state. This read-only component also respects --no-tools.
+        history::refresh_native_durable_notice(harness, &state, &chat_container).await;
     }
 
     let _compaction_watcher = harness.watch({
@@ -1530,7 +1580,7 @@ pub async fn interactive_tui(
         if let Some((command, exclude_from_context)) = parse_user_bash(text) {
             if ctx_for_cb.state.user_bash_running() {
                 add_error_message(
-                    &ctx_for_cb.state.notice_container(),
+                    &ctx_for_cb.chat,
                     "A bash command is already running. Press Esc to cancel it first.",
                 );
                 ctx_for_cb.tui.request_render(false);
@@ -1545,10 +1595,10 @@ pub async fn interactive_tui(
             let images = ctx_for_cb.state.take_pending_images();
             let message = user_message_with_images(text, images.clone());
             let lane = ctx_for_cb.lane.clone();
-            let chat = ctx_for_cb.state.notice_container();
+            let chat = ctx_for_cb.chat.clone();
             let tui = ctx_for_cb.tui.clone();
             let state = ctx_for_cb.state.clone();
-            tokio::spawn(async move {
+            state.session_write_tasks.clone().spawn(async move {
                 // Queue immediately while the agent loop is still running.
                 // Routing this through the TUI's main channel delayed it until
                 // `prompt_text()` returned, after the loop's drain points had
@@ -1628,12 +1678,12 @@ pub async fn interactive_tui(
     // Check rpi and installed registry packages in the background so startup
     // remains responsive while their latest versions are fetched.
     let mut update_check_handles = Vec::new();
-    let update_container = state.history_page.updates.clone();
+    let rpi_chat = chat_container.clone();
     let rpi_tui = tui.clone();
     update_check_handles.push(tokio::spawn(async move {
         let report = crate::updates::check_rpi_startup().await;
         if !report.is_empty() {
-            add_update_notices(&update_container, &report);
+            add_update_notices(&rpi_chat, &report);
         }
         rpi_tui.request_render(false);
     }));
@@ -1666,28 +1716,6 @@ pub async fn interactive_tui(
     let reload_bridge_handle = tokio::spawn(async move {
         while reload_sig_rx.recv().await.is_some() {
             if reload_tx.send(TuiMessage::ReloadExtensions).is_err() {
-                break; // main loop gone — stop forwarding
-            }
-        }
-    });
-
-    // ---- plugin→TUI model-catalog refresh bridge (action id 31) ----
-    //
-    // `runtime_action(ReloadModels)` must run the refresh on the main loop
-    // (it owns the harness), and the caller wants the answer — so this is a
-    // request/reply channel, not the fire-and-forget `ReloadMailbox` above.
-    let (reload_models_tx, mut reload_models_rx) =
-        tokio::sync::mpsc::unbounded_channel::<rpi_extensions::ReloadModelsRequest>();
-    reload_context
-        .reload_models_mailbox
-        .install(reload_models_tx);
-    let reload_models_tx = tx.clone();
-    let reload_models_bridge_handle = tokio::spawn(async move {
-        while let Some(request) = reload_models_rx.recv().await {
-            if reload_models_tx
-                .send(TuiMessage::ReloadModels { request })
-                .is_err()
-            {
                 break; // main loop gone — stop forwarding
             }
         }
@@ -2009,7 +2037,7 @@ pub async fn interactive_tui(
                                     == Some(false)
                             {
                                 add_note_message(
-                                    &state_for_key.notice_container(),
+                                    &state_for_key.chat_container,
                                     "Clipboard unavailable. Selection kept; press Ctrl+X to retry.",
                                 );
                                 tui_for_key.request_render(false);
@@ -2068,7 +2096,7 @@ pub async fn interactive_tui(
                             state_for_key.queue_image(image);
                         }
                         add_note_message(
-                            &state_for_key.notice_container(),
+                            &state_for_key.chat_container,
                             "Dropped images attached to the next prompt.",
                         );
                         tui_for_key.request_render(false);
@@ -2240,7 +2268,7 @@ pub async fn interactive_tui(
                         &tui_for_key,
                     )
                 {
-                    add_note_message(&state_for_key.notice_container(), "OAuth flow cancelled.");
+                    add_note_message(&state_for_key.chat_container, "OAuth flow cancelled.");
                 }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
@@ -2339,7 +2367,7 @@ pub async fn interactive_tui(
             {
                 match copy_mouse_selection_with(&tui_for_key, copy_to_clipboard) {
                     Some(copied) => add_note_message(
-                        &state_for_key.notice_container(),
+                        &state_for_key.chat_container,
                         if copied {
                             "Copied selection to the clipboard."
                         } else {
@@ -2348,7 +2376,7 @@ pub async fn interactive_tui(
                     ),
                     None => {
                         if editor_for_key.has_selection() && editor_for_key.copy_selection() {
-                            add_note_message(&state_for_key.notice_container(), "Copied!");
+                            add_note_message(&state_for_key.chat_container, "Copied!");
                         } else {
                             copy_last_assistant(&state_for_key);
                         }
@@ -2519,7 +2547,7 @@ pub async fn interactive_tui(
                 let expanded = state_for_key.toggle_tool_outputs();
                 // Persist per-session so a later `-c`/`-r` restores it.
                 let session = ctx_for_key.session.clone();
-                tokio::spawn(async move {
+                ctx_for_key.state.session_write_tasks.spawn(async move {
                     let _ = session
                         .set_value("display.tool_outputs_expanded", serde_json::json!(expanded))
                         .await;
@@ -2537,7 +2565,7 @@ pub async fn interactive_tui(
                 let hide = state_for_key.toggle_thinking();
                 // Persist per-session so a later `-c`/`-r` restores it.
                 let session = ctx_for_key.session.clone();
-                tokio::spawn(async move {
+                ctx_for_key.state.session_write_tasks.spawn(async move {
                     let _ = session
                         .set_value("display.hide_thinking", serde_json::json!(hide))
                         .await;
@@ -2567,14 +2595,14 @@ pub async fn interactive_tui(
                 let lane = lane_for_key.clone();
                 let state = state_for_key.clone();
                 let tui = tui_for_key.clone();
-                tokio::spawn(async move {
+                state.session_write_tasks.clone().spawn(async move {
                     match cycle_model(&lane, &catalog, cycle_backward).await {
                         Ok(Some(model)) => {
                             report_model_selection(&lane, &state, &tui, model, false).await;
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            add_error_message(&state.notice_container(), &error);
+                            add_error_message(&state.chat_container, &error);
                             tui.request_render(false);
                         }
                     }
@@ -2595,7 +2623,7 @@ pub async fn interactive_tui(
                     .unwrap_or_else(|error| error.into_inner())
                     .clone();
                 let state = state_for_key.clone();
-                tokio::spawn(async move {
+                state.session_write_tasks.clone().spawn(async move {
                     let Ok(current_model) = lane.get_model().await else {
                         return;
                     };
@@ -2659,7 +2687,7 @@ pub async fn interactive_tui(
                             state_for_key.queue_image(image);
                         }
                         add_note_message(
-                            &state_for_key.notice_container(),
+                            &state_for_key.chat_container,
                             "Clipboard images attached to the next prompt.",
                         );
                     } else {
@@ -2671,7 +2699,7 @@ pub async fn interactive_tui(
                 if let Ok(Some(image)) = read_clipboard_image() {
                     state_for_key.queue_image(image);
                     add_note_message(
-                        &state_for_key.notice_container(),
+                        &state_for_key.chat_container,
                         "Clipboard image attached to the next prompt.",
                     );
                     tui_for_key.request_render(false);
@@ -2852,7 +2880,7 @@ pub async fn interactive_tui(
                 // Routed through `handle_dequeue` (not the raw restore) so the
                 // `Restored N queued message(s)` status note fires, mirroring
                 // upstream's `handleDequeue`.
-                tokio::spawn(handle_dequeue(
+                state_for_key.session_write_tasks.spawn(handle_dequeue(
                     lane_for_key.clone(),
                     editor_for_key.clone(),
                     state_for_key.clone(),
@@ -2895,10 +2923,10 @@ pub async fn interactive_tui(
                     let images = state_for_key.take_pending_images();
                     let message = user_message_with_images(&prompt, images.clone());
                     let lane = lane_for_key.clone();
-                    let chat = state_for_key.notice_container();
+                    let chat = state_for_key.chat_container.clone();
                     let tui = tui_for_key.clone();
                     let state = state_for_key.clone();
-                    tokio::spawn(async move {
+                    state.session_write_tasks.clone().spawn(async move {
                         if let Err(error) = lane.follow_up(message).await {
                             state.restore_pending_images(images);
                             add_error_message(&chat, &format!("Could not queue message: {error}"));
@@ -3086,9 +3114,6 @@ pub async fn interactive_tui(
     {
         tracing::warn!("[rpi] extension vetoed SessionStart (advisory): {reason}");
     }
-    if let Ok(model) = lane.get_model().await {
-        selectors::dispatch_model_select(&state, &model);
-    }
 
     // ---- Initial prompts (run before reading from the channel) ----
     let mut prompts: Vec<String> = Vec::new();
@@ -3168,9 +3193,9 @@ pub async fn interactive_tui(
                 match switch_provider(&input, &manifests, &available, &lane).await {
                     Ok((model, note)) => {
                         state.set_current_model(&model);
-                        add_note_message(&state.notice_container(), &note);
+                        add_note_message(&chat_container, &note);
                     }
-                    Err(error) => add_error_message(&state.notice_container(), &error),
+                    Err(error) => add_error_message(&chat_container, &error),
                 }
                 tui.request_render(false);
             }
@@ -3190,7 +3215,7 @@ pub async fn interactive_tui(
                 );
                 if !prompt_images.is_empty() {
                     add_note_message(
-                        &state.notice_container(),
+                        &chat_container,
                         &format!("Attached {} image(s) to this prompt.", prompt_images.len()),
                     );
                 }
@@ -3211,12 +3236,9 @@ pub async fn interactive_tui(
                         let cursor = text.chars().count();
                         editor.set_text(&text);
                         editor.set_cursor(0, cursor);
-                        add_note_message(
-                            &state.notice_container(),
-                            "Draft updated from external editor.",
-                        );
+                        add_note_message(&chat_container, "Draft updated from external editor.");
                     }
-                    Err(error) => add_error_message(&state.notice_container(), &error),
+                    Err(error) => add_error_message(&chat_container, &error),
                 }
                 tui.request_render(false);
             }
@@ -3244,7 +3266,7 @@ pub async fn interactive_tui(
                             .unsaved
                             .store(true, std::sync::atomic::Ordering::SeqCst);
                         add_error_message(
-                            &state.notice_container(),
+                            &chat_container,
                             &format!("Could not record bash result: {error}"),
                         );
                         tui.request_render(false);
@@ -3257,7 +3279,7 @@ pub async fn interactive_tui(
             Some(TuiMessage::OpenTree) => {
                 if *state.status.lock().unwrap() != RunStatus::Idle {
                     add_note_message(
-                        &state.notice_container(),
+                        &chat_container,
                         "Wait for the current run to finish before opening the tree.",
                     );
                     tui.request_render(false);
@@ -3283,20 +3305,20 @@ pub async fn interactive_tui(
                             );
                             history::restore(harness, &state, &chat_container).await;
                             add_note_message(
-                                &state.notice_container(),
+                                &chat_container,
                                 "Moved to the selected session entry.",
                             );
                         }
                         rpi_harness::agent_harness::NavigationOutcome::Failed { error, .. } => {
-                            add_error_message(&state.notice_container(), &error.message);
+                            add_error_message(&chat_container, &error.message);
                         }
                         _ => add_note_message(
-                            &state.notice_container(),
+                            &chat_container,
                             "The selected entry could not be opened.",
                         ),
                     },
                     Err(error) => add_error_message(
-                        &state.notice_container(),
+                        &chat_container,
                         &format!("Could not navigate session tree: {error}"),
                     ),
                 }
@@ -3358,7 +3380,7 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ShareSession) => {
-                share_session(harness, &state.notice_container()).await;
+                share_session(harness, &chat_container).await;
                 tui.request_render(false);
             }
             Some(TuiMessage::SetSessionName(name)) => {
@@ -3370,12 +3392,12 @@ pub async fn interactive_tui(
                         // and `/name` looked like a no-op on screen.
                         state.footer.set_session_name(Some(&name));
                         add_note_message(
-                            &state.notice_container(),
+                            &chat_container,
                             &format!("Session renamed to \"{name}\"."),
                         );
                     }
                     Err(e) => add_error_message(
-                        &state.notice_container(),
+                        &chat_container,
                         &format!("Could not rename session: {e}"),
                     ),
                 }
@@ -3388,13 +3410,12 @@ pub async fn interactive_tui(
                 let path = cwd.join(&file_name);
                 match agent_session.export_to_markdown(&path).await {
                     Ok(_) => add_note_message(
-                        &state.notice_container(),
+                        &chat_container,
                         &format!("Exported session to {}", path.display()),
                     ),
-                    Err(e) => add_error_message(
-                        &state.notice_container(),
-                        &format!("Could not write export: {e}"),
-                    ),
+                    Err(e) => {
+                        add_error_message(&chat_container, &format!("Could not write export: {e}"))
+                    }
                 }
                 tui.request_render(false);
             }
@@ -3403,13 +3424,21 @@ pub async fn interactive_tui(
                 let path = cwd.join(&file_name);
                 match agent_session.export(format, &path).await {
                     Ok(_) => add_note_message(
-                        &state.notice_container(),
+                        &chat_container,
                         &format!("Exported session to {}", path.display()),
                     ),
-                    Err(e) => add_error_message(
-                        &state.notice_container(),
-                        &format!("Could not write export: {e}"),
-                    ),
+                    Err(e) => {
+                        add_error_message(&chat_container, &format!("Could not write export: {e}"))
+                    }
+                }
+                tui.request_render(false);
+            }
+            Some(TuiMessage::NativeDurable(args)) => {
+                match crate::native_durable::interactive_command(agent_session.harness(), &args)
+                    .await
+                {
+                    Ok(text) => add_note_message(&chat_container, &text),
+                    Err(text) => add_error_message(&chat_container, &text),
                 }
                 tui.request_render(false);
             }
@@ -3456,12 +3485,11 @@ pub async fn interactive_tui(
                                 ));
                             }
                         }
-                        add_note_message(&state.notice_container(), &lines.join("\n"));
+                        add_note_message(&chat_container, &lines.join("\n"));
                     }
-                    None => add_error_message(
-                        &state.notice_container(),
-                        "Could not read session usage stats.",
-                    ),
+                    None => {
+                        add_error_message(&chat_container, "Could not read session usage stats.")
+                    }
                 }
                 tui.request_render(false);
             }
@@ -3559,7 +3587,7 @@ pub async fn interactive_tui(
                     Ok(auth) => auth,
                     Err(error) => {
                         add_error_message(
-                            &state.notice_container(),
+                            &chat_container,
                             &format!("Could not read saved credentials: {error}"),
                         );
                         tui.request_render(false);
@@ -3586,17 +3614,17 @@ pub async fn interactive_tui(
                         match crate::config::delete_credential(&provider) {
                             Ok(true) => {
                                 add_note_message(
-                                    &state.notice_container(),
+                                    &chat_container,
                                     &format!("Removed saved credentials for {provider}; reloading providers…"),
                                 );
                                 let _ = ctx.tx.send(TuiMessage::ReloadExtensions);
                             }
                             Ok(false) => add_note_message(
-                                &state.notice_container(),
+                                &chat_container,
                                 &format!("No saved credentials found for {provider}."),
                             ),
                             Err(error) => add_error_message(
-                                &state.notice_container(),
+                                &chat_container,
                                 &format!("Could not remove {provider} credentials: {error}"),
                             ),
                         }
@@ -3604,24 +3632,12 @@ pub async fn interactive_tui(
                     }
                     None => {
                         add_note_message(
-                            &state.notice_container(),
+                            &chat_container,
                             &format!("No saved credentials found for {provider}."),
                         );
                         tui.request_render(false);
                     }
                 }
-            }
-            Some(TuiMessage::ReloadModels { request }) => {
-                // Re-read the model/provider catalog from disk — **without**
-                // reloading extensions, so a running turn keeps receiving
-                // plugin events (unlike `ReloadExtensions` above, which swaps
-                // the extension session and blinds the in-flight run).
-                let reload_ctx = ctx.reload_context.clone();
-                let result = crate::session::reload_model_catalog_only(harness, &reload_ctx).await;
-                // The caller is blocked on this reply — always answer, even on
-                // failure, or the plugin's action call hangs forever.
-                let _ = request.reply.send(result);
-                tui.request_render(false);
             }
             Some(TuiMessage::ReloadExtensions) => {
                 // B5d: drive the shared reload routine on the async runtime,
@@ -3631,29 +3647,12 @@ pub async fn interactive_tui(
                 // clone the `Arc` out so the borrow of `harness` (the main
                 // loop's `&AgentHarness`) lives across the await.
                 let reload_ctx = ctx.reload_context.clone();
-                add_note_message(
-                    &state.notice_container(),
-                    "Reloading extensions + resources…",
-                );
+                add_note_message(&chat_container, "Reloading extensions + resources…");
                 tui.request_render(false);
                 let outcome =
                     crate::session::reload_extension_resources(harness, &reload_ctx).await;
                 if !outcome.had_errors {
                     if let Ok(resources) = harness.get_resources().await {
-                        let global = crate::settings::load_settings().unwrap_or_default();
-                        let project = if outcome.project_trusted.unwrap_or(project_trusted) {
-                            crate::settings::load_project_settings(&cwd)
-                        } else {
-                            Vec::new()
-                        };
-                        configure_resource_autocomplete(
-                            &state.autocomplete,
-                            registry.visible_entries(),
-                            &resources,
-                            &cwd,
-                            skill_commands_enabled(&global, &project),
-                        );
-                        state.autocomplete_container.clear();
                         update_resource_listing(
                             &ctx.resources,
                             ctx.startup_context.as_ref(),
@@ -3708,7 +3707,7 @@ pub async fn interactive_tui(
                             &registry,
                             &state.theme_manager,
                         ) {
-                            add_note_message(&state.notice_container(), &notice);
+                            add_note_message(&chat_container, &notice);
                             state.set_active_theme_spec(Some("dark".to_string()));
                         }
                         rebuilt = Some(registry);
@@ -3736,21 +3735,21 @@ pub async fn interactive_tui(
                     // Hard failure: the summary itself carries the error detail
                     // (e.g. "Settings reload failed: …"), so render it as an
                     // error without an extra stderr pointer.
-                    add_error_message(&state.notice_container(), &outcome.summary);
+                    add_error_message(&chat_container, &outcome.summary);
                 } else if outcome.had_warnings {
                     // Reload succeeded but produced soft diagnostics (skill
                     // shadowing, name validation, …). The details are printed
                     // to stderr; keep this as an informational note so a
                     // successful reload isn't shown as a red ✗ error.
                     add_note_message(
-                        &state.notice_container(),
+                        &chat_container,
                         &format!(
                             "{} (with warnings — see stderr for details).",
                             outcome.summary
                         ),
                     );
                 } else {
-                    add_note_message(&state.notice_container(), &outcome.summary);
+                    add_note_message(&chat_container, &outcome.summary);
                 }
                 tui.request_render(false);
             }
@@ -3760,13 +3759,35 @@ pub async fn interactive_tui(
 
     // ---- Shutdown ----
     state.history_page.invalidate();
-    // Let anything the lane has already committed to writing reach the disk
-    // before the tasks that carry those writes are aborted. A turn's entries are
-    // appended by the harness rather than by the drain task, but the drain task
-    // is what acknowledges them to the UI, so aborting it first can leave a turn
-    // the user saw with no durable counterpart.
-    let _ = lane.wait_for_idle().await;
-    lane.drain_session().await;
+    let mut key_handle = Some(key_handle);
+    let mut exit_code = 0;
+    if args.native_durable {
+        // Stop/join the built-in input producer before sealing its accepted
+        // background session writers. Dialog cancellation can unblock key work;
+        // the streaming event consumer stays live through producer settlement.
+        *running.lock().unwrap() = false;
+        ask_user_bridge.shutdown();
+        if key_handle.take().unwrap().await.is_err() {
+            exit_code = 1;
+        }
+        // Native shutdown is an explicit cooperative runtime boundary: settle
+        // an active prompt before the producer join/core barrier. Idle lanes
+        // return an error here, which is intentionally ignored just like RPC
+        // shutdown; the subsequent settlement still owns accepted writers.
+        let _ = lane.abort_and_reconcile().await;
+        if !settlement::settle_native(harness, state.session_write_tasks.seal()).await {
+            eprintln!("[rpi] native TUI settlement failed");
+            exit_code = 1;
+        }
+    } else {
+        // Let anything the lane has already committed to writing reach the disk
+        // before the tasks that carry those writes are aborted. A turn's entries are
+        // appended by the harness rather than by the drain task, but the drain task
+        // is what acknowledges them to the UI, so aborting it first can leave a turn
+        // the user saw with no durable counterpart.
+        let _ = lane.wait_for_idle().await;
+        lane.drain_session().await;
+    }
 
     ask_user_bridge.shutdown();
     *running.lock().unwrap() = false;
@@ -3776,7 +3797,9 @@ pub async fn interactive_tui(
     }
     // The input worker checks `running` at least every 50ms. Join it before
     // restoring cooked mode so no late event read races terminal cleanup.
-    let _ = key_handle.await;
+    if let Some(key_handle) = key_handle {
+        let _ = key_handle.await;
+    }
     tick_handle.abort();
     if let Some(handle) = drain_handle {
         handle.abort();
@@ -3786,10 +3809,6 @@ pub async fn interactive_tui(
     // redundant — the recv terminates — but cheap + makes shutdown explicit.)
     reload_context.mailbox.clear();
     reload_bridge_handle.abort();
-    // Same for the model-catalog refresh bridge: closing the mailbox ends the
-    // request channel, so a pending caller gets "TUI gone" instead of hanging.
-    reload_context.reload_models_mailbox.clear();
-    reload_models_bridge_handle.abort();
     tui.stop(Default::default());
 
     // upstream prints how to resume the session after an interactive exit so
@@ -3800,9 +3819,8 @@ pub async fn interactive_tui(
         println!("\x1b[2mTo resume this session:\x1b[0m {command}");
     }
     println!("\nGoodbye!");
-    let _ = args;
 
-    0
+    exit_code
 }
 
 // ===========================================================================
@@ -3817,3 +3835,28 @@ pub fn is_tui_supported() -> bool {
 // Keep the `Color` import used (theme accent rendering in autocomplete).
 #[allow(unused_imports)]
 use rpi_tui::Color as _Color;
+
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_failed_attach_tests.rs"]
+mod experimental_dialog_failed_attach_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_generation_tests.rs"]
+mod experimental_dialog_generation_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_reattachment_tests.rs"]
+mod experimental_dialog_reattachment_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_retirement_tests.rs"]
+mod experimental_dialog_retirement_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_dialog_startup_tests.rs"]
+mod experimental_dialog_startup_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_durable_tests.rs"]
+mod experimental_durable_shutdown_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_event_retirement_tests.rs"]
+mod experimental_event_retirement_tests;
+#[cfg(test)]
+#[path = "interactive_tui/shutdown/experimental_reload_bridge_tests.rs"]
+mod experimental_reload_bridge_tests;

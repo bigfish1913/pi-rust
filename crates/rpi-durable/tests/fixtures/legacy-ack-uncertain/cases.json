@@ -1,0 +1,441 @@
+{
+  "schema": "rpi-synthetic-ack-uncertain-cases-v1",
+  "frames": [
+    {
+      "index": 0,
+      "label": "start",
+      "kind": "commit",
+      "action": {
+        "action": "start",
+        "name": "ACK Plan",
+        "steps": [
+          {
+            "id": "a",
+            "title": "Check"
+          }
+        ]
+      },
+      "oldBlocked": false,
+      "oldEntries": 1,
+      "nativeReceipts": 1,
+      "oldReads": 1,
+      "retryOf": null,
+      "expected": {
+        "revision": 1,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "workflow": {
+          "name": "ACK Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        },
+        "queue": []
+      }
+    },
+    {
+      "index": 1,
+      "label": "missing-ack",
+      "kind": "missingAck",
+      "action": {
+        "action": "enqueue",
+        "text": "missing"
+      },
+      "oldBlocked": true,
+      "oldEntries": 2,
+      "nativeReceipts": 2,
+      "oldReads": 1,
+      "retryOf": null,
+      "expected": {
+        "revision": 2,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "workflow": {
+          "name": "ACK Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        },
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "missing",
+            "status": "queued",
+            "createdRevision": 2,
+            "updatedRevision": 2
+          }
+        ]
+      }
+    },
+    {
+      "index": 2,
+      "label": "retry-before-missing-reload",
+      "kind": "retry",
+      "action": {
+        "action": "enqueue",
+        "text": "missing"
+      },
+      "oldBlocked": true,
+      "oldEntries": 2,
+      "nativeReceipts": 2,
+      "oldReads": 1,
+      "retryOf": 1,
+      "expected": {
+        "revision": 2,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "workflow": {
+          "name": "ACK Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        },
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "missing",
+            "status": "queued",
+            "createdRevision": 2,
+            "updatedRevision": 2
+          }
+        ]
+      }
+    },
+    {
+      "index": 3,
+      "label": "reload-missing",
+      "kind": "reload",
+      "action": null,
+      "oldBlocked": false,
+      "oldEntries": 2,
+      "nativeReceipts": 2,
+      "oldReads": 2,
+      "retryOf": null,
+      "expected": {
+        "revision": 2,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "workflow": {
+          "name": "ACK Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        },
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "missing",
+            "status": "queued",
+            "createdRevision": 2,
+            "updatedRevision": 2
+          }
+        ]
+      }
+    },
+    {
+      "index": 4,
+      "label": "malformed-ack",
+      "kind": "malformedAck",
+      "action": {
+        "action": "enqueue",
+        "text": "malformed"
+      },
+      "oldBlocked": true,
+      "oldEntries": 3,
+      "nativeReceipts": 3,
+      "oldReads": 2,
+      "retryOf": null,
+      "expected": {
+        "revision": 3,
+        "nextRunId": 0,
+        "nextQueueId": 2,
+        "workflow": {
+          "name": "ACK Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        },
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "missing",
+            "status": "queued",
+            "createdRevision": 2,
+            "updatedRevision": 2
+          },
+          {
+            "id": "item-2",
+            "text": "malformed",
+            "status": "queued",
+            "createdRevision": 3,
+            "updatedRevision": 3
+          }
+        ]
+      }
+    },
+    {
+      "index": 5,
+      "label": "retry-before-malformed-reload",
+      "kind": "retry",
+      "action": {
+        "action": "enqueue",
+        "text": "malformed"
+      },
+      "oldBlocked": true,
+      "oldEntries": 3,
+      "nativeReceipts": 3,
+      "oldReads": 2,
+      "retryOf": 4,
+      "expected": {
+        "revision": 3,
+        "nextRunId": 0,
+        "nextQueueId": 2,
+        "workflow": {
+          "name": "ACK Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        },
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "missing",
+            "status": "queued",
+            "createdRevision": 2,
+            "updatedRevision": 2
+          },
+          {
+            "id": "item-2",
+            "text": "malformed",
+            "status": "queued",
+            "createdRevision": 3,
+            "updatedRevision": 3
+          }
+        ]
+      }
+    },
+    {
+      "index": 6,
+      "label": "reload-malformed",
+      "kind": "reload",
+      "action": null,
+      "oldBlocked": false,
+      "oldEntries": 3,
+      "nativeReceipts": 3,
+      "oldReads": 3,
+      "retryOf": null,
+      "expected": {
+        "revision": 3,
+        "nextRunId": 0,
+        "nextQueueId": 2,
+        "workflow": {
+          "name": "ACK Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        },
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "missing",
+            "status": "queued",
+            "createdRevision": 2,
+            "updatedRevision": 2
+          },
+          {
+            "id": "item-2",
+            "text": "malformed",
+            "status": "queued",
+            "createdRevision": 3,
+            "updatedRevision": 3
+          }
+        ]
+      }
+    },
+    {
+      "index": 7,
+      "label": "status-reconciled",
+      "kind": "read",
+      "action": {
+        "action": "status"
+      },
+      "oldBlocked": false,
+      "oldEntries": 3,
+      "nativeReceipts": 3,
+      "oldReads": 3,
+      "retryOf": null,
+      "expected": {
+        "revision": 3,
+        "nextRunId": 0,
+        "nextQueueId": 2,
+        "workflow": {
+          "name": "ACK Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        },
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "missing",
+            "status": "queued",
+            "createdRevision": 2,
+            "updatedRevision": 2
+          },
+          {
+            "id": "item-2",
+            "text": "malformed",
+            "status": "queued",
+            "createdRevision": 3,
+            "updatedRevision": 3
+          }
+        ]
+      }
+    },
+    {
+      "index": 8,
+      "label": "after-reconciliation",
+      "kind": "commit",
+      "action": {
+        "action": "enqueue",
+        "text": "after"
+      },
+      "oldBlocked": false,
+      "oldEntries": 4,
+      "nativeReceipts": 4,
+      "oldReads": 3,
+      "retryOf": null,
+      "expected": {
+        "revision": 4,
+        "nextRunId": 0,
+        "nextQueueId": 3,
+        "workflow": {
+          "name": "ACK Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        },
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "missing",
+            "status": "queued",
+            "createdRevision": 2,
+            "updatedRevision": 2
+          },
+          {
+            "id": "item-2",
+            "text": "malformed",
+            "status": "queued",
+            "createdRevision": 3,
+            "updatedRevision": 3
+          },
+          {
+            "id": "item-3",
+            "text": "after",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ]
+      }
+    },
+    {
+      "index": 9,
+      "label": "final-status",
+      "kind": "read",
+      "action": {
+        "action": "status"
+      },
+      "oldBlocked": false,
+      "oldEntries": 4,
+      "nativeReceipts": 4,
+      "oldReads": 3,
+      "retryOf": null,
+      "expected": {
+        "revision": 4,
+        "nextRunId": 0,
+        "nextQueueId": 3,
+        "workflow": {
+          "name": "ACK Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        },
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "missing",
+            "status": "queued",
+            "createdRevision": 2,
+            "updatedRevision": 2
+          },
+          {
+            "id": "item-2",
+            "text": "malformed",
+            "status": "queued",
+            "createdRevision": 3,
+            "updatedRevision": 3
+          },
+          {
+            "id": "item-3",
+            "text": "after",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ]
+      }
+    }
+  ]
+}

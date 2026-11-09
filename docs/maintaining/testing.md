@@ -32,7 +32,7 @@
 
 | 场景 | 当前入口 | 为什么不与默认 CI PASS 混淆 / 后续条件 |
 | --- | --- | --- |
-| 实验 native store 与进程终止/SQLite spill 恢复 | `cargo test -p rpi-harness --features experimental-native-store --lib process_tests --locked -- --test-threads=1` | 具备合成、离线、子进程隔离条件，**适合后续独立 feature CI job**；当前工作流未启用此 feature，默认 workspace 绿灯不覆盖它。详见 [实验进程测试](../architecture/experimental-native-process-tests.md)。 |
+| durable SQLite journal backend | `cargo test -p rpi-durable --all-features --locked --offline` | 仅在显式启用 `rpi-durable/sqlite`（或 harness 的 `durable-sqlite`）时覆盖；默认 harness 构建使用 memory/JSONL，不引入 SQLite。 |
 | 真实 Windows TUI 压力 | `compare-resources.py --case tui ...` | 需要 Windows ConPTY、可用的 pywinpty 与实际输入确认；当前仅控制器单测进 CI，实际终端缺依赖/未确认输入应记 SKIP。 |
 | 真实 macOS / iTerm2 长会话向上回看 | [iTerm2 人工验收](../debugging/macos-iterm2-scrollback.md#iterm2-人工验收修复后仍必需) | 后台工具仍运行、耗时行进入历史区时观察多帧闪屏/跳位，以及完整命令和消息唯一性；当前环境未执行，不能用虚拟终端或 fullscreen 对照 PASS 代替。 |
 | 多版本 binary 的资源/冷启动 AB/BA 对比 | `compare-resources.py --variant ...`；`resource-cold-start.py --baseline ... --candidate ...` | 需要可验证的旧、新产物与一致 profile；CI 冷启动门禁只测当前产物，不伪造旧基线。可后续做受控 performance workflow。 |

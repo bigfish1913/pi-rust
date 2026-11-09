@@ -1,0 +1,72 @@
+// Prepended helpers are the exact pinned upstream old-SDK runtime contract.
+#[test]
+fn export_actual_control_noops_rejections_and_before_append_failure() {
+    let api=PluginApi {
+        abi_version:rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+        struct_size:std::mem::size_of::<PluginApi>() as u32,free_string,
+        register_tool:Some(register_tool),register_command:Some(register_command),
+        register_shortcut:None,register_flag:None,register_provider:None,
+        register_message_renderer:None,register_markdown_transformer:None,
+        register_entry_renderer:None,register_event_handler:Some(register_event),
+        register_resources_discover:None,runtime_action:runtime,dispatch_event:None,
+        user_data:std::ptr::null_mut(),declare:None,register_before_agent_start:None,
+        register_oauth_provider:None,
+    };
+    assert_eq!(rpi_durable::rpi_plugin_register(&api),0);
+    assert_eq!(empty(EventTag::SessionStart),0);
+    let cases:Value=serde_json::from_str(include_str!("cases.json")).unwrap();
+    assert_eq!(cases["schema"],"rpi-synthetic-control-failure-cases-v1");
+    assert_eq!(cases["frames"].as_array().unwrap().len(),20);
+    let mut exported=Vec::new();
+    for frame in cases["frames"].as_array().unwrap() {
+        let index=frame["index"].as_u64().unwrap();
+        let kind=frame["kind"].as_str().unwrap();
+        let before=action(json!({"action":"status"})).unwrap();
+        let entries_before=host().lock().unwrap().entries.clone();
+        if kind=="appendFailure" {host().lock().unwrap().fail_append=true;}
+        let answer=action(frame["action"].clone());
+        let (channel,raw,error)=match answer {
+            Ok(value)=>{
+                let failed=value["details"]["error"].is_string();
+                let error=value["details"]["error"].as_str().map(str::to_owned);
+                (if failed {"details-error"}else {"done"},Some(value),error)
+            },
+            Err(message)=>("tool-error",None,Some(message)),
+        };
+        let after=action(json!({"action":"status"})).unwrap();
+        let mut state=after["details"].clone();
+        state.as_object_mut().unwrap().remove("action").unwrap();
+        assert!(state.get("error").is_none());
+        let expected:rpi_durable_core::DurableState=serde_json::from_value(frame["expected"].clone()).unwrap();
+        assert_eq!(state,serde_json::to_value(expected).unwrap(),"case {index}: {}",frame["label"]);
+        let entries=host().lock().unwrap().entries.clone();
+        assert_eq!(entries.len() as u64,frame["oldEntries"].as_u64().unwrap());
+        assert_eq!(serde_json::to_value(rpi_durable_core::DurableState::try_from_branch(&entries).unwrap()).unwrap(),state);
+        match kind {
+            "changed"=>{assert_eq!(channel,"done","case {index}: {} result={raw:?}",frame["label"]);assert_eq!(entries.len(),entries_before.len()+1);},
+            "noop"|"read"=>{assert_eq!(channel,"done","case {index}: {} result={raw:?}",frame["label"]);assert_eq!(entries,entries_before);assert_eq!(after,before);},
+            "reject"=>{assert_ne!(channel,"done");assert!(error.as_ref().is_some_and(|s|!s.is_empty()));assert_eq!(entries,entries_before);assert_eq!(after,before);},
+            "appendFailure"=>{assert_eq!(channel,"tool-error");assert!(!host().lock().unwrap().fail_append);assert_eq!(entries,entries_before);assert_eq!(after,before);},
+            _=>panic!("unknown fixed case kind"),
+        }
+        exported.push(json!({"index":index,"label":frame["label"],"action":frame["action"],
+            "kind":kind,"legacyChannel":channel,"legacyResult":raw,"legacyError":error,
+            "state":state,"entryCount":entries.len(),"entryId":entries.last().map(|entry|entry["id"].clone())}));
+    }
+    let entries=host().lock().unwrap().entries.clone();
+    assert_eq!(entries.len(),7);
+    assert_eq!(entries[0]["data"]["kind"],"snapshot");
+    assert_eq!(entries[0]["data"]["revision"],1);
+    assert_eq!(empty(EventTag::SessionTree),0);
+    assert_eq!(host().lock().unwrap().entries,entries);
+    let artifact=json!({"schema":"rpi-synthetic-legacy-control-failure-export-v1",
+        "legacyCommit":"041c981b21ac42348feee371757f5ef26ecbdcab",
+        "pluginSha256":"0f4be632b1f5dab5dfa0ac9cf55bb9119b1a37ec3ac195f08161dca9480fdaac",
+        "casesSha256":"4eace46c0dd0353b8c91e4e10b60beb5b5afa880829592e82b031c98ab25b6f5",
+        "frames":exported,"entries":entries});
+    // Explicit runner-owned synthetic TempDir only; never a user journal.
+    let path=std::env::var_os("RPI_SYNTHETIC_LEGACY_CONTROL_FAILURE_EXPORT").expect("explicit synthetic export path");
+    use std::io::Write;
+    let mut file=std::fs::OpenOptions::new().create_new(true).write(true).open(path).unwrap();
+    file.write_all(serde_json::to_string(&artifact).unwrap().as_bytes()).unwrap();
+}

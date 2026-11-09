@@ -176,8 +176,6 @@ pub struct Args {
     /// scopedModels — the same set /scoped-models edits). Empty = all models.
     pub models: Option<Vec<String>>,
     pub session_dir: Option<PathBuf>,
-    /// Reserved even in feature-off builds; fresh explicit print sessions only.
-    pub experimental_native_store: Option<PathBuf>,
     pub no_session: bool,
     pub name: Option<String>,
 
@@ -185,6 +183,10 @@ pub struct Args {
     pub exclude_tools: Option<Vec<String>>,
     pub no_tools: bool,
     pub no_builtin_tools: bool,
+    /// Opt-in native durable prototype; never replaces a legacy extension silently.
+    pub native_durable: bool,
+    /// Explicit experimental v2 epoch; requires native durable admission.
+    pub experimental_durable_epoch: Option<String>,
 
     /// `--no-skills`/`-ns`: skip skill discovery + the `<available_skills>`
     /// system-prompt listing.
@@ -394,6 +396,17 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-session" => result.no_session = true,
             "--no-tools" | "-nt" => result.no_tools = true,
             "--no-builtin-tools" | "-nbt" => result.no_builtin_tools = true,
+            "--native-durable" => result.native_durable = true,
+            "--experimental-durable-epoch" => {
+                if result.experimental_durable_epoch.is_some() {
+                    result
+                        .errors
+                        .push("--experimental-durable-epoch may only be supplied once".into());
+                }
+                if let Some(epoch) = take_value(&mut result, "--experimental-durable-epoch") {
+                    result.experimental_durable_epoch = Some(epoch);
+                }
+            }
             "--no-skills" | "-ns" => result.no_skills = true,
             "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
             "--no-context-files" | "-nc" => result.no_context_files = true,
@@ -469,17 +482,6 @@ pub fn parse_args(args: &[String]) -> Args {
             "--prompt-template" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.prompt_template.push(PathBuf::from(v));
-                }
-            }
-            "--experimental-native-store" => {
-                if let Some(value) = take_value(&mut result, &flag_key) {
-                    if result.experimental_native_store.is_some() {
-                        result
-                            .errors
-                            .push("--experimental-native-store may be supplied only once".into());
-                    } else {
-                        result.experimental_native_store = Some(PathBuf::from(value));
-                    }
                 }
             }
             "--session-dir" => {
@@ -600,7 +602,7 @@ pub fn parse_args(args: &[String]) -> Args {
     // `--print` + `--mode json`: `--print` implies non-interactive, but
     // `--mode json` selects the JSON event stream. The TS `resolveAppMode`
     // treats `mode === "json"` as its own non-interactive mode; we follow that.
-    if let Err(error) = crate::native_store::validate(&result) {
+    if let Err(error) = crate::native_durable::experimental_epoch::policy(&result) {
         result.errors.push(error);
     }
     result
@@ -690,14 +692,15 @@ pub fn print_help() {
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
   --session-dir <dir>            Directory for session storage
-  --experimental-native-store <dir>
-                                Fresh --print text/json only; requires experimental-native-store build feature
   --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
   --tools, -t <list>             Comma-separated allowlist of tool names to enable
   --exclude-tools, -xt <list>    Comma-separated denylist of tool names to disable
   --no-tools, -nt                Disable all tools
   --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write, docs)
+  --native-durable              Opt in to native durable v1 (no legacy import; restart to reload)
+  --experimental-durable-epoch <id>
+                                With --native-durable only: bounded v2 ledger, explicit same epoch on reopen; no migration
   --no-skills, -ns               Skip skill discovery (no <available_skills> block)
   --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
   --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)

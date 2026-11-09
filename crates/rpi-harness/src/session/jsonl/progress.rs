@@ -97,6 +97,10 @@ impl JsonlProgressStore {
                 .await,
             "initialize progress companion",
         )?;
+        file_result(
+            self.fs.sync_file(&self.path, false, None).await,
+            "sync initialized progress companion",
+        )?;
         state.length = length;
         state.digest = digest;
         state.progress = Some(progress);
@@ -275,6 +279,10 @@ impl JsonlProgressStore {
                             .await,
                         "repair torn progress tail",
                     )?;
+                    file_result(
+                        self.fs.sync_file(&self.path, true, None).await,
+                        "sync repaired progress tail",
+                    )?;
                     break;
                 }
                 Err(error) => {
@@ -342,18 +350,28 @@ impl JsonlProgressStore {
         let length = bytes.len() as u64;
         let mut digest = Sha256::new();
         digest.update(&bytes);
-        let temporary = format!("{}.tmp", self.path);
-        file_result(
-            self.fs
-                .write_file(&temporary, FileContent::Bytes(bytes), None)
-                .await,
-            "stage progress checkpoint",
-        )?;
-        if let Err(error) = self.fs.rename_file(&temporary, &self.path, None).await {
-            // Rename may have succeeded before its error was reported. Never append
-            // using the stale in-memory projection in that uncertain state.
-            state.poisoned = true;
-            return file_result(Err(error), "publish progress checkpoint");
+        let fs = self.fs.clone();
+        let path = self.path.clone();
+        let publish_result =
+            super::storage::publish_file_atomically(&fs, &path, move |fs, temporary| {
+                Box::pin(async move {
+                    file_result(
+                        fs.write_file(temporary, FileContent::Bytes(bytes), None)
+                            .await,
+                        "stage progress checkpoint",
+                    )
+                })
+            })
+            .await;
+        if let Err(error) = publish_result {
+            // A staging failure leaves the destination untouched and can be
+            // retried by the same live owner. Once publication is attempted,
+            // however, the rename or a following sync may have succeeded before
+            // the error was reported; never append using that stale projection.
+            if !error.message.starts_with("stage progress checkpoint:") {
+                state.poisoned = true;
+            }
+            return Err(error);
         }
         state.length = length;
         state.digest = digest;
@@ -426,6 +444,10 @@ impl JsonlProgressStore {
                     }
                 };
                 drop(handle);
+                let result = match result {
+                    Ok(()) => store.fs.sync_file(&store.path, true, None).await,
+                    Err(error) => Err(error),
+                };
                 if let Err(error) = result {
                     let rolled_back = match store.fs.read_binary_file(&store.path, None).await {
                         Ok(current)
@@ -436,11 +458,16 @@ impl JsonlProgressStore {
                                 && current[before as usize..]
                                     == bytes[..current.len() - before as usize] =>
                         {
-                            store
+                            if store
                                 .fs
                                 .truncate_file(&store.path, before, None)
                                 .await
                                 .is_ok()
+                            {
+                                store.fs.sync_file(&store.path, true, None).await.is_ok()
+                            } else {
+                                false
+                            }
                         }
                         _ => false,
                     };

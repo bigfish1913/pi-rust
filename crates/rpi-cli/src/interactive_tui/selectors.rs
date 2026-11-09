@@ -197,7 +197,7 @@ pub(super) fn open_model_selector(
         let lane = lane_sel.clone();
         let state = state_sel.clone();
         let tui = tui_sel.clone();
-        tokio::spawn(async move {
+        state.session_write_tasks.clone().spawn(async move {
             report_model_selection(&lane, &state, &tui, model, false).await;
         });
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
@@ -1016,7 +1016,7 @@ pub(super) fn open_thinking_selector(
         };
         let lane = lane_sel.clone();
         let footer_sel = state_sel.footer.clone();
-        tokio::spawn(async move {
+        state_sel.session_write_tasks.spawn(async move {
             let _ = lane.set_thinking_level(level).await;
         });
         // Reflect the chosen level in the footer's model suffix (pi parity:
@@ -1106,7 +1106,7 @@ pub(super) fn open_tools_selector(
         let on = next.iter().any(|a| a == &item.value);
         let lane = lane_sel.clone();
         let next_clone = next.clone();
-        tokio::spawn(async move {
+        state_sel.session_write_tasks.spawn(async move {
             let _ = lane.set_active_tools(next_clone).await;
         });
         let list_str = if next.is_empty() {
