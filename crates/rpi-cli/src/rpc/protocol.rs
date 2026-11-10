@@ -139,6 +139,20 @@ pub enum Command {
     },
     GetAvailableModels,
     GetAuthStatus,
+    GetProviderModels {
+        api: String,
+        #[serde(rename = "baseUrl")]
+        base_url: String,
+        #[serde(rename = "apiKey")]
+        api_key: String,
+    },
+    TestProviderConfig {
+        api: String,
+        #[serde(rename = "baseUrl")]
+        base_url: String,
+        #[serde(rename = "apiKey")]
+        api_key: String,
+    },
     #[serde(rename = "oauth")]
     OAuth {
         provider: String,
@@ -149,6 +163,45 @@ pub enum Command {
         provider: String,
         #[serde(rename = "apiKey")]
         api_key: String,
+    },
+    SetProviderConfig {
+        provider: String,
+        api: String,
+        #[serde(rename = "baseUrl")]
+        base_url: String,
+        #[serde(rename = "apiKey")]
+        api_key: String,
+        #[serde(rename = "modelId")]
+        model_id: String,
+        #[serde(rename = "modelName")]
+        model_name: Option<String>,
+        #[serde(rename = "contextWindow")]
+        context_window: Option<u64>,
+        #[serde(rename = "maxOutputTokens")]
+        max_output_tokens: Option<u64>,
+        #[serde(rename = "supportsImages")]
+        supports_images: Option<bool>,
+    },
+    UpdateProviderConfig {
+        provider: String,
+        api: String,
+        #[serde(rename = "baseUrl")]
+        base_url: String,
+        #[serde(rename = "apiKey")]
+        api_key: Option<String>,
+        #[serde(rename = "modelId")]
+        model_id: String,
+        #[serde(rename = "modelName")]
+        model_name: Option<String>,
+        #[serde(rename = "contextWindow")]
+        context_window: Option<u64>,
+        #[serde(rename = "maxOutputTokens")]
+        max_output_tokens: Option<u64>,
+        #[serde(rename = "supportsImages")]
+        supports_images: Option<bool>,
+    },
+    DeleteProviderConfig {
+        provider: String,
     },
     SetModel {
         provider: Option<String>,
@@ -601,6 +654,76 @@ mod tests {
         );
         assert!(!status.to_string().contains("secret-fixture"));
     }
+    #[test]
+    fn provider_configuration_payloads_are_valid_rpc_commands() {
+        let set: Request = serde_json::from_value(json!({
+            "type": "set_provider_config",
+            "provider": "gateway",
+            "api": "openai-completions",
+            "baseUrl": "https://api.example.test/v1",
+            "apiKey": "fixture-key",
+            "modelId": "model-a",
+            "modelName": "Model A",
+            "contextWindow": 128000,
+            "maxOutputTokens": 4096,
+            "supportsImages": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            set.command,
+            Command::SetProviderConfig {
+                provider,
+                model_id,
+                supports_images: Some(true),
+                ..
+            } if provider == "gateway" && model_id == "model-a"
+        ));
+
+        let update: Request = serde_json::from_value(json!({
+            "type": "update_provider_config",
+            "provider": "gateway",
+            "api": "openai-completions",
+            "baseUrl": "https://api.example.test/v1",
+            "apiKey": "",
+            "modelId": "model-b"
+        }))
+        .unwrap();
+        assert!(matches!(
+            update.command,
+            Command::UpdateProviderConfig {
+                provider,
+                api_key: Some(key),
+                model_id,
+                ..
+            } if provider == "gateway" && key.is_empty() && model_id == "model-b"
+        ));
+
+        for kind in ["get_provider_models", "test_provider_config"] {
+            let request: Request = serde_json::from_value(json!({
+                "type": kind,
+                "api": "openai-completions",
+                "baseUrl": "https://api.example.test/v1",
+                "apiKey": "fixture-key"
+            }))
+            .unwrap();
+            match (kind, request.command) {
+                ("get_provider_models", Command::GetProviderModels { .. })
+                | ("test_provider_config", Command::TestProviderConfig { .. }) => {}
+                _ => panic!("unexpected command for {kind}"),
+            }
+        }
+
+        let delete: Request = serde_json::from_value(json!({
+            "type": "delete_provider_config",
+            "provider": "gateway"
+        }))
+        .unwrap();
+        assert!(matches!(
+            delete.command,
+            Command::DeleteProviderConfig { provider } if provider == "gateway"
+        ));
+    }
+
     #[test]
     fn prompt_payload_accepts_legacy_content_and_prompt_fields() {
         for field in ["content", "prompt"] {
