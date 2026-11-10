@@ -31,6 +31,31 @@ pub enum Command {
     GetResourceState {
         version: Option<u32>,
     },
+    /// Native durable v1 shapes; strict validation belongs to its bounded adapter.
+    GetDurableState {
+        version: u32,
+        #[serde(rename = "runId")]
+        run_id: Option<String>,
+    },
+    /// Explicit scope-bound native execution page; strict cursor validation is shared.
+    GetDurableRuns {
+        version: u32,
+        cursor: Option<Value>,
+    },
+    DurableMutate {
+        version: u32,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        expected: Value,
+        action: Value,
+        #[serde(rename = "runId")]
+        run_id: Option<String>,
+    },
+    GetDurableRequest {
+        version: u32,
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     /// List extension slash commands (name and description).
     GetCommands,
     /// Invoke an extension handler and return its JSON result as response data.
@@ -212,6 +237,10 @@ pub const SUPPORTED_EVENTS: &[&str] = &[
 
 pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_resource_state",
+    "get_durable_state",
+    "durable_mutate",
+    "get_durable_request",
+    "get_durable_runs",
     "get_state",
     "get_commands",
     "execute_command",
@@ -291,6 +320,7 @@ pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
         "supportedEvents": SUPPORTED_EVENTS,
         "promptContent": super::prompt_content::prompt_capabilities(),
         "fileIO": super::file_io::capabilities(),
+        "durable": crate::native_durable::capabilities(false),
         "toolProgramChildren": {
             "version": 1,
             "summaryCommand": "get_tool_program_children",

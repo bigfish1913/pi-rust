@@ -175,6 +175,7 @@ async fn harness_with_options(
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: None,
+        require_native_durable: false,
         allow_existing_session: false,
     };
 
@@ -633,6 +634,7 @@ async fn harness_forwards_after_tool_call_option_into_loop() {
             transform_context: None,
             entry_transforms: Vec::new(),
             provider_hooks: None,
+            require_native_durable: false,
             allow_existing_session: false,
         };
         let harness = AgentHarness::create(options).await.expect("create harness");
@@ -789,6 +791,7 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
             transform_context: None,
             entry_transforms: Vec::new(),
             provider_hooks: Some(hooks),
+            require_native_durable: false,
             allow_existing_session: false,
         };
         let harness = AgentHarness::create(options).await.expect("create harness");
@@ -935,6 +938,7 @@ async fn provider_hooks_can_replace_the_system_prompt_the_model_sees() {
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: Some(Arc::new(AppendHooks) as Arc<dyn ProviderHooks>),
+        require_native_durable: false,
         allow_existing_session: false,
     };
     let harness = AgentHarness::create(options).await.expect("create harness");
@@ -1419,6 +1423,7 @@ async fn reopen_harness(session: rpi_harness::session::session::Session) -> Agen
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: None,
+        require_native_durable: false,
         allow_existing_session: true,
     };
     AgentHarness::create(options)
@@ -1676,6 +1681,7 @@ async fn harness_with_hanging_tool(script: FauxScript) -> (AgentHarness, Arc<Fau
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: None,
+        require_native_durable: false,
         allow_existing_session: false,
     };
     let harness = AgentHarness::create(options).await.expect("create harness");
@@ -2179,6 +2185,7 @@ async fn replayable_harness_full(
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: None,
+        require_native_durable: false,
         allow_existing_session,
     };
     AgentHarness::create(options).await.expect("create harness")
@@ -2802,11 +2809,25 @@ async fn an_explicitly_aborted_run_is_not_resumed() {
         "the run must have started before it can be aborted"
     );
 
-    harness.lane("main").abort().await.expect("abort succeeds");
+    let reconciled = harness
+        .lane("main")
+        .abort_and_reconcile()
+        .await
+        .expect("abort and reconciliation succeed");
+    assert!(reconciled.settled);
+    assert!(!reconciled.abort.run_id.is_empty());
     let outcome = run.await.expect("the run task finished");
     assert!(
         outcome.is_ok(),
         "an aborted run settles normally: {outcome:?}"
+    );
+    assert_eq!(
+        reconciled
+            .terminal
+            .as_ref()
+            .map(|result| result.run_id.as_str()),
+        Some(reconciled.abort.run_id.as_str()),
+        "cooperative abort must expose the committed terminal result after settlement"
     );
 
     let session = harness.session().clone();
@@ -3945,7 +3966,7 @@ async fn check_crash_before_first_request(with_custom_entries: bool) {
     if with_custom_entries {
         for _ in 0..2 {
             session
-                .append_custom_entry("durable-state", Some(serde_json::json!({"running": true})))
+                .append_custom_entry("plugin-state", Some(serde_json::json!({"running": true})))
                 .await
                 .expect("append AgentStart journal");
         }
@@ -3969,7 +3990,7 @@ async fn check_crash_before_first_request(with_custom_entries: bool) {
         recovered
             .session()
             .append_custom_entry(
-                "durable-state",
+                "plugin-state",
                 Some(serde_json::json!({"interrupted": true})),
             )
             .await
@@ -4532,6 +4553,9 @@ mod native_identity_bind_failure {
         }
         async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
             self.inner.get_lanes().await
+        }
+        async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+            self.inner.history_identity().await
         }
         async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
             self.inner.create_lane(lane, at).await

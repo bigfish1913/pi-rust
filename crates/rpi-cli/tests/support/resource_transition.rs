@@ -290,7 +290,7 @@ async fn transition_conflicts_invalid_targets_and_concurrent_writers_are_read_on
             "--session-id",
             "conflicts",
         ],
-        "already open",
+        "writer lease is already held",
     )
     .await;
     for key in [

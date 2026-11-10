@@ -13,6 +13,7 @@ pub mod cache_stats;
 pub mod compaction;
 pub mod context_files;
 pub mod diagnostics;
+pub mod durable;
 pub mod error;
 pub mod events;
 pub mod frame_progress;

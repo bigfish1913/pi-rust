@@ -11,8 +11,8 @@ rpi 是 Rust 原生 Agent SDK 与终端应用。当前 workspace 包含十一个
 | `rpi-runtime` | 可嵌入的模型目录、配置与凭据解析、认证状态、模型/thinking 选择和私有执行绑定 |
 | `rpi-agent` | Agent Loop、工具调用、事件、队列、取消与轮次回调 |
 | `rpi-tools` | 内置工具与 ExecutionEnv 执行环境抽象 |
-| `rpi-durable` | 后端无关的活动进度 checkpoint 校验、投影与恢复原语 |
-| `rpi-harness` | 会话树、JSONL 持久化、上下文压缩、恢复、skills 与模板 |
+| `rpi-durable` | durable domain、runtime 写入边界，以及 JSONL/可选 SQLite journal storage |
+| `rpi-harness` | Pi-facing 会话抽象、memory/JSONL session storage、上下文压缩、Agent Loop 恢复、skills 与模板 |
 | `rpi-tui` | 终端组件、编辑器、布局、Markdown 与 transcript 渲染 |
 | `rpi-plugin-sdk` | 动态库扩展使用的 C ABI 类型与注册接口 |
 | `rpi-extensions` | 宿主扩展加载与跨 ABI 调用桥接 |
@@ -51,7 +51,7 @@ Provider 是 LLM 协议边界。上层处理统一消息和事件，具体 HTTP/
 
 ## 会话与长任务
 
-会话是带 branch 和 lane 的 entry 树，JSONL 后端记录消息、操作及步骤。Harness 根据 branch 构造模型上下文，并管理提交、取消与崩溃恢复。流式 assistant frame 作为不进入上下文的进度 record 写入持久化 session；durable writer 会将 frame 按最多 32 条或约 50 ms 聚合，并在绑定 assistant entry、清理 stream/run 前强制 flush。这样保留崩溃恢复的已提交前缀，同时减少每帧一次文件追加的调度开销。压缩新增摘要 entry，保留原始历史；当前既支持 run 前检查，也支持工具结果后的运行中检查。需要定位请求、上下文或 frame writer 耗时时，可使用 `RPI_AGENT_DIAGNOSTICS=1` 和 `RPI_FRAME_DIAGNOSTICS=1`，详见 [Rust 调试指南](../debugging/rust-debugging.md)。
+会话是带 branch 和 lane 的 entry 树。Harness 提供 Pi-facing Session 抽象并根据 branch 构造模型上下文；durable runtime/storage 负责最终的 journal 写入、顺序和 revision CAS。runtime 按 authority 分为 actor、scope、admission、receipt、reconcile 五个公开边界，但不新增外部 effect 或 exactly-once 语义。Harness 默认使用 memory/JSONL session storage；durable SQLite journal 属于 `rpi-durable` 的独立 opt-in backend，可由 harness 的 `durable-sqlite` feature 显式转发启用。旧 harness Session SQLite backend 已移除，不提供迁移兼容层。Transcript entry 与 operation/tool record 在语义上保持分离，即使未来共享同一个 durable writer/backend。流式 assistant frame 作为不进入上下文的进度 record 写入持久化 session；durable writer 会将 frame 按最多 32 条或约 50 ms 聚合，并在绑定 assistant entry、清理 stream/run 前强制 flush。这样保留崩溃恢复的已提交前缀，同时减少每帧一次文件追加的调度开销。压缩新增摘要 entry，保留原始历史；当前既支持 run 前检查，也支持工具结果后的运行中检查。需要定位请求、上下文或 frame writer 耗时时，可使用 `RPI_AGENT_DIAGNOSTICS=1` 和 `RPI_FRAME_DIAGNOSTICS=1`，详见 [Rust 调试指南](../debugging/rust-debugging.md)。
 
 恢复和重放行为受记录状态与工具 replay 策略约束，不能将所有工具视为可安全重复执行。详细排查证据见 [恢复与重复思考复盘](../debugging/llm-repetition-forensics.md)。
 
@@ -59,6 +59,7 @@ Provider 是 LLM 协议边界。上层处理统一消息和事件，具体 HTTP/
 
 - [Agent 项目结构](../agent/project-structure.md)
 - [原生 durable 与 session 选择性恢复](native-durable-session.md)
+- [Session 到 durable storage boundary 迁移](durable-session-boundary-migration.md)
 - [可嵌入运行时与选择器拆分](reusable-runtime.md)
 - [Agent Loop 与流式消息链路](../agent/loop-walkthrough.md)
 - [上下文压缩](../agent/context-compaction.md)

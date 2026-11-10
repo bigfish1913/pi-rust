@@ -85,11 +85,10 @@ async fn run_inner() -> i32 {
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
-    if let Err(error) = crate::native_store::early_check(&argv) {
+    if let Err(error) = crate::native_durable::experimental_epoch::early_check(&argv) {
         eprintln!("error: {error}");
         return EXIT_USAGE;
     }
-
     // Safe old-host negotiation: callers discover this flag through --help
     // first. Never fall through to prompts, remote clients, resource commands,
     // trust, migration, leases, credentials, providers or DLL startup.
@@ -200,6 +199,7 @@ async fn run_inner() -> i32 {
                 .await;
         }
         Some("events") => return crate::events::run(&argv[1..]).await,
+        Some("session") => return crate::session_gc::run(&argv[1..]).await,
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
         Some("install") => return crate::install::run_async(&argv[1..]).await,
         Some("uninstall") => return crate::install::uninstall(&argv[1..]),
@@ -242,14 +242,6 @@ async fn run_inner() -> i32 {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
-    match crate::native_store::root(&parsed, &cwd) {
-        Ok(root) => parsed.experimental_native_store = root,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return EXIT_USAGE;
-        }
-    }
-
     // ---- Legacy-layout migration (flat ~/.rpi → ~/.rpi/agent/) ----
     // Best-effort; never blocks startup. Skipped when RPI_CODING_AGENT_DIR is
     // set (an explicit override is its own layout).
@@ -320,9 +312,7 @@ async fn run_inner() -> i32 {
     // adopted cwd belongs to another project's tree. Pinning the resolved root
     // into `args` makes `prepare_extensions` and the build below read one root.
     let session_root = crate::session::configured_session_dir(&parsed, &cwd);
-    if parsed.experimental_native_store.is_none() {
-        parsed.session_dir = Some(session_root.clone());
-    }
+    parsed.session_dir = Some(session_root.clone());
     let mut startup_notices: Vec<String> = Vec::new();
     // The peek and the build both derive their selection from this frozen root,
     // so they can never inspect one session and open another.
@@ -472,7 +462,6 @@ async fn run_inner() -> i32 {
     harness_build.finish();
     startup.finish();
     reload_context.dev_extension = dev_extension;
-
     // ---- post-load stdin claim + initial message ----
     // Extensions are loaded by `build()` (above). A plugin may have declared
     // `{"ownsStdio":true}`: this process's stdio belongs to it (an ACP/MCP stdio
@@ -561,13 +550,6 @@ async fn run_inner() -> i32 {
     // otherwise the host would start a TUI/print run that writes to a stream the
     // plugin owns.
     let mode = if stdio_claimed { RunMode::Rpc } else { mode };
-    if let Err(error) =
-        crate::native_store::validate_mode(parsed.experimental_native_store.is_some(), mode)
-    {
-        eprintln!("error: {error}");
-        return EXIT_USAGE;
-    }
-
     // ---- startup notices (restored-session cwd) ----
     // The interactive TUI renders them as transcript notes (they must survive
     // into the alternate screen); headless modes print them to stderr like the
@@ -692,13 +674,14 @@ async fn run_inner() -> i32 {
                         let session = reload_context.extension_session.lock().unwrap();
                         session.snapshot_arc()
                     };
-                    crate::modes::rpc(
+                    crate::modes::rpc_with_durable(
                         &harness,
                         Some(event_rx),
                         model_catalog,
                         reload_context.ui_dialog.clone(),
                         oauth_snapshot,
                         parsed.rpc_message_updates,
+                        parsed.native_durable,
                     )
                     .await
                 };

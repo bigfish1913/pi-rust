@@ -12,6 +12,7 @@ use rpi_tui::truncate_to_width;
 /// Install one command-discovery snapshot at startup and after successful
 /// resource reloads. Skills expand in the harness's normal input path, not in
 /// slash dispatch, so images and queued messages keep their ordinary behavior.
+#[allow(dead_code)]
 pub(super) fn configure_resource_autocomplete(
     autocomplete: &AutocompleteManager,
     mut commands: Vec<SlashCommandEntry>,
@@ -24,7 +25,7 @@ pub(super) fn configure_resource_autocomplete(
     // then reserve hidden builtins and aliases against resource commands too.
     let mut seen = std::collections::BTreeSet::new();
     commands.retain(|command| seen.insert(command.name.clone()));
-    seen.extend(super::builtin_reserved_names());
+    seen.extend(super::builtin_reserved_names(false));
     let skills = if enable_skill_commands {
         resources.skills
     } else {
@@ -48,6 +49,7 @@ pub(super) fn configure_resource_autocomplete(
     autocomplete.set_provider(Arc::new(combined));
 }
 
+#[allow(dead_code)]
 pub(super) fn skill_commands_enabled(
     global: &crate::settings::Settings,
     project: &[crate::settings::Settings],
@@ -569,7 +571,9 @@ pub(super) fn resolve_enter_completion(
     // Same explicit-context rule as `navigate_autocomplete`: only the `/`
     // token at input start or an `@`-file token counts as a popup the Enter
     // key belongs to.
-    let explicit = text[start..].starts_with('/') || text[..start].ends_with('@');
+    let explicit = text[start..].starts_with('/')
+        || text[..start].ends_with('@')
+        || text[..start].ends_with("@\"");
     if !explicit {
         return None;
     }
@@ -696,9 +700,11 @@ pub(super) fn navigate_autocomplete(
         return false;
     }
     let start = sugg.start.min(text.len());
-    // `/` commands keep the slash at `start`; the path provider keeps `@` by
-    // placing `start` *after* it, so look just before `start` for `@`.
-    let explicit = text[start..].starts_with('/') || text[..start].ends_with('@');
+    // `/` commands keep the slash at `start`; the path provider keeps `@`
+    // (and an optional opening quote) before `start`.
+    let explicit = text[start..].starts_with('/')
+        || text[..start].ends_with('@')
+        || text[..start].ends_with("@\"");
     if !explicit {
         return false;
     }

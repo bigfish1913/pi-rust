@@ -139,7 +139,7 @@ pub(super) fn abort_run_restoring_queue(
     state: Arc<TuiState>,
     tui: Arc<TuiAltScreen>,
 ) {
-    tokio::spawn(async move {
+    state.session_write_tasks.clone().spawn(async move {
         let _ = restore_queued_messages_to_editor(lane.clone(), editor, state, tui.clone()).await;
         let _ = lane.abort().await;
         tui.request_render(false);

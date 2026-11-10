@@ -30,12 +30,10 @@
 //!   The interactive `-c`/`-r`/`--session` paths enable that mode and replay
 //!   the existing branch before appending new messages. See [`SessionSelection`].
 
-mod backend;
-
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::AgentHarness;
@@ -303,8 +301,6 @@ pub enum SessionSelection {
     Ephemeral,
     /// Fresh durable JSONL session under `--session-dir` (or the default dir).
     New { dir: PathBuf, name: Option<String> },
-    /// Explicit fresh print-only experimental backend; never a restore selection.
-    ExperimentalNative { dir: PathBuf },
     /// `-c` / `-r`: restore the most recent session in the default dir.
     Latest { dir: PathBuf },
     /// `--session <id|path>`: restore the session whose id matches, or whose
@@ -324,13 +320,6 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
 
 /// Resolve the root once at startup; runtime actions retain this selection.
 pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
-    if let Some(root) = &args.experimental_native_store {
-        return if root.is_absolute() {
-            root.clone()
-        } else {
-            cwd.join(root)
-        };
-    }
     let dir = args
         .session_dir
         .clone()
@@ -350,9 +339,6 @@ pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
 }
 
 pub(crate) fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
-    if args.experimental_native_store.is_some() {
-        return SessionSelection::ExperimentalNative { dir };
-    }
     if args.no_session {
         return SessionSelection::Ephemeral;
     }
@@ -397,15 +383,12 @@ pub struct PreparedExtensions {
     session_selection: SessionSelection,
     transition_session: Option<Session>,
     pub extension_session: ExtensionSession,
-    native_store: Option<PathBuf>,
     session_dir: PathBuf,
     runtime: tokio::runtime::Handle,
     tool_context: rpi_extensions::ToolCallContext,
     action_host: Arc<crate::extensions_actions::HarnessActionHost>,
     harness_cell: Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>,
     reload_mailbox: rpi_extensions::ReloadMailbox,
-    /// Request channel for `runtime_action(ReloadModels)` (action id 31).
-    reload_models_mailbox: rpi_extensions::ReloadModelsMailbox,
     ui_dialog_mailbox: rpi_extensions::UiDialogMailbox,
     ext_status_mailbox: rpi_extensions::ExtensionStatusMailbox,
     editor_text_mailbox: rpi_extensions::EditorTextMailbox,
@@ -475,7 +458,6 @@ pub(crate) fn preflight_extension_startup(
                             clock: Arc::new(SystemClock),
                             ids: Arc::new(DefaultIdGenerator::new()),
                         });
-                        let binding_facts = StartupSpan::start(Phase::BindingFacts);
                         let facts = if resources.as_ref().is_some_and(|r| r.transition.is_some()) {
                             rpi_harness::session::jsonl::JsonlSessionStorage::read_resource_transition_facts(
                                 Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())), &meta.path,
@@ -488,7 +470,6 @@ pub(crate) fn preflight_extension_startup(
                             resources.as_ref(),
                         )
                         .map_err(BuildError::SessionOpen)?;
-                        binding_facts.finish();
                         Ok(match selection {
                             SessionSelection::Fork { .. } => SessionSelection::Fork {
                                 source: meta.path,
@@ -509,8 +490,7 @@ pub fn prepare_extensions(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
-    let native_store =
-        crate::native_store::root(args, cwd).map_err(BuildError::NativeStorePolicy)?;
+    crate::native_durable::experimental_epoch::policy(args).map_err(BuildError::HarnessCreate)?;
     let resource_leases =
         crate::resource_management::host_leases(cwd).map_err(BuildError::HarnessCreate)?;
     let (resource_selection, session_selection) =
@@ -528,11 +508,11 @@ pub fn prepare_extensions(
                     let meta = resolve_restore_target(&session_selection, &cwd.to_string_lossy()).await?
                         .ok_or_else(|| BuildError::SessionOpen("transition session disappeared".into()))?;
                     let path = std::fs::canonicalize(&meta.path).map_err(|e| BuildError::SessionOpen(e.to_string()))?;
-                    claim_session_lock_inner(&path.to_string_lossy(), false).map_err(BuildError::SessionOpen)?;
                     let storage = rpi_harness::session::jsonl::JsonlSessionStorage::load_for_resource_transition(
                         Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())), &path.to_string_lossy(),
                         Arc::new(SystemClock), Arc::new(DefaultIdGenerator::new()),
                     ).await.map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                    storage.acquire_writer_lease().await.map_err(|e| BuildError::SessionOpen(e.to_string()))?;
                     let session = Session::new(Arc::new(storage), None);
                     crate::resource_selection::bind_session(&session, resource_selection.as_ref()).await.map_err(BuildError::SessionOpen)?;
                     Ok::<_, BuildError>(session)
@@ -576,10 +556,6 @@ pub fn prepare_extensions(
         BuildError::HarnessCreate(format!("no tokio runtime for action bridge: {e}"))
     })?;
     let catalog = Vec::new();
-    // Request channel for `runtime_action(ReloadModels)` (action id 31).
-    // Created before the host so the host can carry it; the TUI installs its
-    // sender once it starts.
-    let reload_models_mailbox = rpi_extensions::ReloadModelsMailbox::new();
     let (action_host, harness_cell) = crate::extensions_actions::HarnessActionHost::new_empty(
         catalog.clone(),
         cwd.to_path_buf(),
@@ -590,8 +566,8 @@ pub fn prepare_extensions(
     let action_host = Arc::new(
         action_host
             .with_session_dir(session_dir.clone())
-            .with_fresh_session_only(native_store.is_some())
-            .with_reload_models_mailbox(reload_models_mailbox.clone()),
+            .with_fresh_session_only(false)
+            .with_native_durable(args.native_durable),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = action_host.clone();
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
@@ -628,7 +604,6 @@ pub fn prepare_extensions(
         editor_text_mailbox.clone(),
     );
 
-    let extension_register = StartupSpan::start(Phase::ExtensionRegister);
     let extension_session = if let Some(selected) = &resource_selection {
         let session = rpi_extensions::load_session_mixed_guarded(
             &[],
@@ -653,15 +628,13 @@ pub fn prepare_extensions(
     } else {
         load_extensions(args, cwd, project_trusted, Some(Arc::clone(&action_bridge)))
     };
-    extension_register.finish();
     if args.verbose {
         if let Some(s) = extension_session.summary() {
             eprintln!("extensions: {s}");
         }
         report_deferred_renderers(&extension_session);
     }
-    crate::native_store::validate_stdio(native_store.is_some(), extension_session.owns_stdio())
-        .map_err(BuildError::NativeStorePolicy)?;
+    validate_durable_extensions(args, &extension_session).map_err(BuildError::HarnessCreate)?;
     // Publish the extension registry so `ListCommands` can enumerate slash
     // commands. Done here rather than at host construction because the registry
     // only exists after extensions load; `/reload` republishes the new snapshot
@@ -672,14 +645,12 @@ pub fn prepare_extensions(
         resource_selection,
         session_selection,
         transition_session,
-        native_store,
         session_dir,
         runtime,
         tool_context,
         action_host,
         harness_cell,
         reload_mailbox,
-        reload_models_mailbox,
         ui_dialog_mailbox,
         ext_status_mailbox,
         editor_text_mailbox,
@@ -736,19 +707,9 @@ pub async fn build_prepared(
     ),
     BuildError,
 > {
-    let native_store =
-        crate::native_store::root(args, cwd).map_err(BuildError::NativeStorePolicy)?;
-    if native_store != prepared.native_store {
-        return Err(BuildError::NativeStorePolicy(
-            "experimental session selection changed after extension preparation".into(),
-        ));
-    }
-    crate::native_store::validate_stdio(
-        native_store.is_some(),
-        prepared.extension_session.owns_stdio(),
-    )
-    .map_err(BuildError::NativeStorePolicy)?;
-    let fresh_session_only = native_store.is_some();
+    let experimental_policy = crate::native_durable::experimental_epoch::policy(args)
+        .map_err(BuildError::HarnessCreate)?;
+    let fresh_session_only = false;
     let cwd_str = cwd.to_string_lossy().to_string();
     // Plugin tools get the session's identity injected into every call's
     // arguments (see `rpi_extensions::ToolCallContext`). It is created here,
@@ -759,14 +720,12 @@ pub async fn build_prepared(
         resource_selection,
         session_selection: selection,
         transition_session,
-        native_store: _,
         session_dir,
         runtime,
         tool_context,
         action_host,
         harness_cell,
         reload_mailbox,
-        reload_models_mailbox,
         ui_dialog_mailbox,
         ext_status_mailbox,
         editor_text_mailbox,
@@ -787,7 +746,9 @@ pub async fn build_prepared(
     let ctx =
         ExecutionToolContext::new(env_dyn.clone(), Some(mut_env)).with_file_io(file_io.clone());
 
-    let mut tools = build_tools(&ctx, args);
+    validate_durable_extensions(args, &extension_session).map_err(BuildError::HarnessCreate)?;
+    let durable_binding = Arc::new(std::sync::OnceLock::new());
+    let mut tools = build_tools_bound(&ctx, args, durable_binding.clone());
 
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools
@@ -1232,6 +1193,7 @@ pub async fn build_prepared(
                 | SessionSelection::ByExactId { .. }
                 | SessionSelection::Fork { .. }
         ),
+        require_native_durable: args.native_durable,
         stream_options: AgentHarnessStreamOptions {
             timeout: args.timeout,
             stream_idle_timeout: args.stream_idle_timeout.or_else(|| {
@@ -1266,11 +1228,14 @@ pub async fn build_prepared(
         agent_emitter: Some(emitter),
         // B3b loop hooks. `before_tool_call` dispatches the pi `on("tool_call")`
         // extension event and honors a veto (a permission gate can block a tool
-        // before it runs). `after_tool_call`/`transform_context` remain `None`
-        // (their host-side adapters are not wired yet).
+        // before it runs). Extension after-tool/context adapters remain unwired.
+        // Native durable observes the committed service per model request, using
+        // the same weak binding as its tool, even when model tools are filtered.
         before_tool_call,
         after_tool_call: None,
-        transform_context: None,
+        transform_context: args
+            .native_durable
+            .then(|| crate::native_durable::context_hook(Arc::clone(&durable_binding))),
         entry_transforms: Vec::new(),
         // Extension provider hooks (B4): plugins subscribing to the
         // BeforeProviderRequest / BeforeProviderHeaders / AfterProviderResponse
@@ -1281,12 +1246,25 @@ pub async fn build_prepared(
             .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
     };
 
-    let harness = AgentHarness::create(options)
+    let harness = match experimental_policy {
+        Some(policy) => AgentHarness::create_experimental(options, policy).await,
+        None => AgentHarness::create(options).await,
+    }
+    .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
+
+    if args.native_durable {
+        // Validate legacy/corrupt branch state before sealing resources or ready.
+        rpi_harness::durable::DurableService::bind(
+            &harness,
+            rpi_harness::durable::DurableActor::owner("native-cli")
+                .map_err(|e| BuildError::HarnessCreate(e.to_string()))?,
+        )
+        .snapshot()
         .await
         .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
-    // Manual skill commands read current bodies through the same environment
-    // that discovered these host-owned resources, including after /reload.
-    harness.set_skill_execution_env(env_dyn.clone());
+        // Populate the weak tool binding before resource selection is published.
+        let _ = durable_binding.set(harness.downgrade());
+    }
 
     // Retain read leases even for resource-only/--no-extensions hosts.
     let harness_leases = resource_leases.clone();
@@ -1318,11 +1296,9 @@ pub async fn build_prepared(
                 "changes": "restart-required"
             }),
         );
-        let resource_observation = StartupSpan::start(Phase::ResourceObservation);
         crate::resource_selection::get_resource_state(&harness)
             .await
             .map_err(BuildError::HarnessCreate)?;
-        resource_observation.finish();
         if selected.transition.is_some() {
             // Re-read persisted facts at commit, not merely the startup mirror.
             // The canonical OS writer claim acquired before registration is
@@ -1332,19 +1308,13 @@ pub async fn build_prepared(
                 .ok_or_else(|| {
                     BuildError::SessionOpen("transition session disappeared before commit".into())
                 })?;
-            let path = std::fs::canonicalize(&meta.path)
-                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
-            let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-            if !SESSION_LOCK_PATHS
-                .get_or_init(|| Mutex::new(HashSet::new()))
-                .lock()
-                .unwrap()
-                .contains(&lock_path)
-            {
+            if !harness.session().storage().writer_lease_held() {
                 return Err(BuildError::SessionOpen(
-                    "resource transition lost canonical writer ownership".into(),
+                    "resource transition lost storage-level writer ownership".into(),
                 ));
             }
+            let path = std::fs::canonicalize(&meta.path)
+                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
             let facts =
                 rpi_harness::session::jsonl::JsonlSessionStorage::read_resource_transition_facts(
                     Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())),
@@ -1367,11 +1337,9 @@ pub async fn build_prepared(
                 ));
             }
         }
-        let inventory_bind = StartupSpan::start(Phase::InventoryBind);
         crate::resource_selection::bind_inventory(&harness, selected)
             .await
             .map_err(BuildError::SessionOpen)?;
-        inventory_bind.finish();
     }
     // Publish only after exact resources have been sealed and validated.
     crate::extensions_actions::HarnessActionHost::set_harness(
@@ -1450,9 +1418,6 @@ pub async fn build_prepared(
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
-        // Request channel for `runtime_action(ReloadModels)` — the TUI installs
-        // its sender and answers on the request's reply channel.
-        reload_models_mailbox,
         ui_dialog: ui_dialog_mailbox,
         ext_status: ext_status_mailbox,
         editor_text: editor_text_mailbox,
@@ -1596,11 +1561,6 @@ pub struct ReloadContext {
     pub tool_context: rpi_extensions::ToolCallContext,
     /// The live action-bridge cell (swapped + old invalidated on reload).
     pub action_bridge: ActionBridgeCell,
-    /// Request channel for `runtime_action(ReloadModels)` (action id 31).
-    ///
-    /// The TUI installs its sender here and performs the (cheap) catalog
-    /// refresh on its main loop, then answers on the request's reply channel.
-    pub reload_models_mailbox: rpi_extensions::ReloadModelsMailbox,
     /// The extension status registry the TUI renders in its footer (`SetStatus`).
     /// Lives in the context (not the cell) so it survives a bridge swap.
     pub ext_status: rpi_extensions::ExtensionStatusMailbox,
@@ -1762,7 +1722,6 @@ pub struct ReloadOutcome {
 
 struct PreparedReloadInputs {
     extension_dirs: Vec<PathBuf>,
-    extension_files: Vec<PathBuf>,
     skill_base_dirs: Vec<PathBuf>,
     prompt_base_dirs: Vec<PathBuf>,
 }
@@ -1803,131 +1762,6 @@ pub async fn reload_extension_resources(
     reload_extension_resources_inner(harness, ctx, || {}).await
 }
 
-/// Re-read the model/provider catalog from disk and swap it into the live
-/// harness — **without** reloading extensions.
-///
-/// This is the cheap counterpart of [`reload_extension_resources`]. That
-/// routine rebuilds the whole `ExtensionSession`, which invalidates the old
-/// `RegistrySnapshot`; the **in-flight run** captured its emitter at run start
-/// (`agent_harness.rs`, `snap.agent_emitter.clone()`), so from that moment
-/// every plugin event is dropped by the staleness guard in
-/// `dispatch_to_handlers`. The TUI keeps rendering (it uses the broadcast
-/// emitter), so the session *looks* alive while its plugin event stream is
-/// dead until the next run.
-///
-/// This routine therefore touches only:
-///
-/// 1. the model catalog (`ctx.catalog` + the action host's copy), and
-/// 2. the provider runtime bindings (`harness.set_models`).
-///
-/// The extension registry, the emitter and the event snapshot are **not**
-/// touched, so a running turn keeps receiving plugin events.
-///
-/// `models.json` is re-read from disk by the resolver
-/// (`resolve_with_extensions` → `load_models_config`), so a catalog edited
-/// out-of-band is picked up here.
-pub async fn reload_model_catalog_only(
-    harness: &AgentHarness,
-    ctx: &ReloadContext,
-) -> Result<usize, String> {
-    let project_trusted = resolve_project_trust(&ctx.args, &ctx.cwd);
-
-    // The **current** extension session is reused (not reloaded): its provider
-    // packages are still registered, so their models stay in the catalog.
-    let session_guard = ctx.extension_session.lock().unwrap();
-    let extension_session = session_guard.clone();
-    drop(session_guard);
-
-    // Re-resolve from disk: `resolve_with_extensions` re-reads `models.json`
-    // and re-reads credentials. Keep the currently selected provider/model so
-    // a catalog refresh does not silently switch the user to another model.
-    let mut args = ctx.args.clone();
-    let current = harness.lane("main").get_model().await.ok();
-    if let Some(model) = current.as_ref() {
-        args.provider = Some(model.provider.clone());
-        args.model = Some(model.id.clone());
-        // ⚠️ 只在 **provider 变了** 时清掉 CLI 覆盖的密钥 / endpoint。
-        //
-        // `api_key` / `base_url` 是 CLI 级的覆盖，resolver 只在 provider/model
-        // 身份选定**之后**才应用它们（见 `rpi-runtime/src/provider.rs`）。
-        // 无条件清掉会让「用 `--api-key` 起的会话」在刷新后回落到
-        // `models.json` / 环境变量 —— 凭据来源静默变了。
-        //
-        // 上游的 `reload_extension_resources` 用的是同一条判据
-        // （`current.provider != ctx.resolved_model.provider`）：换了 provider
-        // 才说明原来的 CLI 覆盖不再适用。
-        if ctx.resolved_model.provider != model.provider {
-            args.api_key = None;
-            args.base_url = None;
-        }
-    }
-    // Keep the lane's current thinking level: the catalog refresh is about
-    // *which models exist*, not about changing how the current one thinks.
-    args.thinking = harness.lane("main").get_thinking_level().await.ok();
-
-    let resolved = crate::provider::resolve_with_extensions(
-        &args,
-        &ctx.cwd,
-        project_trusted,
-        &extension_session,
-    )
-    .map_err(|error| format!("重读模型清单失败：{error}"))?;
-
-    let catalog = crate::provider::authenticated_catalog(&resolved);
-
-    // Swap the runtime bindings FIRST: the harness must be able to route to a
-    // provider that only exists in the new catalog before anything tries to
-    // use it.
-    let providers = build_models_with_extensions_for_reload(
-        &resolved.providers,
-        &extension_session,
-        ctx.runtime.clone(),
-    );
-    harness
-        .set_models(providers)
-        .await
-        .map_err(|error| format!("换模型运行时失败：{error}"))?;
-
-    // Publish the catalog to every reader: the action host (what `set_model`
-    // resolves against) and the reload context (what the TUI renders).
-    if let Some(bridge) = ctx.action_bridge.lock().unwrap().as_ref() {
-        bridge.clone_host().replace_model_catalog(catalog.clone());
-    }
-    *ctx.catalog
-        .write()
-        .unwrap_or_else(|error| error.into_inner()) = catalog.clone();
-    *ctx.providers
-        .write()
-        .unwrap_or_else(|error| error.into_inner()) = resolved.providers.clone();
-
-    // Keep the lane on its current model identity, but take the entry from the
-    // NEW catalog: cloning the old object would leave the lane running on
-    // stale metadata (endpoint, context window, sampling) that the catalog no
-    // longer serves. Fall back to the freshly resolved model when the current
-    // one is gone.
-    let lane_model = current
-        .as_ref()
-        .and_then(|model| {
-            catalog
-                .iter()
-                .find(|m| m.id == model.id && m.provider == model.provider)
-        })
-        .cloned()
-        .unwrap_or_else(|| resolved.model.clone());
-    harness
-        .lane("main")
-        .set_model(lane_model)
-        .await
-        .map_err(|error| format!("设置当前模型失败：{error}"))?;
-
-    tracing::info!(
-        models = catalog.len(),
-        provider = %resolved.model.provider,
-        "模型清单已重读（未重载扩展）"
-    );
-    Ok(catalog.len())
-}
-
 async fn reload_extension_resources_inner<F>(
     harness: &AgentHarness,
     ctx: &ReloadContext,
@@ -1936,6 +1770,17 @@ async fn reload_extension_resources_inner<F>(
 where
     F: FnOnce() + Send,
 {
+    if ctx.args.native_durable {
+        return ReloadOutcome {
+            summary:
+                "Native durable prototype is restart-required; reload/dev hot apply unsupported"
+                    .into(),
+            had_warnings: true,
+            details: Vec::new(),
+            had_errors: true,
+            project_trusted: None,
+        };
+    }
     if harness.has_exact_resources()
         || ctx.args.resource_config.is_some()
         || ctx.args.resource_transition.is_some()
@@ -1991,7 +1836,6 @@ where
     after_prepare();
     let PreparedReloadInputs {
         extension_dirs,
-        extension_files,
         skill_base_dirs,
         prompt_base_dirs,
     } = prepared;
@@ -2044,7 +1888,8 @@ where
             Arc::new(
                 action_host
                     .with_session_dir(ctx.session_dir())
-                    .with_fresh_session_only(ctx.fresh_session_only),
+                    .with_fresh_session_only(ctx.fresh_session_only)
+                    .with_native_durable(ctx.args.native_durable),
             )
         }
     };
@@ -2063,24 +1908,13 @@ where
     let extension_session = if effective_args.no_extensions {
         rpi_extensions::ExtensionSession::none()
     } else {
-        load_extensions_from_files(
+        load_extensions_from_dirs(
+            &effective_args,
             &extension_dirs,
-            &extension_files,
             Some(Arc::clone(&fresh_bridge)),
             Some(ctx.resource_leases.clone()),
         )
     };
-    if let Err(error) =
-        crate::native_store::validate_stdio(ctx.fresh_session_only, extension_session.owns_stdio())
-    {
-        return ReloadOutcome {
-            summary: "Reload refused by experimental native session policy".into(),
-            had_warnings: true,
-            details: vec![error],
-            had_errors: true,
-            project_trusted: None,
-        };
-    }
     if extension_session.is_empty() && !effective_args.no_extensions {
         // The fresh session may be empty if no cdylibs are present — not a
         // warning per se, but note it.
@@ -2317,7 +2151,12 @@ where
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env))
         .with_file_io(ctx.file_io.clone());
-    let mut tools = build_tools(&tool_ctx, &effective_args);
+    // Native durable reload is rejected above; this binding cannot be used.
+    let mut tools = build_tools_bound(
+        &tool_ctx,
+        &effective_args,
+        Arc::new(std::sync::OnceLock::new()),
+    );
     merge_extension_tools(
         &mut tools,
         &extension_session,
@@ -2560,22 +2399,6 @@ where
     if !args.no_extensions {
         extension_dirs.extend(args.extensions_dir.iter().cloned());
     }
-    remove_global_native_package_dir(&mut extension_dirs);
-    remove_project_package_dirs(cwd, &mut extension_dirs);
-    let mut extension_files = if args.no_extensions {
-        Vec::new()
-    } else {
-        args.extension.clone()
-    };
-    if !args.no_extensions && !args.dev_local_only {
-        if project_trusted || args.project_only {
-            extension_files.extend(crate::packages::active_project_package_artifacts(cwd));
-        }
-        if !args.project_only {
-            extension_files.extend(crate::install::active_global_native_package_artifacts());
-            extension_files.extend(crate::install::unregistered_global_native_package_artifacts());
-        }
-    }
 
     let skill_base_dirs = if args.no_skills {
         Vec::new()
@@ -2607,7 +2430,6 @@ where
 
     Ok(PreparedReloadInputs {
         extension_dirs,
-        extension_files,
         skill_base_dirs,
         prompt_base_dirs,
     })
@@ -2673,8 +2495,6 @@ fn report_deferred_renderers(session: &ExtensionSession) {
 /// A harness-build error.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
-    #[error("Experimental native session policy: {0}")]
-    NativeStorePolicy(String),
     #[error("Could not create the session directory: {0}")]
     SessionDir(String),
     #[error("Could not open the saved session: {0}")]
@@ -2733,18 +2553,6 @@ pub(crate) fn load_extensions(
         global_extension_dirs()
     };
     dirs.extend(args.extensions_dir.iter().cloned());
-    remove_global_native_package_dir(&mut dirs);
-    remove_project_package_dirs(cwd, &mut dirs);
-    let mut files = args.extension.clone();
-    if !args.dev_local_only {
-        if project_trusted || args.project_only {
-            files.extend(crate::packages::active_project_package_artifacts(cwd));
-        }
-        if !args.project_only {
-            files.extend(crate::install::active_global_native_package_artifacts());
-            files.extend(crate::install::unregistered_global_native_package_artifacts());
-        }
-    }
     let leases = match crate::resource_management::host_leases(cwd) {
         Ok(leases) => leases,
         Err(error) => {
@@ -2752,42 +2560,71 @@ pub(crate) fn load_extensions(
             return ExtensionSession::none();
         }
     };
-    load_extensions_from_files(&dirs, &files, action_bridge, Some(leases))
+    load_extensions_from_dirs(args, &dirs, action_bridge, Some(leases))
 }
 
-fn remove_global_native_package_dir(dirs: &mut Vec<PathBuf>) {
-    let Ok(agent_dir) = crate::config::agent_dir() else {
-        return;
-    };
-    let native_dir = agent_dir.join("extensions");
-    dirs.retain(|dir| dir != &native_dir);
-}
-
-fn remove_project_package_dirs(cwd: &Path, dirs: &mut Vec<PathBuf>) {
-    let package_dirs = crate::packages::project_package_dirs(cwd, "extensions");
-    dirs.retain(|dir| !package_dirs.iter().any(|package_dir| dir == package_dir));
-}
-
-fn load_extensions_from_files(
+fn load_extensions_from_dirs(
+    args: &Args,
     dirs: &[PathBuf],
-    files: &[PathBuf],
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
     host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> ExtensionSession {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
     // B5a: the action bridge is cloned into every loaded plugin's vtable
     // `user_data` so post-register `runtime_action` calls recover the harness
-    // host from any thread. Directory scanning remains for project/configured
-    // extensions; installed global packages are supplied as explicit active
-    // artifact paths so retired versions are never loaded accidentally.
-    rpi_extensions::load_session_mixed_guarded(dirs, files, diagnostics, action_bridge, host_guard)
+    // host from any thread. The call site already gates `load_extensions` behind
+    // `!no_extensions` and threads `Some(bridge)`; `None` is only passed by the
+    // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
+    // and tests. Explicit `--extension`/`-e` files load after the dirs.
+    rpi_extensions::load_session_mixed_guarded(
+        dirs,
+        &args.extension,
+        diagnostics,
+        action_bridge,
+        host_guard,
+    )
 }
 
-/// Merge the loaded extension tools into the built-in set. An extension tool
-/// overrides a same-named built-in; first-extension-wins across plugins is
-/// already guaranteed by the registry (`register_tool` keeps the prior). The
-/// explicit `--tools` allowlist / `--exclude-tools` denylist apply to the
-/// merged set (the built-ins were already filtered in [`build_tools`]).
+/// The host permanently owns both durable public names.
+/// Refuse rather than override, fall back to, or dual-write a legacy extension
+/// implementation. The core native durable feature may still be disabled; that
+/// does not make the reserved names available to extensions.
+fn validate_durable_extensions(args: &Args, session: &ExtensionSession) -> Result<(), String> {
+    if args.native_durable && session.owns_stdio() {
+        return Err(
+            "--native-durable requires the native host; stdio-owning extensions are unsupported"
+                .into(),
+        );
+    }
+    if let Some(snapshot) = session.snapshot() {
+        if reserved_durable_name(
+            snapshot.tools().iter().map(|tool| tool.tool.name.as_str()),
+            snapshot
+                .commands()
+                .iter()
+                .map(|command| command.name.as_str()),
+        ) {
+            return Err("extension durable tool or /durable command uses a host-reserved name; remove the legacy extension durable implementation (no automatic import or fallback)".into());
+        }
+    }
+    Ok(())
+}
+
+fn reserved_durable_name<'a>(
+    mut tools: impl Iterator<Item = &'a str>,
+    mut commands: impl Iterator<Item = &'a str>,
+) -> bool {
+    tools.any(|name| name == "durable")
+        || commands.any(|name| name.trim_start_matches('/') == "durable")
+}
+
+#[cfg(test)]
+#[path = "native_durable/session_tests.rs"]
+mod native_durable_session_tests;
+
+/// Merge extension tools into the built-ins. Ordinarily extensions override
+/// same-named built-ins (first extension wins); host-reserved durable names
+/// were already checked above. Both tool filters still apply to the merged set.
 fn merge_extension_tools(
     tools: &mut Vec<HarnessTool>,
     session: &ExtensionSession,
@@ -2808,19 +2645,6 @@ fn merge_extension_tools(
         match tools.iter_mut().find(|t| t.tool.schema().name == *name) {
             Some(slot) => *slot = harness_tool,
             None => tools.push(harness_tool),
-        }
-    }
-    // `tool_result` transforms see every tool's result, built-in or plugin.
-    // Without one, the tools stay unwrapped.
-    if let Some(snapshot) = session.snapshot_arc() {
-        if !snapshot.tool_result().is_empty() {
-            for tool in tools.iter_mut() {
-                tool.tool = rpi_extensions::with_tool_result_transform(
-                    Arc::clone(&tool.tool),
-                    Arc::clone(&snapshot),
-                    session.keepalive(),
-                );
-            }
         }
     }
 }
@@ -2850,7 +2674,16 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     }
 }
 
+#[cfg(test)]
 fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
+    build_tools_bound(ctx, args, Arc::new(std::sync::OnceLock::new()))
+}
+
+fn build_tools_bound(
+    ctx: &ExecutionToolContext,
+    args: &Args,
+    durable_binding: Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>,
+) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
     }
@@ -2887,6 +2720,16 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
             HarnessTool::new(create_docs_tool()).with_replay(ToolReplay::Safe),
         ),
     ];
+
+    if args.native_durable {
+        // Mixed read/write tool is NEVER safe for automatic replay.
+        all.push((
+            "durable",
+            HarnessTool::new(Arc::new(crate::native_durable::NativeDurableTool::new(
+                durable_binding,
+            ))),
+        ));
+    }
 
     // Add PowerShell tool on Windows
     #[cfg(target_os = "windows")]
@@ -2972,10 +2815,6 @@ async fn build_session(
 ) -> Result<Session, BuildError> {
     match selection {
         SessionSelection::Ephemeral => Ok(ephemeral_session()),
-        SessionSelection::ExperimentalNative { dir } => Ok(Session::new(
-            backend::fresh_experimental_native(dir).await?,
-            None,
-        )),
         SessionSelection::New { dir, .. } => {
             // Ensure the sessions directory exists, then create a fresh JSONL
             // session file inside it.
@@ -3027,14 +2866,9 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
         };
     };
     let sessions_root = selection_dir(selection);
-    let writer_restore = StartupSpan::start(Phase::WriterRestore);
-    let result = open_session(&meta, cwd, &sessions_root)
+    open_session(&meta, cwd, &sessions_root)
         .await
-        .map(|restored| restored.session);
-    if result.is_ok() {
-        writer_restore.finish();
-    }
-    result
+        .map(|restored| restored.session)
 }
 
 /// The sessions root a selection was resolved against.
@@ -3042,7 +2876,6 @@ fn selection_dir(selection: &SessionSelection) -> PathBuf {
     match selection {
         SessionSelection::Ephemeral => PathBuf::new(),
         SessionSelection::New { dir, .. }
-        | SessionSelection::ExperimentalNative { dir }
         | SessionSelection::Latest { dir }
         | SessionSelection::ById { dir, .. }
         | SessionSelection::ByExactId { dir, .. }
@@ -3071,7 +2904,6 @@ async fn resolve_restore_target(
             Ok(metas.into_iter().find(|m| m.id == *id))
         }
         SessionSelection::Fork { .. }
-        | SessionSelection::ExperimentalNative { .. }
         | SessionSelection::New { .. }
         | SessionSelection::Ephemeral => Ok(None),
     }
@@ -3203,7 +3035,10 @@ async fn fork_session_at_launch(
         )
         .await
         .map_err(|e| BuildError::SessionDir(format!("fork {}: {e}", source_meta.path)))?;
-    claim_session_lock(&fork_storage.jsonl_metadata().path).map_err(BuildError::SessionOpen)?;
+    fork_storage
+        .acquire_writer_lease()
+        .await
+        .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(fork_storage);
     Ok(Session::new(storage_arc, None))
 }
@@ -3258,8 +3093,39 @@ impl std::fmt::Display for OpenError {
     }
 }
 
+/// Which sessions a picker lists. The default is [`Self::Project`]: with a
+/// shared `sessionDir`, a flat list over every cwd directory buries the current
+/// project's history (fork issue DavidHinton-xcpc/pi-rust#13). `All` is an
+/// explicit opt-in and rows carry their project so the list stays traceable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionScope {
+    #[default]
+    Project,
+    All,
+}
+
+impl SessionScope {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Project => Self::All,
+            Self::All => Self::Project,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Project => "this project",
+            Self::All => "all projects",
+        }
+    }
+}
+
 /// List the JSONL session metadata under the default session dir, newest
 /// first. Shared by startup restore and the TUI `/session` hot-switch.
+///
+/// `list_session_metadata` intentionally stays unscoped: it resolves sessions
+/// to *open* (including `--continue`/`-c`), where filtering by cwd would make
+/// a session that the caller named by id unopenable. Only pickers apply a scope.
 pub async fn list_session_metadata(
     cwd: &str,
 ) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
@@ -3270,6 +3136,17 @@ pub async fn list_session_metadata(
 pub(crate) async fn list_session_metadata_in_dir(
     cwd: &str,
     dir: &Path,
+) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
+    list_session_metadata_in_scope_in_dir(cwd, dir, SessionScope::All).await
+}
+
+/// Scope-aware metadata listing for pickers. `Project` passes the cwd to the
+/// repo's typed list API, so the enumeration and the open path agree on which
+/// directory belongs to this project.
+pub(crate) async fn list_session_metadata_in_scope_in_dir(
+    cwd: &str,
+    dir: &Path,
+    scope: SessionScope,
 ) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionListOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
@@ -3284,9 +3161,15 @@ pub(crate) async fn list_session_metadata_in_dir(
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
+    let options = JsonlSessionListOptions {
+        cwd: match scope {
+            SessionScope::Project => Some(cwd.to_string()),
+            SessionScope::All => None,
+        },
+    };
     let metadata_lookup = StartupSpan::start(Phase::MetadataLookup);
     let result = repo
-        .list_typed(&JsonlSessionListOptions::default())
+        .list_typed(&options)
         .await
         .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")));
     if result.is_ok() {
@@ -3496,8 +3379,19 @@ pub fn short_session_id(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
+/// One listed session file. `project` is the cwd-encoded directory name when
+/// the row comes from a project subdirectory; `None` for legacy files that sit
+/// directly under the sessions root. The All view renders it so a flat list is
+/// still attributable to a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFileEntry {
+    pub path: PathBuf,
+    pub project: Option<String>,
+}
+
 /// Synchronously list every JSONL session file under `dir`, newest-first by
-/// modification time.
+/// modification time. Kept for callers that explicitly want the full set (e.g.
+/// resolving a session by id); pickers use [`list_session_files_in_scope_sync`].
 ///
 /// The repo's [`list_session_metadata`] is async and scans one cwd-encoded
 /// subdirectory level; the in-TUI `/session` selector runs on the blocking key
@@ -3505,8 +3399,69 @@ pub fn short_session_id(id: &str) -> &str {
 /// `.jsonl` files directly under `dir` and one level of subdirectories are
 /// accepted.
 pub fn list_session_files_sync(dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-    let mut visit = |path: PathBuf| {
+    list_entries_sync(dir, None)
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect()
+}
+
+/// Scope-aware synchronous listing for the `/session` selector.
+///
+/// `Project` resolves the current project's directory with the *same* encoding
+/// the repo uses for create/open (`jsonl_session_directory_name`), rather than
+/// re-deriving it: the old flat walk and the open path disagreed about which
+/// files belong to this project (fork issue #13). `All` keeps the old layout but
+/// tags each row with its project directory.
+pub fn list_session_files_in_scope_sync(
+    cwd: &Path,
+    dir: &Path,
+    scope: SessionScope,
+) -> Vec<SessionFileEntry> {
+    let project_dir = match scope {
+        SessionScope::Project => {
+            let resolved = normalize_cwd(cwd);
+            Some(rpi_harness::session::jsonl::jsonl_session_directory_name(
+                &resolved.to_string_lossy(),
+            ))
+        }
+        SessionScope::All => None,
+    };
+    match project_dir {
+        Some(name) => list_entries_sync(&dir.join(&name), None),
+        None => list_entries_sync(dir, Some(true)),
+    }
+}
+
+/// Mirror the repo's `absolute_path` normalization for a cwd path: the picker
+/// runs on the blocking key thread and cannot await the `FileSystem` trait, so
+/// this is the synchronous equivalent of `OsExecutionEnv::absolute_path`.
+fn normalize_cwd(cwd: &Path) -> PathBuf {
+    let absolute = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(cwd)
+    };
+    // Lexical normalization only (`.` / `..` components), no symlink or FS
+    // access — the repo's normalize_absolute is likewise purely lexical.
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn list_entries_sync(dir: &Path, tag_projects: Option<bool>) -> Vec<SessionFileEntry> {
+    let tag_projects = tag_projects.unwrap_or(false);
+    let mut files: Vec<(SessionFileEntry, std::time::SystemTime)> = Vec::new();
+    let mut visit = |path: PathBuf, project: Option<String>| {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl")
             || path.to_string_lossy().ends_with(".progress.jsonl")
         {
@@ -3515,24 +3470,31 @@ pub fn list_session_files_sync(dir: &Path) -> Vec<PathBuf> {
         let modified = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
-        files.push((path, modified));
+        files.push((SessionFileEntry { path, project }, modified));
     };
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                let project = if tag_projects {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                } else {
+                    None
+                };
                 if let Ok(inner) = std::fs::read_dir(&path) {
                     for child in inner.flatten() {
-                        visit(child.path());
+                        visit(child.path(), project.clone());
                     }
                 }
             } else {
-                visit(path);
+                visit(path, None);
             }
         }
     }
     files.sort_by(|a, b| b.1.cmp(&a.1));
-    files.into_iter().map(|(path, _)| path).collect()
+    files.into_iter().map(|(entry, _)| entry).collect()
 }
 
 /// Pick the session `--continue`/`-c` should open: the newest session that has
@@ -3685,7 +3647,10 @@ pub(crate) async fn fork_session_storage(
         )
         .await
         .map_err(|e| e.to_string())?;
-    claim_session_lock(&fork_storage.jsonl_metadata().path)?;
+    fork_storage
+        .acquire_writer_lease()
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(Session::new(Arc::new(fork_storage), None))
 }
 
@@ -3713,17 +3678,7 @@ pub(crate) async fn import_session_file(
     // for previously opened sessions, so its own copies additionally verify a
     // stable history around the sidecar snapshot (bind/entry before retirement).
     let source_progress = PathBuf::from(format!("{}.progress.jsonl", source.display()));
-    let source_lock_path = PathBuf::from(format!("{}.lock", source.display()));
-    let canonical_lock = std::fs::canonicalize(&source_lock_path).ok();
-    let owned_here = SESSION_LOCK_PATHS.get().is_some_and(|paths| {
-        paths.lock().unwrap().iter().any(|path| {
-            path == &source_lock_path
-                || canonical_lock.as_ref().is_some_and(|canonical| {
-                    std::fs::canonicalize(path).ok().as_ref() == Some(canonical)
-                })
-        })
-    });
-    let _source_lock = if !owned_here && source_progress.try_exists().map_err(|e| e.to_string())? {
+    let _source_lock = if source_progress.try_exists().map_err(|e| e.to_string())? {
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -3828,10 +3783,10 @@ pub(crate) async fn import_session_file(
         .map_err(|e| e.to_string())?;
     let path = destination.jsonl_metadata().path.clone();
     drop(destination);
-    if let Err(error) = claim_session_lock(&path) {
-        // Another process owns this destination; leave its file intact.
-        return Err(error);
-    }
+    // Do not claim the session-level `.lock` here. The destination storage
+    // opened below owns the same OS lease; claiming it first would make this
+    // process conflict with itself. The JSONL storage lease is the
+    // authoritative writer fence for the imported session.
     let destination_progress = format!("{path}.progress.jsonl");
     let publish = (|| -> std::io::Result<()> {
         if has_progress {
@@ -3850,57 +3805,6 @@ pub(crate) async fn import_session_file(
         .await
         .map_err(|e| e.to_string())?;
     Ok(Session::new(Arc::new(storage), None))
-}
-
-/// Session logs this process has claimed, so re-claiming is a no-op.
-static SESSION_LOCK_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-/// The held lock handles. Kept alive for the process lifetime — dropping the
-/// `File` would release the OS lock, so the guard is parked here.
-static SESSION_LOCKS: OnceLock<Mutex<Vec<std::fs::File>>> = OnceLock::new();
-
-/// Claim the exclusive lock for a session log.
-///
-/// Two rpi processes appending to one JSONL diverge their `sequence` counters
-/// (duplicate / gapped seqs) and corrupt it. The lock is an OS advisory lock on
-/// `<path>.lock`: the second process gets a clear "already open" error instead
-/// of corrupting the log, and the OS releases it automatically when the holder
-/// exits (no stale-lock cleanup). Re-claiming a path this process already holds
-/// is a no-op, so the TUI's session hot-switch can re-open freely.
-fn claim_session_lock(session_path: &str) -> Result<(), String> {
-    claim_session_lock_inner(session_path, true)
-}
-fn claim_session_lock_inner(session_path: &str, allow_reentry: bool) -> Result<(), String> {
-    let canonical =
-        std::fs::canonicalize(session_path).unwrap_or_else(|_| PathBuf::from(session_path));
-    let lock_path = PathBuf::from(format!("{}.lock", canonical.display()));
-    let mut paths = SESSION_LOCK_PATHS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap();
-    if paths.contains(&lock_path) {
-        return if allow_reentry {
-            Ok(())
-        } else {
-            Err("transition session already has a writer in this process".into())
-        };
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| format!("open session lock {}: {e}", lock_path.display()))?;
-    if fs2::FileExt::try_lock_exclusive(&file).is_err() {
-        return Err(format!(
-            "session {session_path} is already open in another rpi process"
-        ));
-    }
-    SESSION_LOCKS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(file);
-    paths.insert(lock_path);
-    Ok(())
 }
 
 /// A restored session together with the working directory it was created in.
@@ -3942,11 +3846,14 @@ async fn open_session(
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
-    claim_session_lock(&meta.path).map_err(BuildError::SessionOpen)?;
     let storage = repo
         .open_by_jsonl_metadata(meta)
         .await
         .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?;
+    storage
+        .acquire_writer_lease()
+        .await
+        .map_err(|e| BuildError::SessionOpen(format!("lock {}: {e}", meta.path)))?;
     // Native saved sessions predating progressFormat remain read-only to plain
     // storage loaders. Only this locked, not-yet-shared restore opts into writes.
     let storage = storage
@@ -4025,9 +3932,8 @@ pub(crate) async fn create_jsonl_session_with_id(
         .create_typed(&opts)
         .await
         .map_err(|e| format!("create session: {e}"))?;
-    claim_session_lock(&storage.jsonl_metadata().path)
-        .map_err(|e| format!("create session: {e}"))?;
-    // `JsonlSessionStorage` implements `SessionStorage`; wrap in the facade.
+    // `JsonlSessionStorage` acquires the storage-level lease during create;
+    // wrap it in the facade without a second CLI-owned lock table.
     let storage_arc: Arc<dyn rpi_harness::session::types::SessionStorage> = Arc::new(storage);
     Ok(Session::new(storage_arc, None))
 }
@@ -4063,10 +3969,6 @@ fn read_prompt_source(path: &Path, sources: &mut Vec<String>) -> Option<String> 
 
 #[cfg(test)]
 mod goal_outbox_smoke_tests;
-#[cfg(all(test, feature = "experimental-native-store"))]
-mod native_roundtrip_tests;
-#[cfg(all(test, feature = "experimental-native-store"))]
-mod native_store_tests;
 #[cfg(test)]
 mod runtime_session_tests;
 
@@ -4176,44 +4078,6 @@ mod tests {
             ["legacy"]
         );
     }
-
-    // A catalog refresh must hand the lane the NEW entry, not the old object:
-    // a successful reload that leaves the lane on stale metadata (endpoint,
-    // context window) is silently wrong -- requests keep using it.
-    #[test]
-    fn catalog_refresh_keeps_model_identity_but_takes_new_metadata() {
-        let stale = rpi_ai::Model {
-            base_url: "http://localhost/old".into(),
-            context_window: 8192,
-            ..rpi_ai::Model::new(
-                "model",
-                "Model",
-                rpi_ai::Api::OpenaiCompletions,
-                "probe",
-                "http://localhost",
-            )
-        };
-        let catalog = vec![rpi_ai::Model {
-            base_url: "http://localhost/new".into(),
-            context_window: 32768,
-            ..stale.clone()
-        }];
-        let current = Some(stale);
-
-        let lane_model = current
-            .as_ref()
-            .and_then(|model| {
-                catalog
-                    .iter()
-                    .find(|m| m.id == model.id && m.provider == model.provider)
-            })
-            .cloned()
-            .unwrap_or_else(|| catalog[0].clone());
-
-        assert_eq!(lane_model.base_url, "http://localhost/new");
-        assert_eq!(lane_model.context_window, 32768);
-    }
-
     use crate::args::Args;
 
     #[test]
@@ -4659,6 +4523,123 @@ mod tests {
         assert!(found.iter().any(|p| p == &file));
         assert!(!found.contains(&sidecar));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Regression for fork issue #13: with a shared session root, the default
+    /// picker scope must show only this project's sessions, and All must show
+    /// every project with its directory tag so a flat list stays traceable.
+    #[test]
+    fn review_issue13_default_scope_is_this_project_and_all_is_tagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("project");
+        let own = root.join(rpi_harness::session::jsonl::jsonl_session_directory_name(
+            &cwd.to_string_lossy(),
+        ));
+        let foreign = root.join("--some-other-project--");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        let own_file = own.join("2026-01-01_own.jsonl");
+        let foreign_file = foreign.join("2026-01-02_foreign.jsonl");
+        std::fs::write(&own_file, "{}\n").unwrap();
+        std::fs::write(&foreign_file, "{}\n").unwrap();
+        // A legacy file directly under the root is not a project subdirectory.
+        let legacy = root.join("2026-01-03_legacy.jsonl");
+        std::fs::write(&legacy, "{}\n").unwrap();
+
+        let project = list_session_files_in_scope_sync(&cwd, &root, SessionScope::Project);
+        assert_eq!(project.len(), 1, "default scope must not flatten projects");
+        assert_eq!(project[0].path, own_file);
+        assert_eq!(project[0].project, None);
+
+        let all = list_session_files_in_scope_sync(&cwd, &root, SessionScope::All);
+        assert_eq!(all.len(), 3);
+        let own_project = own.file_name().unwrap().to_str().unwrap();
+        assert!(all
+            .iter()
+            .any(|e| e.path == own_file && e.project.as_deref() == Some(own_project)));
+        assert!(all
+            .iter()
+            .any(|e| e.path == foreign_file
+                && e.project.as_deref() == Some("--some-other-project--")));
+        assert!(all.iter().any(|e| e.path == legacy && e.project.is_none()));
+
+        assert_eq!(SessionScope::Project.toggled(), SessionScope::All);
+        assert_eq!(SessionScope::All.toggled(), SessionScope::Project);
+        assert_eq!(SessionScope::default(), SessionScope::Project);
+    }
+
+    /// The project directory name must be the repo's own encoding, not a
+    /// re-derivation that drifts from create/open. A relative cwd resolves
+    /// against the process cwd the same way `OsExecutionEnv::absolute_path` does.
+    #[test]
+    fn review_issue13_project_scope_uses_the_repo_directory_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("project");
+        let name =
+            rpi_harness::session::jsonl::jsonl_session_directory_name(&cwd.to_string_lossy());
+        std::fs::create_dir_all(root.join(&name)).unwrap();
+        let file = root.join(&name).join("a.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        // A look-alike directory that a naive "last path component" derivation
+        // would pick instead. The repo encodes the *full* cwd, so this must not
+        // be listed by the Project scope.
+        let lookalike = root.join("--project--");
+        std::fs::create_dir_all(&lookalike).unwrap();
+        let other_file = lookalike.join("b.jsonl");
+        std::fs::write(&other_file, "{}\n").unwrap();
+        let found = list_session_files_in_scope_sync(&cwd, &root, SessionScope::Project);
+        assert_eq!(
+            found,
+            vec![SessionFileEntry {
+                path: file,
+                project: None
+            }]
+        );
+    }
+
+    /// Fork issue #13, async path: the `-r` picker's default scope must use the
+    /// repo's typed list API with an explicit cwd, and the open path must stay
+    /// unscoped so a row chosen from All still resolves by id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_issue13_resume_scope_and_open_path_agree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let foreign_cwd = tmp.path().join("other");
+        std::fs::create_dir_all(&foreign_cwd).unwrap();
+        let cwd_text = cwd.to_string_lossy().into_owned();
+        let own = create_jsonl_session(&root, &cwd_text).await.unwrap();
+        let own_id = own.storage().metadata().id.clone();
+        drop(own);
+        let foreign = create_jsonl_session(&root, &foreign_cwd.to_string_lossy())
+            .await
+            .unwrap();
+        let foreign_id = foreign.storage().metadata().id.clone();
+        drop(foreign);
+
+        let project =
+            list_session_metadata_in_scope_in_dir(&cwd_text, &root, SessionScope::Project)
+                .await
+                .unwrap();
+        assert_eq!(project.len(), 1, "-r default must not flatten projects");
+        assert_eq!(project[0].id, own_id);
+        let all = list_session_metadata_in_scope_in_dir(&cwd_text, &root, SessionScope::All)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|m| m.cwd == foreign_cwd.to_string_lossy()));
+        // `list_session_metadata_in_dir` (the open path) must remain unscoped.
+        let open = list_session_metadata_in_dir(&cwd_text, &root)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 2);
+        let found = find_session_metadata(&foreign_id, &cwd_text, &root)
+            .await
+            .unwrap();
+        assert_eq!(found.unwrap().id, foreign_id);
     }
 
     /// The default CLI tool set plus the `todo` tool its bundled plugins add.
@@ -5826,3 +5807,10 @@ mod tests {
         assert!(resolve_project_trust(&args, &launch));
     }
 }
+
+#[cfg(test)]
+#[path = "session/experimental_dialog_continuity_tests.rs"]
+mod experimental_dialog_continuity_tests;
+#[cfg(test)]
+#[path = "session/experimental_reload_continuity_tests.rs"]
+mod experimental_reload_continuity_tests;

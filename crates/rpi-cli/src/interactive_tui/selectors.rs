@@ -197,7 +197,7 @@ pub(super) fn open_model_selector(
         let lane = lane_sel.clone();
         let state = state_sel.clone();
         let tui = tui_sel.clone();
-        tokio::spawn(async move {
+        state.session_write_tasks.clone().spawn(async move {
             report_model_selection(&lane, &state, &tui, model, false).await;
         });
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
@@ -358,6 +358,10 @@ pub(super) fn cycle_prev_model(
 /// selected session directory, newest-first, labelled with the session name or
 /// first prompt so two sessions are distinguishable. Header-only sessions are
 /// skipped: there is nothing to switch to.
+///
+/// The default scope is the current project (fork issue #13). Tab toggles to All,
+/// which tags rows with their project directory. The scope resets to Project on
+/// every open, so it cannot leak between sessions.
 pub(super) fn open_session_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
@@ -365,42 +369,18 @@ pub(super) fn open_session_selector(
     tui: &Arc<TuiAltScreen>,
     tx: &mpsc::UnboundedSender<TuiMessage>,
 ) {
-    let dir = &state.session_dir;
-    let mut items: Vec<SelectItem> = Vec::new();
-    for path in crate::session::list_session_files_sync(dir) {
-        let summary = crate::session::summarize_session_file(&path);
-        if summary.empty {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("(unnamed)")
-            .to_string();
-        let label = crate::session::session_display_label(&summary);
-        // The file stem is `<timestamp>_<uuid>`; the id tail disambiguates rows
-        // that share a timestamp.
-        let id_tail = stem.rsplit('_').next().unwrap_or(&stem);
-        let short_id = crate::session::short_session_id(id_tail);
-        let description = format!(
-            "{} · {}",
-            crate::session::format_session_bytes(summary.bytes),
-            short_id,
-        );
-        items.push(
-            SelectItem::new(&stem, &label)
-                .with_description(&description)
-                .with_search_text(&format!("{label} {short_id} {stem}")),
-        );
-    }
-    if items.is_empty() {
-        add_note_message(
-            &state.notice_container(),
-            "No saved sessions found. Sessions are created automatically in interactive mode.",
-        );
-        tui.request_render(false);
-        return;
-    }
+    *state.session_scope.lock().unwrap() = crate::session::SessionScope::Project;
+    let scope = *state.session_scope.lock().unwrap();
+    let items = session_selector_items(state, scope);
+    // Keep the picker installed even with zero rows: it advertises Tab for All,
+    // and without an active selector the key loop cannot own Tab. The empty
+    // list renders "No matching items"; Tab then rebuilds the rows in place.
+    let description = if items.is_empty() {
+        "No sessions for this project · Tab: all projects"
+    } else {
+        "Type to filter · Tab: all projects"
+    };
+    let description = description.to_string();
     let mut list = SelectList::new(items, 10);
     list.set_layout(rpi_tui::SelectListLayoutOptions {
         min_primary_column_width: Some(56),
@@ -435,10 +415,82 @@ pub(super) fn open_session_selector(
         editor,
         tui,
         Some("Resume session"),
-        Some("Type to filter sessions"),
+        Some(&description),
         list,
         SelectorKind::Session,
     );
+}
+
+/// Key-loop hook: a bare Tab in the open `/session` selector toggles its scope.
+/// Split out of the key loop so the routing itself is probe-able (the loop's
+/// `selector_open()` branch is not reachable from a unit test).
+pub(super) fn selector_owns_key(state: &Arc<TuiState>, key: &KeyEvent) -> bool {
+    key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE && toggle_session_scope(state)
+}
+
+/// Tab in the open `/session` selector swaps the scope and rebuilds the rows in
+/// place. The typed filter is re-applied from the search input so switching
+/// scope cannot silently widen an active query. Returns false when the active
+/// selector is not the session picker, letting the key loop fall through.
+pub(super) fn toggle_session_scope(state: &Arc<TuiState>) -> bool {
+    let guard = state.active_selector.lock().unwrap();
+    let Some((SelectorView::Searchable(searchable), SelectorKind::Session)) = guard.as_ref() else {
+        return false;
+    };
+    let searchable = searchable.clone();
+    drop(guard);
+    let mut scope = state.session_scope.lock().unwrap();
+    let next = scope.toggled();
+    *scope = next;
+    drop(scope);
+    let filter = searchable.input().get_value();
+    let list = searchable.list();
+    list.set_items(session_selector_items(state, next));
+    list.set_filter(&filter);
+    true
+}
+
+/// Build rows for one scope. The All view prefixes each row with its project so
+/// a flat list stays attributable; the project view uses the cwd-encoded
+/// directory the repo itself writes into.
+fn session_selector_items(
+    state: &Arc<TuiState>,
+    scope: crate::session::SessionScope,
+) -> Vec<SelectItem> {
+    let mut items: Vec<SelectItem> = Vec::new();
+    for entry in crate::session::list_session_files_in_scope_sync(
+        &state.session_cwd,
+        &state.session_dir,
+        scope,
+    ) {
+        let summary = crate::session::summarize_session_file(&entry.path);
+        if summary.empty {
+            continue;
+        }
+        let stem = entry
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("(unnamed)")
+            .to_string();
+        let label = crate::session::session_display_label(&summary);
+        let id_tail = stem.rsplit('_').next().unwrap_or(&stem);
+        let short_id = crate::session::short_session_id(id_tail);
+        let mut description = format!(
+            "{} · {}",
+            crate::session::format_session_bytes(summary.bytes),
+            short_id,
+        );
+        if let Some(project) = &entry.project {
+            description = format!("{project} · {description}");
+        }
+        items.push(
+            SelectItem::new(&stem, &label)
+                .with_description(&description)
+                .with_search_text(&format!("{label} {short_id} {stem}")),
+        );
+    }
+    items
 }
 
 pub(super) fn custom_entry_display_text(
@@ -964,7 +1016,7 @@ pub(super) fn open_thinking_selector(
         };
         let lane = lane_sel.clone();
         let footer_sel = state_sel.footer.clone();
-        tokio::spawn(async move {
+        state_sel.session_write_tasks.spawn(async move {
             let _ = lane.set_thinking_level(level).await;
         });
         // Reflect the chosen level in the footer's model suffix (pi parity:
@@ -1054,7 +1106,7 @@ pub(super) fn open_tools_selector(
         let on = next.iter().any(|a| a == &item.value);
         let lane = lane_sel.clone();
         let next_clone = next.clone();
-        tokio::spawn(async move {
+        state_sel.session_write_tasks.spawn(async move {
             let _ = lane.set_active_tools(next_clone).await;
         });
         let list_str = if next.is_empty() {

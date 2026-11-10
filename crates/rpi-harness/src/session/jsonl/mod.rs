@@ -21,8 +21,10 @@ pub use codec::{
     encode_header, encode_mutation, metadata_from_header, parse_header, parse_mutation,
 };
 pub use errors::{file_result, invalid_file, JsonlDecodeError, JsonlDecodeErrorKind};
-pub use repo::JsonlSessionRepo;
-pub use storage::{JsonlSessionFacts, JsonlSessionStorage};
+pub use repo::{jsonl_session_directory_name, JsonlSessionRepo};
+pub use storage::{
+    compact_retired_frames, JsonlSessionFacts, JsonlSessionStorage, RetiredFrameGcReport,
+};
 pub use types::{
     HeaderKind, JsonlSessionCreateOptions, JsonlSessionListOptions, JsonlSessionMetadata,
     JsonlSessionRepoOptions, JsonlSourceFormat, JsonlV4Header,

@@ -6,6 +6,7 @@ mod autocomplete_flicker;
 mod clipboard_persistence;
 mod context_panel;
 mod enter_completion;
+mod native_durable;
 mod session_regressions;
 mod skill_commands;
 mod updown_cursor;
@@ -444,8 +445,11 @@ fn markdown_flag_only_comes_from_an_explicit_true() {
 /// the explicit literals other tests build, but keeps one copy in sync.
 pub(super) fn test_tui_state() -> Arc<TuiState> {
     Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1851,8 +1855,11 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
     };
 
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3481,8 +3488,11 @@ fn test_autocomplete_slash_suggestions_render() {
     // The autocomplete container should render at least one suggestion
     // line when the editor holds a `/` prefix, and clear when it doesn't.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3580,8 +3590,11 @@ fn test_select_list_swap_restores_editor() {
     // child; closing restores it. Verify the container child count + the
     // active_selector flag round-trip.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3682,8 +3695,11 @@ fn test_message_history_browse_restores_draft() {
     // messages, browse older → newer → back past the newest restores the
     // draft the user was typing.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3787,8 +3803,11 @@ fn test_message_history_browse_restores_draft() {
 fn test_accept_top_suggestion_replaces_prefix() {
     // `/he` + Tab → `/help ` (slash command provider inserts a space).
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3878,8 +3897,11 @@ fn test_accept_top_suggestion_replaces_prefix() {
 /// installed by each test).
 fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
     Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -4557,8 +4579,8 @@ fn ask_user_prompt_parser_supports_flat_and_questions_shapes() {
 #[test]
 fn ask_user_bridge_answers_and_cancels_by_request_id() {
     let mailbox = rpi_extensions::UiDialogMailbox::new();
-    mailbox.attach();
     let bridge = AskUserBridge::new(mailbox.clone());
+    assert!(bridge.attach());
 
     // Two concurrent requests must not cross answers.
     mailbox
@@ -5342,6 +5364,28 @@ fn final_review_pr106_enter_path_completion_must_preserve_the_parent_directory()
         expected,
         "Enter must complete the basename without discarding the directory from the file reference"
     );
+}
+
+#[test]
+fn final_review_pr106_quoted_at_completion_closes_the_quote() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("notes.txt");
+    std::fs::write(&path, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let input = "@\"not";
+    editor.set_text(input);
+    set_editor_cursor_offset(&editor, input, input.len());
+
+    let completion = resolve_enter_completion(&state, &editor).expect("a quoted @ decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyOnly);
+    assert!(completion.apply(&state, &editor));
+    assert_eq!(editor.get_text(), "@\"notes.txt\" ");
 }
 
 /// A path candidate that disappears between the decision and the apply must

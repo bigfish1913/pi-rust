@@ -1,0 +1,142 @@
+[
+  {
+    "name": "workflow reset preserves completed manual queue",
+    "actions": [
+      {
+        "action": "start",
+        "name": "  Ship  ",
+        "steps": [
+          {
+            "id": " build ",
+            "title": " Build "
+          }
+        ]
+      },
+      {
+        "action": "enqueue",
+        "text": " check "
+      },
+      {
+        "action": "claim",
+        "item": "item-1"
+      },
+      {
+        "action": "finish",
+        "item": "item-1",
+        "status": "completed",
+        "note": " verified "
+      },
+      {
+        "action": "checkpoint",
+        "step": "build",
+        "status": "completed"
+      },
+      {
+        "action": "complete"
+      },
+      {
+        "action": "reset"
+      }
+    ],
+    "expected": {
+      "revision": 7,
+      "nextQueueId": 1,
+      "workflow": null,
+      "queue": [
+        {
+          "id": "item-1",
+          "text": "check",
+          "status": "completed",
+          "createdRevision": 2,
+          "updatedRevision": 4,
+          "note": "verified"
+        }
+      ]
+    }
+  },
+  {
+    "name": "explicit null cancel uses legacy default",
+    "actions": [
+      {
+        "action": "enqueue",
+        "text": " work "
+      },
+      {
+        "action": "cancel",
+        "item": "item-1",
+        "note": null
+      }
+    ],
+    "expected": {
+      "revision": 2,
+      "nextQueueId": 1,
+      "workflow": null,
+      "queue": [
+        {
+          "id": "item-1",
+          "text": "work",
+          "status": "cancelled",
+          "createdRevision": 1,
+          "updatedRevision": 2,
+          "note": "cancelled"
+        }
+      ]
+    }
+  },
+  {
+    "name": "explicit null failure uses legacy default",
+    "actions": [
+      {
+        "action": "start",
+        "name": "  Ship  ",
+        "steps": [
+          {
+            "id": " build ",
+            "title": " Build "
+          }
+        ]
+      },
+      {
+        "action": "fail",
+        "reason": null
+      }
+    ],
+    "expected": {
+      "revision": 2,
+      "nextQueueId": 0,
+      "workflow": {
+        "name": "Ship",
+        "status": "failed",
+        "steps": [
+          {
+            "id": "build",
+            "title": "Build",
+            "status": "pending"
+          }
+        ],
+        "reason": "workflow marked as failed"
+      },
+      "queue": []
+    }
+  },
+  {
+    "name": "read and empty reset do not advance state revision",
+    "actions": [
+      {
+        "action": "status"
+      },
+      {
+        "action": "queue"
+      },
+      {
+        "action": "reset"
+      }
+    ],
+    "expected": {
+      "revision": 0,
+      "nextQueueId": 0,
+      "workflow": null,
+      "queue": []
+    }
+  }
+]

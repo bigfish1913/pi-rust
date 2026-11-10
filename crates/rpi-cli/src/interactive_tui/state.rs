@@ -157,9 +157,16 @@ pub(super) fn auto_send_step(
 }
 
 pub(super) struct TuiState {
+    pub(super) session_write_tasks: super::settlement::SessionWriteTasks,
     pub(super) history_page: history::HistoryUi,
     /// The root selected at startup, retained across session switches/reloads.
     pub(super) session_dir: std::path::PathBuf,
+    /// The cwd captured at startup. Session pickers scope their default view
+    /// to this project; extensions may mutate the process cwd at runtime, so
+    /// reading `current_dir()` here would silently change the picker's scope.
+    pub(super) session_cwd: std::path::PathBuf,
+    /// `/session` and `-r` scope, reset to Project every time a picker opens.
+    pub(super) session_scope: std::sync::Mutex<crate::session::SessionScope>,
     /// The in-flight streaming assistant message (cleared on finalize).
     /// `Arc`-shared with the [`TranscriptView`] the event drain renders through,
     /// so the render-tick / reload / toggle paths keep direct access.
