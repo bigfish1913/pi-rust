@@ -415,8 +415,14 @@ jobs:
           runs = data.get("runs", [])
           summaries = [item for item in data.get("summaries", [])
                        if item.get("gate", {}).get("gatesExit")]
-          only_latency = bool(runs and summaries and
-                              all(run.get("status") == "PASS" for run in runs) and
+          only_latency = bool(data.get("status") == "FAIL" and "fatalError" not in data and
+                              runs and summaries and
+                              all(run.get("status") == "PASS" and not run.get("errors")
+                                  for run in runs) and
+                              all(item["gate"].get("complete") is True for item in summaries) and
+                              all(item.get("metrics", {}).get(key) is not None
+                                  for item in summaries
+                                  for key in ("readyMs", "getMessages40Ms", "getStateMs")) and
                               any(item.get("gate", {}).get("status") == "FAIL"
                                   for item in summaries))
           raise SystemExit(0 if only_latency else 1)
@@ -455,8 +461,14 @@ jobs:
           runs = data.get("runs", [])
           summaries = [item for item in data.get("summaries", [])
                        if item.get("gate", {}).get("gatesExit")]
-          only_latency = bool(runs and summaries and
-                              all(run.get("status") == "PASS" for run in runs) and
+          only_latency = bool(data.get("status") == "FAIL" and "fatalError" not in data and
+                              runs and summaries and
+                              all(run.get("status") == "PASS" and not run.get("errors")
+                                  for run in runs) and
+                              all(item["gate"].get("complete") is True for item in summaries) and
+                              all(item.get("metrics", {}).get(key) is not None
+                                  for item in summaries
+                                  for key in ("readyMs", "getMessages40Ms", "getStateMs")) and
                               any(item.get("gate", {}).get("status") == "FAIL"
                                   for item in summaries))
           raise SystemExit(0 if only_latency else 1)
