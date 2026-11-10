@@ -2,9 +2,7 @@
 use rpi_harness::error::SessionErrorCode;
 use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
 use rpi_harness::session::types::*;
-use rpi_harness::session::{
-    DefaultIdGenerator, InMemorySessionRepo, SqliteSessionRepo, SystemClock,
-};
+use rpi_harness::session::{DefaultIdGenerator, InMemorySessionRepo, SystemClock};
 use rpi_tools::{FileSystem, OsExecutionEnv};
 use std::sync::Arc;
 
@@ -312,11 +310,6 @@ async fn memory_fork_tip_contract() {
         Arc::new(DefaultIdGenerator::new()),
     ))
     .await;
-}
-#[tokio::test]
-async fn sqlite_fork_tip_contract() {
-    let dir = tempfile::tempdir().unwrap();
-    check(SqliteSessionRepo::open(dir.path().join("sessions.db")).unwrap()).await;
 }
 #[tokio::test]
 async fn jsonl_cold_fork_tip_contract() {

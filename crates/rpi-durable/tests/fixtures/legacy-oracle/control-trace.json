@@ -1,0 +1,106 @@
+{
+  "name": "synthetic paired control journal; no real sessions or execution proof",
+  "frames": [
+    {
+      "name": "empty snapshot",
+      "entry": {"id":"oracle-0","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"snapshot","baseRevision":0,"revision":0,"baseEntryId":null,"state":{"revision":0,"nextRunId":0,"nextQueueId":0,"queue":[]}}},
+      "expected": {"revision":0,"nextQueueId":0,"workflow":null,"queue":[]}
+    },
+    {
+      "name": "start two pending steps",
+      "entry": {"id":"oracle-1","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":0,"revision":1,"baseEntryId":"oracle-0","changes":[{"op":"setWorkflow","workflow":{"name":"Preview","status":"running","steps":[{"id":"a","title":"Inspect","status":"pending"},{"id":"b","title":"Deliver","status":"pending"}]}}]}},
+      "action": {"action":"start","name":"Preview","steps":[{"id":"a","title":"Inspect"},{"id":"b","title":"Deliver"}]},
+      "expected": {"revision":1,"nextQueueId":0,"workflow":{"name":"Preview","status":"running","steps":[{"id":"a","title":"Inspect","status":"pending"},{"id":"b","title":"Deliver","status":"pending"}]},"queue":[]}
+    },
+    {
+      "name": "checkpoint completed with note",
+      "entry": {"id":"oracle-2","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":1,"revision":2,"baseEntryId":"oracle-1","changes":[{"op":"updateStep","step_id":"a","status":"completed","note":"reviewed"}]}},
+      "action": {"action":"checkpoint","step":"a","status":"completed","note":"reviewed"},
+      "expected": {"revision":2,"nextQueueId":0,"workflow":{"name":"Preview","status":"running","steps":[{"id":"a","title":"Inspect","status":"completed","note":"reviewed"},{"id":"b","title":"Deliver","status":"pending"}]},"queue":[]}
+    },
+    {
+      "name": "pause reason",
+      "entry": {"id":"oracle-3","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":2,"revision":3,"baseEntryId":"oracle-2","changes":[{"op":"setWorkflowMeta","name":"Preview","status":"paused","reason":"waiting"}]}},
+      "action": {"action":"pause","reason":"waiting"},
+      "expected": {"revision":3,"nextQueueId":0,"workflow":{"name":"Preview","status":"paused","reason":"waiting","steps":[{"id":"a","title":"Inspect","status":"completed","note":"reviewed"},{"id":"b","title":"Deliver","status":"pending"}]},"queue":[]}
+    },
+    {
+      "name": "resume clears reason",
+      "entry": {"id":"oracle-4","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":3,"revision":4,"baseEntryId":"oracle-3","changes":[{"op":"setWorkflowMeta","name":"Preview","status":"running","reason":null}]}},
+      "action": {"action":"resume"},
+      "expected": {"revision":4,"nextQueueId":0,"workflow":{"name":"Preview","status":"running","steps":[{"id":"a","title":"Inspect","status":"completed","note":"reviewed"},{"id":"b","title":"Deliver","status":"pending"}]},"queue":[]}
+    },
+    {
+      "name": "enqueue first stable id",
+      "entry": {"id":"oracle-5","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":4,"revision":5,"baseEntryId":"oracle-4","changes":[{"op":"appendQueue","item":{"id":"item-1","text":"compile","status":"queued","createdRevision":5,"updatedRevision":5}},{"op":"setCounters","next_run_id":0,"next_queue_id":1}]}},
+      "action": {"action":"enqueue","text":"compile"},
+      "expected": {"revision":5,"nextQueueId":1,"workflow":{"name":"Preview","status":"running","steps":[{"id":"a","title":"Inspect","status":"completed","note":"reviewed"},{"id":"b","title":"Deliver","status":"pending"}]},"queue":[{"id":"item-1","text":"compile","status":"queued","createdRevision":5,"updatedRevision":5,"note":"","claimedBy":null}]}
+    },
+    {
+      "name": "pure claim without host owner assignment",
+      "entry": {"id":"oracle-6","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":5,"revision":6,"baseEntryId":"oracle-5","changes":[{"op":"updateQueue","item":{"id":"item-1","text":"compile","status":"claimed","createdRevision":5,"updatedRevision":6}}]}},
+      "action": {"action":"claim","item":"item-1"},
+      "expected": {"revision":6,"nextQueueId":1,"workflow":{"name":"Preview","status":"running","steps":[{"id":"a","title":"Inspect","status":"completed","note":"reviewed"},{"id":"b","title":"Deliver","status":"pending"}]},"queue":[{"id":"item-1","text":"compile","status":"claimed","createdRevision":5,"updatedRevision":6,"note":"","claimedBy":null}]}
+    },
+    {
+      "name": "finish retains terminal queue history",
+      "entry": {"id":"oracle-7","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":6,"revision":7,"baseEntryId":"oracle-6","changes":[{"op":"updateQueue","item":{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built"}}]}},
+      "action": {"action":"finish","item":"item-1","status":"completed","note":"built"},
+      "expected": {"revision":7,"nextQueueId":1,"workflow":{"name":"Preview","status":"running","steps":[{"id":"a","title":"Inspect","status":"completed","note":"reviewed"},{"id":"b","title":"Deliver","status":"pending"}]},"queue":[{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built","claimedBy":null}]}
+    },
+    {
+      "name": "enqueue second item",
+      "entry": {"id":"oracle-8","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":7,"revision":8,"baseEntryId":"oracle-7","changes":[{"op":"appendQueue","item":{"id":"item-2","text":"optional","status":"queued","createdRevision":8,"updatedRevision":8}},{"op":"setCounters","next_run_id":0,"next_queue_id":2}]}},
+      "action": {"action":"enqueue","text":"optional"},
+      "expected": {"revision":8,"nextQueueId":2,"workflow":{"name":"Preview","status":"running","steps":[{"id":"a","title":"Inspect","status":"completed","note":"reviewed"},{"id":"b","title":"Deliver","status":"pending"}]},"queue":[{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built","claimedBy":null},{"id":"item-2","text":"optional","status":"queued","createdRevision":8,"updatedRevision":8,"note":"","claimedBy":null}]}
+    },
+    {
+      "name": "cancel default note",
+      "entry": {"id":"oracle-9","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":8,"revision":9,"baseEntryId":"oracle-8","changes":[{"op":"updateQueue","item":{"id":"item-2","text":"optional","status":"cancelled","createdRevision":8,"updatedRevision":9,"note":"cancelled"}}]}},
+      "action": {"action":"cancel","item":"item-2"},
+      "expected": {"revision":9,"nextQueueId":2,"workflow":{"name":"Preview","status":"running","steps":[{"id":"a","title":"Inspect","status":"completed","note":"reviewed"},{"id":"b","title":"Deliver","status":"pending"}]},"queue":[{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built","claimedBy":null},{"id":"item-2","text":"optional","status":"cancelled","createdRevision":8,"updatedRevision":9,"note":"cancelled","claimedBy":null}]}
+    },
+    {
+      "name": "checkpoint second step",
+      "entry": {"id":"oracle-10","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":9,"revision":10,"baseEntryId":"oracle-9","changes":[{"op":"updateStep","step_id":"b","status":"completed","note":null}]}},
+      "action": {"action":"checkpoint","step":"b","status":"completed"},
+      "expected": {"revision":10,"nextQueueId":2,"workflow":{"name":"Preview","status":"running","steps":[{"id":"a","title":"Inspect","status":"completed","note":"reviewed"},{"id":"b","title":"Deliver","status":"completed"}]},"queue":[{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built","claimedBy":null},{"id":"item-2","text":"optional","status":"cancelled","createdRevision":8,"updatedRevision":9,"note":"cancelled","claimedBy":null}]}
+    },
+    {
+      "name": "complete workflow",
+      "entry": {"id":"oracle-11","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":10,"revision":11,"baseEntryId":"oracle-10","changes":[{"op":"setWorkflowMeta","name":"Preview","status":"completed","reason":null}]}},
+      "action": {"action":"complete"},
+      "expected": {"revision":11,"nextQueueId":2,"workflow":{"name":"Preview","status":"completed","steps":[{"id":"a","title":"Inspect","status":"completed","note":"reviewed"},{"id":"b","title":"Deliver","status":"completed"}]},"queue":[{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built","claimedBy":null},{"id":"item-2","text":"optional","status":"cancelled","createdRevision":8,"updatedRevision":9,"note":"cancelled","claimedBy":null}]}
+    },
+    {
+      "name": "reset preserves queue and counter",
+      "entry": {"id":"oracle-12","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":11,"revision":12,"baseEntryId":"oracle-11","changes":[{"op":"setWorkflow","workflow":null}]}},
+      "action": {"action":"reset"},
+      "expected": {"revision":12,"nextQueueId":2,"workflow":null,"queue":[{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built","claimedBy":null},{"id":"item-2","text":"optional","status":"cancelled","createdRevision":8,"updatedRevision":9,"note":"cancelled","claimedBy":null}]}
+    },
+    {
+      "name": "post-reset id does not recycle",
+      "entry": {"id":"oracle-13","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":12,"revision":13,"baseEntryId":"oracle-12","changes":[{"op":"appendQueue","item":{"id":"item-3","text":"later","status":"queued","createdRevision":13,"updatedRevision":13}},{"op":"setCounters","next_run_id":0,"next_queue_id":3}]}},
+      "action": {"action":"enqueue","text":"later"},
+      "expected": {"revision":13,"nextQueueId":3,"workflow":null,"queue":[{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built","claimedBy":null},{"id":"item-2","text":"optional","status":"cancelled","createdRevision":8,"updatedRevision":9,"note":"cancelled","claimedBy":null},{"id":"item-3","text":"later","status":"queued","createdRevision":13,"updatedRevision":13,"note":"","claimedBy":null}]}
+    },
+    {
+      "name": "start after reset",
+      "entry": {"id":"oracle-14","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":13,"revision":14,"baseEntryId":"oracle-13","changes":[{"op":"setWorkflow","workflow":{"name":"Second","status":"running","steps":[{"id":"c","title":"Retry","status":"pending"}]}}]}},
+      "action": {"action":"start","name":"Second","steps":[{"id":"c","title":"Retry"}]},
+      "expected": {"revision":14,"nextQueueId":3,"workflow":{"name":"Second","status":"running","steps":[{"id":"c","title":"Retry","status":"pending"}]},"queue":[{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built","claimedBy":null},{"id":"item-2","text":"optional","status":"cancelled","createdRevision":8,"updatedRevision":9,"note":"cancelled","claimedBy":null},{"id":"item-3","text":"later","status":"queued","createdRevision":13,"updatedRevision":13,"note":"","claimedBy":null}]}
+    },
+    {
+      "name": "fail default reason",
+      "entry": {"id":"oracle-15","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":14,"revision":15,"baseEntryId":"oracle-14","changes":[{"op":"setWorkflowMeta","name":"Second","status":"failed","reason":"workflow marked as failed"}]}},
+      "action": {"action":"fail"},
+      "expected": {"revision":15,"nextQueueId":3,"workflow":{"name":"Second","status":"failed","reason":"workflow marked as failed","steps":[{"id":"c","title":"Retry","status":"pending"}]},"queue":[{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built","claimedBy":null},{"id":"item-2","text":"optional","status":"cancelled","createdRevision":8,"updatedRevision":9,"note":"cancelled","claimedBy":null},{"id":"item-3","text":"later","status":"queued","createdRevision":13,"updatedRevision":13,"note":"","claimedBy":null}]}
+    },
+    {
+      "name": "start replaces terminal workflow without reset",
+      "entry": {"id":"oracle-16","type":"custom","customType":"durable-state","data":{"format":"rpi-durable-journal","version":1,"kind":"delta","baseRevision":15,"revision":16,"baseEntryId":"oracle-15","changes":[{"op":"setWorkflow","workflow":{"name":"Replacement","status":"running","steps":[{"id":"d","title":"Fresh","status":"pending"}]}}]}},
+      "action": {"action":"start","name":"Replacement","steps":[{"id":"d","title":"Fresh"}]},
+      "expected": {"revision":16,"nextQueueId":3,"workflow":{"name":"Replacement","status":"running","steps":[{"id":"d","title":"Fresh","status":"pending"}]},"queue":[{"id":"item-1","text":"compile","status":"completed","createdRevision":5,"updatedRevision":7,"note":"built","claimedBy":null},{"id":"item-2","text":"optional","status":"cancelled","createdRevision":8,"updatedRevision":9,"note":"cancelled","claimedBy":null},{"id":"item-3","text":"later","status":"queued","createdRevision":13,"updatedRevision":13,"note":"","claimedBy":null}]}
+    }
+  ]
+}

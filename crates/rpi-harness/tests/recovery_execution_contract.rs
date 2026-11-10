@@ -12,7 +12,7 @@ use rpi_harness::frame_progress::unknown_tool_outcomes;
 use rpi_harness::runtime::SessionRuntime;
 use rpi_harness::session::jsonl::{JsonlSessionStorage, JsonlV4Header};
 use rpi_harness::session::types::*;
-use rpi_harness::session::{DefaultIdGenerator, Session, SqliteSessionRepo, SystemClock};
+use rpi_harness::session::{DefaultIdGenerator, Session, SystemClock};
 use rpi_harness::types::{AgentHarnessOptions, HarnessTool};
 use rpi_tools::{FileSystem, OsExecutionEnv};
 use tokio::sync::Notify;
@@ -112,7 +112,6 @@ struct Backend {
     kind: &'static str,
     path: String,
     memory: Option<Arc<dyn SessionStorage>>,
-    metadata: SessionMetadata,
 }
 impl Backend {
     async fn create(kind: &'static str) -> (Self, Session) {
@@ -130,19 +129,8 @@ impl Backend {
                 .await
                 .unwrap(),
             ),
-            "sqlite" => Arc::new(
-                SqliteSessionRepo::open(&path)
-                    .unwrap()
-                    .create(&SessionCreateOptions {
-                        id: Some("review-contract".into()),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap(),
-            ),
             _ => AgentHarnessOptions::default().session.storage(),
         };
-        let metadata = storage.metadata();
         let memory = (kind == "memory").then(|| storage.clone());
         (
             Self {
@@ -150,7 +138,6 @@ impl Backend {
                 kind,
                 path,
                 memory,
-                metadata,
             },
             Session::new(storage, None),
         )
@@ -166,13 +153,6 @@ impl Backend {
                 )
                 .await
                 .unwrap(),
-            ),
-            "sqlite" => Arc::new(
-                SqliteSessionRepo::open(&self.path)
-                    .unwrap()
-                    .open(&self.metadata)
-                    .await
-                    .unwrap(),
             ),
             _ => self.memory.clone().unwrap(),
         };
@@ -252,7 +232,7 @@ async fn terminals(session: &Session) -> Vec<LaneRecord> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn conflicting_result_identity_keeps_recovery_open_without_replaying_any_call() {
-    for kind in ["memory", "sqlite", "jsonl"] {
+    for kind in ["memory", "jsonl"] {
         for policy in [ToolReplay::Never, ToolReplay::Safe] {
             let (backend, session) = Backend::create(kind).await;
             setup_interrupted(&session, 2, Some(policy)).await;
@@ -317,7 +297,7 @@ async fn conflicting_result_identity_keeps_recovery_open_without_replaying_any_c
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exact_reserved_results_stay_settled_across_two_restores() {
-    for kind in ["memory", "sqlite", "jsonl"] {
+    for kind in ["memory", "jsonl"] {
         let (backend, session) = Backend::create(kind).await;
         setup_interrupted(&session, 2, Some(ToolReplay::Safe)).await;
         for index in 0..2 {

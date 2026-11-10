@@ -3,9 +3,24 @@ use rpi_tui::terminal::{InputEvent, Terminal, TerminalInfo};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn state_with_root(root: &std::path::Path) -> Arc<TuiState> {
+    state_with_root_and_cwd(root, root)
+}
+
+fn state_with_root_and_cwd(root: &std::path::Path, cwd: &std::path::Path) -> Arc<TuiState> {
     let mut state = test_tui_state();
-    Arc::get_mut(&mut state).unwrap().session_dir = root.to_path_buf();
+    let inner = Arc::get_mut(&mut state).unwrap();
+    inner.session_dir = root.to_path_buf();
+    inner.session_cwd = cwd.to_path_buf();
     state
+}
+
+fn is_session_locked(path: &str) -> bool {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(format!("{path}.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).is_err()
 }
 
 fn assert_session_locked(path: &str) {
@@ -43,7 +58,7 @@ async fn tui_fork_locks_the_copy_and_keeps_the_selected_root_for_switch_and_pick
     let initial_id = source.storage().metadata().id.clone();
     let harness = AgentHarness::create(Default::default()).await.unwrap();
     harness.set_session(source).await.unwrap();
-    let state = state_with_root(&root);
+    let state = state_with_root_and_cwd(&root, &cwd);
     let context = rpi_extensions::ToolCallContext::new(cwd.to_string_lossy());
     fork_session(&harness, &cwd, &state.chat_container, &state, &context).await;
     let fork_id = harness.session().storage().metadata().id.clone();
@@ -52,8 +67,14 @@ async fn tui_fork_locks_the_copy_and_keeps_the_selected_root_for_switch_and_pick
         .await
         .unwrap();
     assert_eq!(metadata.len(), 2);
+    // The storage binding owns the writer lease. After the fork switch only
+    // the active fork remains writable; the source is intentionally released.
     for row in &metadata {
-        assert_session_locked(&row.path);
+        if row.id == fork_id {
+            assert_session_locked(&row.path);
+        } else {
+            assert!(!is_session_locked(&row.path));
+        }
     }
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     assert!(
@@ -128,6 +149,7 @@ async fn tui_import_preserves_identity_history_and_source_across_cwds() {
     let expected = source.storage().metadata().id.clone();
     let source_path = crate::session::list_session_files_sync(&source_root).remove(0);
     let original = std::fs::read(&source_path).unwrap();
+    drop(source);
     let harness = AgentHarness::create(Default::default()).await.unwrap();
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     let state = state_with_root(&root);
@@ -156,6 +178,9 @@ async fn tui_import_preserves_identity_history_and_source_across_cwds() {
     assert_eq!(metadata.len(), 1);
     assert_eq!(metadata[0].cwd, old_cwd.to_string_lossy());
     assert_session_locked(&metadata[0].path);
+    harness.session().storage().release_writer_lease();
+    drop(lane);
+    drop(harness);
     let restored =
         crate::session::open_session_by_id_in_dir(&expected, &cwd.to_string_lossy(), &root)
             .await
@@ -168,6 +193,7 @@ async fn tui_import_preserves_identity_history_and_source_across_cwds() {
     );
     let imported = std::fs::read(&metadata[0].path).unwrap();
     assert_eq!(imported, original);
+    drop(restored);
     // Both repeated imports and importing a repository's own log must fail
     // without touching either saved history or the original source.
     for path in [&source_path, &std::path::PathBuf::from(&metadata[0].path)] {
@@ -237,6 +263,10 @@ async fn session_switch_banner_reports_real_capabilities() {
         .append_message(user_message_with_images("first session history", vec![]))
         .await
         .unwrap();
+    // A fresh JSONL binding owns the writer lease until its storage binding is
+    // dropped; the switch below must open the first session after this fixture
+    // releases its original owner.
+    drop(first);
     let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -577,6 +607,7 @@ async fn switching_back_to_a_session_restores_its_model() {
         ))
         .await
         .unwrap();
+    drop(first);
     let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -692,6 +723,7 @@ async fn switching_back_to_a_session_restores_its_footer_usage() {
         ))
         .await
         .unwrap();
+    drop(first);
     let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -759,6 +791,7 @@ async fn unknown_session_model_leaves_the_current_model_in_place() {
         ))
         .await
         .unwrap();
+    drop(first);
     let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -842,6 +875,7 @@ async fn review_pr104_replay_preserves_the_live_cache_hit_rate() {
     for message in &messages {
         source.append_message(message.clone()).await.unwrap();
     }
+    drop(source);
     let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -917,6 +951,7 @@ async fn review_pr104_restore_model_must_follow_the_selected_branch() {
         .unwrap();
     // This is the move made by /tree before leaving/reopening the session.
     source.move_lane("main", Some(&selected)).await.unwrap();
+    drop(source);
     let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -985,6 +1020,7 @@ async fn review_pr104_restore_model_must_ignore_a_child_lane() {
         ))
         .await
         .unwrap();
+    drop(source);
     let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -1095,6 +1131,7 @@ async fn rereview_pr104_context_must_not_come_from_a_child_lane() {
         .append_message(review_084_context_turn("child-model", 190_000))
         .await
         .unwrap();
+    drop(source);
     let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -1159,6 +1196,7 @@ async fn rereview_pr104_compaction_must_invalidate_pre_compaction_context() {
         )
         .await
         .unwrap();
+    drop(source);
     let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
         .await
         .unwrap();
@@ -1794,5 +1832,162 @@ fn review_pr202_theme_watch_notify_repaints_idle_session() {
     assert!(
         frames.load(Ordering::SeqCst) > after_ok,
         "error notice must schedule a repaint too"
+    );
+}
+
+/// Fork issue #13: `/session` opens on this project, Tab widens to all projects,
+/// and every open resets the scope to Project (state must not leak between
+/// visits). The rows come from the same cwd-encoded directory the repo writes,
+/// so what the picker shows is what the open path can resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_issue13_session_selector_tab_switches_scope_and_resets_on_reopen() {
+    use rpi_harness::session::jsonl::jsonl_session_directory_name;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("sessions");
+    let cwd = tmp.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let foreign_cwd = tmp.path().join("another-project");
+    std::fs::create_dir_all(&foreign_cwd).unwrap();
+    let own = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    own.append_message(user_message_with_images("own project prompt", vec![]))
+        .await
+        .unwrap();
+    let foreign = crate::session::create_jsonl_session(&root, &foreign_cwd.to_string_lossy())
+        .await
+        .unwrap();
+    foreign
+        .append_message(user_message_with_images("foreign project prompt", vec![]))
+        .await
+        .unwrap();
+    // Sanity: the fixture actually landed in two distinct project dirs.
+    assert!(root
+        .join(jsonl_session_directory_name(&cwd.to_string_lossy()))
+        .exists());
+    assert!(root
+        .join(jsonl_session_directory_name(&foreign_cwd.to_string_lossy()))
+        .exists());
+    drop(own);
+    drop(foreign);
+
+    let state = state_with_root_and_cwd(&root, &cwd);
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let editor_container = Arc::new(Container::new());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    open_session_selector(&state, &editor_container, &state.editor, &tui, &tx);
+    assert!(state.selector_open());
+    assert_eq!(
+        *state.session_scope.lock().unwrap(),
+        crate::session::SessionScope::Project
+    );
+    let rendered = |s: &Arc<TuiState>| {
+        let (view, _) = s.active_selector.lock().unwrap().as_ref().unwrap().clone();
+        match view {
+            SelectorView::Searchable(searchable) => strip_ansi(&searchable.render(160).join("\n")),
+            _ => panic!("session selector must be searchable"),
+        }
+    };
+    let project_view = rendered(&state);
+    assert!(
+        project_view.contains("own project prompt"),
+        "{project_view}"
+    );
+    assert!(
+        !project_view.contains("foreign project prompt"),
+        "{project_view}"
+    );
+
+    // Drive the same hook the key loop uses, not just the underlying function:
+    // a bare Tab must be claimed, and a modified Tab must fall through.
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    assert!(selector_owns_key(&state, &tab));
+    assert_eq!(
+        *state.session_scope.lock().unwrap(),
+        crate::session::SessionScope::All
+    );
+    assert!(!selector_owns_key(
+        &state,
+        &KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)
+    ));
+    let all_view = rendered(&state);
+    assert!(all_view.contains("own project prompt"), "{all_view}");
+    assert!(all_view.contains("foreign project prompt"), "{all_view}");
+    // All rows are attributable to a project directory.
+    assert!(all_view.contains("another-project"), "{all_view}");
+
+    // Reopening resets the scope; a stale All from the previous visit must not
+    // leak into the next picker.
+    open_session_selector(&state, &editor_container, &state.editor, &tui, &tx);
+    assert_eq!(
+        *state.session_scope.lock().unwrap(),
+        crate::session::SessionScope::Project
+    );
+    let reopened = rendered(&state);
+    assert!(reopened.contains("own project prompt"), "{reopened}");
+    assert!(!reopened.contains("foreign project prompt"), "{reopened}");
+}
+
+/// Review #269: a fresh project has zero sessions in Project scope, but the
+/// picker must stay installed so its advertised Tab action can reach the All
+/// view. The old implementation returned before installing the selector.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review269_empty_project_keeps_the_session_selector_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("sessions");
+    let cwd = tmp.path().join("fresh-project");
+    let foreign_cwd = tmp.path().join("another-project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&foreign_cwd).unwrap();
+    let foreign = crate::session::create_jsonl_session(&root, &foreign_cwd.to_string_lossy())
+        .await
+        .unwrap();
+    foreign
+        .append_message(user_message_with_images("foreign project prompt", vec![]))
+        .await
+        .unwrap();
+    drop(foreign);
+
+    let state = state_with_root_and_cwd(&root, &cwd);
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let editor_container = Arc::new(Container::new());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    open_session_selector(&state, &editor_container, &state.editor, &tui, &tx);
+    assert!(
+        state.selector_open(),
+        "the empty Project view must keep the picker installed"
+    );
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    assert!(
+        selector_owns_key(&state, &tab),
+        "a bare Tab must be claimed by the empty picker"
+    );
+    assert_eq!(
+        *state.session_scope.lock().unwrap(),
+        crate::session::SessionScope::All
+    );
+    let (view, _) = state
+        .active_selector
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let all_view = match view {
+        SelectorView::Searchable(searchable) => strip_ansi(&searchable.render(160).join("\n")),
+        _ => panic!("session selector must be searchable"),
+    };
+    assert!(
+        all_view.contains("foreign project prompt"),
+        "Tab must populate the All rows: {all_view}"
     );
 }

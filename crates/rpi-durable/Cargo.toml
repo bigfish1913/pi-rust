@@ -8,11 +8,18 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
-description = "Backend-independent checkpoint and recovery primitives for the native rpi host"
+description = "Native rpi durable domain, runtime and journal storage"
+
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
 
 [dependencies]
+fs2 = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+rusqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+tempfile = { workspace = true }

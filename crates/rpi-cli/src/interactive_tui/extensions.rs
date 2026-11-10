@@ -535,6 +535,11 @@ const ASK_USER_FREEFORM: &str = "\u{0}ask-user-freeform";
 pub(super) struct AskUserBridge {
     pub(super) mailbox: rpi_extensions::UiDialogMailbox,
     pub(super) visible: Arc<Mutex<Option<String>>>,
+    /// Local mailbox generation marker used by this bridge. Clones share the
+    /// same marker, while a fresh bridge records a newer one on attach. `None`
+    /// means its latest attach failed, so shutdown cannot infer ownership from
+    /// the mailbox's current generation.
+    generation: Arc<Mutex<Option<u64>>>,
 }
 
 impl AskUserBridge {
@@ -542,12 +547,36 @@ impl AskUserBridge {
         Self {
             mailbox,
             visible: Arc::new(Mutex::new(None)),
+            generation: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Mark the interactive consumer as available. Idempotent.
-    pub(super) fn attach(&self) {
-        self.mailbox.attach();
+    /// Mark the interactive consumer as available and record its new local
+    /// generation. Re-attaching is idempotent for the mailbox contract, but a
+    /// fresh bridge must own a generation distinct from stale bridge clones.
+    /// A failed attach clears ownership so shutdown remains fail-closed.
+    pub(super) fn attach(&self) -> bool {
+        let generation = self.mailbox.try_attach_with_generation();
+        let accepted = self.record_attach_result(generation);
+        if !accepted {
+            // A generation acquired from the mailbox must not outlive a failed
+            // local ownership publication. This is especially important when
+            // the marker mutex is poisoned: shutdown cannot safely prove that
+            // this bridge owns the mailbox generation, so detach only the
+            // generation acquired by this attempt before refusing startup.
+            if let Some(generation) = generation {
+                let _ = self.mailbox.detach_if_generation(generation);
+            }
+        }
+        accepted
+    }
+
+    pub(super) fn record_attach_result(&self, generation: Option<u64>) -> bool {
+        let Ok(mut owned) = self.generation.lock() else {
+            return false;
+        };
+        *owned = generation;
+        generation.is_some()
     }
 
     /// Take the next pending request and mark it visible. Only the single key
@@ -606,10 +635,48 @@ impl AskUserBridge {
     /// Detach + cancel everything (TUI shutdown) so a parked plugin `poll`
     /// observes a terminal state instead of blocking on a dead session.
     pub(super) fn shutdown(&self) {
-        self.mailbox.detach();
+        let generation = self.generation.lock().ok().and_then(|owned| *owned);
+        if let Some(generation) = generation {
+            let _ = self.mailbox.detach_if_generation(generation);
+        }
         if let Ok(mut visible) = self.visible.lock() {
             *visible = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod failed_attach_tests {
+    use super::*;
+
+    #[test]
+    fn failed_attach_result_clears_owned_generation() {
+        let bridge = AskUserBridge::new(rpi_extensions::UiDialogMailbox::new());
+        assert_eq!(*bridge.generation.lock().unwrap(), None);
+        *bridge.generation.lock().unwrap() = Some(41);
+
+        assert!(!bridge.record_attach_result(None));
+        assert_eq!(*bridge.generation.lock().unwrap(), None);
+
+        assert!(bridge.record_attach_result(Some(42)));
+        assert_eq!(*bridge.generation.lock().unwrap(), Some(42));
+    }
+
+    #[test]
+    fn poisoned_generation_marker_rejects_attach_and_releases_new_generation() {
+        let mailbox = rpi_extensions::UiDialogMailbox::new();
+        let bridge = AskUserBridge::new(mailbox.clone());
+        let marker = bridge.generation.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = marker.lock().unwrap();
+            panic!("poison synthetic generation marker");
+        })
+        .join()
+        .is_err());
+
+        assert!(!bridge.attach());
+        assert!(!mailbox.is_attached());
+        bridge.shutdown();
     }
 }
 
