@@ -516,5 +516,7 @@ async fn capability_header_survives_restore_and_page_replacement_once() {
     assert_eq!(text(&state).matches("capability-header").count(), 1);
 }
 
+#[path = "tests/live_images.rs"]
+mod live_images;
 #[path = "tests/notice_order.rs"]
 mod notice_order;

@@ -38,7 +38,7 @@ static DOCS: &[DocPage] = &[
         topic: "guide",
         description: "完整使用手册：安装、模型、CLI、.rpi 资源、Rust 扩展、SDK、排错和发布",
         content: include_str!("../embedded-docs/user-guide.md"),
-        aliases: &["manual", "user-guide", "cli", "quickstart", "package", "packages", "extension", "extensions"],
+        aliases: &["manual", "user-guide", "cli", "quickstart", "package", "packages", "extension", "extensions", "provider", "providers", "models", "models.json", "sessions", "session", "skills", "skill"],
     },
     DocPage {
         topic: "overview",
@@ -68,7 +68,7 @@ static DOCS: &[DocPage] = &[
         topic: "debugging",
         description: "Rust cdylib 扩展编写（统一 C ABI、工具生命周期、事件处理器）与 agent/扩展调试（事件日志、rpi dev-local、常见失败定位）",
         content: include_str!("../embedded-docs/rust-debugging.md"),
-        aliases: &["rust", "rust-debug", "extension-debug", "troubleshoot", "debug"],
+        aliases: &["rust", "rust-debug", "extension-debug", "troubleshoot", "debug", "doctor", "diagnose", "diagnostics", "troubleshooting"],
     },
 ];
 
@@ -399,6 +399,45 @@ mod tests {
             assert!(output.starts_with("# rpi docs: guide"));
             assert!(output.contains("Matches for"));
         }
+    }
+
+    /// Review #273: the audit's operational queries must resolve to an
+    /// existing page that actually covers their subject. This is a routing
+    /// index, not a second copy of configuration and command behaviour, so
+    /// each alias is pinned to a needle in the page it routes to.
+    #[tokio::test]
+    async fn review273_operational_aliases_expose_relevant_existing_content() {
+        for (alias, page, needle) in [
+            ("skills", "guide", "skills"),
+            ("skill", "guide", "skills"),
+            ("doctor", "debugging", "rpi auth check"),
+            ("diagnose", "debugging", "RPI_EVENT_LOG"),
+            ("diagnostics", "debugging", "RPI_AGENT_DIAGNOSTICS"),
+            ("troubleshooting", "debugging", "rpi events tail"),
+            ("provider", "guide", "models.json"),
+            ("providers", "guide", "models.json"),
+            ("models", "guide", "models.json"),
+            ("models.json", "guide", "models.json"),
+            ("sessions", "guide", "--session-dir"),
+            ("session", "guide", "--session-dir"),
+        ] {
+            let output = execute(serde_json::json!({ "topic": alias })).await;
+            assert!(
+                output.starts_with(&format!("# rpi docs: {page}")),
+                "alias {alias} must route to {page}: {output}"
+            );
+            assert!(
+                output.contains(needle),
+                "alias {alias} must expose {needle} in {page}: {output}"
+            );
+        }
+        // Aliases are discoverable from the catalog without maintaining a
+        // separate operations page.
+        let catalog = execute(serde_json::json!({})).await;
+        for topic in ["guide", "authoring", "debugging"] {
+            assert!(catalog.contains(&format!("- {topic}:")), "{catalog}");
+        }
+        assert!(!catalog.contains("- operations:"), "{catalog}");
     }
 
     #[tokio::test]

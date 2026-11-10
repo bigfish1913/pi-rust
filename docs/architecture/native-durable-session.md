@@ -103,59 +103,23 @@ fixture 为 12,132,666 bytes，包含 4096 个已取消 enqueue、4096 条取消
 返回量不是进程峰值内存；fixture 刚写入、查询已预热，不能视为冷磁盘结果。
 primary history 初次读取/解析依然存在，这组数值不能外推为整个 session 恢复加速倍数。
 
-## 第二期隔离原型
+## 当前 Session storage 边界
 
-[版本化 managed recovery 原型](managed-recovery-prototype.md) 已在 test-only SQLite 行存储中
-验证 checkpoint + 固定预算 metadata tail、历史正文懒读和事务故障边界。
-它没有接入任何生产 SessionStorage/宿主，也没有改变本页所述 v4 初次全量扫描的事实。
-正式格式、完整事实模型与迁移仍属后续工作。
+旧 harness 内置的 SQLite Session backend、`experimental-native-store` feature 及其兼容测试已移除；本项目按新项目假设不提供旧格式迁移。`rpi-harness` 默认只构建 memory/JSONL Session storage。
 
-## 第三期真实事实投影（仍仅隔离测试）
+Durable journal storage 属于 `rpi-durable`，默认也是 JSONL；需要 SQLite 时显式启用 `rpi-durable/sqlite`，或使用 harness 的 `durable-sqlite` 转发 feature。两者不是同一个 Session backend，durable SQLite 不会让默认 harness 构建引入 `rusqlite`。
 
-[原生事实恢复投影](native-fact-recovery-prototype.md) 将原型推进到真实 `SessionMutation`，
-逐步对照 `SessionState`，覆盖全部 entry/record 变种、真实 pending/open/facts/stats 语义，
-并验证 checkpoint 活动引用及内容级 ACK 对账。不接入生产 backend，不替换现有 JSONL。
+当前 durable runtime/storage boundary 继续负责 journal 的顺序、revision CAS、actor/scope/admission/receipt/reconcile 等边界；Session facade 通过 adapter 使用该 boundary，不承担旧 SQLite 格式兼容职责。
 
-## 第四期显式实验后端（默认关闭）
+### CLI 默认选择
 
-[实验 SessionStorage/Repo](experimental-native-store.md) 提供 feature-gated、显式构造的接口，
-复用第三期事实引擎，增加事务批写、独立 progress 与取消后 owner/drain 边界。
-不接 CLI/Web，不迁移旧 session；delete 仍 fail closed。第四期 v2 的一般查询扫描 metadata、
-summary/window unsupported 是该提交的历史边界，不代表下述 v3 查询实现。
-这是实验接口，不是完整生产恢复交付。
+CLI 默认启用 native durable。`--native-durable` 仍作为兼容性显式参数保留；迁移期间如需回退到旧 session 行为，使用临时参数：
 
-## 第五期第一步：v3 选择性查询（宿主 opt-in 待实现）
+```bash
+rpi --no-native-durable
+```
 
-同一显式实验后端使用独立 v3 格式，拒绝 v1/v2，不自动升级。普通 entry/record/log 查询先在
-SQL 选择 keys 和 limit，再校验所选 metadata/索引并读取正文；summary 仅取独立预算内预览，
-window 只 materialize 选中正文。canonical facts、查询索引、ancestor/user/transcript links、
-UI summary 与 root/checkpoint 同事务发布。Memory oracle、损坏注入和正文 authorizer 验证
-查询边界；不把结构性 point-read 数量当作端到端 benchmark。
-
-branch/context/fork、深 cursor 的 metadata 遍历、SQL COUNT/组合扫描及任意大 active state
-仍不保证常数成本。被访问行的校验不证明任意外部 SQL 改写后的全局索引完备性。
-详见 [实验原生后端](experimental-native-store.md)。此步没有 CLI/Web 路由或真实数据迁移。
-
-## 第五期第二步：显式 print-only CLI（默认关闭）
-
-[实验 CLI opt-in](experimental-native-cli.md) 增加默认关闭 feature 与专用参数，仅新建
-text/json print session，不接恢复/选择身份/分叉/Web/RPC/TUI。保留参数在 feature-off
-构建也明确拒绝，非法组合早于旧 session 副作用；prepare/build、stdio/mode、runtime
-routing 与 reload host 保留边界。真实二进制使用隔离 mock provider 验证新格式事实、
-工具结果、持久化失败与旧根不变；默认不带参数仍使用 JSONL。
-不迁移真实 session，不等于稳定生产格式/默认切换或完整有界恢复交付。
-
-## 隔离进程故障验证（仅实验测试）
-
-[进程终止/SQLite 写锁矩阵](experimental-native-process-tests.md) 在合成 fixture 检查真实
-事务 COMMIT 前后 kill、返回前 ACK 丢失、history/checkpoint/派生行与 progress/prune 的原子
-可见性，以及独立 writer busy、释放/死亡后的重试与序号。连接局部探针仅存在于 cfg(test)，
-没有新增 CLI 恢复或自动重试 API。当前实测仅 Windows / SQLite DELETE journal，不代表
-断电原子性、跨进程生命周期 fencing、安全 delete 或生产完成。
-后续强制 cache-spill 变体证明 main 原有页已变与 journal 真实存在，暴露并修复已有
-experimental repo 的只读 identity probe 无法恢复 hot journal 的缺陷；先 OS header
-准入再让 SQLite 恢复，保留所有逻辑校验。不是新增 CLI 恢复或格式迁移；已识别 v3 的
-open/list 可能回放 journal，不能承诺所有报错均物理无副作用。
+`--no-session` 仍然优先表示完全不持久化当前 session；它不是 native durable 的回退开关。
 
 ## 后续阶段（生产路径尚未实现）
 

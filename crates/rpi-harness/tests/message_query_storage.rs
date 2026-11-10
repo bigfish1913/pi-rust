@@ -7,9 +7,7 @@ use rpi_harness::session::session::DefaultIdGenerator;
 use rpi_harness::session::types::{
     MessageSummaryQuery, MessageWindowQuery, SessionCreateOptions, SessionRepo, SessionStorage,
 };
-use rpi_harness::session::{
-    CounterIdGenerator, InMemorySessionRepo, Session, SqliteSessionRepo, SystemClock,
-};
+use rpi_harness::session::{CounterIdGenerator, InMemorySessionRepo, Session, SystemClock};
 use rpi_tools::{FileSystem, OsExecutionEnv};
 use std::sync::Arc;
 async fn fill(storage: Arc<dyn SessionStorage>) {
@@ -77,19 +75,6 @@ async fn memory_user_summary_pages() {
     let repo = InMemorySessionRepo::new(Arc::new(SystemClock), Arc::new(CounterIdGenerator::new()));
     let storage = repo.create(&SessionCreateOptions::default()).await.unwrap();
     fill(Arc::new(storage.clone())).await;
-    check(&storage).await;
-}
-#[tokio::test]
-async fn sqlite_reopen_rebuilds_user_index_and_keeps_context_cursors() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("query.sqlite");
-    let repo = SqliteSessionRepo::open(&path).unwrap();
-    let storage = repo.create(&SessionCreateOptions::default()).await.unwrap();
-    let metadata = storage.metadata();
-    fill(Arc::new(storage)).await;
-    drop(repo);
-    let repo = SqliteSessionRepo::open(&path).unwrap();
-    let storage = repo.open(&metadata).await.unwrap();
     check(&storage).await;
 }
 #[tokio::test]

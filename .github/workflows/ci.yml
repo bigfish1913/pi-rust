@@ -16,6 +16,11 @@ on:
         required: false
         type: boolean
         default: true
+      publish_preview:
+        description: 'Publish preview binaries from the preview branch'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -446,7 +451,7 @@ jobs:
     env:
       # Update this deliberately when rpi-package compatibility is reviewed.
       # The SHA makes the extension set reproducible and auditable.
-      RPI_PACKAGE_REF: f3936a1a68d0bc9eb4d69dad99d13b0e647b3484
+      RPI_PACKAGE_REF: 0d8b0d4fe51964a4c8484819df2d47bcb5d4ca36
       COMPAT_DIAGNOSTICS_NAME: extension-compat-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out host
@@ -663,9 +668,14 @@ jobs:
       prepare: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.prepare_release == true) }}
     secrets: inherit
 
+  # Preview pushes still run validation, but publishing is manual and opt-in.
   preview-version:
     name: Prepare preview release
-    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/preview' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: >-
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.ref == 'refs/heads/preview' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish_preview == true
     needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
     runs-on: ubuntu-latest
     permissions:

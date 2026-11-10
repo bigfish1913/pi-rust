@@ -406,6 +406,16 @@ pub struct AgentHarnessOptions {
     /// existing transcript and keeps appending to the same file.
     pub allow_existing_session: bool,
 
+    /// Opt-in native control-journal admission policy, independent of tools.
+    /// Validate each lane's current branch before startup recovery or publishing
+    /// a replacement session, the candidate branch before tree navigation, and
+    /// the current lane before admitted-run/explicit-compaction recovery or
+    /// execution, and again at threshold-triggered automatic compaction boundaries.
+    /// Legacy journals require explicit import; copied receipts do not adopt a
+    /// new session identity. No tools/context are enabled
+    /// by this policy, and default embedders retain their existing behavior.
+    pub require_native_durable: bool,
+
     /// Provider registry keyed by `model.provider`. The harness resolves which
     /// provider serves the configured `model` (and any compaction model) and
     /// calls `provider.stream_simple` inside the `StreamFn` it builds. Mirrors
@@ -507,6 +517,7 @@ impl Default for AgentHarnessOptions {
                 None,
             ),
             allow_existing_session: false,
+            require_native_durable: false,
             models: Vec::new(),
             to_provider_messages: None,
             entry_projectors: BTreeMap::new(),
