@@ -1,4 +1,5 @@
-//! Real current-SDK resource boundaries for the opt-in native durable host.
+//! Real current-SDK resource boundaries for the native durable host and its
+//! temporary legacy-mode escape hatch.
 use super::*;
 use std::collections::BTreeMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

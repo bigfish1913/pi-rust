@@ -100,6 +100,8 @@ impl Fixture {
             ]);
         if enabled {
             command.arg("--native-durable");
+        } else {
+            command.arg("--no-native-durable");
         }
         command.args(extra);
         command
@@ -320,7 +322,7 @@ fn has_name(data: &Value, field: &str, name: &str) -> bool {
 }
 
 #[test]
-fn native_durable_is_disabled_by_default() {
+fn native_durable_can_be_disabled_with_the_transition_flag() {
     let fixture = Fixture::new();
     let mut host = fixture.start(false, &["--no-session", "--no-tools"]);
     for (kind, fields) in [

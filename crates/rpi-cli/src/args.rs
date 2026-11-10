@@ -183,7 +183,8 @@ pub struct Args {
     pub exclude_tools: Option<Vec<String>>,
     pub no_tools: bool,
     pub no_builtin_tools: bool,
-    /// Opt-in native durable prototype; never replaces a legacy extension silently.
+    /// Native durable host selection. CLI parsing enables it by default; the
+    /// temporary `--no-native-durable` escape hatch selects legacy session behavior.
     pub native_durable: bool,
     /// Explicit experimental v2 epoch; requires native durable admission.
     pub experimental_durable_epoch: Option<String>,
@@ -285,6 +286,9 @@ fn file_arg(arg: &str) -> Option<PathBuf> {
 /// ergonomics). Short flags use a single leading `-`.
 pub fn parse_args(args: &[String]) -> Args {
     let mut result = Args::default();
+    // Native durable is the CLI default. Keep `Args::default()` unchanged for
+    // embedded/test hosts that construct programmatic options explicitly.
+    result.native_durable = true;
     result.offline = offline_env_enabled();
     // `RPI_EXTENSIONS_DIR` env: an extra list of plugin dirs prepended to any
     // `--extensions-dir` flags. Semicolon-separated on Windows, colon-separated
@@ -396,7 +400,10 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-session" => result.no_session = true,
             "--no-tools" | "-nt" => result.no_tools = true,
             "--no-builtin-tools" | "-nbt" => result.no_builtin_tools = true,
+            // `--native-durable` remains accepted for scripts during the
+            // transition; `--no-native-durable` is the temporary escape hatch.
             "--native-durable" => result.native_durable = true,
+            "--no-native-durable" => result.native_durable = false,
             "--experimental-durable-epoch" => {
                 if result.experimental_durable_epoch.is_some() {
                     result
@@ -698,9 +705,10 @@ pub fn print_help() {
   --exclude-tools, -xt <list>    Comma-separated denylist of tool names to disable
   --no-tools, -nt                Disable all tools
   --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write, docs)
-  --native-durable              Opt in to native durable v1 (no legacy import; restart to reload)
+  --native-durable              Enable native durable v1 (default; no legacy import; restart to reload)
+  --no-native-durable            Temporary escape hatch: use legacy session behavior
   --experimental-durable-epoch <id>
-                                With --native-durable only: bounded v2 ledger, explicit same epoch on reopen; no migration
+                                With native durable enabled: bounded v2 ledger, explicit same epoch on reopen; no migration
   --no-skills, -ns               Skip skill discovery (no <available_skills> block)
   --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
   --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)
@@ -902,6 +910,15 @@ mod tests {
             a.tools.as_deref(),
             Some(&["read".to_string(), "bash".to_string(), "write".to_string()][..])
         );
+    }
+
+    #[test]
+    fn native_durable_is_enabled_by_default_with_a_transition_escape_hatch() {
+        assert!(parse_args(&s(&[])).native_durable);
+        assert!(parse_args(&s(&["--native-durable"])).native_durable);
+        assert!(!parse_args(&s(&["--no-native-durable"])).native_durable);
+        assert!(parse_args(&s(&["--no-native-durable", "--native-durable"])).native_durable);
+        assert!(!parse_args(&s(&["--native-durable", "--no-native-durable"])).native_durable);
     }
 
     #[test]
