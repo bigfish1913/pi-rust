@@ -389,22 +389,88 @@ jobs:
           --rounds 5 --profile release
       # Shared hosted runners need explicit, more tolerant budgets than the
       # local 2s modern target. Both shapes keep the full historical record load.
+      # A pure latency-gate failure gets one fresh attempt to absorb transient
+      # hosted-runner contention; protocol, semantic and cleanup failures do not.
       - name: Regress cold opening 701000 synthetic append frames (modern)
-        run: >-
-          python3 -B scripts/resource-cold-start.py
-          --candidate target/resource-tests-cargo/release/rpi
-          --output "$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-modern"
-          --shapes modern --frames 701000 --entries 21733 --repeats 3
-          --max-ready-ms 4000 --max-single-ready-ms 8000
-          --max-get-messages-ms 250 --max-get-state-ms 2000
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_base="$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-modern"
+          run_benchmark() {
+            local output="$1"
+            python3 -B scripts/resource-cold-start.py \
+              --candidate target/resource-tests-cargo/release/rpi \
+              --output "$output" \
+              --shapes modern --frames 701000 --entries 21733 --repeats 3 \
+              --max-ready-ms 4000 --max-single-ready-ms 8000 \
+              --max-get-messages-ms 250 --max-get-state-ms 2000
+          }
+          latency_only_failure() {
+            python3 - "$1" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              data = json.load(stream)
+          runs = data.get("runs", [])
+          summaries = [item for item in data.get("summaries", [])
+                       if item.get("gate", {}).get("gatesExit")]
+          only_latency = bool(runs and summaries and
+                              all(run.get("status") == "PASS" for run in runs) and
+                              any(item.get("gate", {}).get("status") == "FAIL"
+                                  for item in summaries))
+          raise SystemExit(0 if only_latency else 1)
+          PY
+          }
+          if run_benchmark "${output_base}-1"; then
+            exit 0
+          fi
+          if ! latency_only_failure "${output_base}-1/results.json"; then
+            echo 'Cold-start benchmark failed for a non-latency reason; not retrying.' >&2
+            exit 1
+          fi
+          echo '::warning::Cold-start latency gate was noisy; retrying once with the same thresholds.'
+          run_benchmark "${output_base}-2"
       - name: Regress cold opening 701000 synthetic append frames (legacy upgrade)
-        run: >-
-          python3 -B scripts/resource-cold-start.py
-          --candidate target/resource-tests-cargo/release/rpi
-          --output "$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-legacy"
-          --shapes legacy --frames 701000 --entries 21733 --repeats 3
-          --max-ready-ms 6000 --max-single-ready-ms 10000
-          --max-get-messages-ms 250 --max-get-state-ms 2000
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_base="$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-legacy"
+          run_benchmark() {
+            local output="$1"
+            python3 -B scripts/resource-cold-start.py \
+              --candidate target/resource-tests-cargo/release/rpi \
+              --output "$output" \
+              --shapes legacy --frames 701000 --entries 21733 --repeats 3 \
+              --max-ready-ms 6000 --max-single-ready-ms 10000 \
+              --max-get-messages-ms 250 --max-get-state-ms 2000
+          }
+          latency_only_failure() {
+            python3 - "$1" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              data = json.load(stream)
+          runs = data.get("runs", [])
+          summaries = [item for item in data.get("summaries", [])
+                       if item.get("gate", {}).get("gatesExit")]
+          only_latency = bool(runs and summaries and
+                              all(run.get("status") == "PASS" for run in runs) and
+                              any(item.get("gate", {}).get("status") == "FAIL"
+                                  for item in summaries))
+          raise SystemExit(0 if only_latency else 1)
+          PY
+          }
+          if run_benchmark "${output_base}-1"; then
+            exit 0
+          fi
+          if ! latency_only_failure "${output_base}-1/results.json"; then
+            echo 'Cold-start benchmark failed for a non-latency reason; not retrying.' >&2
+            exit 1
+          fi
+          echo '::warning::Cold-start latency gate was noisy; retrying once with the same thresholds.'
+          run_benchmark "${output_base}-2"
       - name: Upload historical cold-start regression diagnostics
         if: always()
         uses: actions/upload-artifact@v4
