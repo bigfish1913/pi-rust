@@ -705,7 +705,6 @@ pub fn print_help() {
   --exclude-tools, -xt <list>    Comma-separated denylist of tool names to disable
   --no-tools, -nt                Disable all tools
   --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write, docs)
-  --native-durable              Enable native durable v1 (default; no legacy import; restart to reload)
   --no-native-durable            Temporary escape hatch: use legacy session behavior
   --experimental-durable-epoch <id>
                                 With native durable enabled: bounded v2 ledger, explicit same epoch on reopen; no migration
