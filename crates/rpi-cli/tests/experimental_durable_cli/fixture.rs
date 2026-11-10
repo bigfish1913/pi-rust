@@ -88,6 +88,8 @@ impl Fixture {
         ]);
         if enabled {
             command.arg("--native-durable");
+        } else {
+            command.arg("--no-native-durable");
         }
         command.args(extra);
         command

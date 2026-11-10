@@ -85,10 +85,11 @@ class Model:
                                 else {"action": "list", "includeDone": True})
                     elif prompt.startswith("DURABLE_") and not results:
                         name = "durable"
-                        args = {"DURABLE_START": {"action": "start", "name": WORKFLOW,
+                        args = {"DURABLE_START": {"action": "start", "requestId": "session-smoke-start",
+                                    "name": WORKFLOW,
                                     "steps": [{"id": "verify", "title": "Verify restart"}]},
-                                "DURABLE_CHECKPOINT": {"action": "checkpoint", "step": "verify",
-                                                       "status": "completed"},
+                                "DURABLE_CHECKPOINT": {"action": "checkpoint", "requestId": "session-smoke-checkpoint",
+                                                       "step": "verify", "status": "completed"},
                                 "DURABLE_STATUS": {"action": "status"}}[prompt]
                     if prompt == "CRASH_PENDING" and not owner.blocked_once:
                         owner.blocked_once = True
@@ -298,11 +299,31 @@ class Host:
 
 
 def user_texts(messages):
-    return [text(m.get("content")) for m in messages if m.get("role") == "user"]
+    # Native durable may inject an observation as a structured user message;
+    # compare only persisted prompt text, not ephemeral provider context.
+    return [m["content"] for m in messages
+            if m.get("role") == "user" and isinstance(m.get("content"), str)]
 
 
 def tool_results(messages):
     return [m for m in messages if m.get("role") in ("toolResult", "tool")]
+
+
+def durable_workflow(result):
+    details = result.get("details") or {}
+    if isinstance(details.get("workflow"), dict):
+        return details["workflow"]
+    state = details.get("state")
+    if isinstance(state, dict):
+        if isinstance(state.get("workflow"), dict):
+            return state["workflow"]
+        nested = state.get("state")
+        if isinstance(nested, dict) and isinstance(nested.get("workflow"), dict):
+            return nested["workflow"]
+    outcome = details.get("outcome")
+    snapshot = outcome.get("snapshot") if isinstance(outcome, dict) else None
+    state = snapshot.get("state") if isinstance(snapshot, dict) else None
+    return state.get("workflow") if isinstance(state, dict) else None
 
 
 def message_view(messages):
@@ -348,8 +369,8 @@ def scenario(binary, root, encoding, extensions):
         if has_todo:
             assert TODO_TEXT in json.dumps(host.tool("TODO_ADD")), "todo add failed"
         if has_durable:
-            assert host.tool("DURABLE_START")["details"]["workflow"]["name"] == WORKFLOW
-            workflow = host.tool("DURABLE_CHECKPOINT")["details"]["workflow"]
+            assert durable_workflow(host.tool("DURABLE_START"))["name"] == WORKFLOW
+            workflow = durable_workflow(host.tool("DURABLE_CHECKPOINT"))
             assert workflow["steps"][0]["status"] == "completed", workflow
         saved = host.snapshot()
         dump(root / "snapshot-before-restart.json", saved)
@@ -368,7 +389,7 @@ def scenario(binary, root, encoding, extensions):
         if has_todo:
             assert TODO_TEXT in json.dumps(host.tool("TODO_LIST")), "todo restart lost state"
         if has_durable:
-            workflow = host.tool("DURABLE_STATUS")["details"]["workflow"]
+            workflow = durable_workflow(host.tool("DURABLE_STATUS"))
             assert workflow["name"] == WORKFLOW and workflow["steps"][0]["status"] == "completed", workflow
         host.stop()
 
@@ -379,7 +400,7 @@ def scenario(binary, root, encoding, extensions):
         if has_todo:
             assert TODO_TEXT not in json.dumps(host.tool("TODO_LIST")), "todo leaked across sessions"
         if has_durable:
-            assert host.tool("DURABLE_STATUS")["details"].get("workflow") is None, "workflow leaked across sessions"
+            assert durable_workflow(host.tool("DURABLE_STATUS")) is None, "workflow leaked across sessions"
         host.stop()
 
         crash_sid = str(uuid.uuid4())
@@ -403,9 +424,13 @@ def scenario(binary, root, encoding, extensions):
         replies = [m for m in recovered["messages"] if m.get("role") == "assistant"
                    and "COMPLETED:CRASH_PENDING" in text(m.get("content"))]
         assert len(replies) == 1, recovered
-        assert user_texts(model.calls[-1]["messages"]) == [
-            "CRASH_PENDING", "Continuing the run that was interrupted (resume 1 of 3)."
-        ], model.calls[-1]
+        request_messages = model.calls[-1]["messages"]
+        assert user_texts(request_messages) == ["CRASH_PENDING"], model.calls[-1]
+        assert any(
+            text(m.get("content")) == "Continuing the run that was interrupted (resume 1 of 3)."
+            for m in request_messages
+            if m.get("role") == "user"
+        ), model.calls[-1]
         assert host.call("resume_pending").get("resumed") is False
         host.stop()
 

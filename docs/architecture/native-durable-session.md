@@ -111,6 +111,16 @@ Durable journal storage 属于 `rpi-durable`，默认也是 JSONL；需要 SQLit
 
 当前 durable runtime/storage boundary 继续负责 journal 的顺序、revision CAS、actor/scope/admission/receipt/reconcile 等边界；Session facade 通过 adapter 使用该 boundary，不承担旧 SQLite 格式兼容职责。
 
+### CLI 默认选择
+
+CLI 默认启用 native durable。`--native-durable` 仍作为兼容性显式参数保留；迁移期间如需回退到旧 session 行为，使用临时参数：
+
+```bash
+rpi --no-native-durable
+```
+
+`--no-session` 仍然优先表示完全不持久化当前 session；它不是 native durable 的回退开关。
+
 ## 后续阶段（生产路径尚未实现）
 
 1. 在隔离旧 session 副本上分别测 load/replay、queue、interrupted repair、上下文准备、首屏 history。

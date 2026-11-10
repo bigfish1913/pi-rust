@@ -154,7 +154,7 @@ mod tests {
     fn invalid_missing_duplicate_and_unsupported_arguments_fail_closed() {
         for args in [
             vec![FLAG],
-            vec![FLAG, "epoch"],
+            vec!["--no-native-durable", FLAG, "epoch"],
             vec!["--native-durable", FLAG, ""],
             vec!["--native-durable", FLAG, "white space"],
             vec!["--native-durable", FLAG, "epoch", FLAG, "epoch"],

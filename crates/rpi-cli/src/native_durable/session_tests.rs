@@ -52,19 +52,16 @@ fn host_durable_names_are_reserved_even_when_native_durable_is_disabled() {
 }
 
 #[test]
-fn native_durable_registration_is_opt_in_and_never_replay_safe() {
-    let args =
-        crate::args::parse_args(&["--native-durable", "--tools", "durable"].map(String::from));
+fn native_durable_registration_is_default_and_never_replay_safe() {
+    let args = crate::args::parse_args(&["--tools", "durable"].map(String::from));
     let env = Arc::new(rpi_tools::InMemoryExecutionEnv::new());
     let context = ExecutionToolContext::new(env.clone(), Some(env));
     let tools = build_tools(&context, &args);
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].tool.schema().name, "durable");
     assert_eq!(tools[0].replay, ToolReplay::Never);
-    let args = Args {
-        tools: Some(vec!["durable".into()]),
-        ..Default::default()
-    };
+    let args =
+        crate::args::parse_args(&["--no-native-durable", "--tools", "durable"].map(String::from));
     assert!(build_tools(&context, &args).is_empty());
 }
 
