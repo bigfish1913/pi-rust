@@ -81,6 +81,28 @@ pub enum UiEvent {
     },
 }
 
+/// Shared monotonic allocator for the per-message ids click regions key on.
+///
+/// The host builds a [`TranscriptView`] per event drain, so the allocator must
+/// outlive the view: a per-view counter restarts at `t1` and every live
+/// assistant message would end up sharing the first message's id, making a
+/// click toggle the wrong message. `TuiState` owns one and hands the same
+/// handle to every view it builds for its transcript.
+#[derive(Clone, Default)]
+pub struct MessageIdSeq(Arc<AtomicU64>);
+
+impl MessageIdSeq {
+    /// A fresh allocator; the first id handed out is `t1`.
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(1)))
+    }
+
+    /// The next opaque id (`t<seq>`).
+    pub fn next_id(&self) -> String {
+        format!("t{}", self.0.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// The retained transcript: the same component maps the local `TuiState` holds,
 /// so a streaming assistant message and each tool/bash panel are updated in
 /// place rather than rebuilt per event.
@@ -96,8 +118,9 @@ pub struct TranscriptView {
     bash_components: Arc<Mutex<HashMap<String, Arc<BashExecutionComponent>>>>,
     /// When true, thinking blocks collapse to a label (toggled by the host).
     hide_thinking: Arc<Mutex<bool>>,
-    /// Monotonic counter backing the per-message ids click regions key on.
-    message_seq: AtomicU64,
+    /// Allocator backing the per-message ids click regions key on. Shared with
+    /// the host so ids stay unique across the views it builds per event.
+    message_seq: MessageIdSeq,
     /// Global tool-output expansion preference (toggled by the host).
     expanded: Arc<Mutex<bool>>,
     /// Optional transformer applied to raw assistant markdown before rendering
@@ -121,6 +144,7 @@ impl TranscriptView {
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(None)),
+            MessageIdSeq::new(),
         )
     }
 
@@ -136,6 +160,7 @@ impl TranscriptView {
         hide_thinking: Arc<Mutex<bool>>,
         expanded: Arc<Mutex<bool>>,
         markdown_transformer: Arc<Mutex<Option<MarkdownTransformer>>>,
+        message_seq: MessageIdSeq,
     ) -> Self {
         Self {
             show_images: true,
@@ -147,7 +172,7 @@ impl TranscriptView {
             hide_thinking,
             expanded,
             markdown_transformer,
-            message_seq: AtomicU64::new(1),
+            message_seq,
         }
     }
 
@@ -271,8 +296,8 @@ impl TranscriptView {
     /// Assign an opaque id to an assistant component so its thinking rows
     /// carry click-region markers. Every assistant message gets one — the
     /// marker is zero-width and costs nothing when the host never clicks.
-    fn assign_message_id(comp: &AssistantMessageComponent, seq: u64) -> String {
-        let id = format!("t{seq}");
+    fn assign_message_id(&self, comp: &AssistantMessageComponent) -> String {
+        let id = self.message_seq.next_id();
         comp.set_message_id(&id);
         id
     }
@@ -350,12 +375,7 @@ impl TranscriptView {
     /// The id every NEW assistant message gets, so the host can route a
     /// click-region hit before knowing which component backs it.
     pub fn next_message_id(&self) -> String {
-        format!("t{}", self.message_seq.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// Allocate the next sequence number (used with `assign_message_id`).
-    fn next_message_id_seq(&self) -> u64 {
-        self.message_seq.fetch_add(1, Ordering::Relaxed)
+        self.message_seq.next_id()
     }
 
     /// Flip the thinking-visibility preference; returns the new value.
@@ -412,7 +432,7 @@ impl TranscriptView {
         let comp = Arc::new(AssistantMessageComponent::new(
             AssistantMessageOptions::default(),
         ));
-        Self::assign_message_id(&comp, self.next_message_id_seq());
+        self.assign_message_id(&comp);
         comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
         comp.set_show_images(self.show_images);
         comp.set_trailing_spacing(1);
@@ -433,7 +453,7 @@ impl TranscriptView {
             let comp = Arc::new(AssistantMessageComponent::new(
                 AssistantMessageOptions::default(),
             ));
-            Self::assign_message_id(&comp, self.next_message_id_seq());
+            self.assign_message_id(&comp);
             comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
             comp.set_show_images(self.show_images);
             comp.set_trailing_spacing(1);

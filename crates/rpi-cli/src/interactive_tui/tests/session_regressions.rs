@@ -2021,3 +2021,110 @@ fn global_hide_thinking_toggle_reaches_restored_assistant_components() {
     state.set_hide_thinking(false);
     assert!(visible().contains("restored reasoning"));
 }
+
+#[test]
+fn second_live_message_click_toggles_only_the_second() {
+    // Axis: the per-message id allocator must live with the STATE, not with
+    // the `TranscriptView`. The host rebuilds a view for every event drain
+    // (`TuiState::transcript_view()`), so a counter owned by the view restarts
+    // at `t1` and every live assistant message gets the SAME id; a click then
+    // matches the FIRST message and toggles the wrong one.
+    //
+    // This drives the real host path — one `transcript_view()` per event, as
+    // the event drain does — instead of a single retained view.
+    use rpi_tui::{strip_ansi, AssistantBlock, Component};
+
+    let state = test_tui_state();
+    state.set_hide_thinking(true);
+
+    state.transcript_view().apply(
+        &UiEvent::AssistantStart {
+            blocks: vec![
+                AssistantBlock::Thinking("first msg reasoning".into()),
+                AssistantBlock::Text("answer one".into()),
+            ],
+        },
+        80,
+    );
+    let first = state
+        .current_assistant
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("first assistant mounted");
+    state.transcript_view().apply(&UiEvent::AgentEnd, 80);
+
+    state.transcript_view().apply(
+        &UiEvent::AssistantStart {
+            blocks: vec![AssistantBlock::Thinking("second msg reasoning".into())],
+        },
+        80,
+    );
+    let second = state
+        .current_assistant
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("second assistant mounted");
+
+    let first_id = first.message_id().expect("first id assigned");
+    let second_id = second.message_id().expect("second id assigned");
+    assert_ne!(
+        first_id, second_id,
+        "two live assistant messages share id {first_id}: a click toggles whichever is first"
+    );
+
+    // A click on the SECOND message must flip only the second.
+    assert!(
+        state.transcript_view().toggle_message_thinking(&second_id),
+        "click on the second message found no component"
+    );
+    let expanded = strip_ansi(&second.render(80).join("\n"));
+    assert!(expanded.contains("second msg reasoning"));
+    let first_render = strip_ansi(&first.render(80).join("\n"));
+    assert!(
+        !first_render.contains("first msg reasoning"),
+        "clicking the second message toggled the first: {first_render}"
+    );
+
+    // Clicking the FIRST addresses the first alone; the second keeps its own
+    // expansion override.
+    assert!(state.transcript_view().toggle_message_thinking(&first_id));
+    assert!(strip_ansi(&first.render(80).join("\n")).contains("first msg reasoning"));
+    assert!(
+        strip_ansi(&second.render(80).join("\n")).contains("second msg reasoning"),
+        "clicking the first message clobbered the second message's override"
+    );
+}
+
+#[test]
+fn three_live_messages_get_distinct_ids_across_per_event_views() {
+    // Cheap guard on the invariant itself, independent of rendering: N events
+    // through N freshly built views must yield N distinct ids.
+    use rpi_tui::AssistantBlock;
+
+    let state = test_tui_state();
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        state.transcript_view().apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Thinking(format!("reasoning {index}"))],
+            },
+            80,
+        );
+        let comp = state
+            .current_assistant
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("assistant mounted");
+        ids.push(comp.message_id().expect("id assigned"));
+        state.transcript_view().apply(&UiEvent::AgentEnd, 80);
+    }
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "duplicate ids across per-event views: {ids:?}"
+    );
+}
