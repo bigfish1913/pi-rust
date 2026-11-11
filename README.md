@@ -1,5 +1,9 @@
 # rpi — a Rust-native coding-agent runtime
 
+<p align="center">
+  <img src="docs/images/rpi-logo.jpg" width="240" alt="rpi project logo">
+</p>
+
 [![crates.io](https://img.shields.io/crates/v/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![downloads](https://img.shields.io/crates/d/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![docs.rs](https://docs.rs/rpi-cli/badge.svg)](https://docs.rs/rpi-cli)
@@ -461,7 +465,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.21.2](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
+| Current release | **[0.22.1](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.88 |
 | Platforms | Linux (GNU and musl), macOS, Windows (CI runs the suite on Linux) |

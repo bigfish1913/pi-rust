@@ -193,6 +193,10 @@ async fn interrupted_program_is_never_automatically_replayed() {
     .unwrap();
     run.abort();
     let _ = run.await;
+    // Aborting the caller must not race the core-owned durable writes that
+    // finish the interrupted program's checkpoint. Drain them before a
+    // replacement harness validates the same session target.
+    h.drain_session().await;
     drop(h);
     for _ in 0..2 {
         let restored = build(

@@ -651,6 +651,40 @@ impl JsonlSessionStorage {
         for (idx, line) in physical_lines.iter().enumerate().skip(1) {
             policy.check(idx)?;
             let line_no = (idx + 1) as u32;
+            // The eager restore path also has a range-capable reader for
+            // ordinary JSONL files. Reuse the allocation-light cold-frame
+            // recognizer here, not only in streaming queries: a historical
+            // frame's discarded payload must still be fully validated, but it
+            // need not become a Value-bearing SessionMutation just to reserve
+            // its identity and source location. Duplicate/stale sequences
+            // fall through to the canonical decoder so exact-duplicate and
+            // divergence handling remains unchanged.
+            if let (Some(reader), Some(metadata)) = (
+                frame_reader.as_ref(),
+                super::cold_decode::parse_cold_frame(line),
+            ) {
+                let mut state = storage.state.lock().await;
+                if metadata.seq > state.sequence() {
+                    if metadata.seq > state.next_sequence() {
+                        state.resync_sequence(metadata.seq - 1);
+                    }
+                    let sequence = metadata.seq;
+                    let offset = line.as_ptr() as usize - content.as_ptr() as usize;
+                    if let Err(error) =
+                        state.apply_loaded_frame(metadata, reader, offset as u64, line.as_bytes())
+                    {
+                        if error.code == SessionErrorCode::InvalidEntry {
+                            drop(state);
+                            return Err(invalid_file(path, line_no, &error));
+                        }
+                        drop(state);
+                        return Err(error);
+                    }
+                    seen_lines.insert(sequence, *line);
+                    kept_lines.push(*line);
+                    continue;
+                }
+            }
             match parse_mutation(line) {
                 Ok(mutation) => {
                     let mut state = storage.state.lock().await;
