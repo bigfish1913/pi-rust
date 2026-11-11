@@ -1,5 +1,9 @@
 # rpi — a Rust-native coding-agent runtime
 
+<p align="center">
+  <img src="docs/images/rpi-logo.jpg" width="240" alt="rpi project logo">
+</p>
+
 [![crates.io](https://img.shields.io/crates/v/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![downloads](https://img.shields.io/crates/d/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![docs.rs](https://docs.rs/rpi-cli/badge.svg)](https://docs.rs/rpi-cli)
