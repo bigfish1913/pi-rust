@@ -74,10 +74,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Release artifacts are pinned instead of using `ubuntu-latest`: the
+          # label moved to Ubuntu 26 in October 2026, so an unpinned gnu build
+          # silently raises the glibc floor and apt package availability can
+          # change under a release at any time.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             archive: tar.gz
           # GitHub-hosted arm64 Linux runners; available for public repos.
@@ -103,7 +107,27 @@ jobs:
 
       - name: Install musl linker
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_musl_tools() {
+            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get install --yes --no-install-recommends \
+              -o Acquire::Retries=3 musl-tools
+          }
+          # apt mirrors flake, and one transient failure here costs the whole
+          # release (0.22.1 shipped without archives because of it).
+          for attempt in 1 2 3 4 5; do
+            if install_musl_tools; then
+              break
+            fi
+            if (( attempt == 5 )); then
+              echo "::error::Could not install musl-tools after ${attempt} attempts."
+              exit 1
+            fi
+            sleep $(( attempt * 10 ))
+          done
+          command -v musl-gcc
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable

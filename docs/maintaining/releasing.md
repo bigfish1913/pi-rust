@@ -118,6 +118,11 @@ the built-in `GITHUB_TOKEN` does not start another push-triggered workflow.
 
 - Re-run failed jobs on the Release PR's original main CI run. Existing crates
   are skipped by the release helper; an existing tag must match the same commit.
+- A re-run reuses the workflow file from the original commit, so it cannot pick
+  up an automation fix. When the binaries job was blocked by infrastructure (a
+  failed apt install, for example), dispatch **Release binaries** on `main`
+  with the already-published `tag` instead: the attach step updates an existing
+  release in place, and the tag and crates.io versions are left untouched.
 - For a channel failure, run **Release install channels** from Actions on `main`
   with the published tag. It verifies all six archives before regenerating
   manifests. Existing winget PRs/files are reused; closed submissions require
