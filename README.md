@@ -1,5 +1,9 @@
 # rpi — a Rust-native coding-agent runtime
 
+<p align="center">
+  <img src="docs/images/rpi-logo.jpg" width="240" alt="rpi project logo">
+</p>
+
 [![crates.io](https://img.shields.io/crates/v/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![downloads](https://img.shields.io/crates/d/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![docs.rs](https://docs.rs/rpi-cli/badge.svg)](https://docs.rs/rpi-cli)
@@ -21,11 +25,17 @@ by Mario Zechner. It now includes its own Rust-native plugin ABI and execution
 infrastructure. See [Acknowledgements](#acknowledgements) and [NOTICE](NOTICE)
 for upstream attribution.
 
-Website: <https://rpi.bigfisharc.cn/> · Docs: <https://rpi.bigfisharc.cn/docs.html>
+[Website](https://rpi.bigfisharc.cn/) · [Docs](https://rpi.bigfisharc.cn/docs.html) · [Extension catalog](https://rpi.bigfisharc.cn/packages.html) · [rpi-package](https://github.com/pi-rust/rpi-package)
+
+## See it in action
 
 ![rpi interactive session](docs/images/rpi-interactive.png)
 
-<sub>Interactive TUI. See [`docs/guides/user-guide.md`](docs/guides/user-guide.md) for the full command surface.</sub>
+<sub>Interactive TUI, recorded with an isolated configuration. See the [user guide](docs/guides/user-guide.md) for the full command surface.</sub>
+
+![rpi terminal demo — opening the built-in help without a model request](docs/images/rpi-tui-demo.gif)
+
+<sub>Open the terminal agent and explore `/help`, with no real API key or model request. Recording script: [`demo/tui.tape`](demo/tui.tape).</sub>
 
 ![rpi SDK demo — an agent loop and a real tool round-trip, offline with the faux provider](docs/images/rpi-sdk-demo.gif)
 
@@ -378,6 +388,11 @@ Ready-to-install extensions live in the companion
 [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
 an [online catalog](https://rpi.bigfisharc.cn/packages.html).
 
+Browse the catalog for install commands, or open the
+[`packages/` source directory](https://github.com/pi-rust/rpi-package/tree/main/packages)
+for extension READMEs and examples. Start with `rpi install rpi-todo` above,
+then use the [extension authoring guide](docs/extensions/authoring.md) to build your own.
+
 ### Web access
 
 Web access is optional, not part of the CLI's default tool set:
@@ -450,7 +465,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.21.2](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
+| Current release | **[0.22.1](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.88 |
 | Platforms | Linux (GNU and musl), macOS, Windows (CI runs the suite on Linux) |
@@ -531,7 +546,7 @@ Join us to ask questions, share ideas and try early builds.
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-04"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-04" width="230" alt="微信交流群二维码 / WeChat group QR code"></a><br>
+      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-09"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-09" width="230" alt="微信交流群二维码 / WeChat group QR code"></a><br>
       <sub><b>WeChat / 微信交流群</b> — 扫码加入 / Scan to join</sub>
     </td>
     <td align="center" width="50%">

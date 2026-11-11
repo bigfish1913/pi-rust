@@ -22,6 +22,104 @@ use crate::error::{SessionError, SessionResult};
 /// same and the codec's `assert_json_serializable` keeps it sound.
 pub type JsonValue = serde_json::Value;
 
+/// Backend identity for a history image. `revision` is the reducer's highest
+/// mutation sequence; `generation` changes only after a successful complete
+/// history replacement. They are intentionally independent so a rewrite can
+/// preserve reducer sequence authority without admitting same-sequence ABA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryIdentity {
+    pub revision: u64,
+    pub generation: u64,
+}
+
+/// A complete reducer history image for the replacement API. Progress is
+/// deliberately not part of this image and must be preserved by a backend.
+/// JSONL callers additionally need the canonical mutation image because a
+/// reducer snapshot does not retain the historical lane name on each entry.
+#[derive(Debug, Clone)]
+pub struct HistoryReplacement {
+    pub state: crate::session::state::SessionState,
+    pub canonical_mutations: Option<Vec<SessionMutation>>,
+}
+
+/// A serialized reducer checkpoint used by the explicit bounded compaction
+/// path. Derived indexes are rebuilt by [`SessionState`] deserialization; the
+/// checkpoint is not a writer token and does not carry progress streams.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryCheckpoint {
+    pub format: String,
+    pub version: u32,
+    pub history_identity: HistoryIdentity,
+    pub state: crate::session::state::SessionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_archive: Option<crate::durable::experimental_ledger::archive::ReceiptArchive>,
+}
+
+impl HistoryCheckpoint {
+    pub const FORMAT: &'static str = "rpi-native-session-history-checkpoint";
+    pub const VERSION: u32 = 1;
+    /// Logical serialized-image bound; this is not a physical RSS guarantee.
+    pub const MAX_BYTES: usize = 8 * 1024 * 1024;
+
+    pub fn new(
+        history_identity: HistoryIdentity,
+        state: crate::session::state::SessionState,
+    ) -> SessionResult<Self> {
+        if state.sequence() != history_identity.revision {
+            return Err(SessionError::invalid_entry(
+                "history checkpoint identity does not match reducer sequence",
+            ));
+        }
+        let checkpoint = Self {
+            format: Self::FORMAT.to_owned(),
+            version: Self::VERSION,
+            history_identity,
+            state,
+            receipt_archive: None,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    /// Attach the validated historical receipt archive that belongs to this
+    /// checkpoint. Old-generation receipts remain historical and cannot act as
+    /// current writer proof.
+    pub fn with_receipt_archive(
+        mut self,
+        archive: crate::durable::experimental_ledger::archive::ReceiptArchive,
+    ) -> SessionResult<Self> {
+        self.receipt_archive = Some(archive);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> SessionResult<()> {
+        if self.format != Self::FORMAT
+            || self.version != Self::VERSION
+            || self.state.sequence() != self.history_identity.revision
+        {
+            return Err(SessionError::invalid_entry(
+                "invalid history checkpoint format or identity",
+            ));
+        }
+        if let Some(archive) = &self.receipt_archive {
+            archive.validate().map_err(|_| {
+                SessionError::invalid_entry("invalid history checkpoint receipt archive")
+            })?;
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|_| SessionError::invalid_entry("history checkpoint is not serializable"))?;
+        if encoded.len() > Self::MAX_BYTES {
+            return Err(SessionError::invalid_entry(
+                "history checkpoint exceeds the serialized size limit",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Reverse of [`provisioned_into_entry`]: pull a [`ProvisionedEntry`] out of a
 /// full [`Entry`] (dropping storage-assigned `seq`/`parent_id`/`timestamp`).
 /// Used by the fork path, which reconstructs provisioned entries from the
@@ -1543,6 +1641,17 @@ pub trait SessionStorage: Send + Sync {
         false
     }
 
+    /// Whether this binding currently owns a backend writer lease. The default
+    /// is false so hosts fail closed for durable backends that have not opted
+    /// into an ownership capability; in-memory backends remain local-only.
+    fn writer_lease_held(&self) -> bool {
+        false
+    }
+
+    /// Retire a backend writer binding. Compatibility backends may treat this
+    /// as a no-op; durable bindings must not silently reacquire afterwards.
+    fn release_writer_lease(&self) {}
+
     // Lanes
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>>;
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()>;
@@ -1574,6 +1683,92 @@ pub trait SessionStorage: Send + Sync {
         Err(SessionError::storage(
             "conditional history writes are unsupported",
         ))
+    }
+
+    /// Replacement generation, distinct from the reducer's
+    /// `history_revision` sequence. Ordinary appends do not advance it;
+    /// successful whole-history replacement advances it under the same backend
+    /// CAS boundary. The compatibility default is zero for legacy or
+    /// replacement-unsupported backends.
+    async fn history_generation(&self) -> SessionResult<u64> {
+        Ok(0)
+    }
+
+    /// Observe the reducer revision and replacement generation as one backend
+    /// identity. Backends should override this when both values share a gate;
+    /// the compatibility default is only a best-effort pair.
+    async fn history_identity(&self) -> SessionResult<HistoryIdentity> {
+        Ok(HistoryIdentity {
+            revision: self.history_revision().await?,
+            generation: self.history_generation().await?,
+        })
+    }
+
+    /// Return the current physical history-file size when this backend has a
+    /// stable file representation. `None` is intentional for Memory/SQLite or
+    /// backends that cannot provide a physical-size observation; it is not a
+    /// resource guarantee or an RSS/IO bound.
+    async fn history_physical_bytes(&self) -> SessionResult<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Read the explicit checkpoint image, when this backend persists one.
+    /// The compatibility default is absent; it does not infer a checkpoint
+    /// from ordinary mutation history.
+    async fn history_checkpoint(&self) -> SessionResult<Option<HistoryCheckpoint>> {
+        Ok(None)
+    }
+
+    /// Atomically replace the complete history image only when both identity
+    /// components match. Implementations must preserve progress and reject a
+    /// stale `(revision, generation)` without publishing any part of the
+    /// replacement. Unsupported backends fail closed.
+    async fn replace_history_if_revision_and_generation(
+        &self,
+        _expected_revision: u64,
+        _expected_generation: u64,
+        _replacement: HistoryReplacement,
+    ) -> SessionResult<HistoryIdentity> {
+        Err(SessionError::storage(
+            "whole-history replacement is unsupported",
+        ))
+    }
+
+    /// Publish a validated checkpoint image under the same revision-plus-
+    /// generation CAS. The default delegates to the existing complete-image
+    /// replacement for resident backends; JSONL overrides this to publish the
+    /// checkpoint in reserved header metadata and remove old mutation lines.
+    async fn replace_history_with_checkpoint_if_revision_and_generation(
+        &self,
+        expected_revision: u64,
+        expected_generation: u64,
+        checkpoint: HistoryCheckpoint,
+    ) -> SessionResult<HistoryIdentity> {
+        checkpoint.validate()?;
+        if checkpoint.history_identity
+            != (HistoryIdentity {
+                revision: expected_revision,
+                generation: expected_generation,
+            })
+        {
+            return Err(SessionError::storage(
+                "history checkpoint identity does not match replacement CAS",
+            ));
+        }
+        if checkpoint.receipt_archive.is_some() {
+            return Err(SessionError::storage(
+                "checkpoint receipt archives are unsupported by this backend",
+            ));
+        }
+        self.replace_history_if_revision_and_generation(
+            expected_revision,
+            expected_generation,
+            HistoryReplacement {
+                state: checkpoint.state,
+                canonical_mutations: None,
+            },
+        )
+        .await
     }
 
     /// Compare the original revision and append within the storage's mutation

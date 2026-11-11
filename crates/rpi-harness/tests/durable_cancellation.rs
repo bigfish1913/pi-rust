@@ -2,9 +2,8 @@
 mod tests {
     use async_trait::async_trait;
     use rpi_harness::session::jsonl::{JsonlSessionStorage, JsonlV4Header};
-    use rpi_harness::session::memory::{Clock, CounterIdGenerator, FakeClock};
+    use rpi_harness::session::memory::{CounterIdGenerator, FakeClock};
     use rpi_harness::session::types::*;
-    use rpi_harness::session::SqliteSessionRepo;
     use rpi_tools::env::AppendFile;
     use rpi_tools::{FileContent, FileError, FileInfo, FileSystem};
     use std::{
@@ -573,137 +572,5 @@ mod tests {
             .await
             .unwrap();
         assert!(loaded.get_entry("tail").await.unwrap().is_some());
-    }
-
-    #[derive(Default)]
-    struct GateClock {
-        armed: AtomicBool,
-        count: std::sync::Mutex<usize>,
-        cv: std::sync::Condvar,
-    }
-    impl Clock for GateClock {
-        fn now_ms(&self) -> i64 {
-            if self.armed.load(Ordering::SeqCst) {
-                let mut c = self.count.lock().unwrap();
-                *c += 1;
-                self.cv.notify_all();
-                if *c < 2 {
-                    drop(
-                        self.cv
-                            .wait_timeout_while(c, Duration::from_secs(2), |v| *v < 2)
-                            .unwrap(),
-                    );
-                }
-            }
-            1
-        }
-    }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sqlite_independent_connections_preserve_concurrent_successes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.sqlite");
-        let clock = Arc::new(GateClock::default());
-        let ids = Arc::new(CounterIdGenerator::new());
-        let repo1 = SqliteSessionRepo::with_clock_ids(&path, clock.clone(), ids.clone()).unwrap();
-        let a = repo1
-            .create(&SessionCreateOptions {
-                id: Some("s".into()),
-                parent_session_id: None,
-                metadata: None,
-            })
-            .await
-            .unwrap();
-        let repo2 = SqliteSessionRepo::with_clock_ids(&path, clock.clone(), ids).unwrap();
-        let metadata = a.metadata();
-        let b = repo2.open(&metadata).await.unwrap();
-        clock.armed.store(true, Ordering::SeqCst);
-        let a = tokio::spawn(async move { a.append_entry(entry("one"), "main").await });
-        let b = tokio::spawn(async move { b.append_entry(entry("two"), "main").await });
-        let (a, b) = (a.await.unwrap().unwrap(), b.await.unwrap().unwrap());
-        clock.armed.store(false, Ordering::SeqCst);
-        assert_ne!(a.seq(), b.seq());
-        let fresh = repo1.open(&metadata).await.unwrap();
-        assert!(fresh.get_entry("one").await.unwrap().is_some());
-        assert!(fresh.get_entry("two").await.unwrap().is_some());
-    }
-    #[tokio::test]
-    async fn sqlite_trigger_failure_rolls_back_and_handle_remains_usable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.sqlite");
-        let repo = SqliteSessionRepo::open(&path).unwrap();
-        let s = repo
-            .create(&SessionCreateOptions {
-                id: Some("s".into()),
-                parent_session_id: None,
-                metadata: None,
-            })
-            .await
-            .unwrap();
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TRIGGER refuse_update BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT,'controlled failure'); END;").unwrap();
-        assert!(s.append_entry(entry("rejected"), "main").await.is_err());
-        assert!(s.get_entry("rejected").await.unwrap().is_none());
-        assert!(s
-            .find_entries(&EntryQuery::default())
-            .await
-            .unwrap()
-            .is_empty());
-        db.execute_batch("DROP TRIGGER refuse_update;").unwrap();
-        let accepted = s.append_entry(entry("accepted"), "main").await.unwrap();
-        assert_eq!(accepted.seq(), 1);
-        let reopened = repo.open(&s.metadata()).await.unwrap();
-        assert!(reopened.get_entry("accepted").await.unwrap().is_some());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_cloned_handle_readers_cannot_overwrite_successful_candidates() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = SqliteSessionRepo::open(dir.path().join("shared.sqlite")).unwrap();
-        let s = repo
-            .create(&SessionCreateOptions {
-                id: Some("shared".into()),
-                parent_session_id: None,
-                metadata: None,
-            })
-            .await
-            .unwrap();
-        let mut writers = vec![];
-        for worker in 0..2 {
-            let s = s.clone();
-            writers.push(tokio::spawn(async move {
-                for index in 0..16 {
-                    s.append_entry(entry(&format!("w{worker}-{index}")), "main")
-                        .await
-                        .unwrap();
-                    tokio::task::yield_now().await;
-                }
-            }));
-        }
-        let reader = tokio::spawn({
-            let s = s.clone();
-            async move {
-                for _ in 0..96 {
-                    s.get_lanes().await.unwrap();
-                    s.find_entries(&EntryQuery::default()).await.unwrap();
-                    tokio::task::yield_now().await;
-                }
-            }
-        });
-        for writer in writers {
-            writer.await.unwrap();
-        }
-        reader.await.unwrap();
-        let reopened = repo.open(&s.metadata()).await.unwrap();
-        let all = reopened.find_entries(&EntryQuery::default()).await.unwrap();
-        assert_eq!(all.len(), 32);
-        for worker in 0..2 {
-            for index in 0..16 {
-                assert!(reopened
-                    .get_entry(&format!("w{worker}-{index}"))
-                    .await
-                    .unwrap()
-                    .is_some());
-            }
-        }
     }
 }

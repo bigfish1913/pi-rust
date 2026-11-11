@@ -323,9 +323,10 @@ pub(super) async fn run_prompt_streaming(
         }
     }
 
-    if !streaming {
-        history::settle(state, tui);
-    }
+    // Settle only after the producer has drained its session writer. The
+    // AgentEnd event is delivered concurrently and may otherwise reload the
+    // previous page, clearing the just-rendered response.
+    history::settle(state, tui);
     tui.request_render(false);
 }
 
@@ -362,6 +363,9 @@ pub(super) async fn run_skill_streaming(
     }
 
     state.set_status(RunStatus::Idle);
+    // Skill runs also emit AgentEnd while their session writes may still be
+    // queued. Wait for the writer before replacing the live transcript.
+    lane.drain_session().await;
     refresh_pending_messages(state, lane).await;
 
     match outcome {
@@ -400,9 +404,10 @@ pub(super) async fn run_skill_streaming(
         },
         Err(error) => add_error_message(&state.notice_container(), &error.to_string()),
     }
-    if !streaming {
-        history::settle(state, tui);
-    }
+    // Settle only after the producer has drained its session writer. The
+    // AgentEnd event is delivered concurrently and may otherwise reload the
+    // previous page, clearing the just-rendered response.
+    history::settle(state, tui);
     tui.request_render(false);
 }
 

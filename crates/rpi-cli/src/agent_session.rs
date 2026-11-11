@@ -29,8 +29,9 @@ use rpi_agent::AgentMessage;
 use rpi_ai::types::{AssistantMessage, Content, ImageContent, Usage};
 use rpi_ai::{Model, ThinkingLevel};
 use rpi_harness::agent_harness::{
-    AgentHarness, AgentLane, HarnessRunOutcome, LaneSnapshot, RunResult,
+    AbortReconciliation, AgentHarness, AgentLane, HarnessRunOutcome, LaneSnapshot, RunResult,
 };
+use rpi_harness::durable::{DurableActor, DurableService};
 use rpi_harness::result::{HarnessError, HarnessResult};
 use rpi_harness::session::types::{Entry, EntryOrder, EntryQuery};
 
@@ -183,6 +184,13 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Cooperatively abort the active run and reconcile its durable terminal
+    /// result before returning. This is an explicit runtime-shutdown boundary;
+    /// it does not claim process-kill or exactly-once guarantees.
+    pub async fn abort_and_reconcile(&self) -> HarnessResult<AbortReconciliation> {
+        self.lane().abort_and_reconcile().await
+    }
+
     // -- model / thinking ----------------------------------------------------
 
     /// The current model.
@@ -262,6 +270,18 @@ impl AgentSession {
     /// The lane read model. Mirrors the TS runtime lane snapshot.
     pub async fn snapshot(&self) -> HarnessResult<LaneSnapshot> {
         self.harness.snapshot().await
+    }
+
+    /// Observe the backend's physical history size when the selected storage
+    /// exposes one. This is owner-gated and deliberately remains an optional
+    /// observation, not a memory, I/O, or compaction guarantee.
+    pub async fn history_physical_bytes(&self) -> HarnessResult<Option<u64>> {
+        let actor = DurableActor::owner("agent-session")
+            .map_err(|error| HarnessError::io(error.to_string()))?;
+        DurableService::bind(&self.harness, actor)
+            .history_physical_bytes()
+            .await
+            .map_err(|error| HarnessError::io(error.to_string()))
     }
 
     /// Name/label facts. Mirrors TS `AgentSession.setName` / `setLabel`.
@@ -488,6 +508,7 @@ mod tests {
             drive: DrivingMode::default(),
             session: test_session(),
             allow_existing_session: true,
+            require_native_durable: false,
             models: Vec::new(),
             to_provider_messages: None,
             entry_projectors: Default::default(),
@@ -548,6 +569,21 @@ mod tests {
             }),
         ];
         assert_eq!(assistant_text(&msg), "hello\nworld");
+    }
+
+    #[tokio::test]
+    async fn product_layer_preserves_optional_physical_size_for_memory() {
+        let session = AgentSession::new(test_harness().await, Vec::new(), Vec::new(), ".");
+        assert_eq!(session.history_physical_bytes().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn abort_and_reconcile_preserves_idle_lane_error_at_the_product_layer() {
+        let session = AgentSession::new(test_harness().await, Vec::new(), Vec::new(), ".");
+        assert!(matches!(
+            session.abort_and_reconcile().await,
+            Err(HarnessError::NoActiveRun { lane, .. }) if lane == "main"
+        ));
     }
 
     #[tokio::test]

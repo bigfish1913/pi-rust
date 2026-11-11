@@ -118,6 +118,7 @@ async fn identity_harness(
         transform_context: None,
         entry_transforms: vec![],
         provider_hooks: None,
+        require_native_durable: false,
         allow_existing_session,
     })
     .await

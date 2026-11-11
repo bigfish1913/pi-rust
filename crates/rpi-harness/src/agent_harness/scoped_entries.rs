@@ -130,6 +130,11 @@ impl AgentHarness {
         self.guarded_branch(guard).await?;
         match entry {
             ScopedEntry::Custom { custom_type, data } => {
+                if crate::durable::reserved_control_type(&custom_type) {
+                    return Err(HarnessError::io(
+                        "native durable control entries are reserved",
+                    ));
+                }
                 if custom_type != guard.custom_type {
                     return Err(HarnessError::io("guard custom type mismatch"));
                 }

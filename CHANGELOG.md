@@ -11,6 +11,49 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.22.1](https://github.com/bigfish1913/pi-rust/compare/v0.22.0...v0.22.1) - 2026-11-11
+
+### Fixed
+
+- *(tui)* align @ file completion and preserve streamed replies ([#303](https://github.com/bigfish1913/pi-rust/pull/303))
+
+## [0.22.0](https://github.com/bigfish1913/pi-rust/compare/v0.21.2...v0.22.0) - 2026-11-10
+
+### Added
+
+- *(cli)* add an operations docs topic for skills, diagnostics, providers and sessions ([#273](https://github.com/bigfish1913/pi-rust/pull/273))
+- *(tui)* align at file completion with pi ([#295](https://github.com/bigfish1913/pi-rust/pull/295))
+- add opt-in native durable session slice
+
+### Fixed
+
+- *(rpc)* validate provider configuration commands ([#298](https://github.com/bigfish1913/pi-rust/pull/298))
+- *(tui)* keep read-tool images in transcript order ([#294](https://github.com/bigfish1913/pi-rust/pull/294))
+- allow test-only autocomplete helpers
+- pass native durable flag to autocomplete reservation
+- *(cli)* scope session pickers to the current project ([#269](https://github.com/bigfish1913/pi-rust/pull/269))
+- *(msrv)* keep preview tests on rust 1.88
+- *(ci)* keep durable checks compatible with rust 1.88
+- *(ci)* allow intentionally dormant preview helpers
+- *(harness)* advance cold replay sequence
+
+### Other
+
+- enable native durable by default
+- Merge remote-tracking branch 'origin/main' into codex/preview-main-sync-291
+- Merge main into durable preview
+- Enforce native durable hard cut
+- Merge remote-tracking branch 'origin/main' into feat/durable-core
+- *(harness)* remove legacy sqlite session backend
+- synchronize durable core with latest main
+- Forward history identity in queue probe
+- Forward history identity in recovery probes
+- Update hard-cut harness fixtures
+- Opt source ledger fixture into experimental mode
+- Opt synthetic ledger fixture into experimental mode
+- Fix paused storage admission fixture
+- *(harness)* fast-path cold assistant frame replay
+
 ## [0.21.2](https://github.com/bigfish1913/pi-rust/compare/v0.21.1...v0.21.2) - 2026-11-08
 
 ### Fixed

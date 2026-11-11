@@ -1,0 +1,64 @@
+[workspace]
+members = [
+    "packages/rpi-run-stats",
+    "packages/rpi-mcp-adapter",
+    "packages/rpi-mcp-core",
+    "packages/rpi-subagents",
+    "packages/rpi-btw",
+    "packages/rpi-lens",
+    "packages/rpi-orchestrator",
+    "packages/rpi-durable",
+    "packages/rpi-durable-core",
+    "packages/rpi-todo",
+    "packages/rpi-goal",
+    "packages/rpi-plan-mode",
+    "packages/rpi-codegraph",
+    "packages/rpi-ask-user",
+    "packages/rpi-permissions",
+    "packages/rpi-websearch",
+    "packages/rpi-webfetch",
+    "packages/rpi-edit-diagnostics",
+    "packages/rpi-im-message",
+    "packages/rpi-server",
+    "packages/rpi-acp",
+    "packages/rpi-ui-adapter",
+    "packages/rpi-permission-gate",
+    "packages/rpi-langfuse",
+    "packages/rpi-voice",
+    "packages/rpi-providers",
+    "packages/rpi-web",
+    "packages/rpi-extcore",
+    "packages/rpi-http",
+    "tools/rpi-package-install",
+]
+exclude = ["tools/rpi-package-smoke"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.12"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+authors = ["BigFish <bigfish1913@gmail.com>"]
+repository = "https://github.com/pi-rust/rpi-package"
+
+[workspace.dependencies]
+# Use the published SDK so CI and cargo publish build against the same source.
+# The optional smoke tool keeps its local pi-rust dependencies.
+# Pin the SDK used by this workspace: newer 0.3.x releases make raw ABI
+# string operations unsafe and require migrating the plugin callbacks.
+# Cargo.lock alone does not constrain SDK resolution for published extensions.
+rpi-plugin-sdk = { version = "=0.3.20" }
+feishu-sdk = { version = "0.1.2", default-features = false, features = ["websocket"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+url = "2"
+wait-timeout = "0.2"
+async-trait = "0.1"
+sha2 = "0.10"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

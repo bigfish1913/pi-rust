@@ -256,7 +256,7 @@ summarization **before cold payload reads** on native cold backends. Metadata-on
 ordinary custom entries and noncustom boundaries remain intact. Generic explicit
 history/export/body reads remain broad and validate payloads. Label/checkpoint
 reads are not redesigned here. Native metadata/ancestry still grow with history;
-memory/ordinary SQLite retain eager backend behavior. Custom storage ancestry
+memory/JSONL retain eager backend behavior. The durable SQLite journal is opt-in and separate from Session storage. Custom storage ancestry
 fallbacks may hydrate entries. These are **not RSS or zero-I/O bounds**.
 
 **Rust API migration:** `EntryQuery` has a new public

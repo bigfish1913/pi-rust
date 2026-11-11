@@ -85,6 +85,16 @@ impl SessionState {
         self.index.next_sequence()
     }
 
+    /// Capture a versioned reducer checkpoint without including progress
+    /// streams. The caller must still perform the backend identity CAS before
+    /// publishing the checkpoint.
+    pub fn history_checkpoint(
+        &self,
+        history_identity: crate::session::types::HistoryIdentity,
+    ) -> SessionResult<crate::session::types::HistoryCheckpoint> {
+        crate::session::types::HistoryCheckpoint::new(history_identity, self.clone())
+    }
+
     /// The highest applied mutation seq (0 before any mutation). The JSONL
     /// loader uses this to detect a duplicated/late append, where a mutation
     /// arrives with an already-consumed seq.

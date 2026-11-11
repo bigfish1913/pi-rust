@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Allocation-light recognition of assistant-frame rows during cold recovery.
 //!
 //! This is deliberately not a second codec: `None` means the caller must use

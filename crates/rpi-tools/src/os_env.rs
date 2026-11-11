@@ -25,6 +25,7 @@
 //! `cleanup()` kills tracked child pids best-effort.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::env::{
     check_cancel_exec, check_cancel_file, ExecutionEnv, FileContent, FileInfo, FileKind,
-    FileSystem, Shell, ShellExecOptions, ShellOutput,
+    FileSystem, Shell, ShellExecOptions, ShellOutput, WriterLease,
 };
 use crate::error::{
     io_to_file_error, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode,
@@ -67,6 +68,43 @@ struct ShellConfig {
 
 mod append;
 mod read;
+
+/// The open lock file is the storage-level ownership capability. Keeping the
+/// file handle inside this value is essential: dropping it releases the OS
+/// advisory lock without stale-lock cleanup or a second authority.
+struct OsWriterLease {
+    file: std::fs::File,
+    fence: u64,
+}
+
+impl WriterLease for OsWriterLease {
+    fn verify_fence(&self) -> Result<(), FileError> {
+        let mut probe = self
+            .file
+            .try_clone()
+            .map_err(|error| io_to_file_error(error, Some("writer lease fence")))?;
+        probe
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_to_file_error(error, Some("writer lease fence")))?;
+        let mut contents = String::new();
+        probe
+            .read_to_string(&mut contents)
+            .map_err(|error| io_to_file_error(error, Some("writer lease fence")))?;
+        let current = contents.trim().parse::<u64>().map_err(|error| {
+            FileError::new(
+                FileErrorCode::Unknown,
+                format!("invalid persisted writer lease fence: {error}"),
+            )
+        })?;
+        if current != self.fence {
+            return Err(FileError::new(
+                FileErrorCode::PermissionDenied,
+                "writer lease fence changed; reopen the session",
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Environment variables the **host** sets for its own runtime plumbing, which
 /// must not be handed to a shell it spawns.
@@ -445,6 +483,139 @@ async fn kill_process_tree(pid: u32) {
 
 #[async_trait]
 impl FileSystem for OsExecutionEnv {
+    async fn try_acquire_writer_lease(
+        &self,
+        path: &str,
+    ) -> Result<Option<Box<dyn WriterLease>>, FileError> {
+        let session_path = Self::resolve_path(&self.cwd, path);
+        let lock_path = PathBuf::from(format!("{}.lock", session_path.display()));
+        let display_path = session_path.to_string_lossy().into_owned();
+        tokio::task::spawn_blocking(move || {
+            use fs2::FileExt;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|error| io_to_file_error(error, Some(&lock_path.to_string_lossy())))?;
+            file.try_lock_exclusive().map_err(|error| {
+                FileError::new(
+                    FileErrorCode::PermissionDenied,
+                    format!("writer lease is already held for {display_path}"),
+                )
+                .with_path(lock_path.to_string_lossy())
+                .with_source(Box::new(error))
+            })?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| io_to_file_error(error, Some(&lock_path.to_string_lossy())))?;
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)
+                .map_err(|error| io_to_file_error(error, Some(&lock_path.to_string_lossy())))?;
+            let previous = if contents.trim().is_empty() {
+                0
+            } else {
+                contents.trim().parse::<u64>().map_err(|error| {
+                    FileError::new(
+                        FileErrorCode::Unknown,
+                        format!("invalid persisted writer lease fence: {error}"),
+                    )
+                    .with_path(lock_path.to_string_lossy())
+                })?
+            };
+            let fence = previous.checked_add(1).ok_or_else(|| {
+                FileError::new(FileErrorCode::Unknown, "writer lease fence exhausted")
+                    .with_path(lock_path.to_string_lossy())
+            })?;
+            file.seek(SeekFrom::Start(0))
+                .and_then(|_| file.set_len(0))
+                .and_then(|_| file.write_all(fence.to_string().as_bytes()))
+                .and_then(|_| file.sync_all())
+                .map_err(|error| io_to_file_error(error, Some(&lock_path.to_string_lossy())))?;
+            Ok(Some(
+                Box::new(OsWriterLease { file, fence }) as Box<dyn WriterLease>
+            ))
+        })
+        .await
+        .map_err(|error| {
+            FileError::new(
+                FileErrorCode::Unknown,
+                format!("writer lease task failed: {error}"),
+            )
+            .with_path(session_path.to_string_lossy())
+        })?
+    }
+
+    async fn sync_file(
+        &self,
+        path: &str,
+        data_only: bool,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let abs = Self::resolve_path(&self.cwd, path);
+        let error_path = abs.to_string_lossy().into_owned();
+        let io_path = error_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&abs)
+                .map_err(|error| io_to_file_error(error, Some(&io_path)))?;
+            if data_only {
+                file.sync_data()
+                    .map_err(|error| io_to_file_error(error, Some(&io_path)))
+            } else {
+                file.sync_all()
+                    .map_err(|error| io_to_file_error(error, Some(&io_path)))
+            }
+        })
+        .await
+        .map_err(|error| {
+            FileError::new(
+                FileErrorCode::Unknown,
+                format!("file sync task failed: {error}"),
+            )
+            .with_path(error_path)
+        })??;
+        Ok(())
+    }
+
+    async fn sync_directory(
+        &self,
+        path: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let abs = Self::resolve_path(&self.cwd, path);
+        #[cfg(unix)]
+        {
+            let error_path = abs.to_string_lossy().into_owned();
+            let io_path = error_path.clone();
+            tokio::task::spawn_blocking(move || {
+                std::fs::File::open(&abs)
+                    .map_err(|error| io_to_file_error(error, Some(&io_path)))?
+                    .sync_all()
+                    .map_err(|error| io_to_file_error(error, Some(&io_path)))
+            })
+            .await
+            .map_err(|error| {
+                FileError::new(
+                    FileErrorCode::Unknown,
+                    format!("directory sync task failed: {error}"),
+                )
+                .with_path(error_path)
+            })??;
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows has no portable directory-handle fsync equivalent in
+            // this abstraction. File contents are still synced above, but
+            // rename-directory durability remains unproved on this target.
+            let _ = abs;
+        }
+        Ok(())
+    }
+
     async fn open_append_file(
         &self,
         path: &str,
@@ -1286,6 +1457,46 @@ impl MutatingEnv for OsExecutionEnv {
 }
 
 /// Validate a timeout (seconds). Mirrors `resolveTimeoutMs` semantics.
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn os_backend_syncs_staged_file_and_publication_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = OsExecutionEnv::with_cwd(temp.path().to_path_buf());
+        env.write_file("staged", FileContent::Text("durable slice".into()), None)
+            .await
+            .unwrap();
+        env.sync_file("staged", false, None).await.unwrap();
+        env.sync_directory(".", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn os_writer_lease_persists_and_verifies_a_monotonic_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = OsExecutionEnv::with_cwd(temp.path().to_path_buf());
+        let first = env
+            .try_acquire_writer_lease("journal.jsonl")
+            .await
+            .unwrap()
+            .unwrap();
+        first.verify_fence().unwrap();
+        drop(first);
+        let second = env
+            .try_acquire_writer_lease("journal.jsonl")
+            .await
+            .unwrap()
+            .unwrap();
+        second.verify_fence().unwrap();
+        drop(second);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("journal.jsonl.lock")).unwrap(),
+            "2"
+        );
+    }
+}
+
 fn resolve_timeout(timeout: Option<f64>) -> Result<Option<std::time::Duration>, ExecutionError> {
     match timeout {
         None => Ok(None),

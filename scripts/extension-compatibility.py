@@ -348,11 +348,9 @@ def web_smoke(web: Path, rpi: Path, root: Path, env: dict[str, str]) -> dict:
         status, created = http_json(base + "/api/v1/sessions", "POST", {})
         assert status == 201 and created.get("sessionId"), (status, created)
         session_id = created["sessionId"]
-        status, durable = http_json(base + f"/api/v1/sessions/{session_id}/durable")
-        assert status == 200 and "state" in durable, (status, durable)
         status, snapshot = http_json(base + f"/api/v1/sessions/{session_id}/snapshot")
         assert status == 200 and snapshot.get("sessionId") == session_id, (status, snapshot)
-        return {"health": health, "created": created, "durable": durable, "snapshot": {"sessionId": snapshot.get("sessionId"), "status": snapshot.get("status")}}
+        return {"health": health, "created": created, "snapshot": {"sessionId": snapshot.get("sessionId"), "status": snapshot.get("status")}}
     finally:
         if session_id:
             try:

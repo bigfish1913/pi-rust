@@ -14,7 +14,7 @@ use rpi_tools::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::AtomicUsize,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -76,14 +76,49 @@ struct MemoryFs {
     inner: InMemoryExecutionEnv,
     mode: Mode,
     readers: std::sync::Mutex<HashMap<String, Arc<MemoryReader>>>,
+    sync_failures: AtomicUsize,
+    directory_sync_failures: AtomicUsize,
+    write_failures: AtomicUsize,
+    rename_failures: AtomicUsize,
 }
+fn consume_failure(counter: &AtomicUsize) -> bool {
+    loop {
+        let current = counter.load(Ordering::SeqCst);
+        let Some(next) = current.checked_sub(1) else {
+            return false;
+        };
+        if counter
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
 impl MemoryFs {
     fn new(mode: Mode) -> Arc<Self> {
         Arc::new(Self {
             inner: InMemoryExecutionEnv::with_cwd("/".into()),
             mode,
             readers: Default::default(),
+            sync_failures: AtomicUsize::new(0),
+            directory_sync_failures: AtomicUsize::new(0),
+            write_failures: AtomicUsize::new(0),
+            rename_failures: AtomicUsize::new(0),
         })
+    }
+    fn fail_next_sync(&self) {
+        self.sync_failures.fetch_add(1, Ordering::SeqCst);
+    }
+    fn fail_next_directory_sync(&self) {
+        self.directory_sync_failures.fetch_add(1, Ordering::SeqCst);
+    }
+    fn fail_next_write(&self) {
+        self.write_failures.fetch_add(1, Ordering::SeqCst);
+    }
+    fn fail_next_rename(&self) {
+        self.rename_failures.fetch_add(1, Ordering::SeqCst);
     }
     fn reader(&self, path: &str) -> Arc<MemoryReader> {
         self.readers.lock().unwrap().get(path).unwrap().clone()
@@ -164,6 +199,12 @@ impl FileSystem for MemoryFs {
         content: FileContent,
         c: Option<&CancellationToken>,
     ) -> FileResult<()> {
+        if consume_failure(&self.write_failures) {
+            return Err(FileError::new(
+                FileErrorCode::Unknown,
+                "injected write failure",
+            ));
+        }
         self.inner.write_file(path, content, c).await?;
         let bytes = self.inner.read_binary_file(path, c).await?;
         self.readers.lock().unwrap().insert(
@@ -185,6 +226,29 @@ impl FileSystem for MemoryFs {
         self.inner.append_file(path, content, c).await?;
         let bytes = self.inner.read_binary_file(path, c).await?;
         *self.reader(path).bytes.lock().unwrap() = bytes;
+        Ok(())
+    }
+    async fn sync_file(
+        &self,
+        _path: &str,
+        _data_only: bool,
+        _c: Option<&CancellationToken>,
+    ) -> FileResult<()> {
+        if consume_failure(&self.sync_failures) {
+            return Err(FileError::new(
+                FileErrorCode::Unknown,
+                "injected sync failure",
+            ));
+        }
+        Ok(())
+    }
+    async fn sync_directory(&self, _path: &str, _c: Option<&CancellationToken>) -> FileResult<()> {
+        if consume_failure(&self.directory_sync_failures) {
+            return Err(FileError::new(
+                FileErrorCode::Unknown,
+                "injected directory sync failure",
+            ));
+        }
         Ok(())
     }
     async fn open_append_file(&self, path: &str) -> FileResult<Option<Box<dyn AppendFile>>> {
@@ -224,6 +288,12 @@ impl FileSystem for MemoryFs {
         dest: &str,
         c: Option<&CancellationToken>,
     ) -> FileResult<()> {
+        if consume_failure(&self.rename_failures) {
+            return Err(FileError::new(
+                FileErrorCode::Unknown,
+                "injected rename failure",
+            ));
+        }
         self.inner.rename_file(source, dest, c).await?;
         let mut readers = self.readers.lock().unwrap();
         let reader = readers.remove(source).unwrap();
@@ -328,6 +398,159 @@ fn frame() -> LaneRecord {
         op: AssistantFrameOp::Append,
         frame: Some(serde_json::json!({"delta":"legacy payload"})),
     })
+}
+fn clear_frame() -> AssistantFrameRecord {
+    AssistantFrameRecord {
+        base: RecordBase {
+            id: "clear-frame".into(),
+            seq: 0,
+            lane: "main".into(),
+            timestamp: 1,
+        },
+        run_id: "run".into(),
+        stream_index: 0,
+        op: AssistantFrameOp::ClearRun,
+        frame: None,
+    }
+}
+async fn seeded_progress(fs: Arc<MemoryFs>) -> (JsonlSessionStorage, Vec<u8>) {
+    let storage = create(fs.clone()).await;
+    storage
+        .append_progress(vec![match frame() {
+            LaneRecord::AssistantFrame(record) => record,
+            _ => unreachable!(),
+        }])
+        .await
+        .unwrap();
+    let before = fs
+        .inner
+        .read_binary_file("/history.jsonl.progress.jsonl", None)
+        .await
+        .unwrap();
+    (storage, before)
+}
+
+#[tokio::test]
+async fn progress_checkpoint_sync_failure_preserves_destination_and_requires_reopen() {
+    let fs = MemoryFs::new(Mode::Stable);
+    let (storage, before) = seeded_progress(fs.clone()).await;
+    fs.fail_next_sync();
+    assert!(storage.append_progress(vec![clear_frame()]).await.is_err());
+    assert_eq!(
+        fs.inner
+            .read_binary_file("/history.jsonl.progress.jsonl", None)
+            .await
+            .unwrap(),
+        before,
+        "a failed staged sync must not publish the new checkpoint"
+    );
+    let reopened = load(fs).await.unwrap();
+    assert_eq!(reopened.read_progress("run").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn history_append_sync_failure_rolls_back_and_reopens_cleanly() {
+    let fs = MemoryFs::new(Mode::Stable);
+    let storage = create(fs.clone()).await;
+    fs.fail_next_sync();
+    assert!(storage
+        .append_entry(large_message("sync-failure"), "main")
+        .await
+        .is_err());
+    let reopened = load(fs).await.unwrap();
+    assert!(reopened.get_entry("sync-failure").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn progress_checkpoint_stage_write_failure_preserves_destination_and_cleans_tmp() {
+    let fs = MemoryFs::new(Mode::Stable);
+    let (storage, before) = seeded_progress(fs.clone()).await;
+    fs.fail_next_write();
+    assert!(storage.append_progress(vec![clear_frame()]).await.is_err());
+    assert_eq!(
+        fs.inner
+            .read_binary_file("/history.jsonl.progress.jsonl", None)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(!fs
+        .inner
+        .exists("/history.jsonl.progress.jsonl.tmp", None)
+        .await
+        .unwrap());
+    assert_eq!(
+        load(fs)
+            .await
+            .unwrap()
+            .read_progress("run")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn progress_checkpoint_rename_failure_preserves_destination_and_cleans_tmp() {
+    let fs = MemoryFs::new(Mode::Stable);
+    let (storage, before) = seeded_progress(fs.clone()).await;
+    fs.fail_next_rename();
+    assert!(storage.append_progress(vec![clear_frame()]).await.is_err());
+    assert_eq!(
+        fs.inner
+            .read_binary_file("/history.jsonl.progress.jsonl", None)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(!fs
+        .inner
+        .exists("/history.jsonl.progress.jsonl.tmp", None)
+        .await
+        .unwrap());
+    assert_eq!(
+        load(fs)
+            .await
+            .unwrap()
+            .read_progress("run")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn progress_checkpoint_directory_sync_failure_reopens_published_destination() {
+    let fs = MemoryFs::new(Mode::Stable);
+    let (storage, before) = seeded_progress(fs.clone()).await;
+    fs.fail_next_directory_sync();
+    assert!(storage.append_progress(vec![clear_frame()]).await.is_err());
+    let after = fs
+        .inner
+        .read_binary_file("/history.jsonl.progress.jsonl", None)
+        .await
+        .unwrap();
+    assert_ne!(
+        after, before,
+        "rename happened before directory sync failed"
+    );
+    assert!(!fs
+        .inner
+        .exists("/history.jsonl.progress.jsonl.tmp", None)
+        .await
+        .unwrap());
+    assert_eq!(
+        load(fs)
+            .await
+            .unwrap()
+            .read_progress("run")
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -440,6 +663,13 @@ async fn capability_io_errors_are_not_treated_as_absence() {
         create(fs.clone()).await;
         assert!(load(fs).await.is_err());
     }
+}
+
+#[tokio::test]
+async fn physical_history_size_keeps_legacy_readers_explicitly_unknown() {
+    let fs = MemoryFs::new(Mode::ReadAllOnly);
+    let storage = create(fs).await;
+    assert_eq!(storage.history_physical_bytes().await.unwrap(), None);
 }
 
 struct TornAppend {

@@ -13,6 +13,9 @@
 //! - **lane mutation**: `{"kind":"lane","lane","leafId"?}`.
 //! - **fact mutation**: `{"kind":"fact","fact":"name","name"?}` or
 //!   `{"kind":"fact","fact":"label","targetId","label"?}`.
+//! - **checkpoint image**: an explicit bounded `HistoryCheckpoint` may be
+//!   carried in reserved header metadata; it replaces the mutation replay base
+//!   and is absent from ordinary v4 files.
 //!
 //! ## Decode validation (mirrors `codec.ts`)
 //!
@@ -35,8 +38,10 @@
 use serde_json::Value;
 
 use crate::session::jsonl::errors::{JsonlDecodeError, JsonlDecodeErrorKind};
-use crate::session::jsonl::types::{JsonlSessionMetadata, JsonlSourceFormat, JsonlV4Header};
-use crate::session::types::{JsonValue, LaneRecord, SessionMutation};
+use crate::session::jsonl::types::{
+    JsonlSessionMetadata, JsonlSourceFormat, JsonlV4Header, HISTORY_CHECKPOINT_METADATA_KEY,
+};
+use crate::session::types::{HistoryCheckpoint, JsonValue, LaneRecord, SessionMutation};
 
 // ---- whitelists (mirror codec.ts ENTRY_TYPES / RECORD_TYPES / OPERATION_KINDS) ----
 
@@ -70,6 +75,32 @@ const OPERATION_KINDS: &[&str] = &["run", "compaction", "navigation"];
 /// `parseHeader` -> `decodeHeader`.
 pub fn parse_header(line: &str) -> Result<JsonlV4Header, JsonlDecodeError> {
     decode_header(line)
+}
+
+/// Decode the optional explicit checkpoint embedded in reserved v4 metadata.
+/// The default path remains unchanged when the key is absent.
+pub fn history_checkpoint(
+    header: &JsonlV4Header,
+) -> Result<Option<HistoryCheckpoint>, JsonlDecodeError> {
+    let Some(value) = header
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(HISTORY_CHECKPOINT_METADATA_KEY))
+    else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Err(schema("has an invalid history checkpoint"));
+    }
+    let checkpoint: HistoryCheckpoint =
+        serde_json::from_value(value.clone()).map_err(|e| schema(e.to_string()))?;
+    checkpoint.validate().map_err(|e| schema(e.to_string()))?;
+    if checkpoint.history_identity.generation != header.history_generation() {
+        return Err(schema(
+            "history checkpoint generation does not match header",
+        ));
+    }
+    Ok(Some(checkpoint))
 }
 
 /// Serialize a header to its newline-terminated JSONL line. Mirrors TS
@@ -525,7 +556,11 @@ fn schema(message: impl Into<String>) -> JsonlDecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::jsonl::types::HeaderKind;
+    use crate::session::jsonl::types::{
+        HeaderKind, HISTORY_CHECKPOINT_METADATA_KEY, HISTORY_GENERATION_METADATA_KEY,
+    };
+    use crate::session::state::SessionState;
+    use crate::session::types::HistoryIdentity;
 
     fn header() -> JsonlV4Header {
         JsonlV4Header::new(
@@ -546,6 +581,61 @@ mod tests {
         assert_eq!(parsed.version, 4);
         assert_eq!(parsed.id, "sess-1");
         assert_eq!(parsed.cwd, "/cwd");
+    }
+
+    #[test]
+    fn checkpoint_metadata_round_trips_and_binds_generation() {
+        let checkpoint = SessionState::new()
+            .history_checkpoint(HistoryIdentity {
+                revision: 0,
+                generation: 2,
+            })
+            .unwrap();
+        let mut value = header();
+        value.metadata = Some(
+            [
+                (
+                    HISTORY_GENERATION_METADATA_KEY.to_owned(),
+                    serde_json::json!(2),
+                ),
+                (
+                    HISTORY_CHECKPOINT_METADATA_KEY.to_owned(),
+                    serde_json::to_value(checkpoint).unwrap(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let parsed = parse_header(encode_header(&value).trim_end()).unwrap();
+        let restored = history_checkpoint(&parsed).unwrap().unwrap();
+        assert_eq!(restored.history_identity.generation, 2);
+    }
+
+    #[test]
+    fn checkpoint_metadata_rejects_header_generation_mismatch() {
+        let checkpoint = SessionState::new()
+            .history_checkpoint(HistoryIdentity {
+                revision: 0,
+                generation: 2,
+            })
+            .unwrap();
+        let mut value = header();
+        value.metadata = Some(
+            [
+                (
+                    HISTORY_GENERATION_METADATA_KEY.to_owned(),
+                    serde_json::json!(3),
+                ),
+                (
+                    HISTORY_CHECKPOINT_METADATA_KEY.to_owned(),
+                    serde_json::to_value(checkpoint).unwrap(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let parsed = parse_header(encode_header(&value).trim_end()).unwrap();
+        assert!(history_checkpoint(&parsed).is_err());
     }
 
     #[test]
