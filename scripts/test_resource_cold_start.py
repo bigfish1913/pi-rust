@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import textwrap
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -632,6 +633,74 @@ class HostLifecycleTests(TemporaryCase):
             self.assertEqual(raised.exception.code, 2)
             run.assert_not_called()
         self.assertFalse((REPOSITORY / "external-must-not-exist").exists())
+
+
+class WorkflowRetryTests(TemporaryCase):
+    def results(self, runs=None):
+        args = parameters(shapes=["modern"], repeats=3)
+        if runs is None:
+            runs = [observation(shape="modern", repeat=repeat) for repeat in range(1, 4)]
+        return dict(status="FAIL", runs=runs, summaries=cold.summarize(runs, args))
+
+    def assert_retry(self, data, allowed):
+        path = self.base / "results.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        workflow = (REPOSITORY / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        classifiers = workflow.split("latency_only_failure() {")[1:]
+        self.assertEqual(len(classifiers), 2, "check modern and legacy retry classifiers")
+        for index, block in enumerate(classifiers):
+            source = textwrap.dedent(block.split("<<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+            with self.subTest(classifier=index), mock.patch.object(sys, "argv", ["-", str(path)]):
+                with self.assertRaises(SystemExit) as raised:
+                    exec(compile(source, "ci-latency-classifier", "exec"), {})
+                self.assertEqual(raised.exception.code, 0 if allowed else 1)
+
+    def test_complete_latency_failures_allow_retry(self):
+        for metric, value in (("readyMs", 3001), ("getMessages40Ms", 101), ("getStateMs", 1501)):
+            with self.subTest(metric=metric):
+                runs = [observation(shape="modern", repeat=repeat) for repeat in range(1, 4)]
+                for run in runs:
+                    run["metrics"][metric] = value
+                self.assert_retry(self.results(runs), True)
+
+    def test_incomplete_measurements_do_not_allow_retry(self):
+        self.assert_retry(self.results([observation(shape="modern")]), False)
+
+    def test_fatal_error_does_not_allow_retry(self):
+        data = self.results()
+        data["fatalError"] = dict(type="OSError", message="fixture generation failed")
+        # A latency failure may coexist with the fatal error.
+        data["summaries"][0]["gate"]["status"] = "FAIL"
+        self.assert_retry(data, False)
+
+    def test_protocol_semantic_and_cleanup_failures_do_not_allow_retry(self):
+        for category in ("protocol", "semantic", "cleanup"):
+            with self.subTest(category=category):
+                runs = [observation(shape="modern", status="FAIL",
+                                    errors=[dict(phase=category, category=category)])]
+                self.assert_retry(self.results(runs), False)
+
+    def test_reported_errors_do_not_allow_retry_even_with_pass_status(self):
+        for category in ("protocol", "semantic", "cleanup"):
+            with self.subTest(category=category):
+                runs = [observation(shape="modern", repeat=repeat) for repeat in range(1, 4)]
+                for run in runs:
+                    run["metrics"]["readyMs"] = 3001
+                runs[0]["errors"] = [dict(phase=category, category=category)]
+                self.assert_retry(self.results(runs), False)
+
+    def test_missing_latency_metric_does_not_allow_retry(self):
+        for metric in ("readyMs", "getMessages40Ms", "getStateMs"):
+            with self.subTest(metric=metric):
+                runs = [observation(shape="modern", repeat=repeat) for repeat in range(1, 4)]
+                for run in runs:
+                    run["metrics"]["readyMs"] = 3001
+                runs[0]["metrics"][metric] = None
+                self.assert_retry(self.results(runs), False)
+
+    def test_passing_and_empty_results_do_not_allow_retry(self):
+        self.assert_retry(self.results(), False)
+        self.assert_retry(self.results([]), False)
 
 
 @unittest.skipUnless(os.environ.get("RPI_COLD_START_BINARY", "").strip(),
