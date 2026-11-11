@@ -242,7 +242,10 @@ pub(super) async fn handle_agent_event(
             {
                 reconcile_footer_from_lane(lane, state).await;
             }
-            history::settle(state, tui);
+            // Do not reload history here. `AgentEnd` can arrive before the
+            // producer has drained its session writer; settling now may read
+            // the previous page and clear the freshly rendered reply. The
+            // prompt/skill driver settles after `drain_session()` completes.
             tui.request_render(false);
         }
 

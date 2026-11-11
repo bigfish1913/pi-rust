@@ -198,10 +198,138 @@ pub struct SlashCommand {
     pub description: String,
 }
 
+const FUZZY_MAX_RESULTS: usize = 20;
+const INDEX_MAX_ENTRIES: usize = 50_000;
+const INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Debug, Clone)]
+struct IndexedPath {
+    path: String,
+    is_directory: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPathIndex {
+    root: PathBuf,
+    built_at: std::time::Instant,
+    entries: Vec<IndexedPath>,
+}
+
 /// File path autocomplete provider.
 pub struct FilePathAutocompleteProvider {
     root_path: Option<PathBuf>,
     max_results: usize,
+    index: Arc<Mutex<Option<CachedPathIndex>>>,
+}
+
+fn to_display_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn completion_needs_quotes(path: &str) -> bool {
+    path.chars().any(|character| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '，' | '．'
+                    | '：'
+                    | '；'
+                    | '！'
+                    | '？'
+                    | '（'
+                    | '）'
+                    | '［'
+                    | '］'
+                    | '｛'
+                    | '｝'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '…'
+                    | '—'
+            )
+    })
+}
+
+/// Build one native-Pi-style path item. `quoted_prefix` means the opening
+/// quote is already in the editor and must remain outside the replacement
+/// span; the returned text therefore contains only the closing quote.
+fn build_path_item(
+    display_path: &str,
+    label: &str,
+    is_directory: bool,
+    quoted_prefix: bool,
+    with_description: bool,
+) -> AutocompleteItem {
+    let path_value = if is_directory {
+        format!("{display_path}/")
+    } else {
+        display_path.to_string()
+    };
+    let needs_quotes = quoted_prefix || completion_needs_quotes(&path_value);
+    let quoted_value = if needs_quotes {
+        format!("\"{path_value}\"")
+    } else {
+        path_value
+    };
+    let text = if quoted_prefix {
+        quoted_value
+            .strip_prefix('"')
+            .unwrap_or(&quoted_value)
+            .to_string()
+    } else {
+        quoted_value
+    };
+    let display_label = if is_directory {
+        format!("{label}/")
+    } else {
+        label.to_string()
+    };
+    let mut item = AutocompleteItem::new(&text)
+        .with_label(&display_label)
+        .with_insert_space(!is_directory);
+    if is_directory {
+        item = item.as_directory();
+    }
+    if with_description {
+        item = item.with_description(display_path);
+    }
+    item
+}
+
+fn path_basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn path_depth(path: &str) -> usize {
+    path.split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .count()
+}
+
+fn score_indexed_path(path: &str, query: &str, is_directory: bool) -> i32 {
+    if query.is_empty() {
+        return 1;
+    }
+    let lower_path = path.replace('\\', "/").to_lowercase();
+    let lower_name = path_basename(path).to_lowercase();
+    let lower_query = query.replace('\\', "/").to_lowercase();
+    let mut score = if lower_name == lower_query {
+        100
+    } else if lower_name.starts_with(&lower_query) {
+        80
+    } else if lower_name.contains(&lower_query) {
+        50
+    } else if lower_path.contains(&lower_query) {
+        30
+    } else {
+        0
+    };
+    if is_directory && score > 0 {
+        score += 10;
+    }
+    score
 }
 
 impl FilePathAutocompleteProvider {
@@ -210,6 +338,7 @@ impl FilePathAutocompleteProvider {
         Self {
             root_path: None,
             max_results: 50,
+            index: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -218,6 +347,7 @@ impl FilePathAutocompleteProvider {
         Self {
             root_path: Some(root),
             max_results: 50,
+            index: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -227,20 +357,18 @@ impl FilePathAutocompleteProvider {
         self
     }
 
+    fn root_directory(&self) -> PathBuf {
+        self.root_path
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
     /// Extract the path prefix from input.
     fn extract_path_prefix(&self, input: &str, cursor: usize) -> Option<(String, usize)> {
-        // Snap to a char boundary so the slices below can never land inside a
-        // multibyte char (callers may pass a char count, not a byte offset).
         let cursor = snap_cursor(input, cursor);
         let before_cursor = &input[..cursor];
-
-        // Native Pi treats CJK punctuation as a token boundary. Opening
-        // wrappers are stripped separately, so
-        // `(@src` and `` `@src `` retain their wrapper in the editor text.
         let mut start = 0;
         for (index, character) in before_cursor.char_indices().rev() {
-            // The quote in an @-reference (`@"src/ma`) belongs to the token;
-            // ordinary quoted paths still use the quote as their delimiter.
             let is_at_quote =
                 character == '"' && index > 0 && before_cursor[..index].ends_with('@');
             if is_path_delimiter(character) && !is_at_quote {
@@ -252,27 +380,17 @@ impl FilePathAutocompleteProvider {
         let raw_token = &input[start..cursor];
         let (token, wrapper_len) = strip_leading_path_wrappers(raw_token);
         let token_start = start + wrapper_len;
-
-        // Check for an @file reference. Return the position after `@` so the
-        // prefix itself is replaced while `@`, parentheses, and backticks are
-        // preserved in the editor text.
         if token.starts_with('@') {
             let path = &token[1..];
             if let Some(path) = path.strip_prefix('"') {
-                // Keep the opening quote out of the replacement span, while
-                // retaining enough information for the caller to close it.
                 return Some((path.to_string(), token_start + 2));
             }
             return Some((path.to_string(), token_start + 1));
         }
         if token.starts_with('"') {
-            // Quoted path (the opening quote is kept in the editor text).
             return Some((token[1..].to_string(), token_start + 1));
         }
 
-        // Native pi only opens a regular path panel when the token looks like
-        // a path. A bare word in prose must not cause a directory scan on
-        // every cursor movement.
         let looks_like_path = token.contains('/')
             || token.contains('\\')
             || token.starts_with('.')
@@ -281,20 +399,24 @@ impl FilePathAutocompleteProvider {
         if !looks_like_path && !quoted {
             return None;
         }
-
         Some((token.to_string(), token_start))
     }
 
-    /// Get completions for a path prefix.
+    fn resolve_directory(&self, raw_dir: &Path) -> PathBuf {
+        let expanded = expand_home_path(raw_dir);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.root_directory().join(expanded)
+        }
+    }
+
+    /// Get direct-directory completions for ordinary paths.
     fn get_path_completions(&self, prefix: &str) -> Vec<AutocompleteItem> {
         let quoted = prefix.starts_with('"');
         let prefix = prefix.strip_prefix('"').unwrap_or(prefix);
         let prefix = prefix.strip_suffix('"').unwrap_or(prefix);
         let has_separator = prefix.contains('/') || prefix.contains('\\');
-
-        // Determine the directory to search. Relative paths are scoped to the
-        // provider root, just like native Pi's basePath; `~` is expanded only
-        // for lookup and is kept in the text inserted by the caller.
         let (raw_dir, partial) = if prefix == "~" {
             (PathBuf::from(prefix), String::new())
         } else if prefix.ends_with(['/', '\\']) {
@@ -307,16 +429,7 @@ impl FilePathAutocompleteProvider {
         } else {
             (PathBuf::from("."), prefix.to_string())
         };
-        let raw_dir = expand_home_path(&raw_dir);
-        let dir = if raw_dir.is_absolute() {
-            raw_dir
-        } else {
-            self.root_path
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(raw_dir)
-        };
-
+        let dir = self.resolve_directory(&raw_dir);
         let partial_lower = partial.to_lowercase();
         let mut entries = Vec::new();
         if let Ok(read_dir) = std::fs::read_dir(&dir) {
@@ -325,15 +438,11 @@ impl FilePathAutocompleteProvider {
                 if !partial_lower.is_empty() && !name.to_lowercase().starts_with(&partial_lower) {
                     continue;
                 }
-                // Follow directory symlinks, matching native Pi's Dirent /
-                // stat fallback instead of treating every symlink as a file.
                 let is_dir =
                     entry.file_type().map(|t| t.is_dir()).unwrap_or(false) || entry.path().is_dir();
                 entries.push((name, is_dir));
             }
         }
-
-        // Native Pi presents directories first and then sorts alphabetically.
         entries.sort_by(|(left_name, left_dir), (right_name, right_dir)| {
             right_dir
                 .cmp(left_dir)
@@ -342,34 +451,137 @@ impl FilePathAutocompleteProvider {
         });
         entries.truncate(self.max_results);
 
-        let display_base = if prefix.ends_with(['/', '\\']) {
-            prefix.to_string()
+        let display_base = if prefix == "~" {
+            "~/".to_string()
+        } else if prefix.ends_with(['/', '\\']) {
+            to_display_path(prefix)
         } else {
             prefix
                 .rfind(['/', '\\'])
-                .map(|index| prefix[..index + 1].to_string())
+                .map(|index| to_display_path(&prefix[..index + 1]))
                 .unwrap_or_default()
         };
-
         entries
             .into_iter()
             .map(|(name, is_dir)| {
                 let display_path = format!("{display_base}{name}");
-                let mut text = if is_dir {
-                    format!("{name}/")
-                } else {
-                    name.clone()
-                };
-                if quoted && !is_dir {
-                    text.push('"');
+                build_path_item(&display_path, &name, is_dir, quoted, true)
+            })
+            .collect()
+    }
+
+    fn resolve_fuzzy_scope(&self, raw_query: &str) -> Option<(PathBuf, String, String)> {
+        let normalized = to_display_path(raw_query);
+        if normalized == "~" {
+            return home_directory().map(|home| (home, String::new(), "~/".to_string()));
+        }
+        let Some(slash) = normalized.rfind(['/', '\\']) else {
+            return Some((self.root_directory(), normalized, String::new()));
+        };
+        let display_base = normalized[..slash + 1].to_string();
+        let query = normalized[slash + 1..].to_string();
+        let base = Path::new(&display_base);
+        let base_dir = if display_base.starts_with("~/") {
+            expand_home_path(base)
+        } else if base.is_absolute() {
+            base.to_path_buf()
+        } else {
+            self.root_directory().join(base)
+        };
+        if !base_dir.is_dir() {
+            return None;
+        }
+        Some((base_dir, query, display_base))
+    }
+
+    fn build_index(root: &Path) -> Vec<IndexedPath> {
+        let mut entries = Vec::new();
+        let walker = ignore::WalkBuilder::new(root)
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .follow_links(true)
+            .filter_entry(|entry| entry.file_name() != ".git")
+            .build();
+        for result in walker {
+            let Ok(entry) = result else { continue };
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            let Some(relative) = relative.to_str() else {
+                continue;
+            };
+            let is_directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            entries.push(IndexedPath {
+                path: to_display_path(relative),
+                is_directory,
+            });
+            if entries.len() >= INDEX_MAX_ENTRIES {
+                break;
+            }
+        }
+        entries
+    }
+
+    fn indexed_entries(&self, root: &Path) -> Vec<IndexedPath> {
+        let now = std::time::Instant::now();
+        if let Ok(cache) = self.index.lock() {
+            if let Some(cache) = cache.as_ref() {
+                if cache.root == root && now.duration_since(cache.built_at) < INDEX_TTL {
+                    return cache.entries.clone();
                 }
-                let mut item = AutocompleteItem::new(&text)
-                    .with_description(&display_path)
-                    .with_insert_space(!is_dir);
-                if is_dir {
-                    item = item.as_directory();
-                }
-                item
+            }
+        }
+        let entries = Self::build_index(root);
+        if let Ok(mut cache) = self.index.lock() {
+            *cache = Some(CachedPathIndex {
+                root: root.to_path_buf(),
+                built_at: now,
+                entries: entries.clone(),
+            });
+        }
+        entries
+    }
+
+    /// Get the recursive fuzzy candidates used by native Pi for `@` paths.
+    fn get_at_completions(&self, raw_query: &str, quoted: bool) -> Vec<AutocompleteItem> {
+        let raw_query = raw_query.strip_prefix('"').unwrap_or(raw_query);
+        let raw_query = raw_query.strip_suffix('"').unwrap_or(raw_query);
+        let Some((base_dir, query, display_base)) = self.resolve_fuzzy_scope(raw_query) else {
+            return Vec::new();
+        };
+        let entries = self.indexed_entries(&base_dir);
+        let mut scored = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let score = score_indexed_path(&entry.path, &query, entry.is_directory);
+                (score > 0).then_some((score, entry))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| path_depth(&left.path).cmp(&path_depth(&right.path)))
+                .then_with(|| left.path.len().cmp(&right.path.len()))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        scored
+            .into_iter()
+            .take(FUZZY_MAX_RESULTS)
+            .map(|(_, entry)| {
+                let display_path = format!("{}{}", display_base, entry.path);
+                build_path_item(
+                    &display_path,
+                    path_basename(&entry.path),
+                    entry.is_directory,
+                    quoted,
+                    true,
+                )
             })
             .collect()
     }
@@ -400,7 +612,11 @@ impl AutocompleteProvider for FilePathAutocompleteProvider {
         } else {
             prefix.clone()
         };
-        let items = self.get_path_completions(&lookup_prefix);
+        let items = if is_at_reference {
+            self.get_at_completions(&lookup_prefix, quoted_at)
+        } else {
+            self.get_path_completions(&lookup_prefix)
+        };
         if items.is_empty() {
             return None;
         }
@@ -681,15 +897,20 @@ mod tests {
         let suggestions = provider
             .get_suggestions(&prefix, prefix.len())
             .expect("the directory's contents are a completion");
-        let texts: Vec<&str> = suggestions
+        let texts: Vec<String> = suggestions
             .items
             .iter()
-            .map(|item| item.text.as_str())
+            .map(|item| item.text.clone())
             .collect();
+        let display_nested = to_display_path(&format!(
+            "{}{separator}",
+            nested.display(),
+            separator = std::path::MAIN_SEPARATOR
+        ));
         assert_eq!(
             texts,
-            vec!["report.txt"],
-            "a trailing separator must list the directory, not offer its own name"
+            vec![format!("{display_nested}report.txt")],
+            "a trailing separator must list the directory's contents, not offer its own name"
         );
         assert_eq!(suggestions.start, 1, "the @ stays outside the span");
         assert_eq!(suggestions.end, prefix.len());
@@ -708,12 +929,23 @@ mod tests {
         let suggestions = provider
             .get_suggestions(&prefix, prefix.len())
             .expect("a partial directory name");
-        let texts: Vec<&str> = suggestions
+        let texts: Vec<String> = suggestions
             .items
             .iter()
-            .map(|item| item.text.as_str())
+            .map(|item| item.text.clone())
             .collect();
-        assert_eq!(texts, vec!["nested/"]);
+        let display_root = to_display_path(&format!(
+            "{}{separator}",
+            scratch.0.display(),
+            separator = std::path::MAIN_SEPARATOR
+        ));
+        assert_eq!(
+            texts,
+            vec![
+                format!("{display_root}nested/"),
+                format!("{display_root}nested/report.txt")
+            ]
+        );
         assert_eq!(suggestions.start, 1);
         assert_eq!(suggestions.end, prefix.len());
     }
@@ -820,13 +1052,21 @@ mod tests {
         let suggestions = provider
             .get_suggestions(&absolute, absolute.len())
             .expect("an absolute @ path completes its basename");
-        assert_eq!(suggestions.items[0].text, "report.txt");
+        let display_nested = to_display_path(&format!(
+            "{}{separator}",
+            nested.display(),
+            separator = std::path::MAIN_SEPARATOR
+        ));
+        assert_eq!(
+            suggestions.items[0].text,
+            format!("{display_nested}report.txt")
+        );
 
         let relative = "@nested/rep";
         let suggestions = provider
             .get_suggestions(relative, relative.len())
             .expect("a relative @ path is scoped to the provider root");
-        assert_eq!(suggestions.items[0].text, "report.txt");
+        assert_eq!(suggestions.items[0].text, "nested/report.txt");
         assert_eq!(
             suggestions.items[0].description.as_deref(),
             Some("nested/report.txt")
@@ -863,6 +1103,39 @@ mod tests {
 
         assert_eq!(suggestions.start, 2, "replace only the text after @\"");
         assert_eq!(suggestions.items[0].text, "notes.txt\"");
+    }
+
+    #[test]
+    fn at_search_is_recursive_ignored_and_quotes_special_paths() {
+        let scratch = Scratch::new("recursive-at");
+        std::fs::write(scratch.0.join(".gitignore"), "ignored/\nignored.txt\n").unwrap();
+        std::fs::create_dir_all(scratch.0.join("src")).unwrap();
+        std::fs::write(scratch.0.join("src").join("main.rs"), "fixture").unwrap();
+        std::fs::create_dir_all(scratch.0.join("ignored")).unwrap();
+        std::fs::write(scratch.0.join("ignored").join("main.rs"), "fixture").unwrap();
+        std::fs::write(scratch.0.join("ignored.txt"), "fixture").unwrap();
+        std::fs::create_dir(scratch.0.join(".git")).unwrap();
+        std::fs::write(scratch.0.join(".git").join("main.rs"), "fixture").unwrap();
+        std::fs::write(scratch.0.join("my notes.txt"), "fixture").unwrap();
+
+        let provider = FilePathAutocompleteProvider::with_root(scratch.0.clone());
+        let recursive = provider
+            .get_suggestions("@main", "@main".len())
+            .expect("recursive @ search should find nested files");
+        let main_path = "src/main.rs";
+        assert_eq!(recursive.items[0].text, main_path);
+        assert!(recursive
+            .items
+            .iter()
+            .all(|item| !item.text.contains("ignored") && !item.text.contains(".git")));
+
+        assert!(provider
+            .get_suggestions("@ignored", "@ignored".len())
+            .is_none());
+        let spaced = provider
+            .get_suggestions("@my", "@my".len())
+            .expect("a spaced file should be searchable");
+        assert_eq!(spaced.items[0].text, "\"my notes.txt\"");
     }
 
     #[test]
