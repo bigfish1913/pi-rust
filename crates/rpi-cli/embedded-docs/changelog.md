@@ -11,6 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.22.1](https://github.com/bigfish1913/pi-rust/compare/v0.22.0...v0.22.1) - 2026-11-11
+
+### Fixed
+
+- *(tui)* align @ file completion and preserve streamed replies ([#303](https://github.com/bigfish1913/pi-rust/pull/303))
+
 ## [0.22.0](https://github.com/bigfish1913/pi-rust/compare/v0.21.2...v0.22.0) - 2026-11-10
 
 ### Added

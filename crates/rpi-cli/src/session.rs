@@ -634,7 +634,7 @@ pub fn prepare_extensions(
         }
         report_deferred_renderers(&extension_session);
     }
-    validate_durable_extensions(args, &extension_session).map_err(BuildError::HarnessCreate)?;
+    validate_durable_extensions(&extension_session).map_err(BuildError::HarnessCreate)?;
     // Publish the extension registry so `ListCommands` can enumerate slash
     // commands. Done here rather than at host construction because the registry
     // only exists after extensions load; `/reload` republishes the new snapshot
@@ -746,7 +746,7 @@ pub async fn build_prepared(
     let ctx =
         ExecutionToolContext::new(env_dyn.clone(), Some(mut_env)).with_file_io(file_io.clone());
 
-    validate_durable_extensions(args, &extension_session).map_err(BuildError::HarnessCreate)?;
+    validate_durable_extensions(&extension_session).map_err(BuildError::HarnessCreate)?;
     let durable_binding = Arc::new(std::sync::OnceLock::new());
     let mut tools = build_tools_bound(&ctx, args, durable_binding.clone());
 
@@ -2587,15 +2587,10 @@ fn load_extensions_from_dirs(
 
 /// The host permanently owns both durable public names.
 /// Refuse rather than override, fall back to, or dual-write a legacy extension
-/// implementation. The core native durable feature may still be disabled; that
-/// does not make the reserved names available to extensions.
-fn validate_durable_extensions(args: &Args, session: &ExtensionSession) -> Result<(), String> {
-    if args.native_durable && session.owns_stdio() {
-        return Err(
-            "--native-durable requires the native host; stdio-owning extensions are unsupported"
-                .into(),
-        );
-    }
+/// implementation. Stdio ownership is independent: adapters such as ACP and
+/// Web use it only to keep their protocol/server lifecycle alive while the
+/// native host still owns session durability.
+fn validate_durable_extensions(session: &ExtensionSession) -> Result<(), String> {
     if let Some(snapshot) = session.snapshot() {
         if reserved_durable_name(
             snapshot.tools().iter().map(|tool| tool.tool.name.as_str()),

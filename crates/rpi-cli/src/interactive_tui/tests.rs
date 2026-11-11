@@ -5353,7 +5353,7 @@ fn final_review_pr106_enter_path_completion_must_preserve_the_parent_directory()
     std::fs::write(&completed, "review fixture").unwrap();
     assert!(!temporary.path().join("report.txt").exists());
     let prefix = format!("@{}", nested.join("repo").display());
-    let expected = format!("@{} ", completed.display());
+    let expected = format!("@{} ", completed.display()).replace('\\', "/");
     let state = test_tui_state();
     state
         .autocomplete
@@ -5505,7 +5505,7 @@ fn final_review_pr106_path_segment_covers_the_text_after_the_caret() {
     );
     assert_eq!(
         editor.get_text(),
-        format!("@{} ", completed.display()),
+        format!("@{} ", completed.display()).replace('\\', "/"),
         "the whole basename segment is completed, not just the part before the caret"
     );
 
@@ -5762,7 +5762,7 @@ fn final_review_pr106_tab_path_completion_must_preserve_the_parent_directory() {
     );
     assert_eq!(
         editor.get_text(),
-        format!("@{} ", report.display()),
+        format!("@{} ", report.display()).replace('\\', "/"),
         "Tab must complete the basename without discarding the directory"
     );
 
