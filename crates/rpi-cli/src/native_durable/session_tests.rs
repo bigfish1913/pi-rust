@@ -40,14 +40,11 @@ fn host_durable_names_are_reserved_even_when_native_durable_is_disabled() {
     );
     let default_error = validate_durable_extensions(&session).unwrap_err();
     assert!(default_error.contains("host-reserved"));
-    assert!(validate_durable_extensions(&session)
-        .unwrap_err()
-        .contains("host-reserved"));
     assert!(validate_durable_extensions(&ExtensionSession::none()).is_ok());
 }
 
 #[test]
-fn stdio_owning_extensions_can_coexist_with_native_durable() {
+fn stdio_owning_adapters_can_coexist_with_native_durable() {
     let mut registry = rpi_extensions::ExtensionRegistry::new();
     assert!(registry.apply_declaration_json(r#"{"ownsStdio":true}"#));
     let session = ExtensionSession::from_parts(

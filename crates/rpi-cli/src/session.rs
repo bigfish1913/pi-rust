@@ -2587,9 +2587,9 @@ fn load_extensions_from_dirs(
 
 /// The host permanently owns both durable public names.
 /// Refuse rather than override, fall back to, or dual-write a legacy extension
-/// implementation. Stdio ownership is independent: extensions such as rpi-web
-/// use it only to keep their server lifecycle alive while the native host still
-/// owns session durability.
+/// implementation. Stdio ownership is independent: adapters such as ACP and
+/// Web use it only to keep their protocol/server lifecycle alive while the
+/// native host still owns session durability.
 fn validate_durable_extensions(session: &ExtensionSession) -> Result<(), String> {
     if let Some(snapshot) = session.snapshot() {
         if reserved_durable_name(
