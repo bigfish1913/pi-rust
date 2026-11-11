@@ -301,7 +301,7 @@ jobs:
         run: |
           set -euo pipefail
           install_musl_tools() {
-            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get update -o Acquire::Retries=3 || return $?
             sudo apt-get install --yes --no-install-recommends \
               -o Acquire::Retries=3 musl-tools
           }
