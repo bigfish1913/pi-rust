@@ -69,6 +69,7 @@ tempfile = "3"
 regex = "1"
 semver = "1"
 globset = "=0.4.15"
+ignore = "0.4"
 dirs = "5"
 rpassword = "7"
 
