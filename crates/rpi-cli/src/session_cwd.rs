@@ -67,6 +67,44 @@ pub fn missing_session_cwd_note(recorded: &Path, fallback: &Path) -> String {
     )
 }
 
+/// Whether two paths name the same directory.
+///
+/// Deciding whether a restore "moved" the run cannot be a textual `==`: the
+/// launch cwd comes from `current_dir` while the recorded one was written by an
+/// earlier run, and the two disagree in spelling for the same directory
+/// (symlinked homes, `..` segments, trailing separators, Windows case). Compare
+/// canonical forms instead, falling back to the addressed paths when either
+/// side cannot be canonicalized (a path that is not there has no identity to
+/// resolve).
+pub(crate) fn is_same_directory(left: &Path, right: &Path) -> bool {
+    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+    match (canonical(left), canonical(right)) {
+        (Some(left), Some(right)) => paths_equal(&left, &right),
+        _ => paths_equal(left, right),
+    }
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    if cfg!(windows) {
+        left.to_string_lossy()
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"))
+    } else {
+        left == right
+    }
+}
+
+/// Returns `None` when the recorded directory IS the launch directory: `-c` in
+/// the project the session was created in adopts nothing, and printing the
+/// adoption note would be a false alarm on every ordinary resume. The formatter
+/// itself stays a plain `String` so the public API does not change.
+pub(crate) fn moved_session_cwd_note(launch: &Path, adopted: &Path) -> Option<String> {
+    if is_same_directory(launch, adopted) {
+        return None;
+    }
+    Some(adopted_session_cwd_note(launch, adopted))
+}
+
 /// The one-line transcript note for a session adopted from another directory.
 ///
 /// Restoring a conversation moves the whole run — tools, system prompt, context
@@ -237,6 +275,39 @@ mod tests {
             adopted_session_cwd_note(Path::new("/launch/project"), Path::new("/other/project"));
         assert!(note.contains("/other/project"), "{note}");
         assert!(note.contains("/launch/project"), "{note}");
+        assert!(note.contains("where it was created"), "{note}");
+    }
+
+    /// `-c` in the directory the session was created in adopts that same
+    /// directory. There is no behaviour change to report, and announcing one
+    /// would fire on every ordinary resume (rpi-web restores repeatedly, so it
+    /// repeated the line for every restored session).
+    #[test]
+    fn adopting_the_launch_directory_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(moved_session_cwd_note(dir.path(), dir.path()), None);
+
+        // The same directory reached by a different spelling is still the
+        // launch directory: the recorded cwd was written by an earlier run, so
+        // a textual comparison is not enough (trailing separator, `.`, `..`).
+        let spelled = dir.path().join("sub").join("..");
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        assert_eq!(
+            moved_session_cwd_note(dir.path(), &spelled),
+            None,
+            "{} vs {}",
+            dir.path().display(),
+            spelled.display()
+        );
+        let mut trailing = dir.path().as_os_str().to_os_string();
+        trailing.push(std::path::MAIN_SEPARATOR_STR);
+        assert_eq!(
+            moved_session_cwd_note(dir.path(), Path::new(&trailing)),
+            None
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        let note = moved_session_cwd_note(dir.path(), elsewhere.path())
+            .expect("a genuinely different directory must still be announced");
         assert!(note.contains("where it was created"), "{note}");
     }
 }

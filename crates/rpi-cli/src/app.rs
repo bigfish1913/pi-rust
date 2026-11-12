@@ -334,7 +334,10 @@ async fn run_inner() -> i32 {
             Some(adopted) => {
                 // Adopting a directory is a behaviour change the user must see:
                 // tools, context files, and extensions all switch projects.
-                startup_notices.push(crate::session_cwd::adopted_session_cwd_note(
+                // `-c` in the project the session was created in adopts nothing
+                // (`adopted` IS `launch_cwd`), so the note is only produced for
+                // a real move.
+                startup_notices.extend(crate::session_cwd::moved_session_cwd_note(
                     &launch_cwd,
                     adopted,
                 ));
@@ -355,7 +358,7 @@ async fn run_inner() -> i32 {
     // Trust is resolved against the (possibly adopted) cwd: a session recorded
     // in another project must not inherit the launch directory's trust decision.
     let project_trusted = crate::session::resolve_project_trust(&parsed, &cwd);
-    if !project_trusted && cwd != launch_cwd {
+    if !project_trusted && !crate::session_cwd::is_same_directory(&cwd, &launch_cwd) {
         startup_notices.push(crate::session_cwd::untrusted_session_cwd_note(&cwd));
     }
     // Development preflight precedes prepare_extensions: protect its registry
