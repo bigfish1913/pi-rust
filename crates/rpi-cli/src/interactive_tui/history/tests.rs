@@ -89,7 +89,7 @@ fn update_notices_mount_before_live_transcript_slot() {
     );
 
     let children = chat.get_children();
-    assert_eq!(children.len(), 3);
+    assert_eq!(children.len(), 4); // Includes the reserved regular update hint.
     let updates: Arc<dyn Component> = history.updates.clone();
     let active: Arc<dyn Component> = history.active.clone();
     let panels: Arc<dyn Component> = history.panels.clone();
@@ -129,7 +129,7 @@ async fn pages_replace_not_accumulate_and_release_old_components_and_search() {
     finish_request(&state).await;
     assert!(text(&state).contains("history-entry-122"));
     assert!(!text(&state).contains("history-entry-072"));
-    assert_eq!(state.chat_container.child_count(), 4);
+    assert_eq!(state.chat_container.child_count(), 5); // Includes reserved hint.
 }
 
 #[tokio::test]
@@ -313,7 +313,7 @@ async fn repeated_restore_replaces_the_page_and_mounts_live_user_messages() {
     let old_page = Arc::downgrade(&state.chat_container.get_children()[1]);
     restore_bound(&state, &state.chat_container).await;
     assert!(old_page.upgrade().is_none());
-    assert_eq!(state.chat_container.child_count(), 4);
+    assert_eq!(state.chat_container.child_count(), 5); // Includes reserved hint.
     state.set_status(RunStatus::Working);
     state.transcript_view().add_user("visible-live-user");
     assert!(text(&state).contains("visible-live-user"));
@@ -349,12 +349,12 @@ async fn repeated_page_failures_keep_one_notice_and_preserve_the_page() {
         request(state.clone(), tui.clone(), Direction::Older);
         finish_request(&state).await;
         assert!(Arc::ptr_eq(&page, &state.chat_container.get_children()[1]));
-        assert_eq!(state.chat_container.child_count(), 5);
+        assert_eq!(state.chat_container.child_count(), 6); // Reserved hint + failure.
         assert_eq!(text(&state).matches("Could not load history").count(), 1);
     }
     request(state.clone(), tui.clone(), Direction::Latest);
     finish_request(&state).await;
-    assert_eq!(state.chat_container.child_count(), 4);
+    assert_eq!(state.chat_container.child_count(), 5); // Includes reserved hint.
     assert!(!text(&state).contains("Could not load history"));
 }
 

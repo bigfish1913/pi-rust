@@ -266,6 +266,8 @@ impl ToolExecutionComponent {
             return Vec::new();
         }
         let colors = &theme.colors;
+        let regular = crate::render::is_main_screen_frame();
+        let expanded = *self.expanded.lock().unwrap();
         if let Some((plan, active)) = self.plan_state.lock().unwrap().as_ref() {
             let status = if *active {
                 "Planning"
@@ -279,6 +281,20 @@ impl ToolExecutionComponent {
                 width,
                 "…",
             )];
+            if regular && !expanded {
+                // Mutable panels belong near the editor, not across several
+                // screens of native history. Explicit expansion still shows
+                // the complete plan; fullscreen keeps its existing preview.
+                rows[0] = truncate_to_width(
+                    &colors
+                        .accent
+                        .fg(&bold(&format!(" Plan · {status} · Ctrl+O or /plan show"))),
+                    width,
+                    "…",
+                );
+                rows.push(String::new());
+                return rows;
+            }
             if plan.trim().is_empty() {
                 let hint = if *active {
                     "Inspect the repository, then complete the plan."
@@ -295,7 +311,6 @@ impl ToolExecutionComponent {
             } else {
                 let content = crate::markdown::Markdown::new(plan.clone(), 0, 0)
                     .render(width.saturating_sub(2).max(1));
-                let expanded = *self.expanded.lock().unwrap();
                 let shown = if expanded {
                     content.len()
                 } else {
@@ -315,6 +330,13 @@ impl ToolExecutionComponent {
                     ));
                 }
             }
+            if regular {
+                // An explicitly expanded body may have scrolled its heading
+                // away. Keep the current status at its tail, never by rewriting
+                // an already-saved heading in the native terminal buffer.
+                let heading = rows.remove(0);
+                rows.push(heading);
+            }
             // Trailing spacer (one convention for every panel: each transcript
             // entry ends with its own blank row; nothing adds a leading one).
             rows.push(String::new());
@@ -331,6 +353,31 @@ impl ToolExecutionComponent {
                 width,
                 "…",
             )];
+            if regular && !expanded {
+                rows[0] = truncate_to_width(
+                    &colors.tool_title.fg(&bold(&format!("{heading} · Ctrl+O"))),
+                    width,
+                    "…",
+                );
+                if let Some((text, _)) = todos
+                    .iter()
+                    .find(|(_, status)| status == "in_progress")
+                    .or_else(|| todos.iter().find(|(_, status)| status != "completed"))
+                {
+                    let label: String = strip_ansi(text)
+                        .chars()
+                        .map(|c| if c.is_whitespace() { ' ' } else { c })
+                        .filter(|c| !c.is_control())
+                        .collect();
+                    rows.push(truncate_to_width(
+                        &colors.tool_output.fg(&format!("   {label}")),
+                        width,
+                        "…",
+                    ));
+                }
+                rows.push(String::new());
+                return rows;
+            }
             if todos.is_empty() {
                 rows.push(colors.muted.fg("   No tasks"));
             }
@@ -356,6 +403,10 @@ impl ToolExecutionComponent {
                         "…",
                     ));
                 }
+            }
+            if regular {
+                let heading = rows.remove(0);
+                rows.push(heading);
             }
             // Trailing spacer (one convention for every panel; see the plan
             // arm above).
@@ -1196,6 +1247,53 @@ mod tools {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn current_regular_panels_are_bounded_but_explicit_expansion_and_fullscreen_keep_details() {
+        use super::*;
+        let todo = ToolExecutionComponent::new("todo", "{}");
+        let mut tasks = (0..30)
+            .map(|i| (format!("task-{i:02}\nlong detail"), "pending".to_string()))
+            .collect::<Vec<_>>();
+        tasks[24].1 = "in_progress".into();
+        todo.set_todo_state(tasks);
+        let fullscreen = todo.render(60);
+        assert!(fullscreen.len() > 30);
+        let compact = crate::render::with_main_screen_frame(|| todo.render(60));
+        assert!(compact.len() <= 3);
+        assert!(strip_ansi(&compact.join("\n")).contains("task-24 long detail"));
+        assert!(!strip_ansi(&compact.join("\n")).contains("task-00"));
+        assert_eq!(
+            todo.render(60),
+            fullscreen,
+            "mode-specific cache must not leak"
+        );
+        todo.set_expanded(true);
+        let expanded = crate::render::with_main_screen_frame(|| todo.render(60));
+        assert!(strip_ansi(&expanded.join("\n")).contains("task-29"));
+        assert!(strip_ansi(&expanded[expanded.len() - 2]).contains("0/30 completed"));
+        let plan = ToolExecutionComponent::new("plan", "{}");
+        plan.set_plan_state(
+            (0..30)
+                .map(|i| format!("- step-{i:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            true,
+        );
+        let compact = crate::render::with_main_screen_frame(|| plan.render(60));
+        assert_eq!(compact.len(), 2);
+        assert!(strip_ansi(&compact[0]).contains("Plan · Planning"));
+        plan.set_expanded(true);
+        let expanded = crate::render::with_main_screen_frame(|| plan.render(60));
+        assert!(strip_ansi(&expanded.join("\n")).contains("step-29"));
+        assert!(strip_ansi(&expanded[expanded.len() - 2]).contains("Plan · Planning"));
+        plan.set_plan_state("- final plan".into(), false);
+        plan.set_expanded(false);
+        assert!(
+            strip_ansi(&crate::render::with_main_screen_frame(|| plan.render(60)).join("\n"))
+                .contains("Plan · Ready")
+        );
+    }
+
     #[test]
     fn regular_panels_have_stable_running_headers_and_keep_final_elapsed() {
         use super::*;

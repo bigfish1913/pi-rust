@@ -185,6 +185,8 @@ pub struct TuiAltScreen {
     /// own scrollback (upstream's default `regular` mode).
     main_screen_mode: Mutex<bool>,
     main_hardware_row: Mutex<usize>,
+    /// Logical row at physical screen row zero, NOT the number of saved rows.
+    /// Reconciliation rebases this mapping without touching native snapshots.
     main_viewport_top: Mutex<usize>,
     main_previous_cursor: Mutex<Option<(usize, usize)>>,
     /// Force live rows to repaint without forgetting the saved document or
@@ -220,6 +222,128 @@ pub struct TuiAltScreen {
     /// global, which a second screen, a reconnect, or a terminal restart would
     /// silently invalidate.
     kitty_uploads: Mutex<crate::terminal_image::KittyUploads>,
+}
+
+/// Locate the old live-screen boundary in a revised logical document. The
+/// unchanged prefix/suffix handles page eviction and late header insertion.
+/// If an old edit and new tail growth share a frame, a unique live-row anchor
+/// lets growth remain incremental instead of silently clipping new output.
+fn main_screen_live_anchor(previous: &[String], current: &[String], top: usize) -> Option<usize> {
+    let prefix = previous
+        .iter()
+        .zip(current)
+        .take_while(|(old, new)| old == new)
+        .count();
+    if top <= prefix {
+        return Some(top.min(current.len()));
+    }
+    let suffix = previous[prefix..]
+        .iter()
+        .rev()
+        .zip(current[prefix..].iter().rev())
+        .take_while(|(old, new)| old == new)
+        .count();
+    if top >= previous.len() - suffix {
+        return Some(current.len() - suffix + top - (previous.len() - suffix));
+    }
+    // A blank or a single repeated row is not a reliable content identity.
+    let anchor = previous.get(top..top.checked_add(3)?)?;
+    if anchor.iter().filter(|row| !row.trim().is_empty()).count() < 2 {
+        return None;
+    }
+    if previous
+        .windows(anchor.len())
+        .filter(|window| *window == anchor)
+        .take(2)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let mut matches = current
+        .windows(anchor.len())
+        .enumerate()
+        .filter_map(|(row, window)| (window == anchor).then_some(row));
+    let row = matches.next()?;
+    matches.next().is_none().then_some(row)
+}
+
+/// If all old live rows were removed, locate the latest surviving saved
+/// block. A unique three-row block avoids mistaking repeated blank/log rows
+/// for message identity. Current rows preceding this cutoff are snapshots,
+/// not output to replay after a collapse, edit or page deletion.
+fn main_screen_saved_anchor(previous: &[String], current: &[String], top: usize) -> Option<usize> {
+    let mut blocks = std::collections::HashMap::new();
+    for block in previous[..top].windows(3) {
+        if block.iter().filter(|row| !row.trim().is_empty()).count() < 2 {
+            continue;
+        }
+        let key = (block[0].as_str(), block[1].as_str(), block[2].as_str());
+        blocks
+            .entry(key)
+            .and_modify(|entry: &mut (bool, Option<usize>)| entry.0 = false)
+            .or_insert((true, None));
+    }
+    for (row, block) in current.windows(3).enumerate() {
+        let key = (block[0].as_str(), block[1].as_str(), block[2].as_str());
+        if let Some((unique, at)) = blocks.get_mut(&key) {
+            if at.is_some() {
+                *unique = false;
+            }
+            *at = Some(row + 3);
+        }
+    }
+    blocks
+        .values()
+        .filter_map(|(unique, at)| unique.then_some(*at).flatten())
+        .max()
+}
+
+/// Choose a live boundary from positional correspondence when content anchors
+/// are ambiguous. The previous live rows are the publication frontier; a saved
+/// anchor must not move that frontier backwards. A positional prefix ending
+/// before the old live view is treated as a collapsed prefix only when none of
+/// the old live rows survive at their positions, which covers collapse-plus-
+/// append without mistaking a saved edit for new output.
+fn main_screen_positional_frontier(
+    previous: &[String],
+    current: &[String],
+    top: usize,
+) -> Option<usize> {
+    if previous.is_empty() || current.is_empty() {
+        return None;
+    }
+    let comparable = previous.len().min(current.len());
+    let live_start = top.min(comparable);
+    let live_survives = (live_start..comparable).any(|row| previous[row] == current[row]);
+    if current.len() <= previous.len() {
+        // Equal-length frames are repairs, not publication growth. Shrinking
+        // frames need the existing content/saved-anchor policy because a
+        // positional truncation alone cannot tell a collapsed panel from a
+        // live tail that should be cleared.
+        return (current.len() == previous.len()).then_some(top.min(current.len()));
+    }
+    if live_survives {
+        return Some(top.min(current.len()));
+    }
+
+    let prefix = previous
+        .iter()
+        .zip(current)
+        .take_while(|(old, new)| old == new)
+        .count();
+    if prefix > 0 && prefix < top && prefix < previous.len() {
+        return Some(prefix);
+    }
+    Some(top.min(current.len()))
+}
+
+fn normalize_main_screen_lines(mut lines: Vec<String>) -> Vec<String> {
+    for line in &mut lines {
+        *line = line.replace(CURSOR_MARKER, "");
+    }
+    strip_thinking_region_markers(&mut lines);
+    lines
 }
 
 impl TuiAltScreen {
@@ -414,6 +538,15 @@ impl TuiAltScreen {
             .lock()
             .map(|mode| *mode)
             .unwrap_or(false)
+    }
+
+    /// Publish a synchronous batch of component-tree changes between frames.
+    /// Build expensive replacement components before entering this closure.
+    /// Do not render, request a render, or await inside the update. Acquire this
+    /// gate before taking any component locks that rendering also needs.
+    pub fn update_components<R>(&self, update: impl FnOnce() -> R) -> R {
+        let _render_guard = self.render_lock.lock().unwrap();
+        update()
     }
 
     /// Set the layout root component.
@@ -716,7 +849,7 @@ impl TuiAltScreen {
         }
         // Alt-screen frames need every row repainted: the terminal reflowed the
         // old frame, so it can no longer be patched cell by cell. Main-screen
-        // mode keeps its document and rebuilds it when it sees the size change.
+        // mode keeps its document and reconciles only the live tail.
         if !self.uses_main_screen() {
             if let Ok(mut prev) = self.previous_screen.lock() {
                 prev.clear();
@@ -889,6 +1022,11 @@ impl TuiAltScreen {
         terminal.refresh_size();
         let width = terminal.columns();
         let height = terminal.rows();
+        if width == 0 || height == 0 {
+            // No physical screen to paint. Preserve the baseline and pending
+            // resize/forced repaint until the terminal is usable again.
+            return;
+        }
         // The main screen is the other half of the same invariant: an image's
         // row count is derived from the cell geometry, so a document laid out
         // for a stale geometry is wrong even when the columns did not move.
@@ -909,16 +1047,11 @@ impl TuiAltScreen {
             line.find(CURSOR_MARKER)
                 .map(|idx| (row, visible_width(&line[..idx])))
         });
-        let lines: Vec<String> = raw_lines
-            .into_iter()
-            .map(|line| line.replace(CURSOR_MARKER, ""))
-            .collect();
         // Main screen mode deliberately never enables click regions (its rows
         // belong to native scrollback and cannot be hit-tested), but its
         // renderer must still strip the markers: an assistant message carries
         // them on its thinking rows in every mode.
-        let mut lines = lines;
-        strip_thinking_region_markers(&mut lines);
+        let lines = normalize_main_screen_lines(raw_lines);
         let previous = self
             .previous_screen
             .lock()
@@ -929,71 +1062,126 @@ impl TuiAltScreen {
         let (previous_width, previous_height) = *self.painted_size.lock().unwrap();
         let previous_cells = *self.painted_cells.lock().unwrap();
         let previous_cursor = *self.main_previous_cursor.lock().unwrap();
-        terminal.write(&crate::terminal_image::removed_kitty_placements(
-            &previous, &lines,
-        ));
 
-        let mut first_changed = None;
-        let mut last_changed = None;
-        for index in 0..previous.len().max(lines.len()) {
-            if previous.get(index) != lines.get(index) {
-                first_changed.get_or_insert(index);
-                last_changed = Some(index);
-            }
-        }
+        let canonical_changed = previous != lines;
         let viewport_top = *self.main_viewport_top.lock().unwrap();
         let force_repaint = self.main_force_repaint.swap(false, Ordering::AcqRel);
-        if force_repaint && !previous.is_empty() {
-            let first = viewport_top.min(lines.len().saturating_sub(1));
-            first_changed = Some(first_changed.map_or(first, |changed| changed.min(first)));
-            let last = lines.len().saturating_sub(1);
-            last_changed = Some(last_changed.map_or(last, |changed| changed.max(last)));
-        }
-        let changed_in_scrollback = first_changed.is_some_and(|first| {
-            first < viewport_top || lines.len().saturating_sub(1) < viewport_top
-        });
-
-        // Saved scrollback cannot be addressed by cursor movement or CSI T:
-        // SD only inserts blanks in the live screen. Rebuild the document when
-        // an old row changes, otherwise repainting its tail appends duplicate
-        // history until a bounded terminal buffer evicts the conversation start.
-        // Size changes also require a rebuild; ordinary screen-local updates
-        // remain incremental.
-        if (previous_width != 0 && previous_width != width)
-            || (previous_height != 0 && previous_height != height)
-            || previous_cells != cells
-            || changed_in_scrollback
+        let resize_dirty = self.resize_dirty.swap(false, Ordering::AcqRel);
+        // An empty logical document can follow a real paint (page eviction,
+        // clear, collapsed panels). It must not start a second initial replay.
+        let initialized = previous_width != 0 && previous_height != 0;
+        let anchor = if canonical_changed {
+            main_screen_live_anchor(&previous, &lines, viewport_top)
+        } else {
+            Some(viewport_top)
+        };
+        let saved_anchor = if anchor.is_none() {
+            main_screen_saved_anchor(&previous, &lines, viewport_top)
+        } else {
+            None
+        };
+        let old_live = previous.get(viewport_top..).unwrap_or_default();
+        let layout_only_reflow = initialized && previous_width != width && {
+            let old_width_raw = crate::render::with_main_screen_frame(|| {
+                crate::terminal_image::with_frame_cell_geometry(previous_cells, || {
+                    root.render(previous_width)
+                })
+            });
+            normalize_main_screen_lines(old_width_raw) == previous
+        };
+        let positional_top = if anchor.is_none() && !layout_only_reflow {
+            main_screen_positional_frontier(&previous, &lines, viewport_top)
+        } else {
+            None
+        };
+        let mapped_top = if layout_only_reflow {
+            lines.len().saturating_sub(height)
+        } else if let Some(positional_top) = positional_top {
+            positional_top
+        } else {
+            anchor.or(saved_anchor).unwrap_or_else(|| {
+                // A collapsed/replaced historical panel has no surviving live
+                // anchor. Its unchanged prefix was already emitted: do not pull
+                // those saved message rows back onto the screen as duplicates.
+                previous
+                    .iter()
+                    .zip(&lines)
+                    .take_while(|(old, new)| old == new)
+                    .count()
+            })
+        };
+        let reconcile_tail = initialized
+            && (previous_width != width
+                || previous_height != height
+                || previous_cells != cells
+                || resize_dirty
+                || force_repaint
+                || anchor.is_none()
+                || lines.len().saturating_sub(mapped_top) < old_live.len());
+        let next_top = if reconcile_tail
+            && anchor.or(saved_anchor).is_none()
+            && positional_top.is_none()
+            && !layout_only_reflow
         {
+            mapped_top.max(lines.len().saturating_sub(height))
+        } else {
+            mapped_top
+        };
+        let new_live = &lines[next_top..];
+        let mut first_changed = None;
+        let mut last_changed = None;
+        for row in 0..old_live.len().max(new_live.len()) {
+            if old_live.get(row) != new_live.get(row) {
+                first_changed.get_or_insert(next_top + row);
+                last_changed = Some(next_top + row);
+            }
+        }
+        // Only live placements belong to the mutable screen. Removing a
+        // logical page must not delete images from already-emitted snapshots.
+        terminal.write(&crate::terminal_image::removed_kitty_placements(
+            old_live, new_live,
+        ));
+
+        if reconcile_tail {
+            // Native saved rows are immutable snapshots: CUP/CSI T cannot
+            // reach them. Never erase/replay history to patch an old status,
+            // late notice, Markdown reflow or evicted page. Repaint only the
+            // mutable suffix and rebase its LOGICAL coordinates. A reliable
+            // anchor can include unpublished growth: emit ALL of it, even on
+            // a forced/resize frame. Only real forward overflow saves rows;
+            // repairing an equal-sized live suffix never advances scrollback.
             terminal.write("\x1b[?2026h");
-            terminal.write("\x1b[2J\x1b[H\x1b[3J");
+            terminal.write("\x1b[2J\x1b[H");
             self.invalidate_kitty_uploads();
-            terminal.write(&lines.join("\r\n"));
+            terminal.write(&lines[next_top..].join("\r\n"));
             terminal.write("\x1b[?2026l");
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
-            *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
-        } else if previous.is_empty() {
+            *self.main_viewport_top.lock().unwrap() =
+                next_top.max(lines.len().saturating_sub(height));
+        } else if !initialized {
             terminal.write("\x1b[?2026h");
             terminal.write(&lines.join("\r\n"));
             terminal.write("\x1b[?2026l");
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else {
-            if first_changed.is_none() && cursor == previous_cursor {
+            if first_changed.is_none() && cursor == previous_cursor && !canonical_changed {
                 return;
             }
+            // Rebase logical coordinates without moving the terminal cursor.
+            let physical_row = self
+                .main_hardware_row
+                .lock()
+                .unwrap()
+                .saturating_sub(viewport_top);
+            *self.main_hardware_row.lock().unwrap() = next_top + physical_row;
+            *self.main_viewport_top.lock().unwrap() = next_top;
             if let (Some(first), Some(last)) = (first_changed, last_changed) {
                 let mut hardware_row = *self.main_hardware_row.lock().unwrap();
                 let mut viewport_top = *self.main_viewport_top.lock().unwrap();
                 let viewport_bottom = viewport_top + height.saturating_sub(1);
-                let deleted_tail_only = first >= lines.len();
-                let append_start = first == previous.len() && first > 0;
-                let move_target = if deleted_tail_only {
-                    lines.len().saturating_sub(1)
-                } else if append_start {
-                    first - 1
-                } else {
-                    first
-                };
+                let append_start = first == next_top + old_live.len() && first > next_top;
+                let move_target = if append_start { first - 1 } else { first };
                 let mut output = String::from("\x1b[?2026h");
                 if move_target > viewport_bottom {
                     let current_screen = hardware_row
@@ -1017,69 +1205,27 @@ impl TuiAltScreen {
                 }
                 output.push_str(if append_start { "\r\n" } else { "\r" });
                 let render_end = last.min(lines.len().saturating_sub(1));
-                if !deleted_tail_only {
-                    for index in first..=render_end {
-                        if index > first {
-                            output.push_str("\r\n");
+                for index in first..=render_end {
+                    if index > first {
+                        output.push_str("\r\n");
+                    }
+                    let old = old_live.get(index - next_top);
+                    if let Some((column, text)) =
+                        old.and_then(|old| crate::line_diff::patch(old, &lines[index]))
+                    {
+                        if column > 0 {
+                            output.push_str(&format!("\x1b[{column}C"));
                         }
-                        if force_repaint {
-                            // Repair unknown cells beyond the logical line too.
-                            // Clear before writing: ED/EL after a full-width row
-                            // can erase its last cell on pending-wrap terminals.
-                            output.push_str("\x1b[2K");
-                        }
-                        if let Some((column, text)) = previous
-                            .get(index)
-                            .filter(|_| !force_repaint)
-                            .and_then(|old| crate::line_diff::patch(old, &lines[index]))
+                        output.push_str(&text);
+                    } else {
+                        output.push_str(&lines[index]);
+                        if old.is_some_and(|old| visible_width(&lines[index]) < visible_width(old))
                         {
-                            if column > 0 {
-                                output.push_str(&format!("\x1b[{column}C"));
-                            }
-                            output.push_str(&text);
-                        } else {
-                            output.push_str(&lines[index]);
-                            if index < previous.len()
-                                && visible_width(&lines[index]) < visible_width(&previous[index])
-                            {
-                                output.push_str("\x1b[K");
-                            }
+                            output.push_str("\x1b[K");
                         }
                     }
                 }
-                let mut final_row = render_end;
-                if previous.len() > lines.len() {
-                    let extra_lines = previous.len() - lines.len();
-                    let clear_start_offset = usize::from(!lines.is_empty());
-                    if clear_start_offset > 0 {
-                        output.push_str("\x1b[1B");
-                    }
-                    for index in 0..extra_lines {
-                        output.push_str("\r\x1b[2K");
-                        if index + 1 < extra_lines {
-                            output.push_str("\x1b[1B");
-                        }
-                    }
-                    let move_back = extra_lines.saturating_sub(1) + clear_start_offset;
-                    if move_back > 0 {
-                        output.push_str(&format!("\x1b[{move_back}A"));
-                    }
-                    if extra_lines > 0 {
-                        final_row = lines.len().saturating_sub(1);
-                    }
-                }
-                if force_repaint {
-                    // Short documents also own blank live rows below their
-                    // tail. Clear these without scrolling or erasing saved rows,
-                    // then return to the row recorded in the physical ledger.
-                    let unused = height.saturating_sub(final_row.saturating_sub(viewport_top) + 1);
-                    for _ in 0..unused {
-                        output.push_str("\x1b[1B\r\x1b[2K");
-                    }
-                    if unused > 0 {
-                        output.push_str(&format!("\x1b[{unused}A"));
-                    }
-                }
+                let final_row = render_end;
                 output.push_str("\x1b[?2026l");
                 terminal.write(&output);
                 let advanced = final_row.saturating_sub(viewport_top + height.saturating_sub(1));
@@ -2604,6 +2750,159 @@ mod tests {
             let rendered = output.lock().unwrap().clone();
             assert!(rendered.find("<stop>").unwrap() < rendered.find("\x1b[?1049l").unwrap());
         }
+    }
+
+    #[test]
+    fn component_updates_publish_between_complete_frames() {
+        use std::sync::mpsc;
+        for main_screen in [false, true] {
+            let terminal = ResizableTerminal::new(40, 8);
+            let output = terminal.output();
+            let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), true, None));
+            tui.set_main_screen_mode(main_screen);
+            let root = Arc::new(Container::new());
+            let history = (0..4)
+                .map(|row| format!("history-{row:03}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            root.add_child(Arc::new(Text::new(&history, 0, 0)));
+            tui.set_layout_root(Some(root.clone()));
+            tui.start_readerless();
+            output.lock().unwrap().clear();
+
+            let (started_tx, started_rx) = mpsc::channel();
+            let (painted_tx, painted_rx) = mpsc::channel();
+            let mut painter = None;
+            tui.update_components(|| {
+                assert!(matches!(
+                    tui.render_lock.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                root.clear();
+                let painting_tui = tui.clone();
+                painter = Some(std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    painting_tui.render_now(false);
+                    painted_tx.send(()).unwrap();
+                }));
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(painted_rx.try_recv().is_err());
+                assert!(output.lock().unwrap().is_empty());
+                root.add_child(Arc::new(Text::new(&history, 0, 0)));
+                root.add_child(Arc::new(Text::new("complete reply", 0, 0)));
+            });
+            // The queued renderer can only paint the completed tree, after the
+            // publisher releases the frame gate; neither mode may deadlock.
+            painted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            painter.unwrap().join().unwrap();
+            assert!(tui.render_lock.try_lock().is_ok());
+            let rendered = output.lock().unwrap().clone();
+            assert!(rendered.contains("complete reply"));
+            assert!(
+                !rendered.contains("\x1b[3J"),
+                "transient empty tree painted"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_live_text_cannot_alias_an_earlier_saved_block() {
+        let previous = ["a", "b", "c", "old-middle", "a", "b", "c", "old-tail"].map(str::to_string);
+        let current = ["a", "b", "c", "new-output-0", "new-output-1"].map(str::to_string);
+        // The sole remaining ABC is the saved copy, not an identity for the
+        // removed second ABC. Only the independently unique saved cutoff maps.
+        assert_eq!(main_screen_live_anchor(&previous, &current, 4), None);
+        assert_eq!(main_screen_saved_anchor(&previous, &current, 4), Some(3));
+    }
+
+    #[test]
+    fn main_screen_geometry_and_zero_size_never_replay_saved_rows() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let size = terminal.size();
+        let pixels = terminal.pixels();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_main_screen_mode(true);
+        let text = Arc::new(Text::new(
+            (0..80)
+                .map(|i| format!("saved-message-{i:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            0,
+            0,
+        ));
+        tui.set_layout_root(Some(text));
+        tui.start_readerless();
+        for dimensions in [(52, 12), (32, 6), (40, 8)] {
+            output.lock().unwrap().clear();
+            *size.lock().unwrap() = dimensions;
+            tui.request_render(false);
+            let frame = output.lock().unwrap().clone();
+            assert!(frame.contains("\x1b[2J"));
+            assert!(!frame.contains("\x1b[3J"));
+            assert!(!frame.contains("saved-message-000"));
+            assert!(frame.contains("saved-message-079"));
+            assert_eq!(*tui.painted_size.lock().unwrap(), dimensions);
+        }
+        output.lock().unwrap().clear();
+        *pixels.lock().unwrap() = Some((400, 160));
+        tui.request_render(false);
+        let frame = output.lock().unwrap().clone();
+        assert!(frame.contains("\x1b[2J"));
+        assert!(!frame.contains("\x1b[3J"));
+        assert!(!frame.contains("saved-message-000"));
+        output.lock().unwrap().clear();
+        let baseline = tui.previous_screen.lock().unwrap().clone();
+        *size.lock().unwrap() = (0, 0);
+        tui.main_force_repaint.store(true, Ordering::Release);
+        tui.note_resize();
+        assert!(output.lock().unwrap().is_empty());
+        assert_eq!(*tui.previous_screen.lock().unwrap(), baseline);
+        assert!(tui.main_force_repaint.load(Ordering::Acquire));
+        assert!(tui.resize_dirty.load(Ordering::Acquire));
+        *size.lock().unwrap() = (40, 8);
+        tui.request_render(false);
+        let frame = output.lock().unwrap().clone();
+        assert!(frame.contains("\x1b[2J"));
+        assert!(!frame.contains("\x1b[3J"));
+        assert!(!frame.contains("saved-message-000"));
+        assert!(!tui.resize_dirty.load(Ordering::Acquire));
+        assert!(!tui.main_force_repaint.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn main_screen_page_removal_preserves_saved_images_but_deletes_live_placements() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_main_screen_mode(true);
+        let placement = |id| {
+            crate::terminal_image::encode_kitty(
+                b"image-payload",
+                &crate::terminal_image::ImageRenderOptions {
+                    id: Some(id),
+                    width: Some(1),
+                    height: Some(1),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut lines = vec![placement(9903)];
+        lines.extend((1..40).map(|i| format!("image-row-{i:03}")));
+        lines.push(placement(9904));
+        tui.set_layout_root(Some(Arc::new(ImageTranscript {
+            lines: lines.clone(),
+        })));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+        lines.remove(0); // Archived image disappears from the logical page.
+        lines.pop(); // Current live image must still be removed.
+        tui.set_layout_root(Some(Arc::new(ImageTranscript { lines })));
+        tui.request_render(false);
+        let frame = output.lock().unwrap().clone();
+        assert!(!frame.contains(&crate::terminal_image::delete_kitty_placement(9903)));
+        assert!(frame.contains(&crate::terminal_image::delete_kitty_placement(9904)));
+        assert!(!frame.contains("\x1b[3J"));
     }
 
     #[test]
