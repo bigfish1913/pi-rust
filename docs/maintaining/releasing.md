@@ -86,7 +86,8 @@ a documentation-only merge.
 ### One-time setup
 
 The repository already uses `CARGO_REGISTRY_TOKEN` for crates.io. Add one secret,
-`RELEASE_AUTOMATION_TOKEN`, for preparing PRs and writing the external channels.
+`RELEASE_AUTOMATION_TOKEN`, for preparing PRs, refreshing README image dates via
+an ordinary PR, and writing the external channels.
 Use a maintainer or dedicated bot **classic PAT with `public_repo`**, with access
 to these public repositories:
 
@@ -103,7 +104,8 @@ Set it in repository Settings → Secrets and variables → Actions, or locally 
 input). Never put the token in a commit or PR description. The publishing jobs
 use the built-in `GITHUB_TOKEN` for this repository and the Cargo secret only in
 the crates publishing step. The automation token is only supplied to the steps
-that prepare PRs, request Auto-merge for the Release PR, or write channels.
+that prepare PRs (including the README image refresh), request Auto-merge for the
+Release PR, or write channels.
 
 Repository Settings must have **Allow auto-merge** enabled. The `main` Ruleset
 continues to protect the branch and must require the `Release PR validation`
@@ -114,10 +116,45 @@ remain manual.
 The binaries workflow is called directly after tag creation: a tag created with
 the built-in `GITHUB_TOKEN` does not start another push-triggered workflow.
 
+### Workflow reliability and required checks
+
+The required `Release PR validation` check aggregates every validation dependency
+for ordinary PRs as well as ready Release PRs. A resource, platform or extension
+compatibility failure must fail that check; it is not an advisory result. Only
+upstream draft Release PRs defer validation while being prepared, and their
+separate Cargo check/test names cannot satisfy the normal branch requirements.
+
+Linux x86_64 release and startup-smoke runners use `ubuntu-24.04`, keeping the
+release glibc baseline explicit. The historical resource benchmark also uses
+`ubuntu-24.04`: moving `ubuntu-latest` must not silently change the environment
+under an absolute latency budget. Normal check/test jobs retain `ubuntu-latest`
+coverage. Resource diagnostics include the OS, runner image, CPU and compiler;
+the modern/legacy budgets and complete 701000-frame workload remain enforced.
+A pinned runner reduces environment drift, not all hosted-runner contention: a
+repeatable failure on that runner still needs profiling, not a threshold bump.
+
+Both musl setup and extension native-dependency setup bound apt calls and retry
+failures. Partial index/DNS errors must fail `apt-get update` instead of allowing
+stale indexes to look successful. An existing musl compiler avoids apt access,
+but must still link and run a static probe. Release setup stays inline because
+recovery checks out an old tag that cannot contain a newly added helper script.
+
+The daily README image refresh updates `automation/readme-images` and creates or
+reuses an ordinary PR. It never pushes directly to protected `main`, requests
+a protection bypass, or uses `[skip ci]`. It reuses `RELEASE_AUTOMATION_TOKEN`
+because PRs created with `GITHUB_TOKEN` do not trigger normal CI. Missing token
+or API/push failure fails visibly. The PR still needs normal checks and a manual
+merge; only Release PRs receive automatic merge requests from repository bots.
+
 ### Recovery and release records
 
 - Re-run failed jobs on the Release PR's original main CI run. Existing crates
   are skipped by the release helper; an existing tag must match the same commit.
+- A re-run reuses the workflow file from the original commit, so it cannot pick
+  up an automation fix. When the binaries job was blocked by infrastructure (a
+  failed apt install, for example), dispatch **Release binaries** on `main`
+  with the already-published `tag` instead: the attach step updates an existing
+  release in place, and the tag and crates.io versions are left untouched.
 - For a channel failure, run **Release install channels** from Actions on `main`
   with the published tag. It verifies all six archives before regenerating
   manifests. Existing winget PRs/files are reused; closed submissions require

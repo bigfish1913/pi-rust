@@ -74,10 +74,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Release artifacts are pinned instead of using `ubuntu-latest`: the
+          # label moved to Ubuntu 26 in October 2026, so an unpinned gnu build
+          # silently raises the glibc floor and apt package availability can
+          # change under a release at any time.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             archive: tar.gz
           # GitHub-hosted arm64 Linux runners; available for public repos.
@@ -103,8 +107,42 @@ jobs:
 
       - name: Install musl linker
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install --yes musl-tools
-
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reuse a preinstalled compiler instead of needlessly hitting mirrors.
+          if ! command -v musl-gcc >/dev/null 2>&1; then
+            install_musl_tools() {
+              # apt-get update normally succeeds with stale indexes on DNS
+              # errors. Treat partial fetch failures as failures and bound each
+              # command, not just the backoff between attempts.
+              timeout 120s sudo apt-get update \
+                -o APT::Update::Error-Mode=any -o Acquire::Retries=2 \
+                -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || return $?
+              timeout 120s sudo apt-get install --yes --no-install-recommends \
+                -o Acquire::Retries=2 -o Acquire::http::Timeout=15 \
+                -o Acquire::https::Timeout=15 musl-tools
+            }
+            for attempt in 1 2 3; do
+              if install_musl_tools; then
+                break
+              fi
+              if (( attempt == 3 )); then
+                echo "::error::Could not install musl-tools after ${attempt} attempts."
+                exit 1
+              fi
+              echo "::warning::musl-tools install failed; retrying (attempt ${attempt}/3)."
+              sleep $(( attempt * 10 ))
+            done
+          fi
+          command -v musl-gcc
+          # Presence alone isn't enough: ensure the compiler links a runnable
+          # static binary before spending minutes on the Rust build.
+          probe="$RUNNER_TEMP/musl-linker-smoke"
+          printf 'int main(void) { return 0; }\n' | musl-gcc -static -x c - -o "$probe"
+          "$probe"
+          rm -f "$probe"
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:

@@ -9,6 +9,7 @@ mod enter_completion;
 mod native_durable;
 mod session_regressions;
 mod skill_commands;
+mod startup_wiring;
 mod updown_cursor;
 
 #[test]

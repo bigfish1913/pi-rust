@@ -995,12 +995,16 @@ where
                         let content = match content {
                             Ok(content) => content,
                             Err(error) => {
+                                active_task.store(false, std::sync::atomic::Ordering::Release);
+                                #[cfg(test)]
+                                if let Some(finished) = &_finished {
+                                    finished.0.observe_terminal(&active_task);
+                                }
                                 write_line(
                                     &out_task,
                                     &rpc_protocol::response(Some(id), &kind, Err(error)),
                                 )
                                 .await;
-                                active_task.store(false, std::sync::atomic::Ordering::Release);
                                 return;
                             }
                         };
@@ -1077,12 +1081,21 @@ where
                                 .and_then(|value| value.get("reclaimed"))
                                 .cloned(),
                         });
+                        // Settlement is the client's permission to start the next
+                        // run. Finish cleanup and release admission BEFORE publishing
+                        // it: the independent writer can expose an enqueued event
+                        // immediately. The dispatcher still joins this retained task
+                        // before starting its successor, preserving output ordering.
+                        mailbox_task.cancel_all();
+                        active_task.store(false, std::sync::atomic::Ordering::Release);
+                        #[cfg(test)]
+                        if let Some(finished) = &_finished {
+                            finished.0.observe_terminal(&active_task);
+                        }
                         let enqueue_timing =
                             RpcPhaseTiming::start(phase_diagnostics, "settled_enqueue");
                         write_line(&out_task, &settled).await;
                         enqueue_timing.finish();
-                        mailbox_task.cancel_all();
-                        active_task.store(false, std::sync::atomic::Ordering::Release);
                     }),
                     run_cancel.clone(),
                 ));

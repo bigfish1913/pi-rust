@@ -1,5 +1,9 @@
 # rpi — a Rust-native coding-agent runtime
 
+<p align="center">
+  <img src="docs/images/rpi-logo.jpg" width="240" alt="rpi project logo">
+</p>
+
 [![crates.io](https://img.shields.io/crates/v/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![downloads](https://img.shields.io/crates/d/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![docs.rs](https://docs.rs/rpi-cli/badge.svg)](https://docs.rs/rpi-cli)
@@ -542,7 +546,7 @@ Join us to ask questions, share ideas and try early builds.
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-09"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-09" width="230" alt="微信交流群二维码 / WeChat group QR code"></a><br>
+      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-12"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-12" width="230" alt="微信交流群二维码 / WeChat group QR code"></a><br>
       <sub><b>WeChat / 微信交流群</b> — 扫码加入 / Scan to join</sub>
     </td>
     <td align="center" width="50%">
