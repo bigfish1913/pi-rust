@@ -3078,8 +3078,10 @@ pub async fn interactive(
         .map(|v| v == "1")
         .unwrap_or(false);
     let code = if force_tui || crate::interactive_tui::is_tui_supported() {
-        // Use TUI-based interactive mode
-        crate::interactive_tui::interactive_tui(
+        // Use TUI-based interactive mode. The TUI future is intentionally
+        // heap-allocated: its large state machine otherwise overflows the
+        // default Windows main-thread stack before its body starts polling.
+        Box::pin(crate::interactive_tui::interactive_tui(
             harness,
             event_rx,
             args,
@@ -3090,7 +3092,7 @@ pub async fn interactive(
             theme,
             no_themes,
             reload_context,
-        )
+        ))
         .await
     } else {
         // Fall back to simple REPL. No transcript container to hold notes, so

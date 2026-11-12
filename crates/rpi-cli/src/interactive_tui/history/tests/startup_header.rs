@@ -19,7 +19,7 @@ async fn first_and_second_reply_keep_startup_logo_tools_and_notes_in_scroll_hist
     // Fresh launches mount the live slot without restoring any persisted page.
     state.history_page.mount_active(&state.chat_container);
     let header = strip_ansi(&state.history_page.header.render(100).join("\n"));
-    assert!(header.contains("██"));
+    assert!(header.contains("-+++="));
     assert!(header.contains("Tools (2) read · bash"));
     assert!(header.contains("Skills (1) synthetic-skill"));
     assert!(header.contains("Context (1)"));
@@ -101,11 +101,14 @@ async fn first_and_second_reply_keep_startup_logo_tools_and_notes_in_scroll_hist
         );
         let tail = strip_ansi(&scroll.render_with_viewport(width, 8).join("\n"));
         assert!(tail.contains("synthetic-reply-1"), "{tail}");
-        assert!(!tail.contains("██"), "logo should scroll offscreen: {tail}");
+        assert!(
+            !tail.contains("-+++="),
+            "logo should scroll offscreen: {tail}"
+        );
         scroll.scroll_to_start();
         let top = strip_ansi(&scroll.render_with_viewport(width, 8).join("\n"));
         assert!(
-            top.contains("██"),
+            top.contains("-+++="),
             "logo should remain in scrollback: {top}"
         );
     }
@@ -142,7 +145,7 @@ async fn startup_notes_without_a_welcome_banner_survive_settlement_and_reset_cle
     let content = text(&state);
     assert_eq!(content.matches("synthetic-quiet-startup-notice").count(), 1);
     assert!(!content.contains("Tools ("));
-    assert!(!content.contains("██"));
+    assert!(!content.contains("-+++="));
     state.history_page.reset();
     assert!(!text(&state).contains("synthetic-quiet-startup-notice"));
 }
