@@ -29,7 +29,10 @@ release their IDs.
 Resource-binding preflight still completes before executable extensions load.
 Its private facts-only loader validates record identities and sequences, but
 need not retain frame-read locations: its only output is metadata and session
-values, not a writable/queryable storage handle. It must not be used for ordinary
+values, not a writable/queryable storage handle. Facts-only replay therefore
+validates every historical frame document and then releases it instead of
+allocating a cold `Location`, which removes about half of the preflight scan
+cost on a 701,000-frame history without changing what is validated. It must not be used for ordinary
 restore, forks, detached snapshots or resource transitions.
 
 The whole-file legacy digest guards an eventual progress-format upgrade. Modern

@@ -203,7 +203,13 @@ impl JsonlSessionStorage {
                         state.resync_sequence(metadata.seq - 1);
                     }
                     let seq = metadata.seq;
-                    state.apply_loaded_frame(metadata, &reader, offset, &raw)?;
+                    if policy.keeps_frame_locations() {
+                        state.apply_loaded_frame(metadata, &reader, offset, &raw)?;
+                    } else {
+                        // Preserve reducer identity/lane checks and clear
+                        // semantics without allocating a retained location.
+                        state.reserve_loaded_frame(metadata)?;
+                    }
                     seen.insert(seq, (offset, raw.len()));
                     spans.push((offset, raw.len() as u64));
                     continue;

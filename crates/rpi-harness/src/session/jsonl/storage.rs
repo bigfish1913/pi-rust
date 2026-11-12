@@ -113,6 +113,13 @@ impl ReadPolicy {
         matches!(self, Self::Restore)
     }
 
+    /// Facts-only replay validates every row but must not retain frame
+    /// locations: `facts()` returns metadata and values only, so a retained
+    /// cold registry is allocated and dropped without ever being consulted.
+    fn keeps_frame_locations(self) -> bool {
+        !matches!(self, Self::FactsOnly)
+    }
+
     fn strict(self) -> bool {
         matches!(
             self,
@@ -3990,6 +3997,111 @@ mod tests {
             assert_eq!(
                 facts.values.get("rpi.resource-selection.v1"),
                 Some(&serde_json::json!(3))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn facts_only_validates_frames_without_retaining_read_locations() {
+        use crate::session::types::{AssistantFrameOp, AssistantFrameRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts-locations.jsonl");
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().into()));
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+        let mut text = encode_header(&header());
+        for seq in 1..=3 {
+            text.push_str(&encode_mutation(&SessionMutation::Record {
+                record: LaneRecord::AssistantFrame(AssistantFrameRecord {
+                    base: RecordBase {
+                        id: format!("frame-{seq}"),
+                        seq,
+                        lane: "main".into(),
+                        timestamp: 1,
+                    },
+                    run_id: "run".into(),
+                    stream_index: 0,
+                    op: AssistantFrameOp::Append,
+                    frame: Some(serde_json::json!({"payload": "historical frame"})),
+                }),
+            }));
+        }
+        text.push_str(&encode_mutation(&SessionMutation::Entry {
+            seq: 4,
+            timestamp: 1,
+            lane: Some("main".into()),
+            entry: Entry::Custom(crate::session::types::CustomEntry {
+                base: crate::session::types::EntryBase {
+                    entry_type: "custom".into(),
+                    id: "value-4".into(),
+                    seq: 4,
+                    parent_id: None,
+                    timestamp: 1,
+                },
+                custom_type: crate::session::values::VALUE_CUSTOM_TYPE.into(),
+                data: Some(serde_json::json!({"key":"rpi.resource-selection.v1","value":4})),
+            }),
+        }));
+        std::fs::write(&path, &text).unwrap();
+
+        let facts = JsonlSessionStorage::load_impl(
+            fs.clone(),
+            path.to_str().unwrap(),
+            clock.clone(),
+            ids.clone(),
+            ReadPolicy::FactsOnly,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            facts.state.lock().await.retained_frame_locations(),
+            0,
+            "facts-only replay must not allocate cold frame locations"
+        );
+        let facts = facts.facts().await.unwrap();
+        assert_eq!(
+            facts.values.get("rpi.resource-selection.v1"),
+            Some(&serde_json::json!(4))
+        );
+
+        // The same rows are still fully validated, so the optimisation cannot
+        // turn a corrupt history into a successful preflight.
+        let loaded = JsonlSessionStorage::load_impl(
+            fs.clone(),
+            path.to_str().unwrap(),
+            clock.clone(),
+            ids.clone(),
+            ReadPolicy::ReadOnly,
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.state.lock().await.retained_frame_locations(), 3);
+        drop(loaded);
+
+        // Break only the discarded payload document; the frame metadata that
+        // the cold recogniser accepts is untouched, so a lax reader would pass.
+        std::fs::write(
+            &path,
+            text.replacen(
+                "\"payload\":\"historical frame\"",
+                "\"payload\":\"historical frame\"}",
+                1,
+            ),
+        )
+        .unwrap();
+        for policy in [ReadPolicy::FactsOnly, ReadPolicy::ReadOnly] {
+            assert!(
+                JsonlSessionStorage::load_impl(
+                    fs.clone(),
+                    path.to_str().unwrap(),
+                    clock.clone(),
+                    ids.clone(),
+                    policy,
+                )
+                .await
+                .is_err(),
+                "a corrupt historical frame must never pass validation"
             );
         }
     }
