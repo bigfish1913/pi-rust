@@ -813,6 +813,75 @@ fn snapshot_contract_short_document_clear_and_regrow_keeps_one_live_dock() {
 }
 
 #[test]
+fn ambiguous_history_anchor_never_discards_unpublished_output() {
+    for force_repaint in [false, true] {
+        let term = VirtualTerminal::new(80, 8);
+        let tui = TuiAltScreen::new(Box::new(term.clone()), false, None);
+        tui.set_main_screen_mode(true);
+        let mut rows = vec!["repeated-log".to_string(); 100];
+        let text = Arc::new(Text::new(rows.join("\n"), 0, 0));
+        tui.set_layout_root(Some(text.clone()));
+        tui.start_readerless();
+        let saved = SavedSnapshots::capture(&term);
+        rows[0] = "edited-old-log".into();
+        rows.extend((0..401).map(|i| format!("unpublished-output-{i:03}")));
+        text.set_text(rows.join("\n"));
+        if force_repaint {
+            tui.render_now(true);
+        } else {
+            tui.request_render(false);
+        }
+        saved.assert_preserved(&term);
+        assert_latest_live_tail(&term, text.as_ref());
+        let actual = document(&term);
+        for i in 0..401 {
+            let marker = format!("unpublished-output-{i:03}");
+            assert_eq!(
+                actual.iter().filter(|row| **row == marker).count(),
+                1,
+                "{marker}"
+            );
+        }
+        assert_eq!(term.state.lock().unwrap().viewport_top, 493);
+        // The reconciled frame must become the next publication baseline.
+        tui.request_render(false);
+        assert_eq!(document(&term), actual);
+    }
+}
+
+#[test]
+fn equal_length_edits_never_republish_saved_history() {
+    let term = VirtualTerminal::new(80, 8);
+    term.state.lock().unwrap().scrollback_limit = Some(128);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), false, None);
+    tui.set_main_screen_mode(true);
+    let mut rows = (0..100)
+        .map(|i| format!("history-{i:03}"))
+        .collect::<Vec<_>>();
+    let text = Arc::new(Text::new(rows.join("\n"), 0, 0));
+    tui.set_layout_root(Some(text.clone()));
+    tui.start_readerless();
+    let saved = SavedSnapshots::capture(&term);
+    // Break the live anchor and the last saved block, while leaving earlier
+    // unique saved blocks intact. Their cutoff is NOT the publication frontier.
+    for revision in 1..=40 {
+        rows[91] = format!("edited-saved-{revision:03}");
+        rows[92] = format!("edited-live-{revision:03}");
+        rows[99] = format!("edited-tail-{revision:03}");
+        text.set_text(rows.join("\n"));
+        tui.request_render(false);
+        saved.assert_preserved(&term);
+        assert_latest_live_tail(&term, text.as_ref());
+        assert_eq!(
+            term.state.lock().unwrap().viewport_top,
+            92,
+            "revision {revision}"
+        );
+        assert_eq!(document(&term).len(), 100);
+    }
+}
+
+#[test]
 fn snapshot_contract_rewrap_and_large_append_in_one_frame_keeps_every_new_row() {
     let term = VirtualTerminal::new(WIDTH, HEIGHT);
     let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
