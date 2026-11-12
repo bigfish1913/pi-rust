@@ -299,6 +299,53 @@ fn main_screen_saved_anchor(previous: &[String], current: &[String], top: usize)
         .max()
 }
 
+/// Choose a live boundary from positional correspondence when content anchors
+/// are ambiguous. The previous live rows are the publication frontier; a saved
+/// anchor must not move that frontier backwards. A positional prefix ending
+/// before the old live view is treated as a collapsed prefix only when none of
+/// the old live rows survive at their positions, which covers collapse-plus-
+/// append without mistaking a saved edit for new output.
+fn main_screen_positional_frontier(
+    previous: &[String],
+    current: &[String],
+    top: usize,
+) -> Option<usize> {
+    if previous.is_empty() || current.is_empty() {
+        return None;
+    }
+    let comparable = previous.len().min(current.len());
+    let live_start = top.min(comparable);
+    let live_survives = (live_start..comparable).any(|row| previous[row] == current[row]);
+    if current.len() <= previous.len() {
+        // Equal-length frames are repairs, not publication growth. Shrinking
+        // frames need the existing content/saved-anchor policy because a
+        // positional truncation alone cannot tell a collapsed panel from a
+        // live tail that should be cleared.
+        return (current.len() == previous.len()).then_some(top.min(current.len()));
+    }
+    if live_survives {
+        return Some(top.min(current.len()));
+    }
+
+    let prefix = previous
+        .iter()
+        .zip(current)
+        .take_while(|(old, new)| old == new)
+        .count();
+    if prefix > 0 && prefix < top && prefix < previous.len() {
+        return Some(prefix);
+    }
+    Some(top.min(current.len()))
+}
+
+fn normalize_main_screen_lines(mut lines: Vec<String>) -> Vec<String> {
+    for line in &mut lines {
+        *line = line.replace(CURSOR_MARKER, "");
+    }
+    strip_thinking_region_markers(&mut lines);
+    lines
+}
+
 impl TuiAltScreen {
     /// Create a new alternate screen TUI.
     pub fn new(
@@ -1000,16 +1047,11 @@ impl TuiAltScreen {
             line.find(CURSOR_MARKER)
                 .map(|idx| (row, visible_width(&line[..idx])))
         });
-        let lines: Vec<String> = raw_lines
-            .into_iter()
-            .map(|line| line.replace(CURSOR_MARKER, ""))
-            .collect();
         // Main screen mode deliberately never enables click regions (its rows
         // belong to native scrollback and cannot be hit-tested), but its
         // renderer must still strip the markers: an assistant message carries
         // them on its thinking rows in every mode.
-        let mut lines = lines;
-        strip_thinking_region_markers(&mut lines);
+        let lines = normalize_main_screen_lines(raw_lines);
         let previous = self
             .previous_screen
             .lock()
@@ -1039,16 +1081,35 @@ impl TuiAltScreen {
             None
         };
         let old_live = previous.get(viewport_top..).unwrap_or_default();
-        let mapped_top = anchor.or(saved_anchor).unwrap_or_else(|| {
-            // A collapsed/replaced historical panel has no surviving live
-            // anchor. Its unchanged prefix was already emitted: do not pull
-            // those saved message rows back onto the screen as duplicates.
-            previous
-                .iter()
-                .zip(&lines)
-                .take_while(|(old, new)| old == new)
-                .count()
-        });
+        let layout_only_reflow = initialized && previous_width != width && {
+            let old_width_raw = crate::render::with_main_screen_frame(|| {
+                crate::terminal_image::with_frame_cell_geometry(previous_cells, || {
+                    root.render(previous_width)
+                })
+            });
+            normalize_main_screen_lines(old_width_raw) == previous
+        };
+        let positional_top = if anchor.is_none() && !layout_only_reflow {
+            main_screen_positional_frontier(&previous, &lines, viewport_top)
+        } else {
+            None
+        };
+        let mapped_top = if layout_only_reflow {
+            lines.len().saturating_sub(height)
+        } else if let Some(positional_top) = positional_top {
+            positional_top
+        } else {
+            anchor.or(saved_anchor).unwrap_or_else(|| {
+                // A collapsed/replaced historical panel has no surviving live
+                // anchor. Its unchanged prefix was already emitted: do not pull
+                // those saved message rows back onto the screen as duplicates.
+                previous
+                    .iter()
+                    .zip(&lines)
+                    .take_while(|(old, new)| old == new)
+                    .count()
+            })
+        };
         let reconcile_tail = initialized
             && (previous_width != width
                 || previous_height != height
@@ -1057,7 +1118,11 @@ impl TuiAltScreen {
                 || force_repaint
                 || anchor.is_none()
                 || lines.len().saturating_sub(mapped_top) < old_live.len());
-        let next_top = if reconcile_tail && anchor.or(saved_anchor).is_none() {
+        let next_top = if reconcile_tail
+            && anchor.or(saved_anchor).is_none()
+            && positional_top.is_none()
+            && !layout_only_reflow
+        {
             mapped_top.max(lines.len().saturating_sub(height))
         } else {
             mapped_top

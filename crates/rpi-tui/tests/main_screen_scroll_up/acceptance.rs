@@ -865,7 +865,7 @@ fn equal_length_edits_never_republish_saved_history() {
     // Break the live anchor and the last saved block, while leaving earlier
     // unique saved blocks intact. Their cutoff is NOT the publication frontier.
     for revision in 1..=40 {
-        rows[91] = format!("edited-saved-{revision:03}");
+        rows[90] = format!("edited-saved-{revision:03}");
         rows[92] = format!("edited-live-{revision:03}");
         rows[99] = format!("edited-tail-{revision:03}");
         text.set_text(rows.join("\n"));
@@ -879,6 +879,31 @@ fn equal_length_edits_never_republish_saved_history() {
         );
         assert_eq!(document(&term).len(), 100);
     }
+}
+
+#[test]
+fn collapsed_repeated_history_followed_by_append_publishes_every_new_row() {
+    let term = VirtualTerminal::new(80, 8);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let mut rows = vec!["repeated-log".to_string(); 100];
+    let text = Arc::new(Text::new(rows.join("\n"), 0, 0));
+    tui.set_layout_root(Some(text.clone()));
+    tui.start_readerless();
+    rows.truncate(50);
+    rows.extend((0..401).map(|i| format!("collapsed-output-{i:03}")));
+    text.set_text(rows.join("\n"));
+    tui.request_render(false);
+    let actual = document(&term);
+    for i in 0..401 {
+        let marker = format!("collapsed-output-{i:03}");
+        assert_eq!(
+            actual.iter().filter(|row| **row == marker).count(),
+            1,
+            "{marker}"
+        );
+    }
+    assert_latest_live_tail(&term, text.as_ref());
 }
 
 #[test]
