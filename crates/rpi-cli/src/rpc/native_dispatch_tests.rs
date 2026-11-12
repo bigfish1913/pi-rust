@@ -37,6 +37,75 @@ async fn stop(client: &mut tokio::io::DuplexStream, task: tokio::task::JoinHandl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_terminal_publication_releases_admission_before_next_prompt() {
+    use crate::rpc::prompt_content::validation_test_hook::{Gate, ReleaseOnDrop};
+    use std::sync::atomic::Ordering;
+
+    let provider = FauxProvider::new(FauxScript::new().with_text("first").with_text("second"));
+    let harness = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+        model: provider.default_model().clone(),
+        models: vec![provider.clone()],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let (mut client, output, task) =
+        start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+    let mut previous_run = Value::Null;
+    // Rejection and settlement are both terminal boundaries. A client may send
+    // its next request as soon as either arrives, with no sleep or busy retry.
+    for (id, invalid) in [
+        ("terminal-invalid", true),
+        ("terminal-first", false),
+        ("terminal-second", false),
+    ] {
+        let gate = Gate::register(id);
+        let _release = ReleaseOnDrop(gate.clone());
+        gate.release();
+        let request = if invalid {
+            json!({"type":"prompt","id":id,"contentBlocks":[{
+                "type":"image","mimeType":"image/png","data":"AAAA"
+            }]})
+        } else {
+            json!({"type":"prompt","id":id,"message":"next run"})
+        };
+        send(&mut client, request).await;
+        let response = output.wait_for(|m| m["id"] == id).await;
+        assert_eq!(response["success"], !invalid, "{response}");
+        if !invalid {
+            let settled = output
+                .wait_for(|m| m["type"] == "agent_settled" && m["runId"] != previous_run)
+                .await;
+            assert_eq!(settled["outcome"], "completed", "{settled}");
+            previous_run = settled["runId"].clone();
+            assert!(previous_run.is_string());
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            gate.terminal_observed.cancelled(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !gate.terminal_active.load(Ordering::Acquire),
+            "terminal publication for {id} must expose idle admission"
+        );
+    }
+    assert_eq!(provider.state().call_count.load(Ordering::SeqCst), 2);
+    let messages = output.messages();
+    let first = messages
+        .iter()
+        .position(|m| m["type"] == "agent_settled")
+        .unwrap();
+    let next = messages
+        .iter()
+        .position(|m| m["id"] == "terminal-second")
+        .unwrap();
+    assert!(first < next, "successor acceptance must follow settlement");
+    stop(&mut client, task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_prompt_pixels_and_model_are_checked_before_acceptance_or_persistence() {
     let mut model = FauxProvider::new(FauxScript::new()).default_model().clone();
     model.input = vec![rpi_ai::types::InputModality::Text];

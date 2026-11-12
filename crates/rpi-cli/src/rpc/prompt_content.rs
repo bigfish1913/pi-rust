@@ -269,6 +269,8 @@ pub(crate) mod validation_test_hook {
         pub entered: CancellationToken,
         pub worker_finished: CancellationToken,
         pub run_finished: CancellationToken,
+        pub terminal_observed: CancellationToken,
+        pub terminal_active: std::sync::atomic::AtomicBool,
         released: Mutex<bool>,
         release_changed: Condvar,
     }
@@ -287,6 +289,14 @@ pub(crate) mod validation_test_hook {
         pub fn release(&self) {
             *self.released.lock().unwrap() = true;
             self.release_changed.notify_all();
+        }
+        // Sample admission immediately before terminal publication, without a
+        // scheduler-dependent race between the writer and the next RPC request.
+        pub fn observe_terminal(&self, active: &std::sync::atomic::AtomicBool) {
+            use std::sync::atomic::Ordering;
+            self.terminal_active
+                .store(active.load(Ordering::Acquire), Ordering::Release);
+            self.terminal_observed.cancel();
         }
         pub fn enter_worker(self: Arc<Self>) -> WorkerFinished {
             self.entered.cancel();
