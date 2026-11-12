@@ -775,7 +775,6 @@ pub fn print_help() {
   RPI_OFFLINE                     Disable startup network operations when set to 1/true/yes
   RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
   RPI_SESSION_ID                 Session id served by a plugin (set by the host; also honored as an override)
-  RPI_NO_EMOJI                   Render the brand lockup without the crab (1/true/yes)
 
 {u}Notes:{r}
   Supported HTTP protocols are Anthropic Messages and OpenAI Chat Completions.
