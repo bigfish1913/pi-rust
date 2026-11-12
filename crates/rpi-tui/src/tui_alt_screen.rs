@@ -3183,10 +3183,6 @@ mod tests {
                 tui.thinking_region_hit(&mouse(MouseEventKind::Down(MouseButton::Left), 2, row))
             })
             .collect();
-        let bf = tui.current_frame.lock().unwrap().clone().unwrap();
-        for (i, line) in bf.lines.iter().enumerate() {
-            println!("BF{i}: {:?}", line);
-        }
         assert!(
             before.iter().any(|hit| hit.as_deref() == Some("t1")),
             "no region on initial frame"
