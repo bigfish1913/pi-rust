@@ -2200,6 +2200,17 @@ async fn rpc_get_queue(
     )
 }
 
+/// Queue names that select `next_run`.
+///
+/// `get_queue` reports a `NextRun` item as `"nextRun"` (from
+/// `QueueKind::as_str()`), while the Web frontend's selector sends
+/// `"nextTurn"`. Editing such an item cancels it and re-submits the reported
+/// name, so that spelling has to round-trip back into an enqueue instead of
+/// being rejected with `unknown queue kind`.
+fn is_next_run_queue(queue: &str) -> bool {
+    matches!(queue, "nextTurn" | "next_run" | "nextRun")
+}
+
 async fn rpc_queue_message(
     lane: &Arc<dyn AgentLane>,
     msg: &serde_json::Value,
@@ -2217,7 +2228,7 @@ async fn rpc_queue_message(
     let result = match queue {
         "steer" => lane.steer(message).await,
         "followUp" | "follow_up" => lane.follow_up(message).await,
-        "nextTurn" | "next_run" => lane.next_run(message).await,
+        queue if is_next_run_queue(queue) => lane.next_run(message).await,
         other => return Err(format!("unknown queue kind: {other}")),
     }
     .map_err(|error| error.to_string())?;
@@ -3265,12 +3276,26 @@ mod transcript_page_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use rpi_agent::events::AgentEvent;
     use rpi_agent::types::AgentToolResult;
     use rpi_ai::types::{
         AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
     };
     use rpi_harness::session::types::OperationError;
+
+    /// `get_queue` reports `NextRun` as `nextRun`; editing that item in the
+    /// Web UI cancels it and re-submits the reported name. It must not be
+    /// rejected as an unknown queue kind (see `is_next_run_queue`).
+    #[test]
+    fn next_run_queue_alias_accepts_get_queue_spelling() {
+        for spelling in ["nextTurn", "next_run", "nextRun"] {
+            assert!(is_next_run_queue(spelling), "{spelling}");
+        }
+        assert!(!is_next_run_queue("steer"));
+        assert!(!is_next_run_queue("followUp"));
+        assert!(!is_next_run_queue("next-run"));
+    }
 
     /// Regression: the abort reply must carry the reclaimed queue back instead
     /// of only `{aborted:true}`, and each queue must be reported separately.
