@@ -251,6 +251,15 @@ fn main_screen_live_anchor(previous: &[String], current: &[String], top: usize) 
     if anchor.iter().filter(|row| !row.trim().is_empty()).count() < 2 {
         return None;
     }
+    if previous
+        .windows(anchor.len())
+        .filter(|window| *window == anchor)
+        .take(2)
+        .count()
+        != 1
+    {
+        return None;
+    }
     let mut matches = current
         .windows(anchor.len())
         .enumerate()
@@ -2729,6 +2738,16 @@ mod tests {
                 "transient empty tree painted"
             );
         }
+    }
+
+    #[test]
+    fn repeated_live_text_cannot_alias_an_earlier_saved_block() {
+        let previous = ["a", "b", "c", "old-middle", "a", "b", "c", "old-tail"].map(str::to_string);
+        let current = ["a", "b", "c", "new-output-0", "new-output-1"].map(str::to_string);
+        // The sole remaining ABC is the saved copy, not an identity for the
+        // removed second ABC. Only the independently unique saved cutoff maps.
+        assert_eq!(main_screen_live_anchor(&previous, &current, 4), None);
+        assert_eq!(main_screen_saved_anchor(&previous, &current, 4), Some(3));
     }
 
     #[test]
