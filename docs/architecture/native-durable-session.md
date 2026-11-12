@@ -121,6 +121,12 @@ rpi --no-native-durable
 
 `--no-session` 仍然优先表示完全不持久化当前 session；它不是 native durable 的回退开关。
 
+### Native durable 与 `/reload`
+
+普通 `/reload` 可以重新发现扩展并重建工具、技能、提示模板和项目上下文；它不会关闭或重建当前 harness，也不会重置 native durable session。重建后的 durable 工具继续通过启动时的弱绑定访问同一个 harness，因此 journal 状态保持在原 session 中。候选扩展若注册 host 保留的 `durable` 工具或 `/durable` 命令，会拒绝发布，避免与 native owner 形成双重入口。
+
+这不放宽精确资源选择的边界：使用 `--resource-config` 或 `--resource-transition` 的会话仍须重启/重新选择资源；reload 与 dev hot apply 不会修改其既定 selection。扩展动态库的构建、加载及卸载仍遵循现有 reload 生命周期；这里保证的是 durable owner/session 连续性，不承诺扩展二进制可在任意平台原地覆盖。
+
 ## 后续阶段（生产路径尚未实现）
 
 1. 在隔离旧 session 副本上分别测 load/replay、queue、interrupted repair、上下文准备、首屏 history。
