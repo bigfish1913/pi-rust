@@ -130,6 +130,28 @@ class AptWorkflowTests(unittest.TestCase):
             self.assertNotIn("UPDATE", result.stdout)
 
 
+class ChannelWorkflowTests(unittest.TestCase):
+    def test_winget_submission_failure_is_not_hidden_by_tee(self):
+        text = (ROOT / ".github/workflows/release-channels.yml").read_text(encoding="utf-8")
+        name = "Submit or update the Microsoft winget PR"
+        block = text.split(f"      - name: {name}\n", 1)[1]
+        # GitHub's implicit Linux shell is bash -e, without pipefail. Explicit
+        # bash uses bash --noprofile --norc -e -o pipefail {0} instead.
+        self.assertIn("        shell: bash\n", block)
+        code = script(text, name)
+        with tempfile.TemporaryDirectory() as directory:
+            env = os.environ | {"RUNNER_TEMP": directory.replace("\\", "/"),
+                                "GH_TOKEN": "offline-test", "TAG": "v0.22.1",
+                                "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary")}
+            for status in (0, 1, 23):
+                with self.subTest(submission_exit=status):
+                    mock = f'bash() {{ echo "mock submission"; return {status}; }}\n'
+                    result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"],
+                                            input=mock + code, text=True, capture_output=True,
+                                            env=env, timeout=15)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+
 class ValidationGateTests(unittest.TestCase):
     def setUp(self):
         self.ci = CI.read_text(encoding="utf-8")
