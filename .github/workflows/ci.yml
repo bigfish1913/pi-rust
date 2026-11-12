@@ -237,6 +237,7 @@ jobs:
           python3 scripts/test_release_automation.py
           python3 scripts/test_release_pr_readiness.py
           python3 scripts/test_release_channels.py
+          python3 -B scripts/test_workflow_infrastructure.py
 
   windows-plugin-lifecycle:
     name: Windows plugin ABI and DLL lifecycle
@@ -275,9 +276,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Match the release baseline; don't let ubuntu-latest move it silently.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
@@ -297,7 +299,42 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install musl linker
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reuse a preinstalled compiler instead of needlessly hitting mirrors.
+          if ! command -v musl-gcc >/dev/null 2>&1; then
+            install_musl_tools() {
+              # apt-get update normally succeeds with stale indexes on DNS
+              # errors. Treat partial fetch failures as failures and bound each
+              # command, not just the backoff between attempts.
+              timeout 120s sudo apt-get update \
+                -o APT::Update::Error-Mode=any -o Acquire::Retries=2 \
+                -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || return $?
+              timeout 120s sudo apt-get install --yes --no-install-recommends \
+                -o Acquire::Retries=2 -o Acquire::http::Timeout=15 \
+                -o Acquire::https::Timeout=15 musl-tools
+            }
+            for attempt in 1 2 3; do
+              if install_musl_tools; then
+                break
+              fi
+              if (( attempt == 3 )); then
+                echo "::error::Could not install musl-tools after ${attempt} attempts."
+                exit 1
+              fi
+              echo "::warning::musl-tools install failed; retrying (attempt ${attempt}/3)."
+              sleep $(( attempt * 10 ))
+            done
+          fi
+          command -v musl-gcc
+          # Presence alone isn't enough: ensure the compiler links a runnable
+          # static binary before spending minutes on the Rust build.
+          probe="$RUNNER_TEMP/musl-linker-smoke"
+          printf 'int main(void) { return 0; }\n' | musl-gcc -static -x c - -o "$probe"
+          "$probe"
+          rm -f "$probe"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -329,7 +366,9 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
       github.event.pull_request.draft == true) }}
-    runs-on: ubuntu-latest
+    # A historical latency budget requires a stable OS baseline. Keep latest
+    # coverage in the check/test jobs, not in this performance comparison.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       RUSTFLAGS: "-D warnings"
@@ -348,6 +387,17 @@ jobs:
         with:
           key: resources-release
           workspaces: . -> target/resource-tests-cargo
+      - name: Record performance environment
+        shell: bash
+        run: |
+          {
+            uname -a
+            cat /etc/os-release
+            printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion"
+            lscpu
+            rustc -Vv
+            python3 --version
+          } | tee "$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-environment.txt"
       - name: Build release resource fixtures
         run: |
           cargo build -p rpi-cli --bin rpi --release --locked --target-dir target/resource-tests-cargo
@@ -491,6 +541,7 @@ jobs:
           # Allowlist diagnostics: even a failed history cleanup must not upload
           # hundreds of MiB of generated transcripts/companion data.
           path: |
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-environment.txt
             ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/results.json
             ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/reproduce.json
             ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/*/report.json
@@ -562,10 +613,29 @@ jobs:
 
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
+        timeout-minutes: 15
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes pkg-config libasound2-dev
+          set -euo pipefail
+          install_native_dependencies() {
+            timeout 120s sudo apt-get update \
+              -o APT::Update::Error-Mode=any -o Acquire::Retries=2 \
+              -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || return $?
+            timeout 120s sudo apt-get install --yes --no-install-recommends \
+              -o Acquire::Retries=2 -o Acquire::http::Timeout=15 \
+              -o Acquire::https::Timeout=15 pkg-config libasound2-dev
+          }
+          for attempt in 1 2 3; do
+            if install_native_dependencies; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              echo "::error::Could not install Linux native dependencies after ${attempt} attempts."
+              exit 1
+            fi
+            echo "::warning::Native dependency install failed; retrying (attempt ${attempt}/3)."
+            sleep $(( attempt * 10 ))
+          done
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -715,14 +785,16 @@ jobs:
     needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
     runs-on: ubuntu-latest
     steps:
-      - name: Require every validation job to pass for Release PRs
+      # This is a required check for ordinary PRs too. A failed resource or
+      # platform job must not be hidden by a successful no-op aggregation.
+      - name: Require every validation job to pass
         if: >-
-          github.event_name == 'pull_request' &&
+          ${{ !(github.event_name == 'pull_request' &&
           github.repository == 'bigfish1913/pi-rust' &&
           github.event.pull_request.base.ref == 'main' &&
           github.event.pull_request.head.repo.full_name == github.repository &&
           startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
-          github.event.pull_request.draft == false
+          github.event.pull_request.draft == true) }}
         run: |
           set -euo pipefail
           test "${{ needs.msrv.result }}" = success
