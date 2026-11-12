@@ -515,6 +515,7 @@ pub(super) async fn render_session_history(
     extension_session: Option<crate::session::ExtensionSessionCell>,
     show_images: bool,
     footer: Option<&rpi_tui::FooterComponent>,
+    hide_thinking: bool,
 ) {
     let tree = harness.session().view("main");
     let Ok(page) = tree.branch_entry_page(&Default::default()).await else {
@@ -526,6 +527,7 @@ pub(super) async fn render_session_history(
         transformer,
         extension_session,
         show_images,
+        hide_thinking,
     );
     restore_history_panels(&tree, chat).await;
     if let Some(footer) = footer {
@@ -538,6 +540,15 @@ pub(super) async fn render_session_history(
     }
 }
 
+/// Monotonic id counter for restored (non-streamed) assistant messages.
+/// Distinct prefix from the live view's `t` ids so ids stay unique even
+/// though the two counters are independent.
+fn next_history_message_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Render complete entries without dropping variants or truncating large entries.
 pub(super) fn render_history_entries(
     entries: Vec<Entry>,
@@ -545,6 +556,7 @@ pub(super) fn render_history_entries(
     transformer: Option<MarkdownTransformer>,
     extension_session: Option<crate::session::ExtensionSessionCell>,
     show_images: bool,
+    hide_thinking: bool,
 ) {
     for e in entries {
         match e {
@@ -557,6 +569,10 @@ pub(super) fn render_history_entries(
                     let comp = Arc::new(AssistantMessageComponent::new(
                         AssistantMessageOptions::default(),
                     ));
+                    // History entries get click regions too: an id is opaque
+                    // and only costs a zero-width marker on thinking rows.
+                    comp.set_message_id(&format!("h{}", next_history_message_id()));
+                    comp.set_hide_thinking(hide_thinking);
                     comp.set_show_images(show_images);
                     comp.set_trailing_spacing(1);
                     if let Some(t) = &transformer {

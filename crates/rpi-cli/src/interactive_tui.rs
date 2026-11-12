@@ -1327,6 +1327,7 @@ pub async fn interactive_tui(
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(hide_thinking)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(tool_outputs_expanded)),
         show_terminal_progress,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -1981,6 +1982,19 @@ pub async fn interactive_tui(
                 }
                 if tui_for_key.handle_scroll_to_end_indicator_mouse_event(&m) {
                     tui_for_key.clear_selection();
+                    continue;
+                }
+                // A click on a thinking label/body row toggles THAT message's
+                // thinking before the press can anchor a text selection. The
+                // regions are frame-scoped: only rows the last painted frame
+                // actually showed resolve, so a stale rectangle can never fire
+                // after a scroll.
+                if let Some(message_id) = tui_for_key.thinking_region_hit(&m) {
+                    state_for_key
+                        .transcript_view()
+                        .toggle_message_thinking(&message_id);
+                    tui_for_key.clear_selection();
+                    tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
                 use crossterm::event::MouseEventKind;

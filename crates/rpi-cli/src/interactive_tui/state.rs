@@ -180,6 +180,11 @@ pub(super) struct TuiState {
     /// Whether package/custom themes may be selected in this session.
     /// Persisted display preference toggled by Ctrl+T (shared with the view).
     pub(super) hide_thinking: Arc<std::sync::Mutex<bool>>,
+    /// Allocator for the per-message ids click regions key on. Shared with every
+    /// [`TranscriptView`] this state builds, so ids stay unique across the
+    /// per-event views (a per-view counter would restart and make clicks toggle
+    /// the first live message).
+    pub(super) message_seq: crate::transcript_view::MessageIdSeq,
     /// Global tool-output expansion preference toggled by Ctrl+O (shared with
     /// the view).
     pub(super) tool_outputs_expanded: Arc<std::sync::Mutex<bool>>,
@@ -1996,6 +2001,19 @@ impl TuiState {
 
     pub(super) fn set_hide_thinking(&self, hide: bool) {
         *self.hide_thinking.lock().unwrap() = hide;
+        // The global toggle applies to the WHOLE transcript, not just the
+        // in-flight message: restored history pages carry their own assistant
+        // components (created far from `start_assistant`).
+        let mut pending = self.chat_container.get_children();
+        pending.extend(self.history_page.active.get_children());
+        while let Some(child) = pending.pop() {
+            if let Some(container) = child.as_any().downcast_ref::<Container>() {
+                pending.extend(container.get_children());
+            }
+            if let Some(assistant) = child.as_any().downcast_ref::<AssistantMessageComponent>() {
+                assistant.set_hide_thinking(hide);
+            }
+        }
         if let Some(comp) = self.current_assistant.lock().unwrap().as_ref() {
             comp.set_hide_thinking(hide);
         }
@@ -2091,6 +2109,7 @@ impl TuiState {
             self.hide_thinking.clone(),
             self.tool_outputs_expanded.clone(),
             self.markdown_transformer.clone(),
+            self.message_seq.clone(),
         )
         .with_panels(if managed {
             self.history_page.panels.clone()

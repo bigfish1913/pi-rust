@@ -194,6 +194,12 @@ async fn run_loop<D: SessionDriver>(
                     }
                     Event::Mouse(mouse) => {
                         if tui.handle_scroll_to_end_indicator_mouse_event(&mouse) { continue; }
+                        // Click-to-toggle per-message thinking (see the local
+                        // TUI's mouse arm): resolve before selection/scrolling.
+                        if tui.thinking_region_hit(&mouse).is_some_and(|id| view.toggle_message_thinking(&id)) {
+                            tui.request_render_reusing_scroll_content();
+                            continue;
+                        }
                         match mouse.kind {
                             MouseEventKind::ScrollUp => tui.scroll_by(-3),
                             MouseEventKind::ScrollDown => tui.scroll_by(3),

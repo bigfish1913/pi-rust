@@ -327,6 +327,7 @@ fn render_page(state: &TuiState, entries: &[Entry]) -> Arc<Container> {
         state.markdown_transformer(),
         Some(state.extension_session.clone()),
         state.images_visible(),
+        state.hide_thinking(),
     );
     state.apply_history_tool_expansion(&chat);
     chat

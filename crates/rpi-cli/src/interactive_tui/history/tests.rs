@@ -298,7 +298,7 @@ async fn byte_budget_keeps_oversized_entries_whole_and_all_variants_page() {
         );
     }
     let chat = Arc::new(Container::new());
-    render_history_entries(page.entries, &chat, None, None, false);
+    render_history_entries(page.entries, &chat, None, None, false, false);
     let output = strip_ansi(&chat.render(100).join("\n"));
     assert!(output.contains("Model changed"));
     assert!(output.contains("Thinking level"));
@@ -520,3 +520,42 @@ async fn capability_header_survives_restore_and_page_replacement_once() {
 mod live_images;
 #[path = "tests/notice_order.rs"]
 mod notice_order;
+
+#[test]
+fn restored_history_honors_the_hide_thinking_preference() {
+    use rpi_harness::session::types::{Entry, EntryBase, MessageEntry};
+    use rpi_tui::{strip_ansi, Component};
+    let chat = Arc::new(Container::new());
+    let mut assistant = rpi_ai::types::AssistantMessage::empty(
+        rpi_ai::types::Api::OpenaiResponses,
+        "test-provider",
+        "test-model",
+        0,
+    );
+    assistant.content.push(rpi_ai::types::Content::Thinking(
+        rpi_ai::types::ThinkingContent {
+            kind: rpi_ai::types::ThinkingContentType,
+            thinking: "restored reasoning".to_string(),
+            thinking_signature: None,
+            redacted: false,
+        },
+    ));
+    let entry = Entry::Message(MessageEntry {
+        base: EntryBase {
+            entry_type: "message".to_string(),
+            id: "e1".to_string(),
+            seq: 1,
+            parent_id: None,
+            timestamp: 0,
+        },
+        message: rpi_agent::message::AgentMessage::Assistant(Box::new(assistant)),
+        terminate: None,
+    });
+    render_history_entries(vec![entry], &chat, None, None, false, true);
+    let output = strip_ansi(&chat.render(100).join("\n"));
+    assert!(
+        !output.contains("restored reasoning"),
+        "hide_thinking must apply at restore time: {output}"
+    );
+    assert!(output.contains("Thinking..."));
+}
