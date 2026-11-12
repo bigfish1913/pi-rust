@@ -93,6 +93,8 @@ jobs:
           name: channel-manifests-${{ inputs.tag }}
           path: packaging/
       - name: Submit or update the Microsoft winget PR
+        # Explicit bash enables pipefail; tee must not hide submission failure.
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
           TAG: ${{ inputs.tag }}
