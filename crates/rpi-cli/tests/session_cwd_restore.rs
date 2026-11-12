@@ -207,6 +207,41 @@ async fn resuming_from_another_directory_runs_in_the_recorded_one() {
     );
 }
 
+/// Resuming in the directory the session was created in adopts nothing, so
+/// there is nothing to announce. rpi-web restores sessions repeatedly in the
+/// project directory they belong to; an unconditional notice printed the same
+/// line once per restored session, which reads as a broken restore.
+#[tokio::test]
+async fn resuming_in_the_recorded_directory_says_nothing() {
+    let fixture = start_fixture().await;
+    let project = fixture.root.path().join("session-cwd-project");
+
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    {
+        let listener = fixture.listener.clone();
+        let collector = Arc::clone(&bodies);
+        tokio::spawn(serve_one_request(listener, collector));
+    }
+    let (status, stdout, stderr) = run_rpi(&fixture, &project, &[], "first").await;
+    assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
+
+    // Same directory, same session: no directory changed.
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    {
+        let listener = fixture.listener.clone();
+        let collector = Arc::clone(&bodies);
+        tokio::spawn(serve_one_request(listener, collector));
+    }
+    let (status, stdout, stderr) = run_rpi(&fixture, &project, &["--continue"], "second").await;
+    assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("ok."), "{stdout}\n{stderr}");
+    assert!(
+        !stderr.contains("where it was created"),
+        "a same-directory resume must not claim it moved: {stdout}\n{stderr}"
+    );
+    assert_eq!(bodies.lock().unwrap().len(), 1, "stderr: {stderr}");
+}
+
 /// A session whose recorded directory has since been deleted falls back to the
 /// launch cwd, and says so on the run's stderr (headless modes have no
 /// transcript to put a note in).
