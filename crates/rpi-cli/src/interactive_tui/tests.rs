@@ -1386,8 +1386,8 @@ fn test_layout_renders_welcome_message() {
 
     let all: String = frame.lines.join("\n");
     assert!(
-        all.contains("rpi"),
-        "Welcome message not found. Rendered: {}",
+        all.contains(":::"),
+        "Welcome logo not found. Rendered: {}",
         all
     );
     assert!(
@@ -1494,17 +1494,15 @@ fn welcome_header_renders_the_brand_mark() {
     let lines: Vec<String> = chat.render(80).iter().map(|l| strip_ansi(l)).collect();
     let all = lines.join("\n");
 
-    // The three-bar mark: the bottom row carries all three bars, and the
-    // wordmark sits on its baseline next to the middle bar.
+    // The fixed-width ASCII logo is rendered with single-cell characters.
     assert!(
-        lines.iter().any(|l| l.contains("██ ██ ██")),
-        "brand mark missing: {all}"
+        lines.iter().any(|l| l.contains(":::")),
+        "brand logo missing: {all}"
     );
     assert!(
-        all.contains("rpi"),
-        "the mark must carry the product name: {all}"
+        all.contains("interactive TUI"),
+        "the welcome tagline is missing: {all}"
     );
-
     // Regression guard for the layout bug this replaced: `π` is East-Asian
     // Ambiguous — width 1 normally, width 2 under a CJK locale — which
     // walked the old box borders out of alignment depending on the user's
