@@ -1405,6 +1405,7 @@ pub async fn build_prepared(
         resource_leases,
         fresh_session_only,
         extension_session: extension_session_cell,
+        durable_binding,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         tool_context,
         file_io,
@@ -1554,6 +1555,9 @@ pub struct ReloadContext {
     pub file_io: Arc<rpi_tools::file_io::FileIORouter>,
     /// The live extension-session cell (swapped on reload).
     pub extension_session: ExtensionSessionCell,
+    /// The process-lifetime durable-tool binding. Reloaded tool instances must
+    /// keep the same weak harness binding as the context hook installed at startup.
+    durable_binding: Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>,
     /// The session's plugin-tool context (`cwd` + session id), reused — not
     /// rebuilt — on reload so the rebuilt adapters keep serving the SAME
     /// session. A reload that made a fresh context would leave every plugin
@@ -1770,17 +1774,6 @@ async fn reload_extension_resources_inner<F>(
 where
     F: FnOnce() + Send,
 {
-    if ctx.args.native_durable {
-        return ReloadOutcome {
-            summary:
-                "Native durable prototype is restart-required; reload/dev hot apply unsupported"
-                    .into(),
-            had_warnings: true,
-            details: Vec::new(),
-            had_errors: true,
-            project_trusted: None,
-        };
-    }
     if harness.has_exact_resources()
         || ctx.args.resource_config.is_some()
         || ctx.args.resource_transition.is_some()
@@ -1841,24 +1834,6 @@ where
     } = prepared;
     let mut warnings = false;
 
-    // Shutdown callbacks must finish before a replacement can unload old DLLs.
-    // Ordinary lifecycle dispatch can time out or stop on a veto; unload cleanup
-    // instead joins every handler while keeping its module mapped.
-    let (shutdown_snapshot, shutdown_keepalive) = {
-        let session = ctx.extension_session.lock().unwrap();
-        (session.snapshot_arc(), session.keepalive())
-    };
-    if let Err(reason) = shutdown_extensions_for_reload(shutdown_snapshot, shutdown_keepalive).await
-    {
-        return ReloadOutcome {
-            summary: "Reload failed during extension shutdown".into(),
-            had_warnings: true,
-            details: vec![reason],
-            had_errors: true,
-            project_trusted: None,
-        };
-    }
-
     // ---- 1. Build a fresh ActionBridge + ExtensionSession ----
     // The fresh bridge carries the SAME `HarnessActionHost` (the host's harness
     // cell already points at this harness; the host impl is reusable across
@@ -1915,6 +1890,18 @@ where
             Some(ctx.resource_leases.clone()),
         )
     };
+    if effective_args.native_durable {
+        if let Err(error) = validate_durable_extensions(&extension_session) {
+            return ReloadOutcome {
+                summary: "Reload rejected because an extension conflicts with native durable"
+                    .into(),
+                had_warnings: true,
+                details: vec![error],
+                had_errors: true,
+                project_trusted: None,
+            };
+        }
+    }
     if extension_session.is_empty() && !effective_args.no_extensions {
         // The fresh session may be empty if no cdylibs are present — not a
         // warning per se, but note it.
@@ -1990,6 +1977,28 @@ where
     } else {
         None
     };
+
+    // Candidate loading and provider resolution above are not yet published to
+    // the live session. Do not tell existing extensions that their session is
+    // shutting down until every rejectable preparation step has
+    // succeeded; otherwise a rejected candidate would leave the old registry
+    // live after it had already received SessionShutdown. Candidate DLLs remain
+    // held by `extension_session`, so the old module is not unloaded before its
+    // shutdown handlers have joined.
+    let (shutdown_snapshot, shutdown_keepalive) = {
+        let session = ctx.extension_session.lock().unwrap();
+        (session.snapshot_arc(), session.keepalive())
+    };
+    if let Err(reason) = shutdown_extensions_for_reload(shutdown_snapshot, shutdown_keepalive).await
+    {
+        return ReloadOutcome {
+            summary: "Reload failed during extension shutdown".into(),
+            had_warnings: true,
+            details: vec![reason],
+            had_errors: true,
+            project_trusted: None,
+        };
+    }
 
     // ---- 2. Invalidate the old session + bridge BEFORE the swap ----
     // The old registry's `active` flag flips false so any in-flight
@@ -2151,12 +2160,10 @@ where
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env))
         .with_file_io(ctx.file_io.clone());
-    // Native durable reload is rejected above; this binding cannot be used.
-    let mut tools = build_tools_bound(
-        &tool_ctx,
-        &effective_args,
-        Arc::new(std::sync::OnceLock::new()),
-    );
+    // Reuse the binding installed in the durable context hook at startup;
+    // constructing a fresh OnceLock here would register a durable tool that
+    // can never resolve its owning harness.
+    let mut tools = build_tools_bound(&tool_ctx, &effective_args, ctx.durable_binding.clone());
     merge_extension_tools(
         &mut tools,
         &extension_session,

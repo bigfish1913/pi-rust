@@ -72,7 +72,7 @@ fn native_durable_registration_is_default_and_never_replay_safe() {
 }
 
 #[tokio::test]
-async fn native_durable_reload_refuses_before_preparing_or_publishing() {
+async fn native_durable_reload_reuses_session_binding_and_preserves_durable_state() {
     let _guard = crate::config::test_support::env_lock().lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let agent = temp.path().join("agent");
@@ -92,7 +92,7 @@ async fn native_durable_reload_refuses_before_preparing_or_publishing() {
         native_durable: true,
         no_session: true,
         no_extensions: true,
-        no_tools: true,
+        tools: Some(vec!["durable".into()]),
         no_skills: true,
         no_context_files: true,
         no_prompt_templates: true,
@@ -144,10 +144,10 @@ async fn native_durable_reload_refuses_before_preparing_or_publishing() {
         durable[0]["description"],
         crate::native_durable::COMMAND_DESCRIPTION
     );
-    assert!(
-        harness.get_tools().await.unwrap().is_empty(),
-        "no-tools must not disable discovery"
-    );
+    let initial_tools = harness.get_tools().await.unwrap();
+    assert!(initial_tools
+        .iter()
+        .any(|tool| tool.tool.schema().name == "durable"));
     assert_eq!(service.snapshot().await.unwrap(), before);
     let foreign = ephemeral_session();
     foreign
@@ -172,12 +172,36 @@ async fn native_durable_reload_refuses_before_preparing_or_publishing() {
         foreign.storage().history_revision().await.unwrap(),
         target_revision
     );
+    let mut prepared = false;
     let outcome = reload_extension_resources_inner(&harness, &context, || {
-        panic!("reload prepared a replacement")
+        prepared = true;
     })
     .await;
-    assert!(outcome.had_errors);
-    assert!(outcome.summary.contains("restart-required"));
+    assert!(
+        prepared,
+        "native durable should use the normal reload pipeline"
+    );
+    assert!(
+        !outcome.had_errors,
+        "{}: {:?}",
+        outcome.summary, outcome.details
+    );
+    assert!(outcome.summary.starts_with("Reloaded "));
+    let reloaded_tools = harness.get_tools().await.unwrap();
+    let durable_tool = reloaded_tools
+        .iter()
+        .find(|tool| tool.tool.schema().name == "durable")
+        .expect("reload must keep the native durable tool registered");
+    durable_tool
+        .tool
+        .execute(
+            "test-call",
+            serde_json::json!({"action":"status"}),
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .expect("reloaded durable tool must still resolve its original harness binding");
     assert_eq!(
         command_host
             .list_commands(serde_json::json!({}))
