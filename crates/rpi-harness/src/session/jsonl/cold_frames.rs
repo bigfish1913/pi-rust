@@ -1324,6 +1324,14 @@ mod context_usage_tests;
 #[path = "cold_frames_tests.rs"]
 mod tests;
 
+impl ResidentState {
+    /// Retained historical frame read locations; zero for facts-only replay.
+    #[cfg(test)]
+    pub(super) fn retained_frame_locations(&self) -> usize {
+        self.cold.locations.len()
+    }
+}
+
 impl ColdFrames {
     fn push(&mut self, location: Arc<Location>) {
         if location.append {
