@@ -11,6 +11,10 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- *(tui)* keep startup output and update cards in the retained header/update slot so live output can no longer render around them
+
 ## [0.22.1](https://github.com/bigfish1913/pi-rust/compare/v0.22.0...v0.22.1) - 2026-11-11
 
 ### Fixed
