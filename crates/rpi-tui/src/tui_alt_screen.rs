@@ -416,6 +416,15 @@ impl TuiAltScreen {
             .unwrap_or(false)
     }
 
+    /// Publish a synchronous batch of component-tree changes between frames.
+    /// Build expensive replacement components before entering this closure.
+    /// Do not render, request a render, or await inside the update. Acquire this
+    /// gate before taking any component locks that rendering also needs.
+    pub fn update_components<R>(&self, update: impl FnOnce() -> R) -> R {
+        let _render_guard = self.render_lock.lock().unwrap();
+        update()
+    }
+
     /// Set the layout root component.
     pub fn set_layout_root(&self, component: Option<Arc<dyn Component>>) {
         if let Ok(mut root) = self.layout_root.lock() {
@@ -2603,6 +2612,59 @@ mod tests {
             tui.stop(TuiStopOptions::default());
             let rendered = output.lock().unwrap().clone();
             assert!(rendered.find("<stop>").unwrap() < rendered.find("\x1b[?1049l").unwrap());
+        }
+    }
+
+    #[test]
+    fn component_updates_publish_between_complete_frames() {
+        use std::sync::mpsc;
+        for main_screen in [false, true] {
+            let terminal = ResizableTerminal::new(40, 8);
+            let output = terminal.output();
+            let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), true, None));
+            tui.set_main_screen_mode(main_screen);
+            let root = Arc::new(Container::new());
+            let history = (0..4)
+                .map(|row| format!("history-{row:03}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            root.add_child(Arc::new(Text::new(&history, 0, 0)));
+            tui.set_layout_root(Some(root.clone()));
+            tui.start_readerless();
+            output.lock().unwrap().clear();
+
+            let (started_tx, started_rx) = mpsc::channel();
+            let (painted_tx, painted_rx) = mpsc::channel();
+            let mut painter = None;
+            tui.update_components(|| {
+                assert!(matches!(
+                    tui.render_lock.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                root.clear();
+                let painting_tui = tui.clone();
+                painter = Some(std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    painting_tui.render_now(false);
+                    painted_tx.send(()).unwrap();
+                }));
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(painted_rx.try_recv().is_err());
+                assert!(output.lock().unwrap().is_empty());
+                root.add_child(Arc::new(Text::new(&history, 0, 0)));
+                root.add_child(Arc::new(Text::new("complete reply", 0, 0)));
+            });
+            // The queued renderer can only paint the completed tree, after the
+            // publisher releases the frame gate; neither mode may deadlock.
+            painted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            painter.unwrap().join().unwrap();
+            assert!(tui.render_lock.try_lock().is_ok());
+            let rendered = output.lock().unwrap().clone();
+            assert!(rendered.contains("complete reply"));
+            assert!(
+                !rendered.contains("\x1b[3J"),
+                "transient empty tree painted"
+            );
         }
     }
 

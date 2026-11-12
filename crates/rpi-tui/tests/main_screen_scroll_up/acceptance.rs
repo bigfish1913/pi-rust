@@ -119,6 +119,92 @@ fn timer_only_updates_preserve_native_history_without_erasing_scrollback() {
 }
 
 #[test]
+fn assistant_rebuild_keeps_the_previous_complete_frame_visible() {
+    use std::sync::mpsc;
+
+    let term = VirtualTerminal::new(WIDTH, HEIGHT);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let root = Arc::new(Container::new());
+    root.add_child(old_history());
+    let assistant = Arc::new(AssistantMessageComponent::default());
+    let previous_text = (0..40)
+        .map(|i| format!("assistant-line-{i:03}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    assistant.update_blocks(&[
+        AssistantBlock::Text("stable first block".into()),
+        AssistantBlock::Text(previous_text.clone()),
+    ]);
+    root.add_child(assistant.clone());
+    add_dock(&root);
+    tui.set_layout_root(Some(root));
+    tui.start_readerless();
+    term.browse_history_at(10);
+    let expected_document = document(&term);
+    let expected_message = assistant.render(WIDTH);
+    let expected_visible = term.visible();
+    let erases_before = term.state.lock().unwrap().scrollback_erase_count;
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    assistant.set_markdown_transformer(Some(Arc::new(move |text| {
+        if text.contains("replacement-tail") {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+        text.to_owned()
+    })));
+    let updating = assistant.clone();
+    let update = std::thread::spawn(move || {
+        updating.update_blocks(&[
+            AssistantBlock::Text("stable first block".into()),
+            AssistantBlock::Text(format!("{previous_text}\n\nreplacement-tail")),
+        ]);
+    });
+    // A channel gates the expensive transformation at the exact point where
+    // clear-then-add used to expose only the first block of a long assistant.
+    // No race-inducing sleep.
+    let reached_transformer = entered_rx.recv_timeout(Duration::from_secs(5));
+    if reached_transformer.is_err() {
+        let _ = release_tx.send(());
+        update.join().unwrap();
+        panic!("replacement did not reach the markdown transformer");
+    }
+    let during_message = assistant.render(WIDTH);
+    tui.request_render(false);
+    let during_document = document(&term);
+    let during_visible = term.visible();
+    let during_erases = term.state.lock().unwrap().scrollback_erase_count;
+    release_tx.send(()).unwrap();
+    update.join().unwrap();
+    tui.request_render(false);
+
+    assert_eq!(
+        during_erases, erases_before,
+        "rebuild erased native scrollback"
+    );
+    assert_eq!(
+        during_message, expected_message,
+        "partial assistant published"
+    );
+    assert_eq!(
+        during_document, expected_document,
+        "transient blank transcript painted"
+    );
+    assert_eq!(
+        during_visible, expected_visible,
+        "native history view jumped"
+    );
+    assert_eq!(term.state.lock().unwrap().history_view_top, Some(10));
+    assert_history_once(&term);
+    assert!(document(&term)
+        .iter()
+        .any(|row| row.contains("replacement-tail")));
+}
+
+#[test]
 fn streamed_output_growth_preserves_history_commands_and_draft() {
     // Positive control: native browsing must not prevent real output growth,
     // duplicate an already-written message, or truncate either command line.

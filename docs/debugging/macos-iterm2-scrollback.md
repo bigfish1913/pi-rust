@@ -22,6 +22,31 @@
 - 主屏 `render_now(true)` 保留差分基线和物理账本，只强制重画 live rows，不会把整个会话再次追加在旧光标处。重绘前清行，并清理短文档下方的空白 live rows，以修复外部 UI 留下的行首、行尾和空白区残留；不清 saved scrollback。
 - **并未禁止所有历史重建。** 真实历史内容编辑、折叠/展开、主题或几何变化仍可能需要重建；不能用这次修复承诺这些操作都保留原生回看锚点，也不能声称已在 iTerm2 实机证实所有闪屏消失。
 
+## v0.22.1 后续报告：流式内容的中间帧
+
+v0.22.1 已包含 PR #303 的写入时序修复，但等待 `drain_session()` 并不能保证
+渲染线程读到完整组件树。后续排查找到两个发布窗口：
+
+- `AssistantMessageComponent` 更新时先清空正在展示的 container，再逐块进行
+  Markdown 转换、创建组件并加入 container。独立的定时渲染线程可在两块之间读到
+  一条长回复仅剩第一块的中间状态，误判为大幅缩短的文档并进入 `ED 3` 重建。
+- 历史结算先清理 live reply、再清空旧 page、最后挂载持久化 page。这些步骤原先
+  不受 renderer 的 frame lock 保护，写入已完成仍可能绘制到空/不完整的 transcript。
+
+修复采用离屏构建、完整发布：assistant 的正常块和错误内容在临时 container 中
+构建完成后一次替换 children；历史 page/live 槽的同步替换使用同一个 frame lock，
+使 regular 和 fullscreen 渲染只能发生在替换前或替换后。耗时的页面读取和组件构建
+不放在 frame lock 内；锁内不 await、不请求重绘。
+
+确定性回归在第二个 Markdown 块的转换处使用 channel 暂停更新，同时请求渲染。
+原生产实现发送一次 `ED 3`（期望 0、实际 1）；修复后旧的完整回复、原生回看锚点、
+既有消息顺序和数量均保持，放行转换后新的回复尾部正常出现。不使用 sleep 猜测竞态。
+另一个测试让两种屏幕模式的 renderer 与批量组件替换并发，验证只绘制完整新树。
+
+**边界不变：**这次修复消除的是非业务内容变化造成的中间空帧，不禁止此前描述的
+真实历史编辑、Markdown 重排、折叠/展开或几何变化触发的历史重建，不能承诺所有
+`ED 3` 都已移除。仍需用户在实际使用的终端复测；协议测试不能代替实机视觉验收。
+
 ## 自动验收
 
 入口：
@@ -39,6 +64,7 @@ cargo test -p rpi-tui --test main_screen_scroll_up -- --nocapture
 | 用例 | 验收要求 |
 | --- | --- |
 | `timer_only_updates_preserve_native_history_without_erasing_scrollback` | 80 行历史 + 长工具结果 + editor/footer；用户回看第 10 行，仅改变历史区耗时标签三次。不得发 `ED 3`，浏览锚点与可见历史不变，既有消息顺序和数量不变。使用真实 ToolExecutionComponent，在每次最多 2 秒的有界轮询中等待可见耗时变化，不假定固定 sleep 后一定变化；期间不修改工具输出、参数或运行状态。 |
+| `assistant_rebuild_keeps_the_previous_complete_frame_visible` | 在第二块 Markdown 转换时暂停后台更新并同步绘制，旧完整回复和原生回看锚点必须保持、不得发 `ED 3`；完成后新尾部可见。原生产实现确定性失败。 |
 | `streamed_output_growth_preserves_history_commands_and_draft` | 使用真实 BashExecutionComponent 连续追加输出；逐帧验证回看锚点不变、当前全部输出各出现一次，以及完整工具命令、编辑器草稿和 footer 各出现一次，不只检查最后一帧。 |
 | `cursor_above_live_viewport_does_not_duplicate_or_drop_command_rows` | 12 条唯一命令、4 行 live screen、光标位于文档第 6 行。首次绘制及相同内容再次刷新后，每条命令必须完整且只出现一次，不得把 06/07 重复绘制到后面并丢失 10/11。 |
 | `offscreen_cursor_can_return_without_corrupting_the_physical_ledger` | 光标在历史区与可见区之间往返，验证隐藏/恢复、物理行列位置和消息完整性。 |

@@ -255,7 +255,7 @@ impl AssistantMessageComponent {
     /// and stop-reason error lines surface through `add_error_message` in the
     /// host). Empty content renders nothing.
     fn rebuild_content(&self, blocks: &[AssistantBlock]) {
-        self.content_container.clear();
+        let content = Container::new();
 
         let opts = self.options.lock().unwrap().clone();
         let has_visible = blocks.iter().any(|b| {
@@ -267,6 +267,7 @@ impl AssistantMessageComponent {
         if !has_visible {
             // Empty / whitespace-only content renders nothing (matches the TS
             // early return when no visible block is present).
+            self.content_container.replace_children(Vec::new());
             return;
         }
 
@@ -287,7 +288,7 @@ impl AssistantMessageComponent {
                     // transformed text.
                     let transformed = self.transform_markdown(t.trim());
                     let md = Arc::new(Markdown::new(transformed, opts.output_pad, 0));
-                    self.content_container.add_child(md);
+                    content.add_child(md);
                     i += 1;
                 }
                 AssistantBlock::Text(_) => {
@@ -297,7 +298,7 @@ impl AssistantMessageComponent {
                 AssistantBlock::Image(data) if !data.is_empty() => {
                     let image = Arc::new(Image::from_data(data.clone(), ImageOptions::default()));
                     image.set_inline_visible(*self.show_images.lock().unwrap());
-                    self.content_container.add_child(image);
+                    content.add_child(image);
                     i += 1;
                 }
                 AssistantBlock::Image(_) => {
@@ -329,11 +330,10 @@ impl AssistantMessageComponent {
                         // can expand THIS message's thinking.
                         let label =
                             italic(&theme().colors.thinking_text.fg(&opts.hidden_thinking_label));
-                        self.content_container
-                            .add_child(Arc::new(ThinkingRegionComponent::new(
-                                Arc::new(Text::new(label, opts.output_pad, 0)),
-                                self.message_id.lock().unwrap().clone(),
-                            )));
+                        content.add_child(Arc::new(ThinkingRegionComponent::new(
+                            Arc::new(Text::new(label, opts.output_pad, 0)),
+                            self.message_id.lock().unwrap().clone(),
+                        )));
                     } else {
                         // Render the joined thinking as one dim italic markdown
                         // section — the TS `color: thinkingText, italic: true`
@@ -357,11 +357,10 @@ impl AssistantMessageComponent {
                         // turn `# heading` / `- item` / ``` fences into a
                         // plain paragraph (pulldown-cmark sees the APC bytes
                         // as inline text).
-                        self.content_container
-                            .add_child(Arc::new(ThinkingRegionComponent::new(
-                                md,
-                                self.message_id.lock().unwrap().clone(),
-                            )));
+                        content.add_child(Arc::new(ThinkingRegionComponent::new(
+                            md,
+                            self.message_id.lock().unwrap().clone(),
+                        )));
                     }
 
                     // Spacer before a following visible block (TS
@@ -372,21 +371,23 @@ impl AssistantMessageComponent {
                             || matches!(b, AssistantBlock::Image(data) if !data.is_empty())
                     });
                     if has_after {
-                        self.content_container.add_child(Arc::new(Spacer::new(1)));
+                        content.add_child(Arc::new(Spacer::new(1)));
                     }
                 }
             }
         }
+        self.content_container
+            .replace_children(content.get_children());
     }
 
     /// Update with error message.
     pub fn update_error(&self, error: &str, stop_reason: &str) {
-        // Clear content container
-        self.content_container.clear();
+        // Keep the previous complete message visible while building its error.
+        let content = Container::new();
         *self.last_blocks.lock().unwrap() = Vec::new();
 
         // Add spacing
-        self.content_container.add_child(Arc::new(Spacer::new(1)));
+        content.add_child(Arc::new(Spacer::new(1)));
 
         // Add error message
         let error_text = match stop_reason {
@@ -397,7 +398,9 @@ impl AssistantMessageComponent {
         };
 
         let error_component = Arc::new(Text::new(error_text, 1, 0));
-        self.content_container.add_child(error_component);
+        content.add_child(error_component);
+        self.content_container
+            .replace_children(content.get_children());
     }
 
     /// Set hide thinking option. Rebuilds the last content so the toggle is

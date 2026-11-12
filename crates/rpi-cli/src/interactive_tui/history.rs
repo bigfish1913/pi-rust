@@ -269,17 +269,26 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
     let page_chat = render_page(state, &page.entries);
     resident.notices = Arc::new(Container::new());
     page_chat.add_child(resident.notices.clone());
-    clear_settled_active(state);
-    chat.clear();
-    state.history_page.mount_header(chat);
-    state.history_page.mount_updates(chat);
-    chat.add_child(page_chat);
-    resident.error = None;
-    state.history_page.panels.clear();
-    for child in panels.get_children() {
-        state.history_page.panels.add_child(child);
+    let mut publish = || {
+        clear_settled_active(state);
+        chat.clear();
+        state.history_page.mount_header(chat);
+        state.history_page.mount_updates(chat);
+        chat.add_child(page_chat);
+        resident.error = None;
+        state
+            .history_page
+            .panels
+            .replace_children(panels.get_children());
+        state.history_page.mount_active(chat);
+    };
+    // Retiring the live reply and mounting its persisted replacement must be
+    // one frame transaction; a periodic renderer otherwise sees a blank tree.
+    if let Some(tui) = &state.tui {
+        tui.update_components(publish);
+    } else {
+        publish();
     }
-    state.history_page.mount_active(chat);
     state.footer.set_session_name(name.as_deref());
     if let Some(overview) = overview {
         apply_overview(&state.footer, &overview);
@@ -404,24 +413,29 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
                 let page_chat = render_page(&state, &page.entries);
                 resident.notices = Arc::new(Container::new());
                 page_chat.add_child(resident.notices.clone());
-                clear_settled_active(&state);
-                resident.error = None;
-                // Drop every reference to the old page (including image components).
-                state.chat_container.clear();
-                state.history_page.mount_header(&state.chat_container);
-                state.history_page.mount_updates(&state.chat_container);
-                state.chat_container.add_child(page_chat);
-                if !page.has_more_after {
+                // Session writes being drained is not sufficient: the frame
+                // scheduler must not observe the gap between clearing the live
+                // reply/old page and installing the complete history page.
+                tui.update_components(|| {
+                    clear_settled_active(&state);
+                    resident.error = None;
+                    // Drop every reference to the old page (including images).
+                    state.chat_container.clear();
+                    state.history_page.mount_header(&state.chat_container);
+                    state.history_page.mount_updates(&state.chat_container);
+                    state.chat_container.add_child(page_chat);
+                    if !page.has_more_after {
+                        state
+                            .chat_container
+                            .add_child(state.history_page.active.clone());
+                    }
                     state
                         .chat_container
-                        .add_child(state.history_page.active.clone());
-                }
-                state
-                    .chat_container
-                    .add_child(state.history_page.panels.clone());
-                state
-                    .history_page
-                    .mount_native_notice(&state.chat_container);
+                        .add_child(state.history_page.panels.clone());
+                    state
+                        .history_page
+                        .mount_native_notice(&state.chat_container);
+                });
                 if let Some(scroll) = tui.get_primary_scroll_view() {
                     scroll.invalidate();
                 }
