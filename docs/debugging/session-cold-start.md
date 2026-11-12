@@ -31,9 +31,11 @@ Its private facts-only loader validates record identities and sequences, but
 need not retain frame-read locations: its only output is metadata and session
 values, not a writable/queryable storage handle. Facts-only replay therefore
 validates every historical frame document and then releases it instead of
-allocating a cold `Location`, which removes about half of the preflight scan
-cost on a 701,000-frame history without changing what is validated. It must not be used for ordinary
-restore, forks, detached snapshots or resource transitions.
+allocating a cold `Location`. ID reservations, lane validation, sequence updates
+and clear handling still use the same reducer checks as ordinary replay. This
+facts-only handle must not be used for ordinary restore, forks, detached snapshots
+or resource transitions. Custom filesystems using the eager fallback retain their
+existing behavior; this optimization applies only to the stable ranged-reader path.
 
 The whole-file legacy digest guards an eventual progress-format upgrade. Modern
 histories and facts-only preflight do not use that upgrade capability, so they
@@ -166,6 +168,31 @@ Legacy's separate budget reflects the additional checked one-time format
 upgrade; **passing that budget does not establish the default two-second target**. The standalone script
 still defaults to 2000/3000 ms for either shape; the Task/CI commands supply their
 legacy limits explicitly, and every report records the limits used.
+
+### Facts-only retention validation measurements
+
+The corrected production code at `474275f` was rebuilt with `--release --locked`
+and measured with `scripts/resource-cold-start.py` on Windows (Rust 1.99.1,
+Python 3.11.9). Each format used three fresh processes, 701,000 frames, 21,733
+entries and 256-byte deltas, with the unchanged **CI budgets** from the table
+above. The two format groups ran sequentially, without a concurrent Cargo build;
+background system load was not controlled and the OS disk cache was not flushed.
+
+| Format | Ready median | Ready min–max | Message query max | State query max |
+| --- | --- | --- | --- | --- |
+| Modern | 2194.0 ms | 2164.0–2456.8 ms | 3.4 ms | 351.2 ms |
+| Legacy upgrade | 3285.7 ms | 3275.1–3289.1 ms | 2.9 ms | 450.6 ms |
+
+All six observations passed protocol, history/query validation, cleanup and the
+explicit CI-budget gates. These local results are **not hosted-runner results**
+and do not satisfy the stricter local modern median target of 2000 ms. No paired
+baseline was measured, so no percentage speed-up is claimed. Earlier exploratory
+numbers that bypassed reducer validation are not evidence for this implementation.
+The measured executable SHA-256 was
+`4cea4551f0bc6d653833bc9020b3100bb54696a73cf67c3dfbbae1bb34f4d247`.
+Detailed local reports are outside Git at
+`D:/Temp/rpi-p2-final-modern/results.json` and
+`D:/Temp/rpi-p2-final-legacy/results.json`.
 
 CI uploads `historical-cold-start-diagnostics` on success or failure. Each format
 has `results.json` with gates/measurements and executable hashes, `reproduce.json`
