@@ -45,6 +45,8 @@ pub(super) struct HistoryUi {
     native_durable_notice: Arc<Container>,
     /// Startup/update notices stay before the live transcript slot.
     pub(super) updates: Arc<Container>,
+    /// Live regular-mode fallback for cards arriving after native publication.
+    pub(super) regular_update_hint: Arc<RegularUpdateHint>,
 }
 impl HistoryUi {
     pub(super) fn with_native_durable(enabled: bool) -> Self {
@@ -73,6 +75,7 @@ impl HistoryUi {
         self.panels.clear();
         self.header.clear();
         self.updates.clear();
+        self.regular_update_hint.clear();
         self.native_durable_notice.clear();
     }
     pub(super) fn bind(&self, harness: &AgentHarness) {
@@ -158,7 +161,19 @@ impl HistoryUi {
         {
             chat.add_child(panels);
         }
+        self.mount_regular_update_hint(chat);
         self.mount_native_notice(chat);
+    }
+    // Reserve once, even while empty: background checks only mutate its text.
+    fn mount_regular_update_hint(&self, chat: &Arc<Container>) {
+        let hint: Arc<dyn Component> = self.regular_update_hint.clone();
+        if !chat
+            .get_children()
+            .iter()
+            .any(|child| Arc::ptr_eq(child, &hint))
+        {
+            chat.add_child(hint);
+        }
     }
     fn mount_native_notice(&self, chat: &Arc<Container>) {
         let notice: Arc<dyn Component> = self.native_durable_notice.clone();
@@ -269,7 +284,7 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
     let page_chat = render_page(state, &page.entries);
     resident.notices = Arc::new(Container::new());
     page_chat.add_child(resident.notices.clone());
-    let mut publish = || {
+    let publish = || {
         clear_settled_active(state);
         chat.clear();
         state.history_page.mount_header(chat);
@@ -432,6 +447,9 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
                     state
                         .chat_container
                         .add_child(state.history_page.panels.clone());
+                    state
+                        .history_page
+                        .mount_regular_update_hint(&state.chat_container);
                     state
                         .history_page
                         .mount_native_notice(&state.chat_container);

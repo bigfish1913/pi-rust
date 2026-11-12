@@ -68,7 +68,16 @@ fn update_checks_target_the_reserved_update_slot() {
         &source,
         "let update_container = state.history_page.updates.clone();",
     );
+    let hint = offset(
+        &source,
+        "let update_hint = state.history_page.regular_update_hint.clone();",
+    );
     let add = offset(&source, "add_update_notices(&update_container, &report);");
+    let live = offset(&source, "update_hint.update(&report);");
+    assert!(
+        slot < hint && hint < add && add < live,
+        "publish full cards before updating the retained live hint"
+    );
     assert!(
         slot < add,
         "the update slot must be captured before the background check renders"

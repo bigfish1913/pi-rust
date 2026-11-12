@@ -1,6 +1,6 @@
-//! Regression test for main-screen mode: when a streamed message re-wraps
-//! *above* the visible viewport, the renderer must rebuild scrollback instead
-//! of treating screen-scroll commands as access to saved history.
+//! Regression tests for main-screen mode: saved native rows are immutable
+//! output snapshots. Historical edits reconcile only the live tail, never
+//! erase/replay scrollback or treat screen-scroll commands as access to it.
 //!
 //! The test drives `TuiAltScreen` through a tiny virtual terminal that models
 //! the main buffer (document + viewport) so we can assert what is actually
@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use rpi_tui::{
-    AssistantBlock, AssistantMessageComponent, Container, Focusable, ScrollView, ScrollViewOptions,
-    Text, TuiAltScreen, TUI,
+    AssistantBlock, AssistantMessageComponent, Component, Container, Focusable, ScrollView,
+    ScrollViewOptions, Text, TuiAltScreen, TUI,
 };
 
 /// Shared virtual-terminal state so the test can keep a handle to the same
@@ -693,10 +693,15 @@ fn repeated_history_edits_keep_the_beginning_in_bounded_scrollback() {
             "message 000",
             "revision {revision}: repeated repaint must not evict the beginning"
         );
+        // Deliberate snapshot contract: the saved row cannot be patched by
+        // cursor movement. The canonical document still has the latest edit.
+        assert_eq!(term.document_row(50).trim(), "message 050 revision 0");
         assert_eq!(
-            term.document_row(50).trim(),
+            text.render(40)[50],
             format!("message 050 revision {revision}")
         );
+        assert_eq!(term.state.lock().unwrap().scrollback_erase_count, 0);
+        assert_eq!(term.state.lock().unwrap().viewport_top, 92);
         assert_eq!(term.visible().last().unwrap().trim(), "message 099");
     }
 }
@@ -734,8 +739,8 @@ fn long_transcript_stream_rewrite_keeps_dock_visible() {
 
     // Simulate a long streamed message re-wrapping *above* the visible tail:
     // replace a transcript line far above the viewport so the changed range
-    // starts before the current viewport top, and also insert an extra line so
-    // the write spans past the bottom of the screen (forcing a scroll).
+    // starts before the current viewport top, and also insert an extra line.
+    // This rebases the logical tail without scrolling/replaying saved rows.
     transcript.clear();
     for i in 0..101 {
         let text = if i == 50 {
@@ -758,11 +763,13 @@ fn long_transcript_stream_rewrite_keeps_dock_visible() {
         visible.iter().any(|row| row.contains('─')),
         "the editor border (input area) must remain visible after the rewrite: {visible:?}"
     );
-    assert!(
-        term.document_row(50).contains("REWRAPPED"),
-        "the rewrite must land on document row 50, not be painted at the wrong row: {:?}",
-        term.document_row(50)
+    assert_eq!(
+        term.document_row(50).trim(),
+        "line 050",
+        "saved rows retain the emitted snapshot, not retroactive logical edits"
     );
+    assert!(transcript.render(40)[50].contains("REWRAPPED"));
+    assert_eq!(term.state.lock().unwrap().scrollback_erase_count, 0);
 
     // A second streamed update must also keep the dock pinned; a corrupted
     // viewport bookkeeping drifts further on each frame and eventually hides it.

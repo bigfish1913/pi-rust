@@ -1685,11 +1685,13 @@ pub async fn interactive_tui(
     // Land in the retained update slot, not on the chat root: a late check must
     // not render after (or be wiped with) the live transcript page.
     let update_container = state.history_page.updates.clone();
+    let update_hint = state.history_page.regular_update_hint.clone();
     let rpi_tui = tui.clone();
     update_check_handles.push(tokio::spawn(async move {
         let report = crate::updates::check_rpi_startup().await;
         if !report.is_empty() {
             add_update_notices(&update_container, &report);
+            update_hint.update(&report);
         }
         rpi_tui.request_render(false);
     }));
