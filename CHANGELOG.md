@@ -11,6 +11,37 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/bigfish1913/pi-rust/compare/v0.22.1...v0.23.0) - 2026-11-13
+
+### Added
+
+- *(session)* allow native durable extension reload
+- *(tui)* click thinking label to expand per message
+
+### Fixed
+
+- *(tui)* preserve native history across replies, panels and update notices ([#314](https://github.com/bigfish1913/pi-rust/pull/314))
+- *(rpc)* accept the nextRun queue kind returned by get_queue
+- *(cli)* only announce session cwd adoption when the directory actually changes
+- *(ci)* make infrastructure and validation gates reliable ([#306](https://github.com/bigfish1913/pi-rust/pull/306))
+- *(tui)* restore the startup and update notice slots ([#307](https://github.com/bigfish1913/pi-rust/pull/307))
+- *(tui)* keep per-message thinking ids unique across per-event views
+- *(tools)* fail fast on interactive credential prompts in shell children
+- *(tools)* prefer PATH pwsh and silence progress in powershell tool
+
+### Other
+
+- Merge branch 'main' into fix/session-cwd-note-only
+- Merge branch 'main' into feat/click-expand-thinking
+- Merge branch 'main' into feat/click-expand-thinking
+- Merge branch 'main' into feat/click-expand-thinking
+- Merge branch 'main' into fix/powershell-path-pwsh
+- Merge branch 'main' into fix/powershell-path-pwsh
+- Merge branch 'main' into fix/noninteractive-shell-prompts
+- *(tools)* add real encoded-command regressions for PowerShell scripts
+- *(session)* stop retaining frame locations during facts-only preflight ([#311](https://github.com/bigfish1913/pi-rust/pull/311))
+- *(tui)* drop leftover frame dump from thinking region probe
+
 ### Fixed
 
 - *(tui)* keep startup output and update cards in the retained header/update slot so live output can no longer render around them
