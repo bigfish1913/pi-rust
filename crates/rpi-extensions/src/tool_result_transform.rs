@@ -16,6 +16,12 @@
 //!   unreadable output leave the result as the previous handler left it.
 //! - **Only when registered.** Tools are wrapped only when at least one handler
 //!   exists, so a session without such a plugin runs the tools untouched.
+//! - **Error results too, through the loop hook.** The `rpi` CLI calls
+//!   [`emit_tool_result_with_status`] from the agent loop's `after_tool_call`
+//!   hook, so failed calls (a bash exit != 0, whose output is the result) and
+//!   the result of a vetoed call reach the handlers as well, with
+//!   `"isError": true`. [`with_tool_result_transform`] stays for SDK users
+//!   who wrap tools themselves; it offers only successful results.
 //!
 //! [`EventTag::ToolResult`]: rpi_plugin_sdk::EventTag::ToolResult
 
@@ -50,13 +56,29 @@ pub fn with_tool_result_transform(
     })
 }
 
-/// Run every `tool_result` transform over one result. `None` means no handler
-/// changed anything (or the snapshot is stale), so the caller keeps `result`.
+/// Run every `tool_result` transform over one successful result. `None` means
+/// no handler changed anything (or the snapshot is stale), so the caller keeps
+/// `result`. Same as [`emit_tool_result_with_status`] with `is_error: false`.
 pub fn emit_tool_result(
     tool_call_id: &str,
     tool_name: &str,
     input: &Value,
     result: &AgentToolResult,
+    snapshot: &RegistrySnapshot,
+) -> Option<AgentToolResult> {
+    emit_tool_result_with_status(tool_call_id, tool_name, input, result, false, snapshot)
+}
+
+/// Run every `tool_result` transform over one result, success or error. The
+/// envelope carries `"isError"` so a handler can tell them apart. `None` means
+/// no handler changed anything (or the snapshot is stale), so the caller keeps
+/// `result`.
+pub fn emit_tool_result_with_status(
+    tool_call_id: &str,
+    tool_name: &str,
+    input: &Value,
+    result: &AgentToolResult,
+    is_error: bool,
     snapshot: &RegistrySnapshot,
 ) -> Option<AgentToolResult> {
     if !assert_active(snapshot.active_flag()) {
@@ -77,6 +99,7 @@ pub fn emit_tool_result(
             "input": input,
             "content": content,
             "details": details,
+            "isError": is_error,
         })
         .to_string();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -329,6 +352,33 @@ mod tests {
             changed.terminate,
             "fields a handler cannot return stay the tool's"
         );
+    }
+
+    #[test]
+    fn envelope_reports_whether_the_result_is_an_error() {
+        /// Echoes the envelope's `isError` into `details`.
+        extern "C" fn echo_is_error(
+            event: StbStringRef,
+            out: *mut StbString,
+            _: *mut std::ffi::c_void,
+        ) -> i32 {
+            // SAFETY: the envelope and output slot are live for the callback.
+            let event: Value = serde_json::from_str(unsafe { event.as_str() }).unwrap();
+            let patch = json!({"details": {"isError": event["isError"]}});
+            unsafe { *out = StbString::from_string(patch.to_string()) };
+            0
+        }
+
+        let snap = snapshot(&[echo_is_error]);
+        let input = json!({});
+        let success = emit_tool_result("c1", "bash", &input, &result(), &snap).unwrap();
+        assert_eq!(success.details, json!({"isError": false}));
+        for is_error in [false, true] {
+            let changed =
+                emit_tool_result_with_status("c1", "bash", &input, &result(), is_error, &snap)
+                    .unwrap();
+            assert_eq!(changed.details, json!({"isError": is_error}));
+        }
     }
 
     #[test]

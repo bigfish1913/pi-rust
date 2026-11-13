@@ -366,9 +366,9 @@ extern "C" fn on_before_agent_start(
 ### 改写工具结果
 
 `rpi_plugin_sdk::register_tool_result(api, handler, user_data)` 注册工具结果变换器，
-对应 pi 的 `tool_result` handler 返回 `content` / `details`。工具成功返回后、结果进入
-会话之前，宿主把 `{"toolCallId", "toolName", "input", "content", "details"}` 交给
-handler（`content` 与插件工具返回值同形：`text` 块和带 base64 `data`、`mimeType` 的
+对应 pi 的 `tool_result` handler 返回 `content` / `details`。工具调用结束后（成功或失败）、
+结果进入会话之前，宿主把 `{"toolCallId", "toolName", "input", "content", "details", "isError"}`
+交给 handler（`content` 与插件工具返回值同形：`text` 块和带 base64 `data`、`mimeType` 的
 `image` 块）；handler 在 `out` 里只写要替换的字段，例如把截图重新编码后返回新的
 `content`：
 
@@ -392,10 +392,17 @@ extern "C" fn on_tool_result(
 
 - **按注册顺序串联**，后一个 handler 看到前一个的结果；返回非零或 panic 时保持原样，
   fan-out 继续。
-- **只改返回的字段。** `terminate`、usage 等仍是工具自己的；失败的调用不经过变换器。
+- **只改返回的字段。** `terminate`、usage 等仍是工具自己的；变换器不改变调用是否失败。
+- **失败的结果也会经过变换器**（`"isError": true`），例如 bash 非零退出时的命令输出。
+  被 `ToolCall` handler 否决（`EVENT_HANDLER_ABORT`）的调用，其宿主原因文本也以
+  `isError: true`、`details: {"blocked": true}` 交给变换器；返回结果中第一个非空 `text`
+  块会成为模型看到的原因，否决插件借此说明为什么拦截。
+- **变换器无法运行时宿主不放行原结果**（例如阻塞线程意外 panic），改为一条
+  “tool result withheld” 错误文本，因为插件可能依赖变换器去掉不该给模型看的内容。
 - **在阻塞线程上运行**，重新编码图片这类慢活不会卡住运行时；结果按变换后的样子写进
   会话，以后每轮原样重发，提示词缓存不受影响。
-- 没有插件注册时宿主不包装任何工具。旧宿主的 `struct_size` 够不到这个槽，
+- 宿主在 agent 循环的 `after_tool_call` 钩子中按调用读取当前会话，所以 `/reload` 后新加的
+  变换器立即生效，子 harness 也继承；没有变换器时直接跳过。旧宿主的 `struct_size` 够不到这个槽，
   `register_tool_result` 返回 `-1`。
 
 ### Provider 与渲染器
