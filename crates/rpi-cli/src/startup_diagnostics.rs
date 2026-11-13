@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Opt-in startup spans. Only fixed phase names and numeric values reach stderr.
 //! Spans nest; their durations must not be added as independent measurements.
 use std::{

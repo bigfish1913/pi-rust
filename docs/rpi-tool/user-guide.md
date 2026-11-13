@@ -191,6 +191,7 @@ ANTHROPIC_AUTH_TOKEN=token
 ```text
 rpi auth login|check|logout
 rpi events path|tail    检查扩展事件日志（需 RPI_EVENT_LOG=1）
+rpi session gc [path...] [--dry-run]  离线剥离已被 clear_run 退役的流式帧负载
 rpi install <crate>
 rpi uninstall <crate>
 rpi extension update [name] # 更新全部符合条件的扩展，或按名称更新
@@ -318,7 +319,7 @@ rpi --project-only
 RPI_CODING_AGENT_DIR=/work/rpi-agent rpi
 ```
 
-会话默认保存到 agent 配置目录下的 sessions；`--no-session` 可使用临时会话。
+会话默认保存到当前项目的 `<cwd>/.rpi/sessions`；`RPI_CODING_AGENT_SESSION_DIR` 可覆盖该路径，命令行 `--session-dir <dir>` 和 `settings.json` 的 `sessionDir` 优先于它。根目录内再按 cwd 编码分子目录。`--no-session` 可使用临时会话。
 
 ## 6. Rust 插件
 
@@ -374,8 +375,10 @@ rpi install my-extension --path ../my-rpi-extension --force
 ```
 
 推荐用 `rpi extension update` 更新全部项目链接扩展和全局 registry/prebuilt 扩展，
-或用 `rpi extension update <name>` 按名称更新。更新保留原来的 Cargo 构建后端或
-显式指定的 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
+或用 `rpi extension update <name>` 按名称更新。预编译扩展可以用
+`rpi extension update --cdn <URL>` 通过 HTTPS CDN 下载归档；清单仍从 GitHub
+获取，CDN 失败会回退到 GitHub。该选项不影响项目链接扩展或 Cargo 构建扩展。
+更新保留原来的 Cargo 构建后端或显式指定的 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
 旧命令 `rpi package update [name]` 仍兼容，但扩展更新推荐使用
 `rpi extension update [name]`。项目链接管理仍使用 `rpi package link`、
 `rpi package list`、`rpi package unlink`，这些命令名称不变。

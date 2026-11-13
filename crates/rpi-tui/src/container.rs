@@ -35,6 +35,15 @@ impl Container {
         }
     }
 
+    /// Publish a complete replacement in one structural update. Construct new
+    /// components before calling this so renderers see either complete frame,
+    /// never the empty/partially populated state between clear and add_child.
+    pub fn replace_children(&self, replacement: Vec<Arc<dyn Component>>) {
+        if let Ok(mut children) = self.children.lock() {
+            *children = replacement;
+        }
+    }
+
     /// Clear all children.
     pub fn clear(&self) {
         if let Ok(mut children) = self.children.lock() {

@@ -157,9 +157,16 @@ pub(super) fn auto_send_step(
 }
 
 pub(super) struct TuiState {
+    pub(super) session_write_tasks: super::settlement::SessionWriteTasks,
     pub(super) history_page: history::HistoryUi,
     /// The root selected at startup, retained across session switches/reloads.
     pub(super) session_dir: std::path::PathBuf,
+    /// The cwd captured at startup. Session pickers scope their default view
+    /// to this project; extensions may mutate the process cwd at runtime, so
+    /// reading `current_dir()` here would silently change the picker's scope.
+    pub(super) session_cwd: std::path::PathBuf,
+    /// `/session` and `-r` scope, reset to Project every time a picker opens.
+    pub(super) session_scope: std::sync::Mutex<crate::session::SessionScope>,
     /// The in-flight streaming assistant message (cleared on finalize).
     /// `Arc`-shared with the [`TranscriptView`] the event drain renders through,
     /// so the render-tick / reload / toggle paths keep direct access.
@@ -173,6 +180,11 @@ pub(super) struct TuiState {
     /// Whether package/custom themes may be selected in this session.
     /// Persisted display preference toggled by Ctrl+T (shared with the view).
     pub(super) hide_thinking: Arc<std::sync::Mutex<bool>>,
+    /// Allocator for the per-message ids click regions key on. Shared with every
+    /// [`TranscriptView`] this state builds, so ids stay unique across the
+    /// per-event views (a per-view counter would restart and make clicks toggle
+    /// the first live message).
+    pub(super) message_seq: crate::transcript_view::MessageIdSeq,
     /// Global tool-output expansion preference toggled by Ctrl+O (shared with
     /// the view).
     pub(super) tool_outputs_expanded: Arc<std::sync::Mutex<bool>>,
@@ -1989,6 +2001,19 @@ impl TuiState {
 
     pub(super) fn set_hide_thinking(&self, hide: bool) {
         *self.hide_thinking.lock().unwrap() = hide;
+        // The global toggle applies to the WHOLE transcript, not just the
+        // in-flight message: restored history pages carry their own assistant
+        // components (created far from `start_assistant`).
+        let mut pending = self.chat_container.get_children();
+        pending.extend(self.history_page.active.get_children());
+        while let Some(child) = pending.pop() {
+            if let Some(container) = child.as_any().downcast_ref::<Container>() {
+                pending.extend(container.get_children());
+            }
+            if let Some(assistant) = child.as_any().downcast_ref::<AssistantMessageComponent>() {
+                assistant.set_hide_thinking(hide);
+            }
+        }
         if let Some(comp) = self.current_assistant.lock().unwrap().as_ref() {
             comp.set_hide_thinking(hide);
         }
@@ -2053,26 +2078,38 @@ impl TuiState {
         self.markdown_transformer.lock().unwrap().clone()
     }
 
+    /// Streamed messages belong in the live slot, even while it is detached.
+    pub(super) fn transcript_container(&self) -> Arc<Container> {
+        if self.history_page.is_bound() {
+            self.history_page.active.clone()
+        } else {
+            self.chat_container.clone()
+        }
+    }
+
+    /// Keep command/background notices visible on the page being viewed.
+    /// On latest history they join streamed output, so later replies follow them.
+    /// Older pages have no live slot; their notices retire with the visible page.
+    pub(super) fn notice_container(&self) -> Arc<Container> {
+        self.history_page.notice_container(&self.chat_container)
+    }
+
     /// Build a [`TranscriptView`] over the shared component maps. Cheap (clones
     /// a handful of `Arc`s) and lets the event drain render the transcript
     /// through the same code path as the remote client.
     ///
     /// [`TranscriptView`]: crate::transcript_view::TranscriptView
     pub(super) fn transcript_view(&self) -> crate::transcript_view::TranscriptView {
-        // Hosts/tests without a managed history binding keep the original flat view.
         let managed = self.history_page.is_bound();
         crate::transcript_view::TranscriptView::with_maps(
-            if managed {
-                self.history_page.active.clone()
-            } else {
-                self.chat_container.clone()
-            },
+            self.transcript_container(),
             self.current_assistant.clone(),
             self.tool_components.clone(),
             self.bash_components.clone(),
             self.hide_thinking.clone(),
             self.tool_outputs_expanded.clone(),
             self.markdown_transformer.clone(),
+            self.message_seq.clone(),
         )
         .with_panels(if managed {
             self.history_page.panels.clone()

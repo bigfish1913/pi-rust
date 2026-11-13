@@ -39,7 +39,7 @@ class ReleaseManifestTests(unittest.TestCase):
             asset.with_name(asset.name + ".prebuilt.json").write_text(json.dumps(row))
             asset.with_name(asset.name + ".sha256").write_text(f"{row['distribution']['sha256']}  {asset.name}\n")
 
-    def test_five_targets_have_archive_and_executable_checksums(self):
+    def test_six_targets_have_archive_and_executable_checksums(self):
         manifest = prebuilt.assemble(self.root, "v1.2.3", "a" * 40)
         self.assertEqual(set(manifest["targets"]), prebuilt.TARGETS)
         self.assertEqual(manifest["name"], "rpi-cli")
@@ -50,7 +50,7 @@ class ReleaseManifestTests(unittest.TestCase):
 
     def test_missing_platform_is_not_a_ready_release(self):
         next(self.root.glob("*.prebuilt.json")).unlink()
-        with self.assertRaisesRegex(ValueError, "five target"):
+        with self.assertRaisesRegex(ValueError, "six target"):
             prebuilt.assemble(self.root, "v1.2.3", "a" * 40)
 
     def test_mixed_source_commits_are_rejected(self):

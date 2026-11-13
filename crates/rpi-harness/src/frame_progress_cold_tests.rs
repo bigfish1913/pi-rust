@@ -23,6 +23,9 @@ async fn cold_legacy_recovery_preserves_uncommitted_bindings_and_clear_markers()
     let stored = Session::new(Arc::new(store), None);
     bind_stream_entry(&stored, "main", "run", 0, "reserved").await.unwrap();
     let original_bytes = std::fs::read(&path).unwrap();
+    // The original writer binding is no longer used for mutation; retire it
+    // before opening the next writable binding for this same OS journal.
+    stored.storage().release_writer_lease();
     let loaded = Session::new(Arc::new(load().await.unwrap()), None);
     assert_eq!(salvage_run_frames(&loaded, "run").await.unwrap(), expected);
     let replayed = replay_run_streams(&loaded, "run").await.unwrap();

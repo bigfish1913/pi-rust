@@ -360,6 +360,17 @@ pub(crate) fn mutation_lease(root: &Path) -> Result<Lease> {
     ensure_complete(root)?;
     Ok(lease)
 }
+
+/// Hold a shared resource lease while updating native package metadata. Native
+/// package installation is append/version based and therefore safe alongside
+/// live hosts, but it must still exclude resource mutations that could race
+/// with the registry/receipt ownership checks.
+pub(crate) fn shared_lease(root: &Path) -> Result<Lease> {
+    let lease = Lease::acquire(root, false, true)?.ok_or("missing resource lease")?;
+    ensure_complete(root)?;
+    Ok(lease)
+}
+
 fn ensure_complete(root: &Path) -> Result<()> {
     if read_bytes(&root.join(JOURNAL), MAX_META)?.is_some() {
         return Err(
@@ -374,8 +385,7 @@ pub(crate) fn host_leases(cwd: &Path) -> Result<Arc<Vec<Lease>>> {
     roots.dedup();
     let mut leases = Vec::new();
     for root in roots {
-        leases.push(Lease::acquire(&root, false, true)?.ok_or("missing resource lease")?);
-        ensure_complete(&root)?;
+        leases.push(shared_lease(&root)?);
     }
     Ok(Arc::new(leases))
 }
@@ -761,7 +771,18 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .map_err(err)?;
     f.write_all(bytes).and_then(|_| f.sync_all()).map_err(err)
 }
-fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<()> {
+/// Copy a resource snapshot into `target` and return the inventory of the copy.
+///
+/// The returned inventory can differ from `observed` on macOS: native artifacts
+/// are re-signed after copying (see `resign_snapshot_native`), which rewrites
+/// their bytes. Callers must record the **returned** inventory, not the source
+/// one, or every later ownership check fails.
+fn copy_snapshot(
+    kind: Kind,
+    source: &Path,
+    target: &Path,
+    observed: &Inventory,
+) -> Result<Inventory> {
     fn copy_file(source: &Path, target: &Path, expected: u64) -> Result<()> {
         checked_path(source)?;
         let input = File::open(source).map_err(err)?;
@@ -812,11 +833,103 @@ fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<(
             copy_file(&source.join(&f.path), &to, f.bytes)?;
         }
     }
-    if inventory(target)? != *observed || inventory(source)? != *observed {
+    if inventory(source)? != *observed {
         return Err("resource source changed during snapshot copy".into());
+    }
+    // Which copied files are loadable native artifacts is decided by the resource
+    // KIND, because only the kind's validator reserves a place for one:
+    //   - Extension: the single-file source is the artifact, even though its
+    //     inventory path is `.` with no extension
+    //   - Package: only direct children of `extensions/` (see `validate_source`),
+    //     so a `.dylib` under `skills/`, `prompts/` or `themes/` is data
+    //   - Skill: nothing. A skill only has to contain SKILL.md, so a same-suffix
+    //     asset means nothing and must never be handed to `codesign`
+    let native: std::collections::BTreeSet<PathBuf> = match kind {
+        Kind::Extension => observed.files.iter().map(|f| f.path.clone()).collect(),
+        Kind::Package => observed
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .filter(|p| is_package_artifact(p))
+            .collect(),
+        Kind::Skill => std::collections::BTreeSet::new(),
+    };
+    let artifacts: Vec<PathBuf> = native.iter().map(|p| target.join(p)).collect();
+    resign_snapshot_native(&artifacts)?;
+    let copied = inventory(target)?;
+    // Every byte outside the re-signed artifacts must still match the source.
+    let comparable = |inv: &Inventory| Inventory {
+        files: inv
+            .files
+            .iter()
+            .filter(|f| !native.contains(&f.path))
+            .cloned()
+            .collect(),
+        directories: inv.directories.clone(),
+        sha256: String::new(),
+    };
+    if comparable(&copied) != comparable(observed) {
+        return Err("resource snapshot copy does not match the source".into());
+    }
+    Ok(copied)
+}
+
+/// Whether a Package file is a native artifact: a direct child of `extensions/`
+/// with the platform library extension. This mirrors what `validate_source`
+/// accepts, so data files that merely use the same suffix elsewhere in the tree
+/// are never handed to `codesign`.
+fn is_package_artifact(path: &Path) -> bool {
+    is_native_artifact(path) && path.components().count() == 2 && path.starts_with("extensions")
+}
+
+/// Whether a path uses this platform's native library extension.
+fn is_native_artifact(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some(std::env::consts::DLL_EXTENSION)
+}
+/// macOS only: re-sign copied native artifacts so the kernel will map them.
+///
+/// A signed Mach-O carries a code directory whose hashes must match the bytes
+/// the kernel maps. Copying is byte-exact, so a well-formed copy stays valid —
+/// but a plain `io::copy` of a freshly linked cargo `cdylib` can also carry a
+/// linker signature the kernel refuses. When it refuses, it does not return an
+/// error: it kills the host that touched the page.
+///
+/// ```text
+/// CODE SIGNING: process 20087[rpi]: rejecting invalid page at address 0x…
+///   in file "~/.pidd/rpi-agent/extensions/librpi_superagent.dylib"
+///   (cs_mtime:1794052202.55 != mtime:1794056571.77)
+/// CODE SIGNING: cs_invalid_page(0x…): denying page sending SIGKILL
+/// ```
+///
+/// No stderr reaches the caller and the only exit status is 137, so the symptom
+/// reads as "rpi cannot start at all". `codesign -v` also reports these copies
+/// as valid, so verifying first is not a substitute for signing.
+///
+/// Only native artifacts are re-signed; text resources are left untouched.
+fn resign_snapshot_native(artifacts: &[PathBuf]) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    for path in artifacts {
+        // Pin the ad-hoc identifier: `codesign --sign -` otherwise derives it from
+        // the file NAME, so the same bytes staged under two different names sign
+        // to different bytes. That would make an unchanged install look changed.
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--identifier", "com.rpi.native"])
+            .arg(path)
+            .output()
+            .map_err(|e| format!("could not run codesign on {}: {e}", path.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not re-sign {} (the kernel will refuse to load it): {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
     }
     Ok(())
 }
+
 /// Small same-filesystem transaction; injection is unit-test-only, never an env backdoor.
 fn publish(
     root: &Path,
@@ -1146,13 +1259,18 @@ fn mutate(root: &Path, o: &Options) -> Result<Value> {
             .version
             .clone()
             .or_else(|| previous.as_ref().and_then(|r| r.version.clone()));
+        // Copy before building the receipt: on macOS the staged native artifacts
+        // are re-signed, so the copy's inventory (which is what gets installed and
+        // later re-verified against) differs from the source's.
+        let staged = stage.path().join("snapshot");
+        let copied = copy_snapshot(kind, &source, &staged, &inv)?;
         let receipt = Receipt {
             kind,
             name: name.into(),
             source,
             version,
             target: target.clone(),
-            inventory: inv,
+            inventory: copied,
         };
         if o.op == "install" {
             if let Some(old) = &previous {
@@ -1167,8 +1285,6 @@ fn mutate(root: &Path, o: &Options) -> Result<Value> {
                 return Err("already installed; use update or reinstall with --path".into());
             }
         }
-        let staged = stage.path().join("snapshot");
-        copy_snapshot(&receipt.source, &staged, &receipt.inventory)?;
         next = Some((receipt, staged));
     }
     r.resources.retain(|r| !(r.kind == kind && r.name == name));

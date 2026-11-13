@@ -17,6 +17,10 @@ pub enum SessionErrorCode {
     InvalidLane,
     InvalidQuery,
     InvalidForkTarget,
+    /// Durable capability revision conflict; callers must refresh explicitly.
+    DurableConflict,
+    /// Durable backend operation is not implemented by the selected backend.
+    DurableUnsupported,
     Storage,
 }
 
@@ -30,6 +34,8 @@ impl SessionErrorCode {
             SessionErrorCode::InvalidLane => "invalid_lane",
             SessionErrorCode::InvalidQuery => "invalid_query",
             SessionErrorCode::InvalidForkTarget => "invalid_fork_target",
+            SessionErrorCode::DurableConflict => "durable_conflict",
+            SessionErrorCode::DurableUnsupported => "durable_unsupported",
             SessionErrorCode::Storage => "storage",
         }
     }
@@ -71,6 +77,12 @@ impl SessionError {
     }
     pub fn invalid_fork_target(message: impl Into<String>) -> Self {
         Self::new(SessionErrorCode::InvalidForkTarget, message)
+    }
+    pub fn durable_conflict(message: impl Into<String>) -> Self {
+        Self::new(SessionErrorCode::DurableConflict, message)
+    }
+    pub fn durable_unsupported(message: impl Into<String>) -> Self {
+        Self::new(SessionErrorCode::DurableUnsupported, message)
     }
     pub fn storage(message: impl Into<String>) -> Self {
         Self::new(SessionErrorCode::Storage, message)

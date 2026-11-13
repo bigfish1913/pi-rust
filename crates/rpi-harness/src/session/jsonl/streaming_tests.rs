@@ -606,6 +606,168 @@ async fn load_frame_history(
 }
 
 #[tokio::test]
+async fn facts_only_preserves_frame_identity_and_lane_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    let first = cold_frame_row(1, "append", serde_json::json!("first"));
+    let mut duplicate: serde_json::Value =
+        serde_json::from_str(&cold_frame_row(2, "append", serde_json::json!("second"))).unwrap();
+    duplicate["id"] = "f1".into();
+    let mut missing_lane: serde_json::Value = serde_json::from_str(&first).unwrap();
+    missing_lane["lane"] = "missing".into();
+    let mut entry_collision = duplicate.clone();
+    entry_collision["id"] = "entry-1".into();
+    for (name, rows, expected_error) in [
+        (
+            "duplicate-frame-id",
+            vec![first.clone(), duplicate.to_string()],
+            "Session id already exists: f1",
+        ),
+        (
+            "missing-lane",
+            vec![missing_lane.to_string()],
+            "references missing lane missing",
+        ),
+        (
+            "entry-reuses-frame-id",
+            vec![
+                first,
+                encode_mutation(&message("f1", 2, None, "entry"))
+                    .trim_end()
+                    .to_owned(),
+            ],
+            "Session id already exists: f1",
+        ),
+        (
+            "frame-reuses-entry-id",
+            vec![
+                encode_mutation(&message("entry-1", 1, None, "entry"))
+                    .trim_end()
+                    .to_owned(),
+                entry_collision.to_string(),
+            ],
+            "Session id already exists: entry-1",
+        ),
+    ] {
+        // Valid JSON and fast-recognisable frames: a resync-only shortcut
+        // would accept these semantic errors despite parsing every document.
+        for row in &rows {
+            if row.contains("assistant_frame") {
+                assert!(crate::session::jsonl::cold_decode::parse_cold_frame(row).is_some());
+            }
+        }
+        let original = format!("{}{}\n", encode_header(&header()), rows.join("\n"));
+        fs.write_file(name, FileContent::Text(original.clone()), None)
+            .await
+            .unwrap();
+        let mut errors = Vec::new();
+        for policy in [ReadPolicy::FactsOnly, ReadPolicy::ReadOnly] {
+            let (result, _) = load_frame_history(fs.clone(), name, policy).await;
+            let error = result.err().expect("invalid frame identity/lane must fail");
+            assert!(error.message.contains(expected_error), "{name}: {error}");
+            errors.push(error);
+            assert_eq!(fs.read_text_file(name, None).await.unwrap(), original);
+        }
+        assert_eq!(errors[0].code, errors[1].code);
+        assert_eq!(errors[0].message, errors[1].message);
+    }
+}
+
+#[tokio::test]
+async fn facts_only_clear_replay_retires_fallback_frames_but_keeps_ids_reserved() {
+    use crate::session::types::{AssistantFrameOp, RecordQuery};
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    for op in ["clear_stream", "clear_run"] {
+        let mut rows = Vec::new();
+        for (seq, stream) in [(1, 0), (2, 1), (5, 0)] {
+            let mut frame: serde_json::Value =
+                serde_json::from_str(&cold_frame_row(seq, "append", serde_json::json!("kept")))
+                    .unwrap();
+            frame["streamIndex"] = stream.into();
+            // Duplicate known fields force canonical fallback and retain a
+            // location even in FactsOnly. A fast clear must retire it too.
+            let fallback = frame.to_string().replacen('{', "{\"id\":\"shadow\",", 1);
+            assert!(crate::session::jsonl::cold_decode::parse_cold_frame(&fallback).is_none());
+            assert!(parse_mutation(&fallback).is_ok());
+            rows.push((seq, fallback));
+        }
+        rows.push((3, cold_frame_row(3, "append", serde_json::json!("fast"))));
+        rows.push((4, cold_frame_row(4, op, serde_json::Value::Null)));
+        rows.sort_by_key(|(seq, _)| *seq);
+        let mut original = encode_header(&header());
+        for (_, row) in rows {
+            original.push_str(&row);
+            original.push('\n');
+        }
+        original.push_str(&encode_mutation(&message(
+            "entry-6",
+            6,
+            None,
+            "after clear",
+        )));
+        fs.write_file(op, FileContent::Text(original.clone()), None)
+            .await
+            .unwrap();
+        let mut facts_results = Vec::new();
+        for policy in [ReadPolicy::FactsOnly, ReadPolicy::ReadOnly] {
+            let (result, _) = load_frame_history(fs.clone(), op, policy).await;
+            let loaded = result.unwrap();
+            {
+                let state = loaded.state.lock().await;
+                assert_eq!(state.sequence(), 6);
+                for id in ["f1", "f2", "f3", "f4", "f5", "entry-6"] {
+                    assert!(state.validate_unused_id(id).is_err(), "{op}: {id}");
+                }
+                assert!(state.validate_unused_id("shadow").is_ok());
+            }
+            let mut appends: Vec<_> = loaded
+                .find_records(&RecordQuery::default())
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|record| match record {
+                    LaneRecord::AssistantFrame(frame) if frame.op == AssistantFrameOp::Append => {
+                        Some(frame.base.id)
+                    }
+                    _ => None,
+                })
+                .collect();
+            appends.sort();
+            let expected = if op == "clear_stream" {
+                vec!["f2", "f5"]
+            } else {
+                vec!["f5"]
+            };
+            assert_eq!(appends, expected, "{op}");
+            facts_results.push(loaded.facts().await.unwrap());
+        }
+        assert_eq!(facts_results[0].metadata, facts_results[1].metadata);
+        assert_eq!(facts_results[0].values, facts_results[1].values);
+        assert_eq!(fs.read_text_file(op, None).await.unwrap(), original);
+
+        // Clearing a frame must never make its ID reusable by a later row.
+        let reused =
+            cold_frame_row(7, "append", serde_json::Value::Null).replace("\"f7\"", "\"f1\"");
+        fs.write_file(op, FileContent::Text(format!("{original}{reused}\n")), None)
+            .await
+            .unwrap();
+        for policy in [ReadPolicy::FactsOnly, ReadPolicy::ReadOnly] {
+            let (result, _) = load_frame_history(fs.clone(), op, policy).await;
+            assert!(result
+                .err()
+                .unwrap()
+                .message
+                .contains("Session id already exists: f1"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn cold_frame_duplicate_sequences_compare_semantics_and_reject_conflicts() {
     let temp = tempfile::tempdir().unwrap();
     let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(

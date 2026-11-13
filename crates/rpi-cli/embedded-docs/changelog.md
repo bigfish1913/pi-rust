@@ -11,6 +11,136 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/bigfish1913/pi-rust/compare/v0.22.1...v0.23.0) - 2026-11-13
+
+### Added
+
+- *(session)* allow native durable extension reload
+- *(tui)* click thinking label to expand per message
+
+### Fixed
+
+- *(tui)* preserve native history across replies, panels and update notices ([#314](https://github.com/bigfish1913/pi-rust/pull/314))
+- *(rpc)* accept the nextRun queue kind returned by get_queue
+- *(cli)* only announce session cwd adoption when the directory actually changes
+- *(ci)* make infrastructure and validation gates reliable ([#306](https://github.com/bigfish1913/pi-rust/pull/306))
+- *(tui)* restore the startup and update notice slots ([#307](https://github.com/bigfish1913/pi-rust/pull/307))
+- *(tui)* keep per-message thinking ids unique across per-event views
+- *(tools)* fail fast on interactive credential prompts in shell children
+- *(tools)* prefer PATH pwsh and silence progress in powershell tool
+
+### Other
+
+- Merge branch 'main' into fix/session-cwd-note-only
+- Merge branch 'main' into feat/click-expand-thinking
+- Merge branch 'main' into feat/click-expand-thinking
+- Merge branch 'main' into feat/click-expand-thinking
+- Merge branch 'main' into fix/powershell-path-pwsh
+- Merge branch 'main' into fix/powershell-path-pwsh
+- Merge branch 'main' into fix/noninteractive-shell-prompts
+- *(tools)* add real encoded-command regressions for PowerShell scripts
+- *(session)* stop retaining frame locations during facts-only preflight ([#311](https://github.com/bigfish1913/pi-rust/pull/311))
+- *(tui)* drop leftover frame dump from thinking region probe
+
+### Fixed
+
+- *(tui)* keep startup output and update cards in the retained header/update slot so live output can no longer render around them
+
+## [0.22.1](https://github.com/bigfish1913/pi-rust/compare/v0.22.0...v0.22.1) - 2026-11-11
+
+### Fixed
+
+- *(tui)* align @ file completion and preserve streamed replies ([#303](https://github.com/bigfish1913/pi-rust/pull/303))
+
+## [0.22.0](https://github.com/bigfish1913/pi-rust/compare/v0.21.2...v0.22.0) - 2026-11-10
+
+### Added
+
+- *(cli)* add an operations docs topic for skills, diagnostics, providers and sessions ([#273](https://github.com/bigfish1913/pi-rust/pull/273))
+- *(tui)* align at file completion with pi ([#295](https://github.com/bigfish1913/pi-rust/pull/295))
+- add opt-in native durable session slice
+
+### Fixed
+
+- *(rpc)* validate provider configuration commands ([#298](https://github.com/bigfish1913/pi-rust/pull/298))
+- *(tui)* keep read-tool images in transcript order ([#294](https://github.com/bigfish1913/pi-rust/pull/294))
+- allow test-only autocomplete helpers
+- pass native durable flag to autocomplete reservation
+- *(cli)* scope session pickers to the current project ([#269](https://github.com/bigfish1913/pi-rust/pull/269))
+- *(msrv)* keep preview tests on rust 1.88
+- *(ci)* keep durable checks compatible with rust 1.88
+- *(ci)* allow intentionally dormant preview helpers
+- *(harness)* advance cold replay sequence
+
+### Other
+
+- enable native durable by default
+- Merge remote-tracking branch 'origin/main' into codex/preview-main-sync-291
+- Merge main into durable preview
+- Enforce native durable hard cut
+- Merge remote-tracking branch 'origin/main' into feat/durable-core
+- *(harness)* remove legacy sqlite session backend
+- synchronize durable core with latest main
+- Forward history identity in queue probe
+- Forward history identity in recovery probes
+- Update hard-cut harness fixtures
+- Opt source ledger fixture into experimental mode
+- Opt synthetic ledger fixture into experimental mode
+- Fix paused storage admission fixture
+- *(harness)* fast-path cold assistant frame replay
+
+## [0.21.2](https://github.com/bigfish1913/pi-rust/compare/v0.21.1...v0.21.2) - 2026-11-08
+
+### Fixed
+
+- *(tui)* preserve todo transcript order
+- *(resource)* re-sign staged native artifacts on macOS ([#284](https://github.com/bigfish1913/pi-rust/pull/284))
+
+### Other
+
+- Merge branch 'main' into perf/offline-retired-frame-gc
+- Merge branch 'main' into perf/offline-retired-frame-gc
+- *(harness)* compact stream frames a clear_run already retired
+- *(harness)* pin GC generation contract for existing append handles
+
+## [0.21.1](https://github.com/bigfish1913/pi-rust/compare/v0.21.0...v0.21.1) - 2026-11-07
+
+### Added
+
+- *(cli)* allow service extensions to start without an agent ([#278](https://github.com/bigfish1913/pi-rust/pull/278))
+
+### Fixed
+
+- *(cli)* support CDN for extension updates
+- *(cli)* emit model_select on startup and model switch
+
+### Other
+
+- Merge branch 'main' into fix/model-select-event-v0.21
+- Revert "feat(cli): allow service extensions to start without an agent ([#278](https://github.com/bigfish1913/pi-rust/pull/278))" ([#279](https://github.com/bigfish1913/pi-rust/pull/279))
+
+## [0.21.0](https://github.com/bigfish1913/pi-rust/compare/v0.20.0...v0.21.0) - 2026-11-06
+
+### Added
+
+- *(plugin-sdk)* tool_result transforms can rewrite a finished tool result ([#240](https://github.com/bigfish1913/pi-rust/pull/240))
+- allow configuring release CDN in settings
+- add optional release CDN mirror
+- version native extension artifacts for hot reload
+- *(release)* support x86_64 musl binaries
+
+### Fixed
+
+- *(tui)* keep runtime notices in transcript order ([#275](https://github.com/bigfish1913/pi-rust/pull/275))
+- *(cli)* tokenize docs queries and fall back across topics ([#272](https://github.com/bigfish1913/pi-rust/pull/272))
+- *(tools)* classify bash command failures in tool details ([#271](https://github.com/bigfish1913/pi-rust/pull/271))
+- *(tui)* gate file autocomplete on path appearance ([#264](https://github.com/bigfish1913/pi-rust/pull/264))
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/cdn-rustfs
+- *(read)* resize images with fast_image_resize ([#241](https://github.com/bigfish1913/pi-rust/pull/241))
+
 ## [0.20.0](https://github.com/bigfish1913/pi-rust/compare/v0.19.0...v0.20.0) - 2026-11-05
 
 ### Added

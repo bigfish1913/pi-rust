@@ -12,6 +12,7 @@ use rpi_tui::truncate_to_width;
 /// Install one command-discovery snapshot at startup and after successful
 /// resource reloads. Skills expand in the harness's normal input path, not in
 /// slash dispatch, so images and queued messages keep their ordinary behavior.
+#[allow(dead_code)]
 pub(super) fn configure_resource_autocomplete(
     autocomplete: &AutocompleteManager,
     mut commands: Vec<SlashCommandEntry>,
@@ -24,7 +25,7 @@ pub(super) fn configure_resource_autocomplete(
     // then reserve hidden builtins and aliases against resource commands too.
     let mut seen = std::collections::BTreeSet::new();
     commands.retain(|command| seen.insert(command.name.clone()));
-    seen.extend(super::builtin_reserved_names());
+    seen.extend(super::builtin_reserved_names(false));
     let skills = if enable_skill_commands {
         resources.skills
     } else {
@@ -48,6 +49,7 @@ pub(super) fn configure_resource_autocomplete(
     autocomplete.set_provider(Arc::new(combined));
 }
 
+#[allow(dead_code)]
 pub(super) fn skill_commands_enabled(
     global: &crate::settings::Settings,
     project: &[crate::settings::Settings],
@@ -363,22 +365,22 @@ pub(super) fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>)
     let start = sugg.start.min(text.len());
     let end = sugg.end.min(text.len());
     if sugg.is_path {
-        // The path provider returns a BASENAME (`report.txt`) but spans the
-        // whole path prefix, so applying its span drops the parent
-        // directories: Tab on `@/abs/nested/repo` produced `@report.txt`, a
-        // reference to a different file. Replace only the basename segment
-        // the caret sits in — the same span the Enter path uses — and keep
-        // the text as typed when the candidate does not complete that whole
-        // segment (no silent drop of what the user typed after the caret).
-        let (segment_start, segment_end) = path_segment_bounds(&text, start, cursor);
-        let completes_whole = state
-            .autocomplete
-            .get_suggestions(&text, segment_end)
+        // Path items now contain the complete display path, like native Pi.
+        // Replace the whole path token so recursive candidates such as
+        // `src/main.rs` do not get inserted into only the basename segment.
+        let (token_start, token_end) = path_token_bounds(&text, start, cursor);
+        let whole_suggestions = state.autocomplete.get_suggestions(&text, token_end);
+        let whole_suggestions = whole_suggestions.or_else(|| {
+            text.get(cursor..)
+                .filter(|rest| rest.starts_with('"'))
+                .and_then(|_| state.autocomplete.get_suggestions(&text, cursor))
+        });
+        let completes_whole = whole_suggestions
             .is_some_and(|whole| whole.items.iter().any(|item| item.text == top.text));
         if !completes_whole {
             return false;
         }
-        return apply_suggestion(state, editor, segment_start, segment_end, top);
+        return apply_suggestion(state, editor, token_start, token_end, top);
     }
     apply_suggestion(state, editor, start, end, top)
 }
@@ -403,20 +405,22 @@ fn apply_suggestion(
     // Keep the text AFTER the replaced span (mid-line completion: replacing
     // `[start, end)` must not drop the rest of the line).
     replaced.push_str(&text[end..]);
-    if item.insert_space && !replaced.ends_with('/') {
+    let add_space = item.insert_space && !item.is_directory;
+    if add_space {
         replaced.push(' ');
     }
+    // Quoted directory completions keep the closing quote after the caret so
+    // the next path segment is typed inside the quote, matching native Pi.
+    let inserted_cursor_len = if item.is_directory && item.text.ends_with('"') {
+        item.text.len() - 1
+    } else {
+        item.text.len()
+    };
     // New caret position: after the inserted text (byte offset; the editor
     // snaps `set_cursor` to a char boundary as a safety net).
-    let new_cursor = replaced.len().min(
-        start
-            + item.text.len()
-            + if item.insert_space && !item.text.ends_with('/') {
-                1
-            } else {
-                0
-            },
-    );
+    let new_cursor = replaced
+        .len()
+        .min(start + inserted_cursor_len + usize::from(add_space));
     editor.set_text(&replaced);
     set_editor_cursor_offset(editor, &replaced, new_cursor);
     close_autocomplete_popup(state);
@@ -452,28 +456,42 @@ fn snap_to_char_boundary(text: &str, cursor: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// The byte range of the path segment (the basename) the caret sits in.
-///
-/// `token_start` is the byte just after the `@`; the range starts after the
-/// last `/` (or `\`) between there and the caret and ends at the next path
-/// separator or whitespace after it. Replacing the whole path prefix instead
-/// would drop the parent directories — the path provider returns a basename
-/// (`report.txt`), so `@/abs/nested/repo` would collapse to `@report.txt`,
-/// a reference to a different file.
-fn path_segment_bounds(text: &str, token_start: usize, cursor: usize) -> (usize, usize) {
+/// Return the complete path-token span around the caret. Unlike the previous
+/// basename-only implementation, this lets a candidate replace a full
+/// recursive path such as `src/main.rs` without duplicating its parent.
+fn path_token_bounds(text: &str, token_start: usize, cursor: usize) -> (usize, usize) {
     let cursor = snap_to_char_boundary(text, cursor);
     let token_start = token_start.min(cursor);
-    let before_caret = &text[token_start..cursor];
-    let start = before_caret
-        .rfind(['/', '\\'])
-        .map(|offset| token_start + offset + 1)
-        .unwrap_or(token_start);
-    let after_caret = &text[cursor..];
-    let end = after_caret
-        .find(|c: char| c == '/' || c == '\\' || c.is_whitespace())
+    let after_cursor = &text[cursor..];
+    let end = after_cursor
+        .find(|character: char| {
+            character.is_whitespace()
+                || character == '"'
+                || matches!(character, ')' | ']' | '}' | '>' | '`')
+                || matches!(
+                    character,
+                    '，' | '．'
+                        | '：'
+                        | '；'
+                        | '！'
+                        | '？'
+                        | '（'
+                        | '）'
+                        | '［'
+                        | '］'
+                        | '｛'
+                        | '｝'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '…'
+                        | '—'
+                )
+        })
         .map(|offset| cursor + offset)
         .unwrap_or(text.len());
-    (start, end)
+    (token_start, end)
 }
 
 /// What a bare Enter does while a completion popup is open. Mirrors the TS
@@ -569,7 +587,9 @@ pub(super) fn resolve_enter_completion(
     // Same explicit-context rule as `navigate_autocomplete`: only the `/`
     // token at input start or an `@`-file token counts as a popup the Enter
     // key belongs to.
-    let explicit = text[start..].starts_with('/') || text[..start].ends_with('@');
+    let explicit = text[start..].starts_with('/')
+        || text[..start].ends_with('@')
+        || text[..start].ends_with("@\"");
     if !explicit {
         return None;
     }
@@ -593,30 +613,32 @@ pub(super) fn resolve_enter_completion(
     let Some(top) = popup.items.get(index) else {
         return None;
     };
-    // A path completion consumes the Enter, so an ambiguous path popup keeps
-    // plain submit until the user picks a row.
-    if popup.is_path && popup.items.len() > 1 && !explicit_selection {
+    // A path completion consumes the Enter. Keep the conservative submit
+    // behavior for ambiguous file matches, but let the highest-ranked
+    // directory win so recursive `@dir-prefix` results can be entered in one
+    // step, matching native Pi's directory-first ordering.
+    if popup.is_path && popup.items.len() > 1 && !explicit_selection && !top.is_directory {
         return Some(EnterCompletion {
             action: EnterCompletionAction::Submit,
             candidate: None,
         });
     }
     // A candidate only rewrites text when it completes the whole unit the
-    // caret sits in — the entire command token, or the entire path segment.
+    // caret sits in — the entire command token or the entire path token.
     // Otherwise the text stays exactly as typed: no silent rewrite to a
     // different command, and no silent drop of what the user typed after the
     // caret. An explicit ↑/↓ selection wins over that inference.
     let (replacement_start, replacement_end, completes_whole) = if popup.is_path {
-        // The path provider returns a BASENAME (`report.txt`) but spans the
-        // whole path prefix; replacing that span would drop the directory and
-        // point the reference at a different file. Replace only the basename
-        // segment, keeping the parent directories the user typed.
-        let (segment_start, segment_end) = path_segment_bounds(&text, start, cursor);
-        let whole = state
-            .autocomplete
-            .get_suggestions(&text, segment_end)
+        let (token_start, token_end) = path_token_bounds(&text, start, cursor);
+        let whole_suggestions = state.autocomplete.get_suggestions(&text, token_end);
+        let whole_suggestions = whole_suggestions.or_else(|| {
+            text.get(cursor..)
+                .filter(|rest| rest.starts_with('"'))
+                .and_then(|_| state.autocomplete.get_suggestions(&text, cursor))
+        });
+        let whole = whole_suggestions
             .is_some_and(|whole| whole.items.iter().any(|item| item.text == top.text));
-        (segment_start, segment_end, whole)
+        (token_start, token_end, whole)
     } else {
         // The replacement must cover the WHOLE command token the caret sits
         // in: the text after the caret that belongs to the same token is part
@@ -696,9 +718,11 @@ pub(super) fn navigate_autocomplete(
         return false;
     }
     let start = sugg.start.min(text.len());
-    // `/` commands keep the slash at `start`; the path provider keeps `@` by
-    // placing `start` *after* it, so look just before `start` for `@`.
-    let explicit = text[start..].starts_with('/') || text[..start].ends_with('@');
+    // `/` commands keep the slash at `start`; the path provider keeps `@`
+    // (and an optional opening quote) before `start`.
+    let explicit = text[start..].starts_with('/')
+        || text[..start].ends_with('@')
+        || text[..start].ends_with("@\"");
     if !explicit {
         return false;
     }

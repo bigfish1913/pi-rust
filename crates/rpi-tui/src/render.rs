@@ -8,10 +8,12 @@ thread_local! {
     static MAIN_SCREEN_FRAME: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Render transcript panels without wall-clock-only changes. Saved main-buffer
-/// rows cannot be patched; live elapsed belongs in the editor/status dock.
+/// Render a regular-mode frame: transcript timers are stable and mutable
+/// panels use compact live summaries. Saved main-buffer rows are snapshots;
+/// elapsed time and late update hints belong in the editor/status dock.
 /// The scope is thread-local and restored even if a nested render panics.
-pub(crate) fn with_main_screen_frame<R>(render: impl FnOnce() -> R) -> R {
+/// Hosts may use this when rendering their own mode-specific components.
+pub fn with_main_screen_frame<R>(render: impl FnOnce() -> R) -> R {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -22,7 +24,8 @@ pub(crate) fn with_main_screen_frame<R>(render: impl FnOnce() -> R) -> R {
     render()
 }
 
-pub(crate) fn is_main_screen_frame() -> bool {
+/// Whether the current thread is rendering a regular/main-screen frame.
+pub fn is_main_screen_frame() -> bool {
     MAIN_SCREEN_FRAME.with(Cell::get)
 }
 

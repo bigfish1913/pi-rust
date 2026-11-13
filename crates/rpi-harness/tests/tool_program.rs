@@ -13,6 +13,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 fn schema(name: &str) -> Tool {
     serde_json::from_value(json!({"name":name,"description":"test","parameters":{"type":"object"}}))
@@ -21,7 +22,7 @@ fn schema(name: &str) -> Tool {
 struct Program {
     schema: Tool,
     count: Arc<AtomicUsize>,
-    pause: bool,
+    pause: Option<Arc<Notify>>,
 }
 #[async_trait::async_trait]
 impl AgentTool for Program {
@@ -58,7 +59,10 @@ impl AgentTool for Program {
             }
             tokio::task::yield_now().await;
         }
-        if self.pause {
+        if let Some(paused) = &self.pause {
+            // A successful child poll includes journal close, not just the
+            // effect itself. The parent remains unfinished for recovery.
+            paused.notify_one();
             std::future::pending::<()>().await;
         }
         Ok(AgentToolResult::text("program done"))
@@ -100,7 +104,7 @@ async fn build(
     session: Session,
     programs: Arc<AtomicUsize>,
     effects: Arc<AtomicUsize>,
-    pause: bool,
+    pause: Option<Arc<Notify>>,
     safe: bool,
 ) -> AgentHarness {
     let provider = FauxProvider::new(
@@ -139,7 +143,7 @@ async fn checkpoint_precedes_effect_without_fabricating_transcript_calls() {
     let session = AgentHarnessOptions::default().session;
     let programs = Arc::new(AtomicUsize::new(0));
     let effects = Arc::new(AtomicUsize::new(0));
-    let h = build(session.clone(), programs, effects.clone(), false, false).await;
+    let h = build(session.clone(), programs, effects.clone(), None, false).await;
     h.prompt_text("run", vec![]).await.unwrap();
     assert_eq!(effects.load(Ordering::SeqCst), 1);
     let entries = session.find_entries(&EntryQuery::default()).await.unwrap();
@@ -174,32 +178,35 @@ async fn interrupted_program_is_never_automatically_replayed() {
     let session = AgentHarnessOptions::default().session;
     let programs = Arc::new(AtomicUsize::new(0));
     let effects = Arc::new(AtomicUsize::new(0));
+    let paused = Arc::new(Notify::new());
     let h = build(
         session.clone(),
         programs.clone(),
         effects.clone(),
-        true,
+        Some(paused.clone()),
         false,
     )
     .await;
     let runner = h.clone();
     let run = tokio::spawn(async move { runner.prompt_text("run", vec![]).await });
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while effects.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    // Interrupt the unfinished parent only once its child has closed its
+    // journal. An effect counter is too early: its owned child task may still
+    // append after the caller is aborted, even with in-memory storage.
+    tokio::time::timeout(std::time::Duration::from_secs(3), paused.notified())
+        .await
+        .unwrap();
     run.abort();
     let _ = run.await;
+    // Backend drain does not join live ToolProgram tasks. The handshake above
+    // establishes that boundary; drain any remaining backend writes as well.
+    h.drain_session().await;
     drop(h);
     for _ in 0..2 {
         let restored = build(
             session.clone(),
             programs.clone(),
             effects.clone(),
-            false,
+            None,
             false,
         )
         .await;
@@ -215,7 +222,7 @@ async fn replay_safe_parent_fails_closed_before_nested_effect() {
         AgentHarnessOptions::default().session,
         Arc::new(AtomicUsize::new(0)),
         effects.clone(),
-        false,
+        None,
         true,
     )
     .await;
@@ -359,7 +366,7 @@ async fn custom_marker_storage_failures_cancel_run_without_retrying_effects() {
         );
         let programs = Arc::new(AtomicUsize::new(0));
         let effects = Arc::new(AtomicUsize::new(0));
-        let harness = build(session, programs.clone(), effects.clone(), false, false).await;
+        let harness = build(session, programs.clone(), effects.clone(), None, false).await;
         let error = harness.prompt_text("run", vec![]).await.unwrap_err();
         assert!(error.to_string().contains(marker), "{error}");
         assert_eq!(programs.load(Ordering::SeqCst), 1);

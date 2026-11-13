@@ -225,6 +225,22 @@ impl SelectList {
             .unwrap_or(false)
     }
 
+    /// Replace the candidate rows in place (used by pickers that swap scope
+    /// without rebuilding their view). Callbacks and layout survive; callers
+    /// re-apply their filter via [`Self::set_filter`] so the search box stays
+    /// the single source of the filter text.
+    pub fn set_items(&self, items: Vec<SelectItem>) {
+        if let Ok(mut current) = self.items.lock() {
+            *current = items.clone();
+        }
+        if let Ok(mut filtered) = self.filtered_items.lock() {
+            *filtered = items;
+        }
+        if let Ok(mut index) = self.selected_index.lock() {
+            *index = 0;
+        }
+    }
+
     /// Set the filter text.
     pub fn set_filter(&self, filter: &str) {
         if let Ok(items) = self.items.lock() {

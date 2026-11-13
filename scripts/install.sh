@@ -42,7 +42,28 @@ os="$(uname -s)"
 arch="$(uname -m)"
 
 case "${os}" in
-  Linux)  os_part="unknown-linux-gnu" ;;
+  Linux)
+    # The release publishes separate GNU and musl binaries. Prefer the
+    # runtime's own libc marker over compiler/build-host assumptions.
+    linux_libc="gnu"
+    if command -v ldd >/dev/null 2>&1; then
+      ldd_version="$(ldd --version 2>&1 || true)"
+      case "${ldd_version}" in
+        *[Mm]usl*) linux_libc="musl" ;;
+      esac
+    else
+      # Minimal musl images may not ship ldd; use their dynamic loader as a
+      # fallback. Do not use this fallback when glibc's ldd is available,
+      # because build toolchains may install a second libc's loader too.
+      for loader in /lib/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1; do
+        if [ -e "${loader}" ]; then
+          linux_libc="musl"
+          break
+        fi
+      done
+    fi
+    os_part="unknown-linux-${linux_libc}"
+    ;;
   Darwin) os_part="apple-darwin" ;;
   MINGW*|MSYS*|CYGWIN*) os_part="pc-windows-msvc" ;;
   *) die "unsupported operating system: ${os}. Build from source with 'cargo install rpi-cli'." ;;
@@ -56,7 +77,7 @@ esac
 
 # Only the combinations the release workflow actually builds.
 case "${arch_part}-${os_part}" in
-  x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-apple-darwin|x86_64-pc-windows-msvc) ;;
+  x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-apple-darwin|x86_64-pc-windows-msvc) ;;
   *) die "no prebuilt binary for ${arch_part}-${os_part}. Build from source with 'cargo install rpi-cli'." ;;
 esac
 

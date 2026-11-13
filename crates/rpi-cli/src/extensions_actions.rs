@@ -52,7 +52,7 @@ use tokio::runtime::Handle;
 
 use crate::session::{default_session_dir, open_session_by_id_in_dir};
 
-/// Merge built-in / extension / prompt-template / skill commands into the
+/// Merge built-in / extension / prompt-template commands into the
 /// `ListCommands` payload.
 ///
 /// It is one function because it is the single source of truth for the shape:
@@ -64,7 +64,7 @@ use crate::session::{default_session_dir, open_session_by_id_in_dir};
 ///   separately (`build_builtin_registry` explicitly says so). They have to be
 ///   read from the harness resources, or a remote `/` completion list is
 ///   permanently shorter than the terminal's — same host, two command tables.
-/// * Precedence is built-in > extension > prompt > skill, matching the TUI (built-ins
+/// * Precedence is built-in > extension > prompt, matching the TUI (built-ins
 ///   register first and cannot be shadowed; a template sharing a built-in name
 ///   is unreachable there too).
 /// * Extension and template names may omit the leading `/`, so normalize.
@@ -77,7 +77,6 @@ fn merge_command_list_reserved(
     builtin: Vec<(String, String)>,
     extension: Vec<(String, String)>,
     templates: Vec<(String, String)>,
-    skills: Vec<(String, String)>,
     reserved: Vec<String>,
 ) -> Vec<serde_json::Value> {
     // Reserved names must block *later* sources without blocking the built-ins
@@ -100,7 +99,6 @@ fn merge_command_list_reserved(
         ("builtin", builtin),
         ("extension", extension),
         ("prompt", templates),
-        ("skill", skills),
     ] {
         for (name, description) in commands {
             let name = if source != "builtin" && !name.starts_with('/') {
@@ -145,6 +143,9 @@ pub struct HarnessActionHost {
     cwd: PathBuf,
     session_dir: PathBuf,
     fresh_session_only: bool,
+    /// Host-owned startup choice, independent of model tools and plugin flags.
+    /// Immutable after construction, including while the registry is published.
+    native_durable: bool,
     /// Parsed unknown long flags retained for extension consumption.
     cli_flags: BTreeMap<String, serde_json::Value>,
     /// The session's plugin-tool context (`cwd` + session id). The session
@@ -165,12 +166,6 @@ pub struct HarnessActionHost {
     /// action then answers with an empty list rather than failing, matching
     /// the "no commands registered" case.
     registry: std::sync::RwLock<Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>>>,
-    /// Request channel for `runtime_action(ReloadModels)` (action id 31).
-    ///
-    /// The refresh itself must run on the TUI's main loop (it owns the
-    /// harness), so the host hands the request over and awaits the answer.
-    /// `None` until the TUI installs its sender.
-    reload_models_mailbox: Option<rpi_extensions::ReloadModelsMailbox>,
 }
 
 impl HarnessActionHost {
@@ -194,6 +189,7 @@ impl HarnessActionHost {
                 catalog: RwLock::new(catalog),
                 session_dir: default_session_dir(&cwd),
                 fresh_session_only: false,
+                native_durable: false,
                 cwd,
                 cli_flags,
                 tool_context,
@@ -201,19 +197,9 @@ impl HarnessActionHost {
                 side_questions: crate::side_questions::SideQuestions::default(),
                 runtime,
                 registry: std::sync::RwLock::new(None),
-                reload_models_mailbox: None,
             },
             harness,
         )
-    }
-
-    /// Attach the `ReloadModels` request channel (once the TUI starts).
-    pub(crate) fn with_reload_models_mailbox(
-        mut self,
-        mailbox: rpi_extensions::ReloadModelsMailbox,
-    ) -> Self {
-        self.reload_models_mailbox = Some(mailbox);
-        self
     }
 
     pub fn set_catalog(&self, catalog: Vec<rpi_ai::Model>) {
@@ -225,6 +211,10 @@ impl HarnessActionHost {
 
     pub(crate) fn with_fresh_session_only(mut self, locked: bool) -> Self {
         self.fresh_session_only = locked;
+        self
+    }
+    pub(crate) fn with_native_durable(mut self, enabled: bool) -> Self {
+        self.native_durable = enabled;
         self
     }
     fn allow_session_routing(&self) -> Result<(), String> {
@@ -543,14 +533,6 @@ pub(crate) fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
 
 #[async_trait::async_trait]
 impl RuntimeActionHost for HarnessActionHost {
-    async fn tool_program(
-        &self,
-        capability: Arc<rpi_agent::tool_program::ToolProgram>,
-        args: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        // Deliberately do not look up the root harness: capability owns the effective binding.
-        capability.handle(args).await
-    }
     fn cancel_side_questions(&self, owner: u64) {
         self.side_questions.cancel_owner(owner);
     }
@@ -588,7 +570,7 @@ impl RuntimeActionHost for HarnessActionHost {
         self.set_catalog(models);
     }
     async fn list_commands(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
-        let builtin = crate::interactive_tui::build_builtin_commands_for_abi();
+        let builtin = crate::interactive_tui::build_builtin_commands_for_abi(self.native_durable);
         let extension: Vec<(String, String)> = self
             .registry_snapshot()
             .as_deref()
@@ -600,23 +582,35 @@ impl RuntimeActionHost for HarnessActionHost {
                     .collect()
             })
             .unwrap_or_default();
-        // Read resources on every call so reloads cannot leave stale commands.
-        // A missing/closed harness must still expose builtin/extension entries.
-        // enableSkillCommands is TUI-only; RPC always enumerates loaded skills.
-        let resources = match self.harness() {
+        // Prompt templates are harness resources, not registry entries — see
+        // `merge_command_list`. A missing/closed harness yields no templates
+        // rather than an error: "none discovered" is a real answer, and `/`
+        // completion must still work for the commands that do exist.
+        let templates: Vec<(String, String)> = match self.harness() {
             Ok(harness) => match harness.get_resources().await {
-                Ok(resources) => crate::resource_commands::resource_command_entries(&resources),
-                Err(_) => Default::default(),
+                Ok(resources) => resources
+                    .prompt_templates
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|template| {
+                        (
+                            template.name,
+                            template
+                                .description
+                                .unwrap_or_else(|| "Expand prompt template".to_string()),
+                        )
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
             },
-            Err(_) => Default::default(),
+            Err(_) => Vec::new(),
         };
         Ok(serde_json::json!({
             "commands": merge_command_list_reserved(
                 builtin,
                 extension,
-                resources.templates,
-                resources.skills,
-                crate::interactive_tui::builtin_reserved_names(),
+                templates,
+                crate::interactive_tui::builtin_reserved_names(self.native_durable),
             )
         }))
     }
@@ -1013,20 +1007,6 @@ impl RuntimeActionHost for HarnessActionHost {
         // the "not configured" fallback.
         Err("reload not configured (no /reload callback on this bridge)".to_string())
     }
-
-    /// `ReloadModels` — re-read the model/provider catalog from disk without
-    /// touching the extension registry.
-    ///
-    /// The work happens on the TUI's main loop (it owns the harness), so the
-    /// request goes through the `ReloadModelsMailbox` and the answer comes
-    /// back over the same request's reply channel.
-    async fn reload_models(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
-        let Some(mailbox) = self.reload_models_mailbox.clone() else {
-            return Err("reload_models is not available (no TUI attached)".to_string());
-        };
-        let count = mailbox.request().await?;
-        Ok(serde_json::json!({ "models": count }))
-    }
 }
 
 #[cfg(test)]
@@ -1113,202 +1093,12 @@ mod send_message_tests {
 }
 
 #[cfg(test)]
+#[path = "extensions_actions/native_durable_inventory_tests.rs"]
+mod native_durable_inventory_tests;
+
+#[cfg(test)]
 mod list_commands_tests {
-    use super::*;
-    use rpi_harness::types::{AgentHarnessOptions, AgentHarnessResources, PromptTemplate, Skill};
-
-    #[tokio::test]
-    async fn review_list_commands_must_include_pi_style_skill_names() {
-        let root = tempfile::tempdir().unwrap();
-        let harness = Arc::new(
-            AgentHarness::create(AgentHarnessOptions {
-                resources: AgentHarnessResources {
-                    skills: Some(vec![Skill {
-                        name: "manual".into(),
-                        description: "Explicit only".into(),
-                        content: "body".into(),
-                        file_path: "/skills/manual/SKILL.md".into(),
-                        disable_model_invocation: Some(true),
-                    }]),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .await
-            .unwrap(),
-        );
-        let (host, cell) = HarnessActionHost::new_empty(
-            vec![],
-            root.path().to_path_buf(),
-            Handle::current(),
-            Default::default(),
-            rpi_extensions::ToolCallContext::new(root.path().to_string_lossy()),
-        );
-        HarnessActionHost::set_harness(&cell, harness.clone());
-        let listing = host.list_commands(serde_json::json!({})).await.unwrap();
-        let command = listing["commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|item| item["name"] == "/skill:manual")
-            .expect("loaded explicit-only skill must be discoverable");
-        assert_eq!(command["source"], "skill");
-        assert_eq!(command["description"], "Explicit only");
-    }
-
-    fn skill(name: &str, description: &str) -> Skill {
-        Skill {
-            name: name.into(),
-            description: description.into(),
-            content: "body".into(),
-            file_path: format!("/skills/{name}/SKILL.md"),
-            disable_model_invocation: Some(false),
-        }
-    }
-
-    fn template(name: &str) -> PromptTemplate {
-        PromptTemplate {
-            name: name.into(),
-            description: None,
-            content: "body".into(),
-        }
-    }
-
-    fn host(root: &std::path::Path) -> (HarnessActionHost, Arc<OnceLock<WeakAgentHarness>>) {
-        let (host, cell) = HarnessActionHost::new_empty(
-            vec![],
-            root.to_path_buf(),
-            Handle::current(),
-            Default::default(),
-            rpi_extensions::ToolCallContext::new(root.to_string_lossy()),
-        );
-        extern "C" fn unused_command(
-            _: rpi_plugin_sdk::StbStringRef,
-            _: *mut rpi_plugin_sdk::StbString,
-            _: *mut std::ffi::c_void,
-        ) -> i32 {
-            0
-        }
-        let mut registry = rpi_extensions::ExtensionRegistry::new();
-        for name in ["deploy", "help", "q", "skill:extension"] {
-            registry.register_command(
-                name.into(),
-                "Extension command".into(),
-                unused_command,
-                std::ptr::null_mut(),
-            );
-        }
-        host.publish_registry(Arc::new(registry.snapshot()));
-        (host, cell)
-    }
-
-    #[tokio::test]
-    async fn list_commands_merges_sources_deduplicates_and_preserves_priority() {
-        let root = tempfile::tempdir().unwrap();
-        let harness = Arc::new(
-            AgentHarness::create(AgentHarnessOptions {
-                resources: AgentHarnessResources {
-                    skills: Some(vec![
-                        skill("extension", "shadowed"),
-                        skill("prompt", "shadowed"),
-                        skill("manual", "First skill"),
-                        skill("manual", "Duplicate skill"),
-                    ]),
-                    prompt_templates: Some(vec![
-                        template("help"),
-                        template("q"),
-                        template("deploy"),
-                        template("skill:prompt"),
-                        template("summarize"),
-                        template("/summarize"),
-                    ]),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .await
-            .unwrap(),
-        );
-        let (host, cell) = host(root.path());
-        HarnessActionHost::set_harness(&cell, harness.clone());
-        let listing = host.list_commands(serde_json::json!({})).await.unwrap();
-        let commands = listing["commands"].as_array().unwrap();
-        let find = |name| commands.iter().find(|c| c["name"] == name).unwrap();
-        assert_eq!(find("/help")["source"], "builtin");
-        assert_eq!(find("/deploy")["source"], "extension");
-        assert_eq!(find("/skill:extension")["source"], "extension");
-        assert_eq!(find("/skill:prompt")["source"], "prompt");
-        assert_eq!(find("/summarize")["description"], "Expand prompt template");
-        assert_eq!(find("/skill:manual")["source"], "skill");
-        assert_eq!(find("/skill:manual")["description"], "First skill");
-        assert!(!names(commands).contains(&"/q"));
-        let unique: std::collections::BTreeSet<_> = names(commands).into_iter().collect();
-        assert_eq!(unique.len(), commands.len());
-        assert_eq!(commands.last().unwrap()["name"], "/skill:manual");
-    }
-
-    #[tokio::test]
-    async fn list_commands_reads_reloaded_resources_and_removes_stale_skills() {
-        let root = tempfile::tempdir().unwrap();
-        let harness = Arc::new(AgentHarness::create(Default::default()).await.unwrap());
-        let (host, cell) = host(root.path());
-        HarnessActionHost::set_harness(&cell, harness.clone());
-        for name in ["oldskill", "freshskill"] {
-            harness
-                .set_resources(AgentHarnessResources {
-                    skills: Some(vec![skill(name, "Reloaded skill")]),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            let listing = host.list_commands(serde_json::json!({})).await.unwrap();
-            let commands = listing["commands"].as_array().unwrap();
-            assert!(names(commands).contains(&format!("/skill:{name}").as_str()));
-            if name == "freshskill" {
-                assert!(!names(commands).contains(&"/skill:oldskill"));
-            }
-        }
-        harness.set_resources(Default::default()).await.unwrap();
-        let listing = host.list_commands(serde_json::json!({})).await.unwrap();
-        assert!(!names(listing["commands"].as_array().unwrap()).contains(&"/skill:freshskill"));
-    }
-
-    #[tokio::test]
-    async fn list_commands_without_live_harness_keeps_builtin_and_extension_entries() {
-        let root = tempfile::tempdir().unwrap();
-        let (host, cell) = host(root.path());
-        let unbound = host.list_commands(serde_json::json!({})).await.unwrap();
-        let commands = unbound["commands"].as_array().unwrap();
-        assert!(commands
-            .iter()
-            .any(|c| c["name"] == "/help" && c["source"] == "builtin"));
-        assert!(commands
-            .iter()
-            .any(|c| c["name"] == "/deploy" && c["source"] == "extension"));
-        let harness = Arc::new(
-            AgentHarness::create(AgentHarnessOptions {
-                resources: AgentHarnessResources {
-                    skills: Some(vec![skill("manual", "Manual")]),
-                    prompt_templates: Some(vec![template("summarize")]),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .await
-            .unwrap(),
-        );
-        HarnessActionHost::set_harness(&cell, harness.clone());
-        harness.close().await.unwrap();
-        assert_eq!(
-            host.list_commands(serde_json::json!({})).await.unwrap(),
-            unbound
-        );
-        drop(harness);
-        assert_eq!(
-            host.list_commands(serde_json::json!({})).await.unwrap(),
-            unbound
-        );
-    }
+    use super::merge_command_list_reserved;
 
     /// Reserving names must not delete the built-ins from the listing.
     ///
@@ -1324,7 +1114,6 @@ mod list_commands_tests {
         let out = merge_command_list_reserved(
             builtin,
             vec![("deploy".into(), "deploy".into())],
-            vec![],
             vec![],
             // Every built-in name is reserved (as in production), plus an alias
             // and a hidden command that are not listed.
@@ -1354,7 +1143,6 @@ mod list_commands_tests {
                 ("deploy".into(), "deploy".into()),
             ],
             vec![],
-            vec![],
             vec!["/q".into(), "/context".into()],
         );
         // `/q` and `/context` are unreachable, `/deploy` is not a built-in.
@@ -1372,7 +1160,6 @@ mod list_commands_tests {
             vec![("/model".into(), "built-in".into())],
             vec![("/model".into(), "extension".into())],
             vec![],
-            vec![],
             Vec::new(),
         );
         assert_eq!(names(&out), vec!["/model"]);
@@ -1386,7 +1173,6 @@ mod list_commands_tests {
             vec![],
             vec![("deploy".into(), "deploy".into())],
             vec![("review".into(), "review".into())],
-            vec![],
             Vec::new(),
         );
         assert_eq!(names(&out), vec!["/deploy", "/review"]);
@@ -1403,7 +1189,6 @@ mod list_commands_tests {
             vec![("/help".into(), "help".into())],
             vec![],
             vec![("review".into(), "review a diff".into())],
-            vec![],
             Vec::new(),
         );
         assert_eq!(names(&out), vec!["/help", "/review"]);
@@ -1419,7 +1204,6 @@ mod list_commands_tests {
             vec![("/review".into(), "built-in".into())],
             vec![],
             vec![("review".into(), "template".into())],
-            vec![],
             Vec::new(),
         );
         assert_eq!(names(&out), vec!["/review"]);
@@ -1428,6 +1212,6 @@ mod list_commands_tests {
 
     #[test]
     fn no_commands_is_an_empty_list_not_an_error() {
-        assert!(merge_command_list_reserved(vec![], vec![], vec![], vec![], Vec::new()).is_empty());
+        assert!(merge_command_list_reserved(vec![], vec![], vec![], Vec::new()).is_empty());
     }
 }

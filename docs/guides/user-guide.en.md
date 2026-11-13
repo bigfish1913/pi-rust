@@ -252,7 +252,7 @@ Global resources normally live under `~/.rpi/agent/`. Project resources take pre
 
 The shorthand keys `skills`, `prompts`, and `extensions` are also supported. Paths are relative to the project root; global settings resolve relative paths against the agent directory. Use `--package-only` or `--project-only` to load only the current project's package and resources. This is different from `--local-only`, which limits extensions to explicitly supplied local paths.
 
-Set `RPI_CODING_AGENT_DIR=/work/rpi-agent` to relocate configuration and default sessions. Use `--no-session` when a temporary, non-persistent run is required.
+Set `RPI_CODING_AGENT_DIR=/work/rpi-agent` to relocate configuration. Sessions default to `<cwd>/.rpi/sessions`; `RPI_CODING_AGENT_SESSION_DIR` overrides that root, while `--session-dir <dir>` and the `sessionDir` setting take precedence. The root is further divided into cwd-encoded subdirectories. Use `--no-session` when a temporary, non-persistent run is required.
 
 ## 6. Rust extensions
 
@@ -275,8 +275,10 @@ rpi install my-extension --path ../my-rpi-extension --force
 
 Use `rpi extension update` to update all project-linked extensions and globally
 installed registry/prebuilt extensions, or `rpi extension update <name>` to select
-one by name. Updates preserve the original Cargo build backend or explicit GitHub
-source. Global development installs made with `--path` are excluded. The old
+one by name. Add `--cdn <URL>` to download prebuilt archives through an HTTPS CDN;
+manifests remain on GitHub and failed CDN requests fall back to GitHub. The option
+does not affect project-linked or Cargo-built extensions. Updates preserve the
+original Cargo build backend or explicit GitHub source. Global development installs made with `--path` are excluded. The old
 `rpi package update [name]` remains compatible; prefer `extension update` for
 extension updates. Project linking commands remain `rpi package link`,
 `rpi package list`, and `rpi package unlink`.

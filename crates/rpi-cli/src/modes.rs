@@ -61,7 +61,7 @@ pub fn outcome_exit_code(outcome: &HarnessRunOutcome) -> i32 {
 /// return the exit code. Mirrors TS `runPrintMode` (text).
 pub async fn print(
     harness: &AgentHarness,
-    args: &Args,
+    _args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
     initial_images: Vec<ImageContent>,
@@ -89,12 +89,29 @@ pub async fn print(
 
     let mut images = initial_images;
     for prompt in prompts {
-        let outcome = lane.prompt_text(&prompt, std::mem::take(&mut images)).await;
+        let run_lane = Arc::clone(&lane);
+        let run_images = std::mem::take(&mut images);
+        // Keep the harness future on a Tokio worker rather than the Windows
+        // process-main stack. The durable run future is intentionally large
+        // (it owns recovery, context, and settlement state); RPC already runs
+        // prompts on a worker, while print mode used to poll it directly and
+        // overflow the small process-main stack before the provider request.
+        let outcome = match tokio::spawn(
+            async move { run_lane.prompt_text(&prompt, run_images).await },
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!("print run task failed: {error}");
+                return 1;
+            }
+        };
         // Print mode has no transcript to report into, so a write failure goes to
         // stderr. Silence here is what let a conversation stop being saved while
         // the run looked fine.
         for failure in lane.take_write_failures() {
-            persistence_failed |= args.experimental_native_store.is_some();
+            persistence_failed = true;
             eprintln!(
                 "session not saved: could not persist {} ({})",
                 failure.what, failure.message
@@ -176,7 +193,7 @@ pub async fn print(
 /// text. Mirrors TS `runPrintMode` (`mode === "json"`) streaming every event.
 pub async fn json(
     harness: &AgentHarness,
-    args: &Args,
+    _args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
     initial_images: Vec<ImageContent>,
@@ -256,16 +273,11 @@ pub async fn json(
                     "error": e.to_string(),
                 });
                 println!("{line}");
-                if args.experimental_native_store.is_some() {
-                    for failure in lane.take_write_failures() {
-                        persistence_failed = true;
-                        println!(
-                            "{}",
-                            serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
-                        );
-                    }
-                    last_exit = 1;
-                    break;
+                for failure in lane.take_write_failures() {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
+                    );
                 }
                 if let Some(task) = agent_event_task {
                     task.abort();
@@ -273,14 +285,12 @@ pub async fn json(
                 return 1;
             }
         }
-        if args.experimental_native_store.is_some() {
-            for failure in lane.take_write_failures() {
-                persistence_failed = true;
-                println!(
-                    "{}",
-                    serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
-                );
-            }
+        for failure in lane.take_write_failures() {
+            persistence_failed = true;
+            println!(
+                "{}",
+                serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
+            );
         }
     }
 
@@ -346,13 +356,35 @@ pub async fn rpc(
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
     message_updates: crate::args::RpcMessageUpdates,
 ) -> i32 {
-    rpc_with_io(
+    rpc_with_durable(
         harness,
         agent_events.take(),
         model_catalog,
         ui_dialog,
         oauth_snapshot,
         message_updates,
+        false,
+    )
+    .await
+}
+
+pub async fn rpc_with_durable(
+    harness: &AgentHarness,
+    mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    model_catalog: Vec<rpi_ai::Model>,
+    ui_dialog: rpi_extensions::UiDialogMailbox,
+    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    message_updates: crate::args::RpcMessageUpdates,
+    native_durable: bool,
+) -> i32 {
+    rpc_with_native_durable_io(
+        harness,
+        agent_events.take(),
+        model_catalog,
+        ui_dialog,
+        oauth_snapshot,
+        message_updates,
+        native_durable,
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
     )
@@ -386,13 +418,78 @@ impl RpcPhaseTiming {
     }
 }
 
+// Never wait for admission on the reader: abort and broker replies must remain
+// readable. If even the bounded busy response cannot enqueue, fail transport
+// rather than silently lose an outcome or allocate another waiting producer.
+/// Shutdown-only run cancellation. The native opt-in path waits for the
+/// cooperative in-process terminal boundary and rereads exact durable result
+/// evidence before the existing native control drain. Default RPC keeps the
+/// historical abort-only behavior; this helper deliberately does not change
+/// the explicit `abort` command response path.
+async fn abort_for_rpc_shutdown(lane: &Arc<dyn AgentLane>, native_durable: bool) {
+    if native_durable {
+        let _ = lane.abort_and_reconcile().await;
+    } else {
+        let _ = lane.abort().await;
+    }
+}
+
+fn admit_durable_rpc(
+    capacity: &Arc<tokio::sync::Semaphore>,
+    out: &RpcWriter,
+    id: serde_json::Value,
+    kind: &str,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match capacity.clone().try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            out.try_write_line(&crate::native_durable::rpc_response(
+                id,
+                kind,
+                Err(crate::native_durable::Failure::busy()),
+            ));
+            None
+        }
+    }
+}
+
+#[cfg(test)]
 async fn rpc_with_io<R, W>(
+    harness: &AgentHarness,
+    agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    model_catalog: Vec<rpi_ai::Model>,
+    ui_dialog: rpi_extensions::UiDialogMailbox,
+    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    message_updates: crate::args::RpcMessageUpdates,
+    input: R,
+    output: W,
+) -> i32
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: Write + Send + 'static,
+{
+    rpc_with_native_durable_io(
+        harness,
+        agent_events,
+        model_catalog,
+        ui_dialog,
+        oauth_snapshot,
+        message_updates,
+        false,
+        input,
+        output,
+    )
+    .await
+}
+
+async fn rpc_with_native_durable_io<R, W>(
     harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
     message_updates: crate::args::RpcMessageUpdates,
+    native_durable: bool,
     mut input: R,
     output: W,
 ) -> i32
@@ -404,6 +501,9 @@ where
         std::env::var_os("RPI_RPC_DIAGNOSTICS").is_some_and(|value| value != "0");
     let setup_timing = RpcPhaseTiming::start(phase_diagnostics, "setup_to_ready_enqueue");
     let mut command_tasks: Vec<RetainedRpcTask<()>> = Vec::new();
+    let durable_capacity = Arc::new(tokio::sync::Semaphore::new(
+        crate::native_durable::MAX_IN_FLIGHT,
+    ));
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     // One blocking writer owns stdout. Producers only enqueue bounded messages,
     // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
@@ -536,6 +636,7 @@ where
     let mut run_task: Option<OwnedRpcRun> = None;
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
     let mut cancel_on_exit = false;
+    let mut native_shutdown_reconciled = false;
 
     let binding = match rpi_harness::session::SessionValues::load(harness.session()).await {
         Ok(values) => crate::resource_selection::binding_state(&values),
@@ -545,6 +646,8 @@ where
         }
     };
     let mut ready = rpc_protocol::ready(message_updates);
+    ready["durable"] =
+        crate::native_durable::experimental_epoch::capabilities_for(harness, native_durable);
     ready["resourceState"] = serde_json::json!({
         "version": 1, "enabled": harness.has_exact_resources(), "command": "get_resource_state",
         "maxSnapshotBytes": crate::resource_selection::MAX_STATE_BYTES,
@@ -588,24 +691,31 @@ where
             Err(error) => {
                 eprintln!("[rpi] rpc stdin error: {error}");
                 run_cancel.cancel();
-                let _ = lane.abort().await;
+                abort_for_rpc_shutdown(&lane, native_durable).await;
+                if native_durable {
+                    native_shutdown_reconciled = true;
+                }
                 external_tools.shutdown();
                 writer_failed.cancel();
                 cancel_on_exit = true;
                 break;
             }
         };
-        let line = match std::str::from_utf8(&line) {
-            Ok(line) => line.trim(),
+        let raw_line = match std::str::from_utf8(&line) {
+            Ok(line) => line,
             Err(_) => {
                 run_cancel.cancel();
-                let _ = lane.abort().await;
+                abort_for_rpc_shutdown(&lane, native_durable).await;
+                if native_durable {
+                    native_shutdown_reconciled = true;
+                }
                 external_tools.shutdown();
                 writer_failed.cancel();
                 cancel_on_exit = true;
                 break;
             }
         };
+        let line = raw_line.trim();
         if line.is_empty() {
             continue;
         }
@@ -630,6 +740,45 @@ where
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        if matches!(
+            kind.as_str(),
+            "get_durable_state" | "durable_mutate" | "get_durable_request" | "get_durable_runs"
+        ) {
+            // Reparse raw frames: Value alone has already lost duplicate keys.
+            let parsed = crate::native_durable::parse_json(raw_line);
+            let safe_id = if serde_json::to_vec(&id).map_or(true, |v| v.len() > 4096) {
+                serde_json::Value::Null
+            } else {
+                id.clone()
+            };
+            let Some(permit) =
+                admit_durable_rpc(&durable_capacity, &stdout, safe_id.clone(), &kind)
+            else {
+                continue;
+            };
+            let owner = harness.clone();
+            let out = stdout.clone();
+            command_tasks.retain(|task| !task.is_finished());
+            command_tasks.push(RetainedRpcTask::new(
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let result = match parsed {
+                        Ok(request) => {
+                            crate::native_durable::rpc(&owner, &request, native_durable).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    write_line(
+                        &out,
+                        &crate::native_durable::rpc_response(safe_id, &kind, result),
+                    )
+                    .await;
+                }),
+                writer_failed.clone(),
+            ));
+            continue;
+        }
 
         if kind == "get_resource_state" && serde_json::to_vec(&id).map_or(true, |v| v.len() > 4096)
         {
@@ -700,6 +849,44 @@ where
                 continue;
             }
             "execute_command" => {
+                if native_durable
+                    && msg
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|name| name.trim_start_matches('/') == "durable")
+                {
+                    let Some(permit) = admit_durable_rpc(
+                        &durable_capacity,
+                        &stdout,
+                        id.clone(),
+                        "execute_command",
+                    ) else {
+                        continue;
+                    };
+                    let owner = harness.clone();
+                    // The legacy typed outer Request has already validated args
+                    // as a string (or absent). Preserve its existing error shape.
+                    let args = msg
+                        .get("args")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let out = stdout.clone();
+                    command_tasks.retain(|task| !task.is_finished());
+                    command_tasks.push(RetainedRpcTask::new(
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let result = crate::native_durable::command(&owner, &args).await;
+                            write_line(
+                                &out,
+                                &crate::native_durable::rpc_response(id, "execute_command", result),
+                            )
+                            .await;
+                        }),
+                        writer_failed.clone(),
+                    ));
+                    continue;
+                }
                 command_tasks.retain(|task| !task.is_finished());
                 let snapshot = oauth_snapshot.clone();
                 let request = msg.clone();
@@ -724,7 +911,10 @@ where
             "stop" => {
                 cancel_on_exit = true;
                 run_cancel.cancel();
-                let _ = lane.abort().await;
+                abort_for_rpc_shutdown(&lane, native_durable).await;
+                if native_durable {
+                    native_shutdown_reconciled = true;
+                }
                 external_tools.shutdown();
                 write_line(
                     &stdout,
@@ -805,12 +995,16 @@ where
                         let content = match content {
                             Ok(content) => content,
                             Err(error) => {
+                                active_task.store(false, std::sync::atomic::Ordering::Release);
+                                #[cfg(test)]
+                                if let Some(finished) = &_finished {
+                                    finished.0.observe_terminal(&active_task);
+                                }
                                 write_line(
                                     &out_task,
                                     &rpc_protocol::response(Some(id), &kind, Err(error)),
                                 )
                                 .await;
-                                active_task.store(false, std::sync::atomic::Ordering::Release);
                                 return;
                             }
                         };
@@ -887,12 +1081,21 @@ where
                                 .and_then(|value| value.get("reclaimed"))
                                 .cloned(),
                         });
+                        // Settlement is the client's permission to start the next
+                        // run. Finish cleanup and release admission BEFORE publishing
+                        // it: the independent writer can expose an enqueued event
+                        // immediately. The dispatcher still joins this retained task
+                        // before starting its successor, preserving output ordering.
+                        mailbox_task.cancel_all();
+                        active_task.store(false, std::sync::atomic::Ordering::Release);
+                        #[cfg(test)]
+                        if let Some(finished) = &_finished {
+                            finished.0.observe_terminal(&active_task);
+                        }
                         let enqueue_timing =
                             RpcPhaseTiming::start(phase_diagnostics, "settled_enqueue");
                         write_line(&out_task, &settled).await;
                         enqueue_timing.finish();
-                        mailbox_task.cancel_all();
-                        active_task.store(false, std::sync::atomic::Ordering::Release);
                     }),
                     run_cancel.clone(),
                 ));
@@ -967,7 +1170,15 @@ where
                 }
             }
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
-            "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
+            "get_commands" => {
+                let mut data = rpc_get_commands(oauth_snapshot.as_deref());
+                if native_durable {
+                    data["commands"].as_array_mut().expect("command array").push(serde_json::json!({
+                        "name":"durable", "description":crate::native_durable::COMMAND_DESCRIPTION
+                    }));
+                }
+                Ok(data)
+            }
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
             "get_tool_program_branch" => {
                 crate::rpc::tool_program_queries::branch(harness, &msg).await
@@ -1021,9 +1232,9 @@ where
     // There can be no more dialog answers, so release approvals, then await the
     // run before SessionShutdown can unload plugins or the runtime exits.
     ui_dialog.detach();
-    if cancel_on_exit {
+    if cancel_on_exit && !(native_durable && native_shutdown_reconciled) {
         run_cancel.cancel();
-        let _ = lane.abort().await;
+        abort_for_rpc_shutdown(&lane, native_durable).await;
     }
     // EOF makes future external replies impossible. Disable the backend before
     // joining, without cancelling an otherwise healthy model-only run.
@@ -1042,7 +1253,7 @@ where
             result = &mut task => result,
             _ = writer_failed.cancelled() => {
                 run_cancel.cancel();
-                let _ = lane.abort().await;
+                abort_for_rpc_shutdown(&lane, native_durable).await;
                 external_tools.shutdown();
                 task.await
             }
@@ -1051,6 +1262,13 @@ where
             eprintln!("[rpi] rpc prompt task failed: {error}");
             exit_code = 1;
         }
+    }
+    // Ingress has ended and retained command/run producers have joined. Only
+    // now can a native gate barrier cover their accepted control work before
+    // commit pumps are retired. This is not the root-future Drop cleanup path.
+    if native_durable && crate::native_durable::drain(harness).await.is_err() {
+        eprintln!("[rpi] native durable settlement barrier failed");
+        exit_code = 1;
     }
     pump_stop.cancel();
     harness.session().set_entry_commit_publisher(None);
@@ -1982,6 +2200,17 @@ async fn rpc_get_queue(
     )
 }
 
+/// Queue names that select `next_run`.
+///
+/// `get_queue` reports a `NextRun` item as `"nextRun"` (from
+/// `QueueKind::as_str()`), while the Web frontend's selector sends
+/// `"nextTurn"`. Editing such an item cancels it and re-submits the reported
+/// name, so that spelling has to round-trip back into an enqueue instead of
+/// being rejected with `unknown queue kind`.
+fn is_next_run_queue(queue: &str) -> bool {
+    matches!(queue, "nextTurn" | "next_run" | "nextRun")
+}
+
 async fn rpc_queue_message(
     lane: &Arc<dyn AgentLane>,
     msg: &serde_json::Value,
@@ -1999,7 +2228,7 @@ async fn rpc_queue_message(
     let result = match queue {
         "steer" => lane.steer(message).await,
         "followUp" | "follow_up" => lane.follow_up(message).await,
-        "nextTurn" | "next_run" => lane.next_run(message).await,
+        queue if is_next_run_queue(queue) => lane.next_run(message).await,
         other => return Err(format!("unknown queue kind: {other}")),
     }
     .map_err(|error| error.to_string())?;
@@ -2873,8 +3102,10 @@ pub async fn interactive(
         .map(|v| v == "1")
         .unwrap_or(false);
     let code = if force_tui || crate::interactive_tui::is_tui_supported() {
-        // Use TUI-based interactive mode
-        crate::interactive_tui::interactive_tui(
+        // Use TUI-based interactive mode. The TUI future is intentionally
+        // heap-allocated: its large state machine otherwise overflows the
+        // default Windows main-thread stack before its body starts polling.
+        Box::pin(crate::interactive_tui::interactive_tui(
             harness,
             event_rx,
             args,
@@ -2885,7 +3116,7 @@ pub async fn interactive(
             theme,
             no_themes,
             reload_context,
-        )
+        ))
         .await
     } else {
         // Fall back to simple REPL. No transcript container to hold notes, so
@@ -3040,9 +3271,6 @@ fn session_storage_notice(message: &str) -> String {
 #[cfg(test)]
 #[path = "rpc/native_dispatch_tests.rs"]
 mod native_dispatch_tests;
-#[cfg(all(test, feature = "experimental-native-store"))]
-#[path = "modes/native_persistence_tests.rs"]
-mod native_persistence_tests;
 #[cfg(test)]
 #[path = "modes/transcript_page_tests.rs"]
 mod transcript_page_tests;
@@ -3050,12 +3278,26 @@ mod transcript_page_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use rpi_agent::events::AgentEvent;
     use rpi_agent::types::AgentToolResult;
     use rpi_ai::types::{
         AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
     };
     use rpi_harness::session::types::OperationError;
+
+    /// `get_queue` reports `NextRun` as `nextRun`; editing that item in the
+    /// Web UI cancels it and re-submits the reported name. It must not be
+    /// rejected as an unknown queue kind (see `is_next_run_queue`).
+    #[test]
+    fn next_run_queue_alias_accepts_get_queue_spelling() {
+        for spelling in ["nextTurn", "next_run", "nextRun"] {
+            assert!(is_next_run_queue(spelling), "{spelling}");
+        }
+        assert!(!is_next_run_queue("steer"));
+        assert!(!is_next_run_queue("followUp"));
+        assert!(!is_next_run_queue("next-run"));
+    }
 
     /// Regression: the abort reply must carry the reclaimed queue back instead
     /// of only `{aborted:true}`, and each queue must be reported separately.
@@ -4809,6 +5051,72 @@ mod session_storage_notice_tests {
         assert!(
             notice.contains("print mode exits"),
             "the notice must say the turn is not coming back: {notice}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "modes/native_durable_shutdown_tests.rs"]
+mod native_durable_shutdown_tests;
+
+#[cfg(test)]
+mod native_durable_admission_tests {
+    use super::*;
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn native_durable_overload_is_bounded_and_does_not_admit_mutations() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (out, writer, _) = start_rpc_writer(
+            Capture(bytes.clone()),
+            crate::args::RpcMessageUpdates::default(),
+        );
+        let capacity = Arc::new(tokio::sync::Semaphore::new(
+            crate::native_durable::MAX_IN_FLIGHT,
+        ));
+        let mut permits: Vec<_> = (0..crate::native_durable::MAX_IN_FLIGHT)
+            .map(|i| {
+                admit_durable_rpc(&capacity, &out, serde_json::json!(i), "get_durable_state")
+                    .unwrap()
+            })
+            .collect();
+        assert!(admit_durable_rpc(
+            &capacity,
+            &out,
+            serde_json::json!("overflow"),
+            "durable_mutate"
+        )
+        .is_none());
+        assert_eq!(capacity.available_permits(), 0);
+        drop(permits.pop());
+        let released = admit_durable_rpc(
+            &capacity,
+            &out,
+            serde_json::json!("available"),
+            "get_durable_state",
+        )
+        .unwrap();
+        assert_eq!(capacity.available_permits(), 0);
+        drop(released);
+        drop(permits);
+        drop(out);
+        writer.await.unwrap().unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(response["id"], "overflow");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["errorDetails"]["code"], "busy");
+        assert_eq!(
+            capacity.available_permits(),
+            crate::native_durable::MAX_IN_FLIGHT
         );
     }
 }

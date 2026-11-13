@@ -6,8 +6,10 @@ mod autocomplete_flicker;
 mod clipboard_persistence;
 mod context_panel;
 mod enter_completion;
+mod native_durable;
 mod session_regressions;
 mod skill_commands;
+mod startup_wiring;
 mod updown_cursor;
 
 #[test]
@@ -444,12 +446,16 @@ fn markdown_flag_only_comes_from_an_explicit_true() {
 /// the explicit literals other tests build, but keeps one copy in sync.
 pub(super) fn test_tui_state() -> Arc<TuiState> {
     Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -721,6 +727,66 @@ async fn dequeue_restores_both_queues_images_and_folded_draft_without_aborting()
     assert!(strip_ansi(&state.chat_container.render(120).join("\n"))
         .contains("Restored 2 queued messages to editor"));
     harness.close().await.unwrap();
+}
+
+#[test]
+fn model_selection_dispatches_provider_payload_while_idle() {
+    use rpi_extensions::{ExtensionRegistry, ExtensionSession, PluginKeepalive};
+    use rpi_plugin_sdk::{EventTag, StablePluginEvent};
+
+    static EVENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    extern "C" fn record(raw: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+        // SAFETY: the host keeps the event alive for the duration of the callback.
+        let event = unsafe { rpi_plugin_sdk::events::EventView::from_raw(&raw) };
+        EVENTS
+            .lock()
+            .unwrap()
+            .push(event.data_text().expect("model_select payload"));
+        0
+    }
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            EVENTS.lock().unwrap().clear();
+            let harness = AgentHarness::create(Default::default()).await.unwrap();
+            let lane: Arc<dyn AgentLane> = harness.lane("main");
+            let state = test_tui_state();
+            let mut registry = ExtensionRegistry::new();
+            registry.register_event_handler(
+                "test".into(),
+                EventTag::ModelSelect,
+                record,
+                std::ptr::null_mut(),
+            );
+            *state.extension_session.lock().unwrap() = ExtensionSession::from_parts(
+                Arc::new(registry.snapshot()),
+                PluginKeepalive::empty(),
+                vec![],
+                None,
+            );
+            let model = rpi_ai::Model::new(
+                "selected-model",
+                "Selected",
+                rpi_ai::Api::OpenaiCompletions,
+                "selected-provider",
+                "http://selected.invalid",
+            );
+
+            apply_model_selection(&lane, &state, model, false)
+                .await
+                .unwrap();
+
+            let events = EVENTS.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            let payload: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+            assert_eq!(payload["model"]["provider"], "selected-provider");
+            assert_eq!(payload["model"]["id"], "selected-model");
+            drop(events);
+            harness.close().await.unwrap();
+        });
 }
 
 #[test]
@@ -1320,8 +1386,8 @@ fn test_layout_renders_welcome_message() {
 
     let all: String = frame.lines.join("\n");
     assert!(
-        all.contains("rpi"),
-        "Welcome message not found. Rendered: {}",
+        all.contains(":::"),
+        "Welcome logo not found. Rendered: {}",
         all
     );
     assert!(
@@ -1428,17 +1494,15 @@ fn welcome_header_renders_the_brand_mark() {
     let lines: Vec<String> = chat.render(80).iter().map(|l| strip_ansi(l)).collect();
     let all = lines.join("\n");
 
-    // The three-bar mark: the bottom row carries all three bars, and the
-    // wordmark sits on its baseline next to the middle bar.
+    // The fixed-width ASCII logo is rendered with single-cell characters.
     assert!(
-        lines.iter().any(|l| l.contains("██ ██ ██")),
-        "brand mark missing: {all}"
+        lines.iter().any(|l| l.contains(":::")),
+        "brand logo missing: {all}"
     );
     assert!(
-        all.contains("rpi"),
-        "the mark must carry the product name: {all}"
+        all.contains("interactive TUI"),
+        "the welcome tagline is missing: {all}"
     );
-
     // Regression guard for the layout bug this replaced: `π` is East-Asian
     // Ambiguous — width 1 normally, width 2 under a CJK locale — which
     // walked the old box borders out of alignment depending on the user's
@@ -1791,12 +1855,16 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
     };
 
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -3421,12 +3489,16 @@ fn test_autocomplete_slash_suggestions_render() {
     // The autocomplete container should render at least one suggestion
     // line when the editor holds a `/` prefix, and clear when it doesn't.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -3520,12 +3592,16 @@ fn test_select_list_swap_restores_editor() {
     // child; closing restores it. Verify the container child count + the
     // active_selector flag round-trip.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -3622,12 +3698,16 @@ fn test_message_history_browse_restores_draft() {
     // messages, browse older → newer → back past the newest restores the
     // draft the user was typing.
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -3727,12 +3807,16 @@ fn test_message_history_browse_restores_draft() {
 fn test_accept_top_suggestion_replaces_prefix() {
     // `/he` + Tab → `/help ` (slash command provider inserts a space).
     let state = Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -3818,12 +3902,16 @@ fn test_accept_top_suggestion_replaces_prefix() {
 /// installed by each test).
 fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
     Arc::new(TuiState {
+        session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
+        session_cwd: std::path::PathBuf::from("unused-session-cwd"),
+        session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        message_seq: crate::transcript_view::MessageIdSeq::new(),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
         show_terminal_progress: true,
         status: std::sync::Mutex::new(RunStatus::Idle),
@@ -4497,8 +4585,8 @@ fn ask_user_prompt_parser_supports_flat_and_questions_shapes() {
 #[test]
 fn ask_user_bridge_answers_and_cancels_by_request_id() {
     let mailbox = rpi_extensions::UiDialogMailbox::new();
-    mailbox.attach();
     let bridge = AskUserBridge::new(mailbox.clone());
+    assert!(bridge.attach());
 
     // Two concurrent requests must not cross answers.
     mailbox
@@ -5264,7 +5352,7 @@ fn final_review_pr106_enter_path_completion_must_preserve_the_parent_directory()
     std::fs::write(&completed, "review fixture").unwrap();
     assert!(!temporary.path().join("report.txt").exists());
     let prefix = format!("@{}", nested.join("repo").display());
-    let expected = format!("@{} ", completed.display());
+    let expected = format!("@{} ", completed.display()).replace('\\', "/");
     let state = test_tui_state();
     state
         .autocomplete
@@ -5282,6 +5370,28 @@ fn final_review_pr106_enter_path_completion_must_preserve_the_parent_directory()
         expected,
         "Enter must complete the basename without discarding the directory from the file reference"
     );
+}
+
+#[test]
+fn final_review_pr106_quoted_at_completion_closes_the_quote() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("notes.txt");
+    std::fs::write(&path, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let input = "@\"not";
+    editor.set_text(input);
+    set_editor_cursor_offset(&editor, input, input.len());
+
+    let completion = resolve_enter_completion(&state, &editor).expect("a quoted @ decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyOnly);
+    assert!(completion.apply(&state, &editor));
+    assert_eq!(editor.get_text(), "@\"notes.txt\" ");
 }
 
 /// A path candidate that disappears between the decision and the apply must
@@ -5394,7 +5504,7 @@ fn final_review_pr106_path_segment_covers_the_text_after_the_caret() {
     );
     assert_eq!(
         editor.get_text(),
-        format!("@{} ", completed.display()),
+        format!("@{} ", completed.display()).replace('\\', "/"),
         "the whole basename segment is completed, not just the part before the caret"
     );
 
@@ -5651,7 +5761,7 @@ fn final_review_pr106_tab_path_completion_must_preserve_the_parent_directory() {
     );
     assert_eq!(
         editor.get_text(),
-        format!("@{} ", report.display()),
+        format!("@{} ", report.display()).replace('\\', "/"),
         "Tab must complete the basename without discarding the directory"
     );
 

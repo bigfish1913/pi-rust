@@ -228,7 +228,7 @@ pub(super) async fn run_prompt_streaming(
     refresh_pending_messages(state, lane).await;
     // The blocking path has no drain task, so `AgentEnd` never runs and this is
     // the only place its write failures can surface.
-    if super::events::report_write_failures(&state.chat_container, lane) {
+    if super::events::report_write_failures(&state.notice_container(), lane) {
         state
             .history_page
             .unsaved
@@ -281,12 +281,12 @@ pub(super) async fn run_prompt_streaming(
                         .as_ref()
                         .and_then(|m| m.error_message.clone())
                         .unwrap_or_else(|| format!("{error:?}"));
-                    add_error_message(&state.chat_container, &msg);
+                    add_error_message(&state.notice_container(), &msg);
                 }
             }
             HarnessRunOutcome::Suspended { .. } => {
                 add_error_message(
-                    &state.chat_container,
+                    &state.notice_container(),
                     "Run suspended (deferred) — resume is not supported in v1.",
                 );
             }
@@ -294,7 +294,7 @@ pub(super) async fn run_prompt_streaming(
                 // Aborted runs render their own partial/final message via the
                 // stream; only add a note on the blocking fallback path.
                 if !streaming {
-                    add_error_message(&state.chat_container, "Request aborted.");
+                    add_error_message(&state.notice_container(), "Request aborted.");
                     let _ = final_message; // (rendered by the stream in streaming mode)
                 }
             }
@@ -316,16 +316,17 @@ pub(super) async fn run_prompt_streaming(
                     .history_page
                     .unsaved
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                add_error_message(&state.chat_container, &tui_session_storage_notice(&e));
+                add_error_message(&state.notice_container(), &tui_session_storage_notice(&e));
             } else {
-                add_error_message(&state.chat_container, &e.to_string());
+                add_error_message(&state.notice_container(), &e.to_string());
             }
         }
     }
 
-    if !streaming {
-        history::settle(state, tui);
-    }
+    // Settle only after the producer has drained its session writer. The
+    // AgentEnd event is delivered concurrently and may otherwise reload the
+    // previous page, clearing the just-rendered response.
+    history::settle(state, tui);
     tui.request_render(false);
 }
 
@@ -362,6 +363,9 @@ pub(super) async fn run_skill_streaming(
     }
 
     state.set_status(RunStatus::Idle);
+    // Skill runs also emit AgentEnd while their session writes may still be
+    // queued. Wait for the writer before replacing the live transcript.
+    lane.drain_session().await;
     refresh_pending_messages(state, lane).await;
 
     match outcome {
@@ -377,11 +381,11 @@ pub(super) async fn run_skill_streaming(
             }
             HarnessRunOutcome::Aborted { .. } => {
                 if !streaming {
-                    add_error_message(&state.chat_container, "Skill invocation aborted.");
+                    add_error_message(&state.notice_container(), "Skill invocation aborted.");
                 }
             }
             HarnessRunOutcome::Suspended { .. } => add_error_message(
-                &state.chat_container,
+                &state.notice_container(),
                 "Skill invocation suspended (deferred) — resume is not supported in v1.",
             ),
             HarnessRunOutcome::Failed {
@@ -394,15 +398,16 @@ pub(super) async fn run_skill_streaming(
                         .as_ref()
                         .and_then(|m| m.error_message.clone())
                         .unwrap_or_else(|| format!("{error:?}"));
-                    add_error_message(&state.chat_container, &message);
+                    add_error_message(&state.notice_container(), &message);
                 }
             }
         },
-        Err(error) => add_error_message(&state.chat_container, &error.to_string()),
+        Err(error) => add_error_message(&state.notice_container(), &error.to_string()),
     }
-    if !streaming {
-        history::settle(state, tui);
-    }
+    // Settle only after the producer has drained its session writer. The
+    // AgentEnd event is delivered concurrently and may otherwise reload the
+    // previous page, clearing the just-rendered response.
+    history::settle(state, tui);
     tui.request_render(false);
 }
 
@@ -418,14 +423,14 @@ pub(super) async fn run_compact(
     tui.request_render(false);
     match lane.compact(None).await {
         Ok(_) => {
-            add_note_message(&state.chat_container, "Conversation compacted.");
+            add_note_message(&state.notice_container(), "Conversation compacted.");
             // The last assistant usage describes the pre-compaction context;
             // reset the badge to `?` until the next response reports the new
             // (much smaller) prompt size — mirrors pi's `percent: null`.
             state.footer.set_context_tokens(None);
         }
         Err(e) => {
-            add_error_message(&state.chat_container, &format!("Compact failed: {e}"));
+            add_error_message(&state.notice_container(), &format!("Compact failed: {e}"));
         }
     }
     state.set_status(RunStatus::Idle);
@@ -446,20 +451,26 @@ pub(super) fn copy_mouse_selection_with(
 /// `/copy`: copy the last assistant reply to the clipboard. Best-effort —
 /// when no clipboard is available (or the `clipboard` feature is off), prints a
 /// hint instead. Mirrors the TS `/copy` (copies `this.messages.at(-1)` text).
-pub(super) fn copy_last_assistant(state: &Arc<TuiState>, chat: &Arc<Container>) {
+pub(super) fn copy_last_assistant(state: &Arc<TuiState>) {
     let text = state.last_assistant_text.lock().unwrap().clone();
     if text.is_empty() {
-        add_note_message(chat, "Nothing to copy yet — no assistant reply captured.");
+        add_note_message(
+            &state.notice_container(),
+            "Nothing to copy yet — no assistant reply captured.",
+        );
         return;
     }
     if copy_to_clipboard(&text) {
-        add_note_message(chat, "Copied last reply to the clipboard.");
+        add_note_message(
+            &state.notice_container(),
+            "Copied last reply to the clipboard.",
+        );
     } else {
         // Clipboard unavailable — print the text to the transcript so the user
         // can select/copy it manually (degrades gracefully in headless envs).
         let preview: String = text.chars().take(200).collect();
         add_note_message(
-            chat,
+            &state.notice_container(),
             &format!(
                 "Clipboard unavailable. Last reply: {preview}{}",
                 if text.chars().count() > 200 {
@@ -651,7 +662,7 @@ pub(super) fn attach_pasted_images(state: &Arc<TuiState>, text: &str) -> bool {
         state.queue_image(image);
     }
     add_note_message(
-        &state.chat_container,
+        &state.notice_container(),
         &format!("Attached {count} image(s) to the next prompt."),
     );
     true

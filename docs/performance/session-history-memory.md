@@ -62,7 +62,7 @@ Linux 可使用无 `.exe` 的 binary，runner 采 `/proc` VmRSS/VmHWM；**本报
 全部 Cargo 验证使用隔离 HOME/config/session 根、`--locked --offline`，测试串行运行；合成测试使用内存/临时文件和 faux/mock provider。
 
 - 默认 `cargo test --workspace`：**2984 passed / 0 failed / 10 ignored**。
-- harness + CLI，启用各自 `experimental-native-store` feature：**1625 passed / 0 failed / 6 ignored**（两个 package 合计，不与默认 suite 相加作为独立覆盖率）。
+- harness 默认构建使用 memory/JSONL；durable SQLite 仅通过 `rpi-durable/sqlite`（或 harness 的 `durable-sqlite`）显式启用。
 - `cargo check --workspace --all-targets`，同上 feature：通过。
 - 正常 Clippy 被未修改的 `crates/rpi-extensions/src/actions.rs:986` 的 `not_unsafe_ptr_arg_deref` deny 阻塞；`--cap-lints warn` 的 advisory 全 workspace/all-targets 检查完成，仍有 warnings，**不是 lint-clean**。
 - focused tests 包含 shared trait contract、source generation/篡改检测、跨块 Unicode/CRLF、大行、duplicate/rechain/torn-tail、兼容 filesystem、失败 append/重试、长期 append、compaction context/intent、snapshot、fork、TUI 翻页/旧引用释放/失败保留/过期结果/active 分离/当前面板/header。

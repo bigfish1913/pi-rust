@@ -89,7 +89,7 @@ fn update_notices_mount_before_live_transcript_slot() {
     );
 
     let children = chat.get_children();
-    assert_eq!(children.len(), 3);
+    assert_eq!(children.len(), 4); // Includes the reserved regular update hint.
     let updates: Arc<dyn Component> = history.updates.clone();
     let active: Arc<dyn Component> = history.active.clone();
     let panels: Arc<dyn Component> = history.panels.clone();
@@ -129,7 +129,7 @@ async fn pages_replace_not_accumulate_and_release_old_components_and_search() {
     finish_request(&state).await;
     assert!(text(&state).contains("history-entry-122"));
     assert!(!text(&state).contains("history-entry-072"));
-    assert_eq!(state.chat_container.child_count(), 4);
+    assert_eq!(state.chat_container.child_count(), 5); // Includes reserved hint.
 }
 
 #[tokio::test]
@@ -298,7 +298,7 @@ async fn byte_budget_keeps_oversized_entries_whole_and_all_variants_page() {
         );
     }
     let chat = Arc::new(Container::new());
-    render_history_entries(page.entries, &chat, None, None, false);
+    render_history_entries(page.entries, &chat, None, None, false, false);
     let output = strip_ansi(&chat.render(100).join("\n"));
     assert!(output.contains("Model changed"));
     assert!(output.contains("Thinking level"));
@@ -313,7 +313,7 @@ async fn repeated_restore_replaces_the_page_and_mounts_live_user_messages() {
     let old_page = Arc::downgrade(&state.chat_container.get_children()[1]);
     restore_bound(&state, &state.chat_container).await;
     assert!(old_page.upgrade().is_none());
-    assert_eq!(state.chat_container.child_count(), 4);
+    assert_eq!(state.chat_container.child_count(), 5); // Includes reserved hint.
     state.set_status(RunStatus::Working);
     state.transcript_view().add_user("visible-live-user");
     assert!(text(&state).contains("visible-live-user"));
@@ -349,12 +349,12 @@ async fn repeated_page_failures_keep_one_notice_and_preserve_the_page() {
         request(state.clone(), tui.clone(), Direction::Older);
         finish_request(&state).await;
         assert!(Arc::ptr_eq(&page, &state.chat_container.get_children()[1]));
-        assert_eq!(state.chat_container.child_count(), 5);
+        assert_eq!(state.chat_container.child_count(), 6); // Reserved hint + failure.
         assert_eq!(text(&state).matches("Could not load history").count(), 1);
     }
     request(state.clone(), tui.clone(), Direction::Latest);
     finish_request(&state).await;
-    assert_eq!(state.chat_container.child_count(), 4);
+    assert_eq!(state.chat_container.child_count(), 5); // Includes reserved hint.
     assert!(!text(&state).contains("Could not load history"));
 }
 
@@ -514,4 +514,48 @@ async fn capability_header_survives_restore_and_page_replacement_once() {
     assert_eq!(text(&state).matches("capability-header").count(), 1);
     restore_bound(&state, &state.chat_container).await;
     assert_eq!(text(&state).matches("capability-header").count(), 1);
+}
+
+#[path = "tests/live_images.rs"]
+mod live_images;
+#[path = "tests/notice_order.rs"]
+mod notice_order;
+
+#[test]
+fn restored_history_honors_the_hide_thinking_preference() {
+    use rpi_harness::session::types::{Entry, EntryBase, MessageEntry};
+    use rpi_tui::{strip_ansi, Component};
+    let chat = Arc::new(Container::new());
+    let mut assistant = rpi_ai::types::AssistantMessage::empty(
+        rpi_ai::types::Api::OpenaiResponses,
+        "test-provider",
+        "test-model",
+        0,
+    );
+    assistant.content.push(rpi_ai::types::Content::Thinking(
+        rpi_ai::types::ThinkingContent {
+            kind: rpi_ai::types::ThinkingContentType,
+            thinking: "restored reasoning".to_string(),
+            thinking_signature: None,
+            redacted: false,
+        },
+    ));
+    let entry = Entry::Message(MessageEntry {
+        base: EntryBase {
+            entry_type: "message".to_string(),
+            id: "e1".to_string(),
+            seq: 1,
+            parent_id: None,
+            timestamp: 0,
+        },
+        message: rpi_agent::message::AgentMessage::Assistant(Box::new(assistant)),
+        terminate: None,
+    });
+    render_history_entries(vec![entry], &chat, None, None, false, true);
+    let output = strip_ansi(&chat.render(100).join("\n"));
+    assert!(
+        !output.contains("restored reasoning"),
+        "hide_thinking must apply at restore time: {output}"
+    );
+    assert!(output.contains("Thinking..."));
 }

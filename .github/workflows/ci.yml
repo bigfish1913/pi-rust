@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main, preview]
     types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    # 00:00 Asia/Shanghai (16:00 UTC on the previous day).
+    - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
       prepare_release:
@@ -13,6 +16,11 @@ on:
         required: false
         type: boolean
         default: true
+      publish_preview:
+        description: 'Publish preview binaries from the preview branch'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -229,6 +237,8 @@ jobs:
           python3 scripts/test_release_automation.py
           python3 scripts/test_release_pr_readiness.py
           python3 scripts/test_release_channels.py
+          python3 -B scripts/test_workflow_infrastructure.py
+          python3 -B scripts/test_ci_transient_recovery.py
 
   windows-plugin-lifecycle:
     name: Windows plugin ABI and DLL lifecycle
@@ -267,8 +277,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Match the release baseline; don't let ubuntu-latest move it silently.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
@@ -279,8 +292,50 @@ jobs:
             target: x86_64-pc-windows-msvc
     env:
       RUSTFLAGS: "-D warnings"
+      # musl-tools installs `musl-gcc`; make both Cargo and cc-rs use it for
+      # the target instead of looking for x86_64-linux-musl-gcc.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
       - uses: actions/checkout@v4
+      - name: Install musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reuse a preinstalled compiler instead of needlessly hitting mirrors.
+          if ! command -v musl-gcc >/dev/null 2>&1; then
+            install_musl_tools() {
+              # apt-get update normally succeeds with stale indexes on DNS
+              # errors. Treat partial fetch failures as failures and bound each
+              # command, not just the backoff between attempts.
+              timeout 120s sudo apt-get update \
+                -o APT::Update::Error-Mode=any -o Acquire::Retries=2 \
+                -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || return $?
+              timeout 120s sudo apt-get install --yes --no-install-recommends \
+                -o Acquire::Retries=2 -o Acquire::http::Timeout=15 \
+                -o Acquire::https::Timeout=15 musl-tools
+            }
+            for attempt in 1 2 3; do
+              if install_musl_tools; then
+                break
+              fi
+              if (( attempt == 3 )); then
+                echo "::error::Could not install musl-tools after ${attempt} attempts."
+                exit 1
+              fi
+              echo "::warning::musl-tools install failed; retrying (attempt ${attempt}/3)."
+              sleep $(( attempt * 10 ))
+            done
+          fi
+          command -v musl-gcc
+          # Presence alone isn't enough: ensure the compiler links a runnable
+          # static binary before spending minutes on the Rust build.
+          probe="$RUNNER_TEMP/musl-linker-smoke"
+          printf 'int main(void) { return 0; }\n' | musl-gcc -static -x c - -o "$probe"
+          "$probe"
+          rm -f "$probe"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -312,7 +367,9 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
       github.event.pull_request.draft == true) }}
-    runs-on: ubuntu-latest
+    # A historical latency budget requires a stable OS baseline. Keep latest
+    # coverage in the check/test jobs, not in this performance comparison.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       RUSTFLAGS: "-D warnings"
@@ -331,6 +388,17 @@ jobs:
         with:
           key: resources-release
           workspaces: . -> target/resource-tests-cargo
+      - name: Record performance environment
+        shell: bash
+        run: |
+          {
+            uname -a
+            cat /etc/os-release
+            printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion"
+            lscpu
+            rustc -Vv
+            python3 --version
+          } | tee "$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-environment.txt"
       - name: Build release resource fixtures
         run: |
           cargo build -p rpi-cli --bin rpi --release --locked --target-dir target/resource-tests-cargo
@@ -372,22 +440,100 @@ jobs:
           --rounds 5 --profile release
       # Shared hosted runners need explicit, more tolerant budgets than the
       # local 2s modern target. Both shapes keep the full historical record load.
+      # A pure latency-gate failure gets one fresh attempt to absorb transient
+      # hosted-runner contention; protocol, semantic and cleanup failures do not.
       - name: Regress cold opening 701000 synthetic append frames (modern)
-        run: >-
-          python3 -B scripts/resource-cold-start.py
-          --candidate target/resource-tests-cargo/release/rpi
-          --output "$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-modern"
-          --shapes modern --frames 701000 --entries 21733 --repeats 3
-          --max-ready-ms 4000 --max-single-ready-ms 8000
-          --max-get-messages-ms 250 --max-get-state-ms 2000
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_base="$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-modern"
+          run_benchmark() {
+            local output="$1"
+            python3 -B scripts/resource-cold-start.py \
+              --candidate target/resource-tests-cargo/release/rpi \
+              --output "$output" \
+              --shapes modern --frames 701000 --entries 21733 --repeats 3 \
+              --max-ready-ms 4000 --max-single-ready-ms 8000 \
+              --max-get-messages-ms 250 --max-get-state-ms 2000
+          }
+          latency_only_failure() {
+            python3 - "$1" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              data = json.load(stream)
+          runs = data.get("runs", [])
+          summaries = [item for item in data.get("summaries", [])
+                       if item.get("gate", {}).get("gatesExit")]
+          only_latency = bool(data.get("status") == "FAIL" and "fatalError" not in data and
+                              runs and summaries and
+                              all(run.get("status") == "PASS" and not run.get("errors")
+                                  for run in runs) and
+                              all(item["gate"].get("complete") is True for item in summaries) and
+                              all(item.get("metrics", {}).get(key) is not None
+                                  for item in summaries
+                                  for key in ("readyMs", "getMessages40Ms", "getStateMs")) and
+                              any(item.get("gate", {}).get("status") == "FAIL"
+                                  for item in summaries))
+          raise SystemExit(0 if only_latency else 1)
+          PY
+          }
+          if run_benchmark "${output_base}-1"; then
+            exit 0
+          fi
+          if ! latency_only_failure "${output_base}-1/results.json"; then
+            echo 'Cold-start benchmark failed for a non-latency reason; not retrying.' >&2
+            exit 1
+          fi
+          echo '::warning::Cold-start latency gate was noisy; retrying once with the same thresholds.'
+          run_benchmark "${output_base}-2"
       - name: Regress cold opening 701000 synthetic append frames (legacy upgrade)
-        run: >-
-          python3 -B scripts/resource-cold-start.py
-          --candidate target/resource-tests-cargo/release/rpi
-          --output "$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-legacy"
-          --shapes legacy --frames 701000 --entries 21733 --repeats 3
-          --max-ready-ms 6000 --max-single-ready-ms 10000
-          --max-get-messages-ms 250 --max-get-state-ms 2000
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_base="$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-legacy"
+          run_benchmark() {
+            local output="$1"
+            python3 -B scripts/resource-cold-start.py \
+              --candidate target/resource-tests-cargo/release/rpi \
+              --output "$output" \
+              --shapes legacy --frames 701000 --entries 21733 --repeats 3 \
+              --max-ready-ms 6000 --max-single-ready-ms 10000 \
+              --max-get-messages-ms 250 --max-get-state-ms 2000
+          }
+          latency_only_failure() {
+            python3 - "$1" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              data = json.load(stream)
+          runs = data.get("runs", [])
+          summaries = [item for item in data.get("summaries", [])
+                       if item.get("gate", {}).get("gatesExit")]
+          only_latency = bool(data.get("status") == "FAIL" and "fatalError" not in data and
+                              runs and summaries and
+                              all(run.get("status") == "PASS" and not run.get("errors")
+                                  for run in runs) and
+                              all(item["gate"].get("complete") is True for item in summaries) and
+                              all(item.get("metrics", {}).get(key) is not None
+                                  for item in summaries
+                                  for key in ("readyMs", "getMessages40Ms", "getStateMs")) and
+                              any(item.get("gate", {}).get("status") == "FAIL"
+                                  for item in summaries))
+          raise SystemExit(0 if only_latency else 1)
+          PY
+          }
+          if run_benchmark "${output_base}-1"; then
+            exit 0
+          fi
+          if ! latency_only_failure "${output_base}-1/results.json"; then
+            echo 'Cold-start benchmark failed for a non-latency reason; not retrying.' >&2
+            exit 1
+          fi
+          echo '::warning::Cold-start latency gate was noisy; retrying once with the same thresholds.'
+          run_benchmark "${output_base}-2"
       - name: Upload historical cold-start regression diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -396,6 +542,7 @@ jobs:
           # Allowlist diagnostics: even a failed history cleanup must not upload
           # hundreds of MiB of generated transcripts/companion data.
           path: |
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-environment.txt
             ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/results.json
             ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/reproduce.json
             ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/*/report.json
@@ -430,11 +577,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [ubuntu-latest, macos-15, windows-latest]
     env:
       # Update this deliberately when rpi-package compatibility is reviewed.
       # The SHA makes the extension set reproducible and auditable.
-      RPI_PACKAGE_REF: f3936a1a68d0bc9eb4d69dad99d13b0e647b3484
+      RPI_PACKAGE_REF: 0d8b0d4fe51964a4c8484819df2d47bcb5d4ca36
       COMPAT_DIAGNOSTICS_NAME: extension-compat-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out host
@@ -467,15 +614,106 @@ jobs:
 
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
+        timeout-minutes: 15
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes pkg-config libasound2-dev
+          set -euo pipefail
+          install_native_dependencies() {
+            timeout 120s sudo apt-get update \
+              -o APT::Update::Error-Mode=any -o Acquire::Retries=2 \
+              -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || return $?
+            timeout 120s sudo apt-get install --yes --no-install-recommends \
+              -o Acquire::Retries=2 -o Acquire::http::Timeout=15 \
+              -o Acquire::https::Timeout=15 pkg-config libasound2-dev
+          }
+          for attempt in 1 2 3; do
+            if install_native_dependencies; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              echo "::error::Could not install Linux native dependencies after ${attempt} attempts."
+              exit 1
+            fi
+            echo "::warning::Native dependency install failed; retrying (attempt ${attempt}/3)."
+            sleep $(( attempt * 10 ))
+          done
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Cache sherpa-onnx archives
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sherpa-onnx-archives
+          key: sherpa-onnx-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rpi-package/Cargo.lock') }}
+
+      - name: Prefetch sherpa-onnx archive
+        shell: bash
+        working-directory: rpi-package
+        run: |
+          set -euo pipefail
+          version="$(python - <<'PY'
+          import tomllib
+
+          with open("Cargo.lock", "rb") as lock_file:
+              lock = tomllib.load(lock_file)
+
+          versions = [
+              package["version"]
+              for package in lock["package"]
+              if package["name"] == "sherpa-onnx-sys"
+          ]
+          if len(versions) != 1:
+              raise SystemExit(f"expected one sherpa-onnx-sys version, found {versions!r}")
+          print(versions[0])
+          PY
+          )"
+
+          case "${RUNNER_OS}:${RUNNER_ARCH}" in
+            Linux:X64)
+              suffix="linux-x64-static-lib"
+              ;;
+            macOS:ARM64)
+              suffix="osx-arm64-static-lib"
+              ;;
+            macOS:X64)
+              suffix="osx-x64-static-lib"
+              ;;
+            Windows:X64)
+              suffix="win-x64-static-MT-Release-lib"
+              ;;
+            *)
+              echo "Unsupported runner: ${RUNNER_OS}:${RUNNER_ARCH}"
+              exit 1
+              ;;
+          esac
+
+          archive="sherpa-onnx-v${version}-${suffix}.tar.bz2"
+          archive_dir="${RUNNER_TEMP}/sherpa-onnx-archives"
+          archive_path="${archive_dir}/${archive}"
+          url="https://github.com/k2-fsa/sherpa-onnx/releases/download/v${version}/${archive}"
+          mkdir -p "$archive_dir"
+
+          if [[ ! -s "$archive_path" ]]; then
+            curl \
+              --fail \
+              --location \
+              --retry 10 \
+              --retry-delay 15 \
+              --retry-connrefused \
+              --retry-max-time 900 \
+              --connect-timeout 30 \
+              --max-time 900 \
+              "$url" \
+              --output "$archive_path"
+          fi
+
+          test -s "$archive_path"
+          echo "SHERPA_ONNX_ARCHIVE_DIR=$archive_dir" >> "$GITHUB_ENV"
+          echo "Using $archive_path"
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -542,21 +780,53 @@ jobs:
           if-no-files-found: ignore
           include-hidden-files: true
 
+  release-validation:
+    name: Release PR validation
+    if: always()
+    needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
+    runs-on: ubuntu-latest
+    steps:
+      # This is a required check for ordinary PRs too. A failed resource or
+      # platform job must not be hidden by a successful no-op aggregation.
+      - name: Require every validation job to pass
+        if: >-
+          ${{ !(github.event_name == 'pull_request' &&
+          github.repository == 'bigfish1913/pi-rust' &&
+          github.event.pull_request.base.ref == 'main' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+          github.event.pull_request.draft == true) }}
+        run: |
+          set -euo pipefail
+          test "${{ needs.msrv.result }}" = success
+          test "${{ needs.check.result }}" = success
+          test "${{ needs.test.result }}" = success
+          test "${{ needs.resources.result }}" = success
+          test "${{ needs['platform-startup'].result }}" = success
+          test "${{ needs['windows-installer'].result }}" = success
+          test "${{ needs['extension-compatibility'].result }}" = success
+
   release:
     name: Release automation
-    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
     permissions:
       contents: write
-      pull-requests: read
+      pull-requests: write
     uses: ./.github/workflows/release.yml
     with:
-      prepare: ${{ github.event_name == 'workflow_dispatch' && inputs.prepare_release == true }}
+      # Daily runs prepare a Release PR and request Auto-merge for it; ordinary PRs remain manual.
+      prepare: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.prepare_release == true) }}
     secrets: inherit
 
+  # Preview pushes still run validation, but publishing is manual and opt-in.
   preview-version:
     name: Prepare preview release
-    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/preview' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: >-
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.ref == 'refs/heads/preview' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish_preview == true
     needs: [msrv, check, test, resources, platform-startup, windows-installer, extension-compatibility]
     runs-on: ubuntu-latest
     permissions:

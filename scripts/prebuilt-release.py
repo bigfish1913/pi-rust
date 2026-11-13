@@ -10,7 +10,8 @@ import zipfile
 
 TARGETS = {
     "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl", "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin", "aarch64-apple-darwin",
 }
 REPOSITORY = "https://github.com/bigfish1913/pi-rust"
 
@@ -53,8 +54,8 @@ def describe(archive, target, version, commit, repository=REPOSITORY):
 def assemble(directory, tag, commit):
     directory = Path(directory)
     rows = [json.loads(file.read_text(encoding="utf-8")) for file in directory.glob("*.prebuilt.json")]
-    if len(rows) != 5 or {row["target"] for row in rows} != TARGETS:
-        raise ValueError("all five target descriptors are required, without duplicates")
+    if len(rows) != 6 or {row["target"] for row in rows} != TARGETS:
+        raise ValueError("all six target descriptors are required, without duplicates")
     version = tag.removeprefix("v")
     for row in rows:
         if row["version"] != version or row["repository"] != REPOSITORY or row["source_commit"] != commit:

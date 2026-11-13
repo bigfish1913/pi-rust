@@ -176,8 +176,6 @@ pub struct Args {
     /// scopedModels — the same set /scoped-models edits). Empty = all models.
     pub models: Option<Vec<String>>,
     pub session_dir: Option<PathBuf>,
-    /// Reserved even in feature-off builds; fresh explicit print sessions only.
-    pub experimental_native_store: Option<PathBuf>,
     pub no_session: bool,
     pub name: Option<String>,
 
@@ -185,6 +183,11 @@ pub struct Args {
     pub exclude_tools: Option<Vec<String>>,
     pub no_tools: bool,
     pub no_builtin_tools: bool,
+    /// Native durable host selection. CLI parsing enables it by default; the
+    /// temporary `--no-native-durable` escape hatch selects legacy session behavior.
+    pub native_durable: bool,
+    /// Explicit experimental v2 epoch; requires native durable admission.
+    pub experimental_durable_epoch: Option<String>,
 
     /// `--no-skills`/`-ns`: skip skill discovery + the `<available_skills>`
     /// system-prompt listing.
@@ -283,6 +286,9 @@ fn file_arg(arg: &str) -> Option<PathBuf> {
 /// ergonomics). Short flags use a single leading `-`.
 pub fn parse_args(args: &[String]) -> Args {
     let mut result = Args::default();
+    // Native durable is the CLI default. Keep `Args::default()` unchanged for
+    // embedded/test hosts that construct programmatic options explicitly.
+    result.native_durable = true;
     result.offline = offline_env_enabled();
     // `RPI_EXTENSIONS_DIR` env: an extra list of plugin dirs prepended to any
     // `--extensions-dir` flags. Semicolon-separated on Windows, colon-separated
@@ -394,6 +400,20 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-session" => result.no_session = true,
             "--no-tools" | "-nt" => result.no_tools = true,
             "--no-builtin-tools" | "-nbt" => result.no_builtin_tools = true,
+            // `--native-durable` remains accepted for scripts during the
+            // transition; `--no-native-durable` is the temporary escape hatch.
+            "--native-durable" => result.native_durable = true,
+            "--no-native-durable" => result.native_durable = false,
+            "--experimental-durable-epoch" => {
+                if result.experimental_durable_epoch.is_some() {
+                    result
+                        .errors
+                        .push("--experimental-durable-epoch may only be supplied once".into());
+                }
+                if let Some(epoch) = take_value(&mut result, "--experimental-durable-epoch") {
+                    result.experimental_durable_epoch = Some(epoch);
+                }
+            }
             "--no-skills" | "-ns" => result.no_skills = true,
             "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
             "--no-context-files" | "-nc" => result.no_context_files = true,
@@ -469,17 +489,6 @@ pub fn parse_args(args: &[String]) -> Args {
             "--prompt-template" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.prompt_template.push(PathBuf::from(v));
-                }
-            }
-            "--experimental-native-store" => {
-                if let Some(value) = take_value(&mut result, &flag_key) {
-                    if result.experimental_native_store.is_some() {
-                        result
-                            .errors
-                            .push("--experimental-native-store may be supplied only once".into());
-                    } else {
-                        result.experimental_native_store = Some(PathBuf::from(value));
-                    }
                 }
             }
             "--session-dir" => {
@@ -600,7 +609,7 @@ pub fn parse_args(args: &[String]) -> Args {
     // `--print` + `--mode json`: `--print` implies non-interactive, but
     // `--mode json` selects the JSON event stream. The TS `resolveAppMode`
     // treats `mode === "json"` as its own non-interactive mode; we follow that.
-    if let Err(error) = crate::native_store::validate(&result) {
+    if let Err(error) = crate::native_durable::experimental_epoch::policy(&result) {
         result.errors.push(error);
     }
     result
@@ -690,14 +699,15 @@ pub fn print_help() {
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
   --session-dir <dir>            Directory for session storage
-  --experimental-native-store <dir>
-                                Fresh --print text/json only; requires experimental-native-store build feature
   --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
   --tools, -t <list>             Comma-separated allowlist of tool names to enable
   --exclude-tools, -xt <list>    Comma-separated denylist of tool names to disable
   --no-tools, -nt                Disable all tools
   --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write, docs)
+  --no-native-durable            Temporary escape hatch: use legacy session behavior
+  --experimental-durable-epoch <id>
+                                With native durable enabled: bounded v2 ledger, explicit same epoch on reopen; no migration
   --no-skills, -ns               Skip skill discovery (no <available_skills> block)
   --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
   --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)
@@ -765,7 +775,6 @@ pub fn print_help() {
   RPI_OFFLINE                     Disable startup network operations when set to 1/true/yes
   RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
   RPI_SESSION_ID                 Session id served by a plugin (set by the host; also honored as an override)
-  RPI_NO_EMOJI                   Render the brand lockup without the crab (1/true/yes)
 
 {u}Notes:{r}
   Supported HTTP protocols are Anthropic Messages and OpenAI Chat Completions.
@@ -899,6 +908,15 @@ mod tests {
             a.tools.as_deref(),
             Some(&["read".to_string(), "bash".to_string(), "write".to_string()][..])
         );
+    }
+
+    #[test]
+    fn native_durable_is_enabled_by_default_with_a_transition_escape_hatch() {
+        assert!(parse_args(&s(&[])).native_durable);
+        assert!(parse_args(&s(&["--native-durable"])).native_durable);
+        assert!(!parse_args(&s(&["--no-native-durable"])).native_durable);
+        assert!(parse_args(&s(&["--no-native-durable", "--native-durable"])).native_durable);
+        assert!(!parse_args(&s(&["--native-durable", "--no-native-durable"])).native_durable);
     }
 
     #[test]

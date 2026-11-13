@@ -1,0 +1,621 @@
+{
+  "schema": "rpi-synthetic-control-failure-cases-v1",
+  "frames": [
+    {
+      "index": 0,
+      "label": "empty-reset",
+      "action": {
+        "action": "reset"
+      },
+      "kind": "noop",
+      "oldEntries": 0,
+      "nativeReceipts": 1,
+      "expected": {
+        "revision": 0,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "queue": []
+      }
+    },
+    {
+      "index": 1,
+      "label": "start",
+      "action": {
+        "action": "start",
+        "name": "Plan",
+        "steps": [
+          {
+            "id": "a",
+            "title": "Check"
+          }
+        ]
+      },
+      "kind": "changed",
+      "oldEntries": 1,
+      "nativeReceipts": 2,
+      "expected": {
+        "revision": 1,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "queue": [],
+        "workflow": {
+          "name": "Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 2,
+      "label": "same-pending",
+      "action": {
+        "action": "checkpoint",
+        "step": "a",
+        "status": "pending"
+      },
+      "kind": "noop",
+      "oldEntries": 1,
+      "nativeReceipts": 3,
+      "expected": {
+        "revision": 1,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "queue": [],
+        "workflow": {
+          "name": "Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 3,
+      "label": "pause",
+      "action": {
+        "action": "pause",
+        "reason": "wait"
+      },
+      "kind": "changed",
+      "oldEntries": 2,
+      "nativeReceipts": 4,
+      "expected": {
+        "revision": 2,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "queue": [],
+        "workflow": {
+          "name": "Plan",
+          "status": "paused",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ],
+          "reason": "wait"
+        }
+      }
+    },
+    {
+      "index": 4,
+      "label": "same-pause",
+      "action": {
+        "action": "pause",
+        "reason": "wait"
+      },
+      "kind": "reject",
+      "oldEntries": 2,
+      "nativeReceipts": 4,
+      "expected": {
+        "revision": 2,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "queue": [],
+        "workflow": {
+          "name": "Plan",
+          "status": "paused",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ],
+          "reason": "wait"
+        }
+      }
+    },
+    {
+      "index": 5,
+      "label": "resume",
+      "action": {
+        "action": "resume"
+      },
+      "kind": "changed",
+      "oldEntries": 3,
+      "nativeReceipts": 5,
+      "expected": {
+        "revision": 3,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "queue": [],
+        "workflow": {
+          "name": "Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 6,
+      "label": "same-resume",
+      "action": {
+        "action": "resume"
+      },
+      "kind": "reject",
+      "oldEntries": 3,
+      "nativeReceipts": 5,
+      "expected": {
+        "revision": 3,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "queue": [],
+        "workflow": {
+          "name": "Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 7,
+      "label": "missing-step",
+      "action": {
+        "action": "checkpoint",
+        "step": "missing",
+        "status": "completed"
+      },
+      "kind": "reject",
+      "oldEntries": 3,
+      "nativeReceipts": 5,
+      "expected": {
+        "revision": 3,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "queue": [],
+        "workflow": {
+          "name": "Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 8,
+      "label": "duplicate-step",
+      "action": {
+        "action": "start",
+        "name": "Bad",
+        "steps": [
+          {
+            "id": "duplicate",
+            "title": "One"
+          },
+          {
+            "id": "duplicate",
+            "title": "Two"
+          }
+        ]
+      },
+      "kind": "reject",
+      "oldEntries": 3,
+      "nativeReceipts": 5,
+      "expected": {
+        "revision": 3,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "queue": [],
+        "workflow": {
+          "name": "Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 9,
+      "label": "failed-enqueue",
+      "action": {
+        "action": "enqueue",
+        "text": "queued"
+      },
+      "kind": "appendFailure",
+      "oldEntries": 3,
+      "nativeReceipts": 5,
+      "expected": {
+        "revision": 3,
+        "nextRunId": 0,
+        "nextQueueId": 0,
+        "queue": [],
+        "workflow": {
+          "name": "Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 10,
+      "label": "explicit-retry-enqueue",
+      "action": {
+        "action": "enqueue",
+        "text": "queued"
+      },
+      "kind": "changed",
+      "oldEntries": 4,
+      "nativeReceipts": 6,
+      "expected": {
+        "revision": 4,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "queued",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ],
+        "workflow": {
+          "name": "Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "pending"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 11,
+      "label": "checkpoint",
+      "action": {
+        "action": "checkpoint",
+        "step": "a",
+        "status": "completed",
+        "note": "checked"
+      },
+      "kind": "changed",
+      "oldEntries": 5,
+      "nativeReceipts": 7,
+      "expected": {
+        "revision": 5,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "queued",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ],
+        "workflow": {
+          "name": "Plan",
+          "status": "running",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "completed",
+              "note": "checked"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 12,
+      "label": "complete",
+      "action": {
+        "action": "complete"
+      },
+      "kind": "changed",
+      "oldEntries": 6,
+      "nativeReceipts": 8,
+      "expected": {
+        "revision": 6,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "queued",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ],
+        "workflow": {
+          "name": "Plan",
+          "status": "completed",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "completed",
+              "note": "checked"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 13,
+      "label": "same-complete",
+      "action": {
+        "action": "complete"
+      },
+      "kind": "reject",
+      "oldEntries": 6,
+      "nativeReceipts": 8,
+      "expected": {
+        "revision": 6,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "queued",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ],
+        "workflow": {
+          "name": "Plan",
+          "status": "completed",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "completed",
+              "note": "checked"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 14,
+      "label": "blank-enqueue",
+      "action": {
+        "action": "enqueue",
+        "text": "   "
+      },
+      "kind": "reject",
+      "oldEntries": 6,
+      "nativeReceipts": 8,
+      "expected": {
+        "revision": 6,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "queued",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ],
+        "workflow": {
+          "name": "Plan",
+          "status": "completed",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "completed",
+              "note": "checked"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 15,
+      "label": "missing-item",
+      "action": {
+        "action": "finish",
+        "item": "absent",
+        "status": "completed"
+      },
+      "kind": "reject",
+      "oldEntries": 6,
+      "nativeReceipts": 8,
+      "expected": {
+        "revision": 6,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "queued",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ],
+        "workflow": {
+          "name": "Plan",
+          "status": "completed",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "completed",
+              "note": "checked"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 16,
+      "label": "status-after-failures",
+      "action": {
+        "action": "status"
+      },
+      "kind": "read",
+      "oldEntries": 6,
+      "nativeReceipts": 8,
+      "expected": {
+        "revision": 6,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "queued",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ],
+        "workflow": {
+          "name": "Plan",
+          "status": "completed",
+          "steps": [
+            {
+              "id": "a",
+              "title": "Check",
+              "status": "completed",
+              "note": "checked"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "index": 17,
+      "label": "reset-retains-queue",
+      "action": {
+        "action": "reset"
+      },
+      "kind": "changed",
+      "oldEntries": 7,
+      "nativeReceipts": 9,
+      "expected": {
+        "revision": 7,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "queued",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ]
+      }
+    },
+    {
+      "index": 18,
+      "label": "same-reset-retains-queue",
+      "action": {
+        "action": "reset"
+      },
+      "kind": "noop",
+      "oldEntries": 7,
+      "nativeReceipts": 10,
+      "expected": {
+        "revision": 7,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "queued",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ]
+      }
+    },
+    {
+      "index": 19,
+      "label": "final-status",
+      "action": {
+        "action": "status"
+      },
+      "kind": "read",
+      "oldEntries": 7,
+      "nativeReceipts": 10,
+      "expected": {
+        "revision": 7,
+        "nextRunId": 0,
+        "nextQueueId": 1,
+        "queue": [
+          {
+            "id": "item-1",
+            "text": "queued",
+            "status": "queued",
+            "createdRevision": 4,
+            "updatedRevision": 4
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -48,6 +48,24 @@ pub struct BashInput {
     pub timeout: Option<f64>,
 }
 
+/// How a bash tool call ended. A non-zero exit is a *command result*, not a
+/// tool malfunction: probes such as `grep` (no match) and `git config --get`
+/// (missing key) legitimately return 1. Fork issue #14 §4 PR-B asks for this
+/// distinction without changing `isError` yet, so the classification lives in
+/// `details.failure_kind` and the agent loop keeps its existing error path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashFailureKind {
+    /// The command ran to completion but returned a non-zero exit code.
+    CommandFailed,
+    /// The user/tool cancelled the command.
+    Cancelled,
+    /// The command exceeded its timeout.
+    Timeout,
+    /// The shell or transport itself failed (spawn, I/O, etc.).
+    ToolFailed,
+}
+
 /// Structured details for the bash tool. Mirrors TS `BashToolDetails`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BashToolDetails {
@@ -55,6 +73,13 @@ pub struct BashToolDetails {
     pub truncation: Option<TruncationResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_output_path: Option<String>,
+    /// Raw exit code when the shell reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Why the call ended; absent on success. `CommandFailed` means "read the
+    /// output before retrying", not "the tool is broken".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<BashFailureKind>,
 }
 
 /// Mutable execution description passed to the optional prepare hook.
@@ -103,7 +128,10 @@ impl BashTool {
                 "Execute a Bash command in the current working directory using Bash/POSIX syntax, even on Windows. PowerShell cmdlets (Get-ChildItem, Select-Object, Select-String) are not valid here; use ls, find, rg, and POSIX pipelines instead. Returns stdout and \
                  stderr. Output is truncated to last {DEFAULT_MAX_LINES} lines or {kb}KB \
                  (whichever is hit first). If truncated, full output is saved to a temp file. \
-                 Defaults to a {default_timeout}-second timeout; provide timeout in seconds to override it.",
+                 Defaults to a {default_timeout}-second timeout; provide timeout in seconds to override it. \
+                 A non-zero exit code is a command result: probe commands such as grep (no match) or \
+                 git config --get (missing key) legitimately return 1. Read the output before deciding \
+                 whether to retry; details carries exit_code and failure_kind.",
                 kb = DEFAULT_MAX_BYTES / 1024
             ),
             parameters: rpi_ai::types::Schema::new(params),
@@ -263,11 +291,14 @@ impl AgentTool for BashTool {
         }
 
         // Build the terminal output text + details, applying truncation notices.
-        let (output_text, details) = build_bash_output(&capture);
-        let details_value = serde_json::to_value(details).unwrap_or(serde_json::Value::Null);
+        let (output_text, mut details) = build_bash_output(&capture);
+        details.exit_code = capture.exit_code;
 
-        // Resolution: cancelled → aborted; timeout → timeout; other exec error;
-        // non-zero exit → Tool error. All become Err(AgentError).
+        // A failed call still returns `isError=true` (unchanged), but carries
+        // structured `details` through `AgentError::StructuredTool` so a
+        // caller can tell "the command returned 1" from "the tool broke".
+        // Plain `AgentError::Tool` is only used where no AgentToolResult can be
+        // built (validation errors earlier in execute).
         let append_status = |status: String| -> String {
             if output_text.is_empty() {
                 status
@@ -275,8 +306,27 @@ impl AgentTool for BashTool {
                 format!("{output_text}\n\n{status}")
             }
         };
+        // A small helper (not an FnMut closure) so `details` is borrowed only
+        // for the duration of each call and `output_text` can be used normally.
+        fn structured_failure(
+            message: String,
+            kind: BashFailureKind,
+            details: &mut BashToolDetails,
+        ) -> AgentError {
+            details.failure_kind = Some(kind);
+            let details_value = serde_json::to_value(&*details).unwrap_or(serde_json::Value::Null);
+            AgentError::StructuredTool(Box::new(AgentToolResult {
+                content: vec![TextContentOrImage::text(message)],
+                details: details_value,
+                ..Default::default()
+            }))
+        }
         if capture.cancelled {
-            return Err(AgentError::Tool(append_status("Command aborted".into())));
+            return Err(structured_failure(
+                append_status("Command aborted".into()),
+                BashFailureKind::Cancelled,
+                &mut details,
+            ));
         }
         if let Some(ee) = &capture.execution_error {
             if ee.code == ExecutionErrorCode::Timeout {
@@ -286,17 +336,25 @@ impl AgentTool for BashTool {
                     Some(secs) => format!("after {secs}s"),
                     None => "".to_string(),
                 };
-                return Err(AgentError::Tool(append_status(format!(
-                    "Command timed out {limit}"
-                ))));
+                return Err(structured_failure(
+                    append_status(format!("Command timed out {limit}")),
+                    BashFailureKind::Timeout,
+                    &mut details,
+                ));
             }
-            return Err(AgentError::Tool(ee.to_string()));
+            return Err(structured_failure(
+                ee.to_string(),
+                BashFailureKind::ToolFailed,
+                &mut details,
+            ));
         }
         if let Some(code) = capture.exit_code {
             if code != 0 {
-                return Err(AgentError::Tool(append_status(format!(
-                    "Command exited with code {code}"
-                ))));
+                return Err(structured_failure(
+                    append_status(format!("Command exited with code {code}")),
+                    BashFailureKind::CommandFailed,
+                    &mut details,
+                ));
             }
         }
         let text = if output_text.is_empty() {
@@ -304,6 +362,7 @@ impl AgentTool for BashTool {
         } else {
             output_text
         };
+        let details_value = serde_json::to_value(&details).unwrap_or(serde_json::Value::Null);
         Ok(AgentToolResult {
             content: vec![TextContentOrImage::text(text)],
             details: details_value,
@@ -351,6 +410,8 @@ fn emit_update(
             let details = BashToolDetails {
                 truncation,
                 full_output_path,
+                exit_code: None,
+                failure_kind: None,
             };
             serde_json::to_value(details).unwrap_or(serde_json::Value::Null)
         }
@@ -401,11 +462,15 @@ fn build_bash_output(capture: &ShellCaptureResult) -> (String, BashToolDetails) 
         BashToolDetails {
             truncation: Some(capture.truncation.clone()),
             full_output_path: path_str,
+            exit_code: None,
+            failure_kind: None,
         }
     } else {
         BashToolDetails {
             truncation: None,
             full_output_path: None,
+            exit_code: None,
+            failure_kind: None,
         }
     };
     (output_text, details)

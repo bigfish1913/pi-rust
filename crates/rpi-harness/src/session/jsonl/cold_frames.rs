@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! JSONL-private payload references. Query plans own only selected sources; no
 //! warm cache and no published plan holds or clones the resident history index.
 use super::{codec::parse_mutation, errors::file_result};
@@ -281,6 +283,50 @@ impl DerefMut for ResidentState {
     }
 }
 impl ResidentState {
+    /// Rehydrate a resident JSONL reducer from a validated checkpoint. The
+    /// checkpoint may intentionally omit old physical entries, so the log's
+    /// sequence can begin after a gap; the checkpoint sequence remains the
+    /// authority for subsequent appends.
+    pub(super) fn from_checkpoint(
+        checkpoint: crate::session::state::SessionState,
+    ) -> SessionResult<Self> {
+        let mut resident = Self::default();
+        for item in checkpoint.get_log(&LogOptions::default())? {
+            let mutation = match item {
+                LogItem::Entry { seq, entry } => SessionMutation::Entry {
+                    seq,
+                    timestamp: entry.base().timestamp,
+                    lane: None,
+                    entry,
+                },
+                LogItem::Record { record, .. } => SessionMutation::Record { record },
+                LogItem::Lane { seq, lane, leaf_id } => {
+                    SessionMutation::Lane { seq, lane, leaf_id }
+                }
+                LogItem::FactName { seq, name } => SessionMutation::FactName { seq, name },
+                LogItem::FactLabel {
+                    seq,
+                    target_id,
+                    label,
+                } => SessionMutation::FactLabel {
+                    seq,
+                    target_id,
+                    label,
+                },
+            };
+            if mutation.seq() > resident.next_sequence() {
+                resident.reducer.resync_sequence(mutation.seq() - 1);
+            }
+            resident.apply_mutation(mutation)?;
+        }
+        if resident.sequence() != checkpoint.sequence() {
+            return Err(SessionError::invalid_entry(
+                "history checkpoint rehydration sequence mismatch",
+            ));
+        }
+        Ok(resident)
+    }
+
     #[cfg(test)]
     pub(super) fn assert_cold_shared(&self, ids: &[String]) -> Arc<dyn ReadFile> {
         assert!(
@@ -408,6 +454,9 @@ impl ResidentState {
         raw: &[u8],
     ) -> SessionResult<()> {
         self.reserve_frame_metadata(&metadata)?;
+        // Cold frames still consume the journal sequence even though their
+        // discarded payload is not reduced into a resident record.
+        self.reducer.resync_sequence(metadata.seq);
         fn symbol(slot: &mut Option<Arc<str>>, value: &str) -> Arc<str> {
             if let Some(current) = slot.as_ref().filter(|current| current.as_ref() == value) {
                 return current.clone();
@@ -1274,6 +1323,14 @@ mod context_usage_tests;
 #[cfg(test)]
 #[path = "cold_frames_tests.rs"]
 mod tests;
+
+impl ResidentState {
+    /// Retained historical frame read locations; zero for facts-only replay.
+    #[cfg(test)]
+    pub(super) fn retained_frame_locations(&self) -> usize {
+        self.cold.locations.len()
+    }
+}
 
 impl ColdFrames {
     fn push(&mut self, location: Arc<Location>) {

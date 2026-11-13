@@ -380,6 +380,50 @@ mod tests {
     use super::*;
     use rpi_tui::theme::ThemeColors;
 
+    /// Theme persistence reads and writes process-global settings. Serialize
+    /// with all config tests, and never write another test's or the user's
+    /// directory. Restore the environment before the guard is released.
+    struct SettingsScope {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        directory: tempfile::TempDir,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl SettingsScope {
+        fn new() -> Self {
+            let guard = crate::config::test_support::env_lock().lock().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os(crate::config::CONFIG_DIR_ENV);
+            std::env::set_var(crate::config::CONFIG_DIR_ENV, directory.path());
+            Self {
+                _guard: guard,
+                directory,
+                previous,
+            }
+        }
+
+        fn assert_saved_theme(&self, expected: &str) {
+            let path = crate::config::settings_path().unwrap();
+            assert!(path.starts_with(self.directory.path()));
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(saved["theme"], expected);
+            assert!(matches!(
+                crate::config::test_support::env_lock().try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+        }
+    }
+
+    impl Drop for SettingsScope {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var(crate::config::CONFIG_DIR_ENV, previous),
+                None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+            }
+        }
+    }
+
     fn temp_theme_file(dir: &Path, name: &str, accent: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(
@@ -572,6 +616,7 @@ mod tests {
 
     #[test]
     fn registry_name_resolves_through_resolve_spec_in() {
+        let settings = SettingsScope::new();
         let root = std::env::temp_dir().join(format!("rpi-themes-loop-{}", std::process::id()));
         let project = root.join("proj/.rpi/themes");
         let path = write_theme(&project, "ocean.json");
@@ -592,15 +637,18 @@ mod tests {
         let manager = ThemeManager::new();
         let message = apply_and_persist("ocean", &manager, Some(&registry)).unwrap();
         assert!(message.starts_with("Theme set to ocean"), "{message}");
+        settings.assert_saved_theme("ocean");
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn apply_and_persist_preset_message_and_error() {
+        let settings = SettingsScope::new();
         let manager = ThemeManager::new();
         let message = apply_and_persist("light", &manager, None).unwrap();
         assert!(message.starts_with("Theme set to Light"), "{message}");
         assert!(message.contains("(saved"), "{message}");
+        settings.assert_saved_theme("light");
         let err = apply_and_persist("no-such.json", &manager, None).unwrap_err();
         assert!(err.contains("no-such.json"), "{err}");
         // Failed apply leaves the previous theme intact.
@@ -612,6 +660,7 @@ mod tests {
 
     #[test]
     fn apply_and_persist_file_theme_message_uses_stem() {
+        let settings = SettingsScope::new();
         let manager = ThemeManager::new();
         let dir = std::env::temp_dir().join(format!("rpi-theme-persist-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -619,6 +668,7 @@ mod tests {
         let spec = path.to_string_lossy().to_string();
         let message = apply_and_persist(&spec, &manager, None).unwrap();
         assert!(message.starts_with("Theme set to ocean"), "{message}");
+        settings.assert_saved_theme(&spec);
         assert_eq!(
             manager.get().colors.accent,
             rpi_tui::theme::Color::Rgb(17, 34, 51)

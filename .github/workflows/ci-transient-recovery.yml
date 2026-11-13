@@ -1,0 +1,65 @@
+name: CI transient recovery
+
+# A hosted runner can be cancelled before it executes a single step (most
+# commonly while a macOS runner is being allocated). CI must keep treating that
+# as a failed required check; this workflow gives the trusted main-branch
+# release path one automatic, whole-run retry instead of silently publishing a
+# partially validated release.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  retry-cancelled-validation:
+    name: Retry cancelled main CI validation
+    if: >-
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt == 1 &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'schedule' ||
+      github.event.workflow_run.event == 'push' ||
+      github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Retry only an infrastructure cancellation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jobs="$(gh api --paginate --slurp \
+            "repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs?per_page=100" | jq 'add')"
+
+          # The aggregate gate is expected to be failure when a dependency was
+          # cancelled, and downstream release jobs are expected to be skipped.
+          # Inspect only the seven actual validation families; never retry a
+          # compile/test/resource failure or a user-cancelled mixed run.
+          cancelled="$(jq '[.[] | select(.conclusion == "cancelled") |
+            select(.name | test("^(Rust 1\\.88|Cargo check|Cargo test|Windows installer|Platform startup|Offline resource regression|Official extension compatibility)"))] | length' <<<"${jobs}")"
+          failed="$(jq '[.[] | select(.conclusion == "failure") |
+            select(.name | test("^(Rust 1\\.88|Cargo check|Cargo test|Windows installer|Platform startup|Offline resource regression|Official extension compatibility)"))] | length' <<<"${jobs}")"
+
+          echo "cancelled validation jobs: ${cancelled}"
+          echo "failed validation jobs: ${failed}"
+          if [[ "${cancelled}" == 0 || "${failed}" != 0 ]]; then
+            echo 'No retry: this was not a cancellation-only validation failure.'
+            exit 0
+          fi
+
+          # Rerun the whole workflow, not only failed jobs: the release job is
+          # downstream of the validation matrix and was skipped in the failed
+          # attempt. run_attempt becomes 2, so this recovery workflow cannot
+          # recurse indefinitely if the hosted runner fails again.
+          gh run rerun "${RUN_ID}" --repo "${REPOSITORY}"
+          echo "Requested one complete retry for CI run ${RUN_ID}."

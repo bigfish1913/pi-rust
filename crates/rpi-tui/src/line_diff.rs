@@ -26,6 +26,23 @@ fn atoms(line: &str) -> Option<Vec<Atom<'_>>> {
                     return None;
                 }
                 end
+            } else if tail.starts_with("\x1b_") {
+                // APC (private): zero-width protocol markers — the cursor
+                // marker and the thinking-region marker live here. Zero-width
+                // atoms are skipped by `slice()` unless started, so `context`
+                // must carry them across sliced boundaries (see below).
+                let mut end = None;
+                for i in 1..bytes.len() {
+                    if bytes[i] == 7 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                    if bytes[i] == 27 && bytes.get(i + 1) == Some(&b'\\') {
+                        end = Some(i + 2);
+                        break;
+                    }
+                }
+                end?
             } else if tail.starts_with("\x1b]8;") {
                 let mut end = None;
                 for i in 4..bytes.len() {
@@ -67,7 +84,10 @@ fn context(atoms: &[Atom<'_>]) -> String {
     let mut sgr = String::new();
     let mut link = String::new();
     for atom in atoms.iter().filter(|atom| atom.width == 0) {
-        if atom.text.starts_with("\x1b[") {
+        if atom.text.starts_with("\x1b_") {
+            // APC markers are positional (they annotate the row they sit on),
+            // so they must NOT be carried into sliced continuations.
+        } else if atom.text.starts_with("\x1b[") {
             if matches!(atom.text, "\x1b[0m" | "\x1b[m") {
                 sgr.clear();
             }
@@ -200,6 +220,11 @@ fn wrapped_context(atoms: &[Atom<'_>]) -> String {
     let mut slots = Vec::new();
     let mut link = None;
     for atom in atoms.iter().filter(|atom| atom.width == 0) {
+        if atom.text.starts_with("\x1b_") {
+            // APC markers annotate their own row; never replay them onto the
+            // next wrapped row.
+            continue;
+        }
         if atom.text.starts_with("\x1b[") {
             update_sgr_context(&mut slots, atom.text);
         } else if atom.text.starts_with("\x1b]8;") {
@@ -304,6 +329,13 @@ pub(crate) fn slice(line: &str, start: usize, width: usize) -> Option<String> {
     let mut column = 0usize;
     let mut started = false;
     let mut output = String::new();
+    // APC protocol markers (cursor/thinking-region) annotate the ROW, not a
+    // column range: a sliced row keeps them wherever the slice starts.
+    for atom in atoms.iter() {
+        if atom.width == 0 && atom.text.starts_with("\x1b_") {
+            output.push_str(atom.text);
+        }
+    }
     for (index, atom) in atoms.iter().enumerate() {
         if atom.width == 0 {
             if started {
@@ -447,5 +479,22 @@ mod tests {
         assert_eq!(column, 4);
         assert!(text.starts_with("     "));
         assert!(patch("plain", "\x1b[2Junsafe").is_none());
+    }
+
+    #[test]
+    fn slice_preserves_apc_row_markers() {
+        let marker = "\u{1b}_pi:zt1x12\u{1b}\\";
+        let line = format!("{marker} Thinking...");
+        let sliced = slice(&line, 0, 80).expect("slice");
+        assert!(
+            sliced.contains(marker),
+            "marker dropped by slice: {sliced:?}"
+        );
+        // A slice that starts past the marker's position still carries it.
+        let shifted = slice(&line, 2, 80).expect("slice");
+        assert!(
+            shifted.contains(marker),
+            "marker dropped on shifted slice: {shifted:?}"
+        );
     }
 }

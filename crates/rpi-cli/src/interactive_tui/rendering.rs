@@ -142,6 +142,94 @@ pub(super) fn update_resource_listing(
     *shared.lock().unwrap() = resources;
 }
 
+/// One bounded live row, independent of the canonical full update cards. Native
+/// main-screen transcript snapshots cannot patch cards published after startup.
+#[derive(Default)]
+pub(super) struct RegularUpdateHint {
+    text: Mutex<Option<(String, String)>>,
+}
+
+impl RegularUpdateHint {
+    pub(super) fn update(&self, report: &crate::updates::UpdateReport) {
+        // Warnings need action first; otherwise prefer the CLI release over a
+        // package release. Derive text from typed data, never rendered cards.
+        let hint = if let Some(warning) = report.warnings.first() {
+            Some((
+                format!("Update failed: {}", warning.message),
+                warning.command.clone(),
+            ))
+        } else {
+            report
+                .notices
+                .iter()
+                .find(|notice| notice.name == "rpi")
+                .or_else(|| report.notices.first())
+                .map(|notice| {
+                    (
+                        format!("Update: {} {} available", notice.name, notice.latest),
+                        notice.command.clone(),
+                    )
+                })
+        };
+        *self.text.lock().unwrap() = hint.map(|(status, command)| {
+            (
+                update_hint_single_line(&status),
+                update_hint_single_line(&command),
+            )
+        });
+    }
+
+    pub(super) fn clear(&self) {
+        self.text.lock().unwrap().take();
+    }
+
+    fn row(&self, width: usize) -> Vec<String> {
+        if width == 0 {
+            return Vec::new();
+        }
+        let text = self.text.lock().unwrap();
+        let Some((status, command)) = text.as_ref() else {
+            return Vec::new();
+        };
+        // Reserve space for the action before truncating a potentially verbose
+        // warning. Common update commands remain fully visible at width 100.
+        let action = rpi_tui::truncate_to_width(command, width.saturating_mul(2) / 3, "…");
+        let status_width = width.saturating_sub(rpi_tui::visible_width(&action) + 3);
+        let status = rpi_tui::truncate_to_width(status, status_width, "…");
+        vec![rpi_tui::truncate_to_width(
+            &format!("{status} | {action}"),
+            width,
+            "…",
+        )]
+    }
+}
+
+fn update_hint_single_line(text: &str) -> String {
+    rpi_tui::strip_ansi(text)
+        .chars()
+        .filter(|c| !c.is_control() || c.is_whitespace())
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl Component for RegularUpdateHint {
+    fn render(&self, width: usize) -> Vec<String> {
+        if !rpi_tui::render::is_main_screen_frame() {
+            return Vec::new();
+        }
+        self.row(width)
+    }
+
+    fn invalidate(&self) {}
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Append update notices inside the live transcript. Fullscreen mode clears
 /// pre-TUI stdout/stderr, so update state must be represented by components.
 pub(super) fn add_update_notices(
@@ -554,10 +642,17 @@ pub(super) fn add_note_message(container: &Arc<Container>, text: &str) {
 /// so without the repaint a background reload (or its parse error) stays
 /// invisible until the next interaction repaints the screen.
 pub(super) fn theme_watch_notify(
-    chat: Arc<Container>,
+    state: &Arc<TuiState>,
     tui: Arc<TuiAltScreen>,
 ) -> impl Fn(Result<String, String>) + Send + Sync + 'static {
+    // The watcher lives in TuiState; a weak reference avoids a cycle and lets
+    // each callback resolve the visible page after history/session navigation.
+    let state = Arc::downgrade(state);
     move |result| {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let chat = state.notice_container();
         match result {
             Ok(message) => add_note_message(&chat, &message),
             Err(message) => add_error_message(&chat, &message),

@@ -38,7 +38,7 @@ static DOCS: &[DocPage] = &[
         topic: "guide",
         description: "完整使用手册：安装、模型、CLI、.rpi 资源、Rust 扩展、SDK、排错和发布",
         content: include_str!("../embedded-docs/user-guide.md"),
-        aliases: &["manual", "user-guide", "cli", "quickstart", "package", "packages", "extension", "extensions"],
+        aliases: &["manual", "user-guide", "cli", "quickstart", "package", "packages", "extension", "extensions", "provider", "providers", "models", "models.json", "sessions", "session", "skills", "skill"],
     },
     DocPage {
         topic: "overview",
@@ -68,7 +68,7 @@ static DOCS: &[DocPage] = &[
         topic: "debugging",
         description: "Rust cdylib 扩展编写（统一 C ABI、工具生命周期、事件处理器）与 agent/扩展调试（事件日志、rpi dev-local、常见失败定位）",
         content: include_str!("../embedded-docs/rust-debugging.md"),
-        aliases: &["rust", "rust-debug", "extension-debug", "troubleshoot", "debug"],
+        aliases: &["rust", "rust-debug", "extension-debug", "troubleshoot", "debug", "doctor", "diagnose", "diagnostics", "troubleshooting"],
     },
 ];
 
@@ -163,7 +163,7 @@ impl AgentTool for DocsTool {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let body = match query {
-            Some(query) => search_page(page, query),
+            Some(query) => search_with_fallback(page, query),
             None => truncate_result(page.content),
         };
         Ok(AgentToolResult::text(format!(
@@ -182,23 +182,50 @@ fn format_catalog() -> String {
     out
 }
 
+/// Split a free-text query into lower-cased terms. A long Chinese query or a
+/// compound phrase used to miss every line because `search_page` did a single
+/// whole-string substring test (fork issue #14 §3: 32 of 51 `docs` calls
+/// returned `No matches`). Both whitespace and common punctuation are term
+/// separators; CJK characters are kept as runs so `资源发现` stays one term.
+fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| c.is_whitespace() || matches!(c, '/' | ',' | ';' | ':' | '(' | ')' | '|'))
+        .filter_map(|part| {
+            let term = part
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            (!term.is_empty()).then_some(term)
+        })
+        .collect()
+}
+
+/// A line matches when **every** term appears in it. AND is deliberate: a
+/// multi-word query is a narrowing request, and OR would flood the result with
+/// lines that contain only `rpi` or only `config`.
+fn line_matches(line: &str, terms: &[String]) -> bool {
+    let lower = line.to_lowercase();
+    terms.iter().all(|term| lower.contains(term))
+}
+
 fn search_page(page: &DocPage, query: &str) -> String {
-    let needle = query.to_lowercase();
+    let terms = query_terms(query);
     let lines: Vec<&str> = page.content.lines().collect();
     let mut selected = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        if !line.to_lowercase().contains(&needle) {
-            continue;
-        }
-        let start = index.saturating_sub(2);
-        let end = (index + 3).min(lines.len());
-        for line_no in start..end {
-            if !selected.contains(&line_no) {
-                selected.push(line_no);
+    if !terms.is_empty() {
+        for (index, line) in lines.iter().enumerate() {
+            if !line_matches(line, &terms) {
+                continue;
             }
-        }
-        if selected.len() >= MAX_SEARCH_RESULTS * 5 {
-            break;
+            let start = index.saturating_sub(2);
+            let end = (index + 3).min(lines.len());
+            for line_no in start..end {
+                if !selected.contains(&line_no) {
+                    selected.push(line_no);
+                }
+            }
+            if selected.len() >= MAX_SEARCH_RESULTS * 5 {
+                break;
+            }
         }
     }
     if selected.is_empty() {
@@ -216,6 +243,33 @@ fn search_page(page: &DocPage, query: &str) -> String {
         }
     }
     out
+}
+
+/// When a query has no hit in the selected topic, look through the other
+/// topics and return the first page that does. The output says which topic was
+/// used so a caller never mistakes a fallback hit for a hit in `page`.
+fn search_with_fallback(page: &DocPage, query: &str) -> String {
+    let direct = search_page(page, query);
+    if !direct.starts_with("No matches for `") {
+        return direct;
+    }
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return direct;
+    }
+    for other in DOCS
+        .iter()
+        .filter(|candidate| candidate.topic != page.topic)
+    {
+        if other.content.lines().any(|line| line_matches(line, &terms)) {
+            let body = search_page(other, query);
+            return format!(
+                "No matches for `{query}` in `{}`. Found it in `{}` instead:\n\n{body}",
+                page.topic, other.topic
+            );
+        }
+    }
+    direct
 }
 
 fn truncate_result(content: &str) -> String {
@@ -347,6 +401,45 @@ mod tests {
         }
     }
 
+    /// Review #273: the audit's operational queries must resolve to an
+    /// existing page that actually covers their subject. This is a routing
+    /// index, not a second copy of configuration and command behaviour, so
+    /// each alias is pinned to a needle in the page it routes to.
+    #[tokio::test]
+    async fn review273_operational_aliases_expose_relevant_existing_content() {
+        for (alias, page, needle) in [
+            ("skills", "guide", "skills"),
+            ("skill", "guide", "skills"),
+            ("doctor", "debugging", "rpi auth check"),
+            ("diagnose", "debugging", "RPI_EVENT_LOG"),
+            ("diagnostics", "debugging", "RPI_AGENT_DIAGNOSTICS"),
+            ("troubleshooting", "debugging", "rpi events tail"),
+            ("provider", "guide", "models.json"),
+            ("providers", "guide", "models.json"),
+            ("models", "guide", "models.json"),
+            ("models.json", "guide", "models.json"),
+            ("sessions", "guide", "--session-dir"),
+            ("session", "guide", "--session-dir"),
+        ] {
+            let output = execute(serde_json::json!({ "topic": alias })).await;
+            assert!(
+                output.starts_with(&format!("# rpi docs: {page}")),
+                "alias {alias} must route to {page}: {output}"
+            );
+            assert!(
+                output.contains(needle),
+                "alias {alias} must expose {needle} in {page}: {output}"
+            );
+        }
+        // Aliases are discoverable from the catalog without maintaining a
+        // separate operations page.
+        let catalog = execute(serde_json::json!({})).await;
+        for topic in ["guide", "authoring", "debugging"] {
+            assert!(catalog.contains(&format!("- {topic}:")), "{catalog}");
+        }
+        assert!(!catalog.contains("- operations:"), "{catalog}");
+    }
+
     #[tokio::test]
     async fn rejects_unknown_topic() {
         let error = DocsTool::new()
@@ -360,5 +453,90 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("Unknown rpi docs topic"));
+    }
+
+    /// The audit recorded 32 `No matches` responses out of 51 `docs` calls.
+    /// These are the reported shapes: long Chinese queries, compound keywords,
+    /// and multi-word phrases that never appear verbatim on one line.
+    #[test]
+    fn review_issue14_compound_queries_are_tokenized() {
+        let cases = [
+            "rpi dev 开发 循环",
+            "extension APIs .rpi configuration",
+            "models.json provider config",
+            "session resume 分页",
+            "RUSTFLAGS -D warnings cargo check",
+        ];
+        for query in cases {
+            let terms = query_terms(query);
+            assert!(
+                terms.len() >= 2,
+                "query must be split: {query} -> {terms:?}"
+            );
+        }
+        assert_eq!(
+            query_terms("AgentBuilder"),
+            vec!["agentbuilder".to_string()]
+        );
+        // Punctuation-only separators do not produce empty terms.
+        assert!(query_terms("/ , ; : |").is_empty());
+    }
+
+    /// AND, not OR: a line containing only one of two terms must not match.
+    #[test]
+    fn review_issue14_all_terms_must_appear_on_the_same_line() {
+        let terms = query_terms("models.json provider");
+        assert_eq!(terms, vec!["models.json", "provider"]);
+        assert!(line_matches("set models.json provider here", &terms));
+        assert!(!line_matches("models.json only", &terms));
+        assert!(!line_matches("provider only", &terms));
+        assert!(!line_matches("nothing relevant", &terms));
+        // Case-insensitive, and CJK runs are kept intact.
+        let cjk = query_terms("资源发现 skills");
+        assert_eq!(cjk, vec!["资源发现", "skills"]);
+        assert!(line_matches("使用 资源发现 和 Skills 目录", &cjk));
+    }
+
+    /// A query that misses the selected topic but exists elsewhere must be
+    /// answered from that other topic, with the substituted topic named.
+    #[tokio::test]
+    async fn review_issue14_no_match_falls_back_to_another_topic() {
+        // `RPI_FRAME_DIAGNOSTICS` lives in the debugging page; searching for it
+        // under `agent` used to return a bare `No matches`.
+        let output = execute(serde_json::json!({
+            "topic": "agent",
+            "query": "RPI_FRAME_DIAGNOSTICS"
+        }))
+        .await;
+        assert!(
+            output.contains("No matches for `RPI_FRAME_DIAGNOSTICS` in `agent`"),
+            "{output}"
+        );
+        assert!(output.contains("Found it in `"), "{output}");
+        assert!(!output.contains("Found it in `agent`"), "{output}");
+        assert!(output.contains("RPI_FRAME_DIAGNOSTICS"), "{output}");
+    }
+
+    /// A genuinely absent keyword must still say "No matches" and must not
+    /// claim a fallback that never happened.
+    #[tokio::test]
+    async fn review_issue14_unknown_query_still_reports_no_match() {
+        let output = execute(serde_json::json!({
+            "topic": "overview",
+            "query": "zzz-nonexistent-keyword-zzz"
+        }))
+        .await;
+        assert!(output.contains("No matches for"), "{output}");
+        assert!(!output.contains("Found it in"), "{output}");
+    }
+
+    /// Single-term and exact-phrase queries keep their previous behaviour: the
+    /// existing `rpi dev` / `cdylib` lookups must not regress into AND-only
+    /// misses.
+    #[tokio::test]
+    async fn review_issue14_existing_single_term_queries_still_hit() {
+        let output = execute(serde_json::json!({"topic": "debugging", "query": "rpi dev"})).await;
+        assert!(output.contains("Matches for `rpi dev`"), "{output}");
+        assert!(output.contains("rpi dev"), "{output}");
     }
 }
