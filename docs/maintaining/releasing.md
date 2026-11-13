@@ -139,6 +139,8 @@ stale indexes to look successful. An existing musl compiler avoids apt access,
 but must still link and run a static probe. Release setup stays inline because
 recovery checks out an old tag that cannot contain a newly added helper script.
 
+A hosted runner can also be cancelled before it executes its first step, especially while a macOS runner is being allocated. The required `Release PR validation` check continues to reject `cancelled` validation jobs; it never treats infrastructure cancellation as a passing test. The separate `CI transient recovery` workflow watches only trusted upstream `main` CI runs from `schedule`, `push`, or explicit dispatch. If the first attempt has no failed validation family and has at least one cancelled validation job, it requests one complete rerun of the same CI run. It reruns the whole run rather than only failed jobs because the release job was skipped behind the failed aggregate. The second attempt is not automatically retried, preventing loops; maintainers must inspect and rerun a repeated runner outage manually. The recovery workflow checks job conclusions through the GitHub API and never checks out or executes the failed run source, so it cannot turn an untrusted PR into a privileged release action.
+
 The daily README image refresh updates `automation/readme-images` and creates or
 reuses an ordinary PR. It never pushes directly to protected `main`, requests
 a protection bypass, or uses `[skip ci]`. It reuses `RELEASE_AUTOMATION_TOKEN`
