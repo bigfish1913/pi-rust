@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "name": "rpi-cli",
+  "version": "0.22.1",
+  "repository": "https://github.com/bigfish1913/pi-rust",
+  "tag": "v0.22.1",
+  "source_commit": "f17841aaa7b761dcd59a13f98932de21d8bfef6d",
+  "targets": {
+    "aarch64-apple-darwin": {
+      "url": "https://github.com/bigfish1913/pi-rust/releases/download/v0.22.1/rpi-v0.22.1-aarch64-apple-darwin.tar.gz",
+      "format": "tar.gz",
+      "size": 15956412,
+      "sha256": "6ccc7ca18d06ca8325242cdefd7c3ef76d2810510dda5e2d5806e32785ebf797",
+      "binary": {
+        "path": "rpi",
+        "sha256": "3039809b55af7d6df63314a780537404a37d290b88e609e39761cbda37d7e0ce"
+      }
+    },
+    "aarch64-unknown-linux-gnu": {
+      "url": "https://github.com/bigfish1913/pi-rust/releases/download/v0.22.1/rpi-v0.22.1-aarch64-unknown-linux-gnu.tar.gz",
+      "format": "tar.gz",
+      "size": 16352576,
+      "sha256": "2e6384f65c2efcbf392290e5af610cff1a36da8b51e9352e4d65bb6f62b5bac3",
+      "binary": {
+        "path": "rpi",
+        "sha256": "0c7b4035ea1fe58267cbb35e2214166071b664c63b0f9e6a9b5a43e592c1a312"
+      }
+    },
+    "x86_64-apple-darwin": {
+      "url": "https://github.com/bigfish1913/pi-rust/releases/download/v0.22.1/rpi-v0.22.1-x86_64-apple-darwin.tar.gz",
+      "format": "tar.gz",
+      "size": 17018834,
+      "sha256": "debe216bd08c6f41a82876a3f15665be2ad79b599332dd735d8ec153bc0dc4e8",
+      "binary": {
+        "path": "rpi",
+        "sha256": "4972d51bf477d7dda42108e037e408ae73136a43f1a9a27a0429884faaf41c43"
+      }
+    },
+    "x86_64-pc-windows-msvc": {
+      "url": "https://github.com/bigfish1913/pi-rust/releases/download/v0.22.1/rpi-v0.22.1-x86_64-pc-windows-msvc.zip",
+      "format": "zip",
+      "size": 17010955,
+      "sha256": "f18885bcb64bd5045918c24f1406f9a64754a3789aff86b784df4706912df6e2",
+      "binary": {
+        "path": "rpi.exe",
+        "sha256": "05a21657392fd34eb57325d55748fb0760d067dc76061b258a31c85a30c6ad5e"
+      }
+    },
+    "x86_64-unknown-linux-gnu": {
+      "url": "https://github.com/bigfish1913/pi-rust/releases/download/v0.22.1/rpi-v0.22.1-x86_64-unknown-linux-gnu.tar.gz",
+      "format": "tar.gz",
+      "size": 17508453,
+      "sha256": "bdc9239cf090d6a9208b2b8fb70bf58f754965b5d66336a26017b8ea06c70d5c",
+      "binary": {
+        "path": "rpi",
+        "sha256": "286f2479cf553b9bffad997fcb68679aaa9e77fa8b6264f657692d84b87b9b21"
+      }
+    },
+    "x86_64-unknown-linux-musl": {
+      "url": "https://github.com/bigfish1913/pi-rust/releases/download/v0.22.1/rpi-v0.22.1-x86_64-unknown-linux-musl.tar.gz",
+      "format": "tar.gz",
+      "size": 17663903,
+      "sha256": "b5cb6e9715fb477f0360955b1b4a330e45a3944bb14ff899a09f6a663ab6a7f2",
+      "binary": {
+        "path": "rpi",
+        "sha256": "7f3bacebd89efa923d032a1e700571e343047cccf6f32af31c5dab6902c90b03"
+      }
+    }
+  }
+}

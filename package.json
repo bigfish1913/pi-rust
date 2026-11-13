@@ -1,0 +1,54 @@
+{
+  "name": "@bigfishnpm/rpi",
+  "version": "0.22.1",
+  "description": "Rust-native coding agent for your terminal",
+  "license": "MIT",
+  "author": "BigFish <fuwei201473@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bigfish1913/pi-rust.git"
+  },
+  "homepage": "https://rpi.bigfisharc.cn/",
+  "bugs": "https://github.com/bigfish1913/pi-rust/issues",
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "cli",
+    "rust",
+    "rpi"
+  ],
+  "bin": {
+    "rpi": "npm/bin/rpi.cjs"
+  },
+  "files": [
+    "npm/bin/rpi.cjs",
+    "npm/install.cjs",
+    "npm/lib.cjs",
+    "npm/release.json",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "scripts": {
+    "prepare:release": "node scripts/prepare-npm.mjs",
+    "prepublishOnly": "node scripts/prepare-npm.mjs",
+    "postinstall": "node npm/install.cjs",
+    "test": "node --test scripts/test-npm.cjs scripts/test-npm-release.mjs"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

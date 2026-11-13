@@ -76,6 +76,17 @@ Verifies the published SHA-256 checksum and installs to
 PATH, then run `rpi --version`. Append `-DryRun` to preview, or use
 `-Version <version>` and `-Dir 'C:\Tools\rpi'` to select a version and directory.
 
+**From npm** (requires Node.js 20+; no Rust toolchain needed):
+
+```bash
+npm install -g @bigfishnpm/rpi
+rpi --version
+```
+
+The npm installer downloads the matching GitHub Release binary and verifies both
+archive and executable SHA-256 checksums pinned in the package. It supports macOS
+(x64/ARM64), Windows (x64), and Linux (x64 glibc/musl and ARM64 glibc).
+
 **From crates.io** (requires Rust 1.88+):
 
 ```bash

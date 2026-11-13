@@ -144,6 +144,7 @@ jobs:
     uses: ./.github/workflows/release-binaries.yml
     permissions:
       contents: write
+      id-token: write
     with:
       tag: ${{ needs.detect.outputs.tag }}
     secrets: inherit
