@@ -273,7 +273,7 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     }
 
-    if let Err(error) = cargo_command("fetch", &manifest, &options, false) {
+    if let Err(error) = cargo_command("fetch", &manifest, &options) {
         eprintln!("error: could not resolve `{}`: {error}", options.package);
         return 1;
     }
@@ -332,13 +332,16 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     }
 
-    if let Err(error) = cargo_command("build", &manifest, &options, true) {
-        eprintln!("error: failed to build `{}`: {error}", options.package);
-        return 1;
-    }
+    let built = match cargo_build(&manifest, &options, &cdylib_targets) {
+        Ok(built) => built,
+        Err(error) => {
+            eprintln!("error: failed to build `{}`: {error}", options.package);
+            return 1;
+        }
+    };
 
     let artifact_dir = temp.path().join("target").join("release");
-    let artifacts = match find_artifacts(&artifact_dir, &cdylib_targets) {
+    let artifacts = match built.into_artifacts(&artifact_dir, &cdylib_targets) {
         Ok(artifacts) => artifacts,
         Err(error) => {
             eprintln!("error: {error}");
@@ -1571,22 +1574,16 @@ fn write_manifest(path: &Path, options: &InstallOptions) -> Result<(), String> {
     std::fs::write(path, contents).map_err(|error| error.to_string())
 }
 
+/// Run the Cargo commands whose output only needs to reach the terminal
+/// (`fetch`). The `build` step has its own runner so it can capture the JSON
+/// machine messages that report artifact paths.
 fn cargo_command(
     subcommand: &str,
     manifest: &Path,
     options: &InstallOptions,
-    build: bool,
 ) -> Result<(), String> {
     let mut command = Command::new("cargo");
     command.arg(subcommand).arg("--manifest-path").arg(manifest);
-    if build {
-        command
-            .arg("--package")
-            .arg(&options.package)
-            .arg("--release")
-            .arg("--target-dir")
-            .arg(manifest.parent().unwrap().join("target"));
-    }
     if options.locked {
         command.arg("--locked");
     }
@@ -1604,6 +1601,145 @@ fn cargo_command(
     } else {
         Err(format!("cargo {subcommand} exited with {status}"))
     }
+}
+
+/// Result of `cargo build --message-format=json-render-diagnostics` for the
+/// temporary installer workspace.
+///
+/// Cargo's build-dir layout is explicitly internal and changed in 1.100.0
+/// (#15010), which dropped `<profile>/deps` in favour of
+/// `<profile>/build/<pkg>/<meta>/out`. The JSON machine messages are the
+/// supported way to learn where a cdylib actually landed, so the artifact paths
+/// are collected here and the directory scan is only a legacy fallback.
+struct CargoBuild {
+    artifacts: Vec<PathBuf>,
+}
+
+impl CargoBuild {
+    /// Resolve exactly one cdylib per requested target, in target order.
+    ///
+    /// Paths reported by Cargo win; only targets Cargo did not name fall back
+    /// to scanning the build directory.
+    fn into_artifacts(
+        self,
+        release_dir: &Path,
+        targets: &[&CargoTarget],
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut artifacts = Vec::with_capacity(targets.len());
+        let mut unresolved = Vec::new();
+        for target in targets {
+            match self
+                .artifacts
+                .iter()
+                .find(|path| artifact_matches_name(path, &target.name))
+            {
+                Some(path) => artifacts.push(path.clone()),
+                None => unresolved.push(*target),
+            }
+        }
+        if !unresolved.is_empty() {
+            // `find_artifacts` reports a single missing target per call, so ask
+            // it for the remaining ones together and preserve their order.
+            let fallback = find_artifacts(release_dir, &unresolved)?;
+            artifacts.extend(fallback);
+        }
+        Ok(artifacts)
+    }
+}
+
+/// Match a built dynamic library against a cdylib target name, tolerating the
+/// platform `lib` prefix and a Cargo metadata hash suffix.
+fn artifact_matches_name(path: &Path, target: &str) -> bool {
+    if !is_dynamic_library(path) {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let stem = normalize_name(stem.trim_start_matches("lib"));
+    let wanted = normalize_name(target);
+    stem == wanted || stem.starts_with(&format!("{wanted}."))
+}
+
+fn cargo_build(
+    manifest: &Path,
+    options: &InstallOptions,
+    targets: &[&CargoTarget],
+) -> Result<CargoBuild, String> {
+    let mut command = Command::new("cargo");
+    command
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest)
+        .arg("--package")
+        .arg(&options.package)
+        .arg("--release")
+        .arg("--target-dir")
+        .arg(manifest.parent().unwrap().join("target"))
+        .arg("--message-format=json-render-diagnostics");
+    if options.locked {
+        command.arg("--locked");
+    }
+    if crate::args::offline_env_enabled() {
+        command.arg("--offline");
+    }
+    // Keep Cargo's diagnostics on the terminal while the machine messages on
+    // stdout are parsed for artifact locations.
+    command.stdin(Stdio::inherit()).stderr(Stdio::inherit());
+    let output = command
+        .output()
+        .map_err(|error| format!("could not execute cargo: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("cargo build exited with {}", output.status));
+    }
+    let wanted: Vec<String> = targets
+        .iter()
+        .map(|target| normalize_name(&target.name))
+        .collect();
+    let mut artifacts = Vec::new();
+    let mut diagnostics = String::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(rendered) = value
+            .get("message")
+            .and_then(|message| message.get("rendered"))
+            .and_then(|rendered| rendered.as_str())
+        {
+            // `json-render-diagnostics` moves diagnostics onto stdout, so the
+            // rendered text has to be replayed for the user.
+            diagnostics.push_str(rendered);
+            continue;
+        }
+        if value.get("reason").and_then(|reason| reason.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(name) = value
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(|name| name.as_str())
+        else {
+            continue;
+        };
+        if !wanted.contains(&normalize_name(name)) {
+            continue;
+        }
+        artifacts.extend(
+            value
+                .get("filenames")
+                .and_then(|filenames| filenames.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|filename| filename.as_str())
+                .map(PathBuf::from)
+                .filter(|path| is_dynamic_library(path) && path.is_file()),
+        );
+    }
+    if !diagnostics.is_empty() {
+        eprint!("{diagnostics}");
+    }
+    Ok(CargoBuild { artifacts })
 }
 
 fn cargo_metadata(manifest: &Path, options: &InstallOptions) -> Result<CargoMetadata, String> {
@@ -1632,13 +1768,27 @@ fn cargo_metadata(manifest: &Path, options: &InstallOptions) -> Result<CargoMeta
 
 fn find_artifacts(release_dir: &Path, targets: &[&CargoTarget]) -> Result<Vec<PathBuf>, String> {
     let mut artifacts = Vec::new();
+    // Legacy layout (<profile>/ and <profile>/deps) plus the 1.100.0 build-dir
+    // layout (<profile>/build/<pkg>/<meta>/out). Only used as a fallback when
+    // Cargo's JSON messages did not name the artifact.
+    let mut dirs = vec![release_dir.to_path_buf(), release_dir.join("deps")];
+    dirs.extend(build_dir_outputs(release_dir));
     for target in targets {
         let wanted = normalize_name(&target.name);
         let mut matches = Vec::new();
-        for dir in [release_dir.to_path_buf(), release_dir.join("deps")] {
-            let entries = std::fs::read_dir(&dir).map_err(|error| {
-                format!("could not inspect build output {}: {error}", dir.display())
-            })?;
+        for dir in &dirs {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                // Cargo omits `deps/` under the 1.100.0 layout; a missing
+                // candidate directory just contributes no matches.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "could not inspect build output {}: {error}",
+                        dir.display()
+                    ));
+                }
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !is_dynamic_library(&path) {
@@ -1668,6 +1818,28 @@ fn find_artifacts(release_dir: &Path, targets: &[&CargoTarget]) -> Result<Vec<Pa
 
 fn normalize_name(name: &str) -> String {
     name.replace('-', "_").to_ascii_lowercase()
+}
+
+/// Collect `<profile>/build/<pkg>/<meta>/out` directories created by the
+/// Cargo 1.100.0 build-dir layout. Absent directories simply yield no
+/// candidates so older Cargo versions keep working unchanged.
+fn build_dir_outputs(release_dir: &Path) -> Vec<PathBuf> {
+    let mut outputs = Vec::new();
+    let Ok(packages) = std::fs::read_dir(release_dir.join("build")) else {
+        return outputs;
+    };
+    for package in packages.flatten() {
+        let Ok(units) = std::fs::read_dir(package.path()) else {
+            continue;
+        };
+        for unit in units.flatten() {
+            let out = unit.path().join("out");
+            if out.is_dir() {
+                outputs.push(out);
+            }
+        }
+    }
+    outputs
 }
 
 pub(crate) fn is_dynamic_library(path: &Path) -> bool {
@@ -2784,5 +2956,78 @@ mod tests {
         assert!(error.contains("is not a plain directory"), "{error}");
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
         assert!(!destination.join("libdemo.so").exists());
+    }
+
+    fn cdylib_target(name: &'static str) -> CargoTarget {
+        CargoTarget {
+            name: name.to_string(),
+            crate_types: vec!["cdylib".to_string()],
+        }
+    }
+
+    #[test]
+    fn find_artifacts_locates_cargo_1_100_build_dir_layout() {
+        // Cargo 1.100.0 moved intermediate artifacts to
+        // `<profile>/build/<pkg>/<meta>/out` and stopped creating `deps`.
+        let temp = tempfile::tempdir().unwrap();
+        let release_dir = temp.path().join("target").join("release");
+        let out = release_dir
+            .join("build")
+            .join("rpi-web")
+            .join("0123456789abcdef")
+            .join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let library = out.join(format!(
+            "{}rpi_web_extension{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        ));
+        std::fs::write(&library, b"cdylib").unwrap();
+
+        let target = cdylib_target("rpi_web_extension");
+        let found = find_artifacts(&release_dir, &[&target]).unwrap();
+        assert_eq!(found, vec![library]);
+    }
+
+    #[test]
+    fn find_artifacts_skips_missing_build_directories() {
+        // With no `deps/` and no `build/`, the scan must report the missing
+        // artifact instead of failing on the absent directory itself.
+        let temp = tempfile::tempdir().unwrap();
+        let release_dir = temp.path().join("target").join("release");
+        let target = cdylib_target("rpi_web_extension");
+
+        let error = find_artifacts(&release_dir, &[&target]).unwrap_err();
+        assert!(error.contains("no cdylib artifact was found"), "{error}");
+        assert!(!error.contains("could not inspect build output"), "{error}");
+    }
+
+    #[test]
+    fn reported_artifacts_win_over_directory_scans() {
+        // Paths from Cargo's JSON messages are authoritative even when the
+        // legacy layout also contains a matching library.
+        let temp = tempfile::tempdir().unwrap();
+        let release_dir = temp.path().join("target").join("release");
+        std::fs::create_dir_all(release_dir.join("deps")).unwrap();
+        let stale = release_dir.join("deps").join(format!(
+            "{}rpi_web_extension{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        ));
+        std::fs::write(&stale, b"stale").unwrap();
+        let reported = temp.path().join(format!(
+            "{}rpi_web_extension.abc123{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        ));
+        std::fs::write(&reported, b"reported").unwrap();
+
+        let target = cdylib_target("rpi_web_extension");
+        let found = CargoBuild {
+            artifacts: vec![reported.clone()],
+        }
+        .into_artifacts(&release_dir, &[&target])
+        .unwrap();
+        assert_eq!(found, vec![reported]);
     }
 }
