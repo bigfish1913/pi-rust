@@ -136,6 +136,8 @@ pub fn prepare_from_argv(argv: &[String]) -> Result<Prepared, String> {
     match support {
         SandboxSupport::Unsupported { reason } => fallback(&policy, reason),
         SandboxSupport::Supported(backend) => {
+            // The supervisor/broker is Linux-only for now (M4 covers Windows).
+            #[cfg(target_os = "linux")]
             if let Err(error) = start_broker(&policy) {
                 match policy.mode {
                     SandboxMode::Required => {
