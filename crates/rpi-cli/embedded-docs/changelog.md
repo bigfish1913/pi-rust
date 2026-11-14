@@ -11,6 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.24.1](https://github.com/bigfish1913/pi-rust/compare/v0.24.0...v0.24.1) - 2026-11-14
+
+### Added
+
+- *(tui)* render README logo with RASCII at 64x32 ([#327](https://github.com/bigfish1913/pi-rust/pull/327))
+
 ## [0.24.0](https://github.com/bigfish1913/pi-rust/compare/v0.23.0...v0.24.0) - 2026-11-13
 
 ### Added
