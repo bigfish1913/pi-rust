@@ -361,6 +361,17 @@ async fn run_inner() -> i32 {
     if !project_trusted && !crate::session_cwd::is_same_directory(&cwd, &launch_cwd) {
         startup_notices.push(crate::session_cwd::untrusted_session_cwd_note(&cwd));
     }
+    // M0 sandbox wiring: parse the `sandbox` settings block and report honestly
+    // when enforcement is unavailable. Disabled by default, so this is silent
+    // unless the user opted in. `mode = "required"` fails closed.
+    match crate::sandbox::startup_check(&cwd, project_trusted) {
+        Ok(Some(note)) => eprintln!("{note}"),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("error: {error}");
+            return EXIT_USAGE;
+        }
+    }
     // Development preflight precedes prepare_extensions: protect its registry
     // reads at orchestration too; the fact reader itself stays non-mutating.
     let _dev_resource_leases = if dev_options.is_some() {

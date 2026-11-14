@@ -28,6 +28,7 @@ rpi-harness = { workspace = true }
 rpi-tui = { workspace = true }
 rpi-plugin-sdk = { workspace = true, features = ["binary"] }
 rpi-extensions = { workspace = true }
+rpi-sandbox = { workspace = true }
 tokio = { workspace = true, features = ["signal", "io-std", "net"] }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

@@ -1,7 +1,7 @@
 # 文件系统沙箱（rpi 自身即沙箱）
 
-> 状态：**设计文档，尚未实现**。本文描述目标行为、跨平台实现方式、授权协议与落地阶段。
-> 当前版本的 `rpi` 没有文件系统沙箱；实现进度以 [ROADMAP](../../ROADMAP.md) 为准。
+> 状态：**M0 已实现**（策略模型、配置解析、平台能力探测）；强制后端尚未实现。
+> 当前版本的 `rpi` 仍不会实际限制写操作；实现进度以 [ROADMAP](../../ROADMAP.md) 为准。
 
 ## 1. 目标与非目标
 
@@ -390,7 +390,7 @@ pub struct ApprovalDecision {
 
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
-| M0 | `rpi-sandbox` 策略模型、路径展开、优先级、能力探测桩；`settings.rs` 增加 `sandbox` 段与“项目只能收紧”合并；同步 `bootstrap()` 空实现 | 配置可解析、可展示、行为不变 |
+| M0（已实现） | `rpi-sandbox` 策略模型、路径展开、优先级、能力探测桩；`settings.rs` 增加 `sandbox` 段与“项目只能收紧”合并；同步 `bootstrap()` 空实现 | 配置可解析、可展示、行为不变 |
 | M1 | Linux Landlock 全进程应用（入口改为同步预检）；`EACCES → SandboxDenied`；bash 后代继承 | 基础语义与逃逸用例通过；默认 `auto` |
 | M2 | supervisor + broker、`ApprovalFrontend`（TUI/headless/RPC）、审计、撤销、pending 持久化 | 授权链路完整；多客户端仲裁正确 |
 | M3 | macOS Seatbelt | 同一测试矩阵通过 |
@@ -404,7 +404,8 @@ pub struct ApprovalDecision {
 | 变更 | 位置 |
 | --- | --- |
 | 新增 crate | `crates/rpi-sandbox/`（策略、平台后端、能力探测、broker 客户端/服务端；不依赖其它 `rpi-*`） |
-| 启动接线 | `crates/rpi-cli/src/bin/rpi.rs`（同步预检 + 应用沙箱 + 建 runtime） |
+| 启动接线 | `crates/rpi-cli/src/sandbox.rs`（策略编译、探测与启动提示）；M1 再把应用点前移到 `crates/rpi-cli/src/bin/rpi.rs` |
+| 启动接线（M1） | `crates/rpi-cli/src/bin/rpi.rs`（同步预检 + 应用沙箱 + 建 runtime） |
 | 配置合并 | `crates/rpi-cli/src/settings.rs`、`crates/rpi-cli/src/config.rs` |
 | 工具层 | `crates/rpi-tools/src/os_env.rs`（捕获 `EACCES`、映射 `SandboxDenied`、broker 重试） |
 | 授权 UI | `crates/rpi-cli/src/interactive_tui/`（弹窗、`/sandbox`、页脚） |

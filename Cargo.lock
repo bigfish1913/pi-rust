@@ -2183,6 +2183,7 @@ dependencies = [
  "rpi-harness",
  "rpi-plugin-sdk",
  "rpi-runtime",
+ "rpi-sandbox",
  "rpi-telemetry",
  "rpi-tools",
  "rpi-tui",
@@ -2287,6 +2288,15 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "rpi-sandbox"
+version = "0.24.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
