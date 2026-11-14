@@ -29,6 +29,7 @@ use rpi_sandbox::{
 static ACTIVE: OnceLock<SandboxStatus> = OnceLock::new();
 static ACTIVE_POLICY: OnceLock<SandboxPolicy> = OnceLock::new();
 /// Broker connection inherited from the supervisor (Linux, M2).
+#[cfg(unix)]
 static BROKER: OnceLock<rpi_sandbox::BrokerClient> = OnceLock::new();
 
 /// Whether this build has a working enforcement backend.
@@ -539,6 +540,7 @@ pub fn active_policy() -> Option<&'static SandboxPolicy> {
 }
 
 /// The inherited broker connection, when the supervisor is running.
+#[cfg(unix)]
 pub fn broker_client() -> Option<&'static rpi_sandbox::BrokerClient> {
     BROKER.get()
 }

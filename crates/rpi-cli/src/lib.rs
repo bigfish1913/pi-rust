@@ -66,6 +66,8 @@ pub mod resource_selection;
 pub mod resume_picker;
 pub(crate) mod rpc;
 pub mod sandbox;
+pub mod sandbox_approval;
+pub mod sandbox_env;
 mod saved_session_read;
 pub mod session;
 pub mod session_cwd;

@@ -323,6 +323,9 @@ export RPI_SANDBOX=0              # 整个 shell 关闭
 
 - 项目 `.rpi/settings.json` 只能追加 `protected`，不能放宽 `writable` 或关闭沙箱。
 - 会话内用 `/sandbox` 查看当前状态、后端、可写根与保护项。
+- 交互式会话中，越权写会弹出授权选择：`Allow once`（仅本次）、
+  `Allow for this session`（本进程内该路径）、`Deny`。授权按精确路径生效；
+  `-p` 等非交互模式直接拒绝。
 - TUI 页脚常驻显示徽标：`🔒 landlock`、`🔓 sandbox off`、`⏸ sandbox bypassed`。
 - `install`/`update`/`auth`/`dev` 等维护命令会自动绕过沙箱并打印一行提示。
 - 当前仅 Linux 有强制后端；macOS/Windows 会按 `auto` 回退为无沙箱并提示，直到对应

@@ -72,6 +72,15 @@ pub enum BrokerRequest {
         /// Destination path.
         target: String,
     },
+    /// Truncate a file to `len` bytes.
+    Truncate {
+        /// Request id.
+        id: u64,
+        /// Absolute target path.
+        path: String,
+        /// New length in bytes.
+        len: u64,
+    },
     /// Create a directory (and its parents).
     Mkdir {
         /// Request id.
@@ -89,6 +98,7 @@ impl BrokerRequest {
             | Self::Write { id, .. }
             | Self::Delete { id, .. }
             | Self::Rename { id, .. }
+            | Self::Truncate { id, .. }
             | Self::Mkdir { id, .. } => *id,
         }
     }
@@ -99,6 +109,7 @@ impl BrokerRequest {
             | Self::Write { path, .. }
             | Self::Delete { path, .. }
             | Self::Rename { path, .. }
+            | Self::Truncate { path, .. }
             | Self::Mkdir { path, .. } => path,
         }
     }
@@ -109,6 +120,7 @@ impl BrokerRequest {
             Self::Write { .. } => "write",
             Self::Delete { .. } => "delete",
             Self::Rename { .. } => "rename",
+            Self::Truncate { .. } => "truncate",
             Self::Mkdir { .. } => "mkdir",
         }
     }
@@ -309,6 +321,17 @@ fn handle(
                 _ => Err("rename requires absolute source and target".to_string()),
             }
         }
+        BrokerRequest::Truncate { path, len, .. } => with_absolute(&path, |path| {
+            if !store.allow(path, WriteOp::Overwrite) {
+                return Err(format!("truncate of {} is not approved", path.display()));
+            }
+            let file = OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+            file.set_len(len)
+                .map_err(|error| format!("cannot truncate {}: {error}", path.display()))
+        }),
         BrokerRequest::Mkdir { path, .. } => with_absolute(&path, |path| {
             if !store.allow(path, WriteOp::Mkdir) {
                 return Err(format!("mkdir of {} is not approved", path.display()));
@@ -366,6 +389,32 @@ fn log_audit(audit: &mut Option<File>, operation: &str, path: &str, ok: bool, er
     });
     let _ = writeln!(file, "{entry}");
     let _ = file.flush();
+}
+
+/// Operations the sandboxed agent can delegate to an unconfined broker.
+///
+/// A trait rather than a concrete client so the tool environment can be tested
+/// with a fake and, later, pointed at a GUI-hosted broker.
+pub trait WriteBroker: Send + Sync {
+    /// Record an approval.
+    fn approve(
+        &self,
+        path: &Path,
+        operations: &[WriteOp],
+        scope: ApprovalScope,
+    ) -> Result<(), String>;
+    /// Write bytes.
+    fn write(&self, path: &Path, data: &[u8]) -> Result<(), String>;
+    /// Append bytes.
+    fn append(&self, path: &Path, data: &[u8]) -> Result<(), String>;
+    /// Truncate a file.
+    fn truncate(&self, path: &Path, len: u64) -> Result<(), String>;
+    /// Delete a file.
+    fn delete(&self, path: &Path) -> Result<(), String>;
+    /// Rename a file.
+    fn rename(&self, path: &Path, target: &Path) -> Result<(), String>;
+    /// Create a directory.
+    fn mkdir(&self, path: &Path) -> Result<(), String>;
 }
 
 /// Client used by the sandboxed agent to ask the broker for approved writes.
@@ -438,6 +487,15 @@ impl BrokerClient {
         })
     }
 
+    /// Truncate a file through the broker.
+    pub fn truncate(&self, path: &Path, len: u64) -> Result<(), String> {
+        self.send(BrokerRequest::Truncate {
+            id: self.id(),
+            path: path.to_string_lossy().into_owned(),
+            len,
+        })
+    }
+
     /// Delete a file through the broker.
     pub fn delete(&self, path: &Path) -> Result<(), String> {
         self.send(BrokerRequest::Delete {
@@ -497,6 +555,76 @@ impl BrokerClient {
                 .error
                 .unwrap_or_else(|| "broker refused the request".to_string()))
         }
+    }
+}
+
+#[cfg(unix)]
+impl WriteBroker for BrokerClient {
+    fn approve(
+        &self,
+        path: &Path,
+        operations: &[WriteOp],
+        scope: ApprovalScope,
+    ) -> Result<(), String> {
+        BrokerClient::approve(self, path, operations, scope)
+    }
+
+    fn write(&self, path: &Path, data: &[u8]) -> Result<(), String> {
+        BrokerClient::write(self, path, data)
+    }
+
+    fn append(&self, path: &Path, data: &[u8]) -> Result<(), String> {
+        BrokerClient::append(self, path, data)
+    }
+
+    fn truncate(&self, path: &Path, len: u64) -> Result<(), String> {
+        BrokerClient::truncate(self, path, len)
+    }
+
+    fn delete(&self, path: &Path) -> Result<(), String> {
+        BrokerClient::delete(self, path)
+    }
+
+    fn rename(&self, path: &Path, target: &Path) -> Result<(), String> {
+        BrokerClient::rename(self, path, target)
+    }
+
+    fn mkdir(&self, path: &Path) -> Result<(), String> {
+        BrokerClient::mkdir(self, path)
+    }
+}
+
+/// Adapt an inherited static client reference to the [`WriteBroker`] trait.
+#[cfg(unix)]
+pub struct SharedBroker(pub &'static BrokerClient);
+
+#[cfg(unix)]
+impl WriteBroker for SharedBroker {
+    fn approve(
+        &self,
+        path: &Path,
+        operations: &[WriteOp],
+        scope: ApprovalScope,
+    ) -> Result<(), String> {
+        self.0.approve(path, operations, scope)
+    }
+    fn write(&self, path: &Path, data: &[u8]) -> Result<(), String> {
+        self.0.write(path, data)
+    }
+    fn append(&self, path: &Path, data: &[u8]) -> Result<(), String> {
+        self.0.append(path, data)
+    }
+    fn truncate(&self, path: &Path, len: u64) -> Result<(), String> {
+        self.0.truncate(path, len)
+    }
+    fn delete(&self, path: &Path) -> Result<(), String> {
+        self.0.delete(path)
+    }
+    fn rename(&self, path: &Path, target: &Path) -> Result<(), String> {
+        self.0.rename(path, target)
+    }
+    fn mkdir(&self, path: &Path) -> Result<(), String> {
+        self.0.mkdir(path)
     }
 }
 

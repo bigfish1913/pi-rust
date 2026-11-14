@@ -1,8 +1,9 @@
 # 文件系统沙箱（rpi 自身即沙箱）
 
-> 状态：**M1 已实现**（Linux Landlock 全进程强制）；**M2 进行中**（broker 进程、
-> 授权协议、审计与 headless 默认拒绝已落地；TUI 授权弹窗待实现）。macOS / Windows
-> 后端尚未实现。实现进度以 [ROADMAP](../../ROADMAP.md) 为准。
+> 状态：**M1 已实现**（Linux Landlock 全进程强制）；**M2 已实现核心链路**
+> （broker 进程、授权协议、审计、headless 默认拒绝、TUI 授权弹窗、
+> `Allow once` / `Allow for this session`）。RPC 事件、撤销与 pending 持久化
+> 仍待实现。macOS / Windows 后端尚未实现。实现进度以 [ROADMAP](../../ROADMAP.md) 为准。
 
 ## 1. 目标与非目标
 
@@ -328,8 +329,10 @@ pub struct ApprovalDecision {
 
 ### 7.3 授权执行流程
 
-> 实现进度：broker 进程、协议、审批存储与审计已落地；写入工具尚未接入
-> “拒绝 → 询问 → broker 重试”，headless 模式按设计直接拒绝。
+> 实现进度：broker 进程、协议、审批存储与审计已落地；`write` / `edit` 通过
+> `SandboxedEnv` 接入“拒绝 → 询问 → broker 重试”。授权按**精确路径**生效：
+> “本会话允许”只覆盖当前文件，同目录的其它文件仍会再次询问。headless 模式
+> 按设计直接拒绝。
 
 ```text
 1. 工具尝试写 /etc/hosts → 内核返回 EACCES
@@ -411,7 +414,7 @@ pub struct ApprovalDecision {
 | --- | --- | --- |
 | M0（已实现） | `rpi-sandbox` 策略模型、路径展开、优先级、能力探测桩；`settings.rs` 增加 `sandbox` 段与“项目只能收紧”合并；同步 `bootstrap()` 空实现 | 配置可解析、可展示、行为不变 |
 | M1（已实现） | Linux Landlock 全进程应用（入口改为同步预检）；`EACCES` 映射为带沙箱提示的错误；bash 后代继承 | 基础语义与逃逸用例通过；默认 `auto` |
-| M2（进行中） | supervisor + broker、审计、headless 默认拒绝（已落地）；`ApprovalFrontend` TUI/RPC 弹窗、撤销、pending 持久化（待实现） | 授权链路完整；多客户端仲裁正确 |
+| M2（核心已实现） | supervisor + broker、审计、headless 默认拒绝、TUI 弹窗与工具接线已落地；RPC 事件、撤销、pending 持久化待实现 | 授权链路完整；多客户端仲裁正确 |
 | M3 | macOS Seatbelt | 同一测试矩阵通过 |
 | M4 | Windows restricted token + ACL 事务 + 崩溃清理 + crypto provider 切换 | 测试矩阵通过；无残留 ACL |
 | M5 | 外部客户端（GUI/IDE）消费授权事件；远程模式下的授权认证 | 协议兼容性测试 |

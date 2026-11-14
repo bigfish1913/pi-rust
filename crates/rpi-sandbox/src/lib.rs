@@ -27,7 +27,9 @@ pub mod linux;
 pub use approval::{
     ApprovalDecision, ApprovalError, ApprovalOption, ApprovalRequest, ApprovalScope, WriteOp,
 };
-pub use broker::{serve, ApprovalStore, BrokerClient, BrokerConfig, BrokerRequest, BrokerResponse};
+#[cfg(unix)]
+pub use broker::BrokerClient;
+pub use broker::{serve, ApprovalStore, BrokerConfig, BrokerRequest, BrokerResponse, WriteBroker};
 pub use policy::{
     compile_policy, expand_configured_path, normalize_and_resolve, Access, ApprovalSettings,
     PathRule, PolicyContext, PolicyOverrides, SandboxMode, SandboxPolicy, SandboxSettings,
