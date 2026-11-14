@@ -395,6 +395,16 @@ impl UiDialogMailbox {
             .is_some_and(|entry| !entry.cancelled && entry.answer.is_none())
     }
 
+    /// Read-only lookup of a still-pending request (no consumption).
+    pub fn pending_request_by_id(&self, request_id: &str) -> Option<UiDialogRequest> {
+        let state = self.state.lock().ok()?;
+        let entry = state.active.get(request_id)?;
+        if entry.cancelled || entry.answer.is_some() {
+            return None;
+        }
+        Some(entry.request.clone())
+    }
+
     /// Supply an answer for a request. Repeating the same operation is
     /// idempotent; answering a cancelled/unknown request is an explicit error.
     pub fn respond(&self, request_id: &str, answer: serde_json::Value) -> Result<(), String> {
@@ -2869,6 +2879,31 @@ mod relay_tests {
             ui: serde_json::json!({"question": "ok?"}),
             raw: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn pending_lookup_is_read_only_and_tracks_answers() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open",
+                "requestId": "lookup-1",
+                "toolCallId": "t1",
+                "ui": {"question": "ok?"}
+            }))
+            .unwrap();
+        let request = mailbox.pending_request_by_id("lookup-1").unwrap();
+        assert_eq!(request.request_id, "lookup-1");
+        // Taking it for the UI must not make the read-only lookup fail:
+        // this is exactly what reconnect replay needs.
+        assert!(mailbox.take_pending().is_some());
+        assert!(mailbox.pending_request_by_id("lookup-1").is_some());
+        mailbox
+            .respond("lookup-1", serde_json::json!({"values": ["Yes"]}))
+            .unwrap();
+        assert!(mailbox.pending_request_by_id("lookup-1").is_none());
+        assert!(!mailbox.is_pending("lookup-1"));
     }
 
     /// A reserved request must be invisible to the TUI but visible to the plugin

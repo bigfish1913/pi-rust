@@ -834,6 +834,76 @@ pub(crate) fn ask_user_frame(
 }
 
 /// Open one `ask_user` request in the TUI input slot.
+/// Render the filesystem-sandbox approval prompt.
+///
+/// The prompt is a plain three-row selector: allow once, allow for the session,
+/// or deny. A note above it shows the raw path, the resolved path and the
+/// operation so the user can see exactly what is being approved.
+pub(super) fn open_approval_dialog(
+    ctx: &CommandContext,
+    job: crate::sandbox_approval::ApprovalJob,
+) {
+    let request = job.request;
+    let mut summary = format!(
+        "🔒 sandbox blocked {}: {}",
+        request.operation.as_str(),
+        request.raw_path
+    );
+    if request.path != std::path::Path::new(&request.raw_path) {
+        summary.push_str(&format!("\nresolved: {}", request.path.display()));
+    }
+    if let Some(bytes) = request.bytes {
+        summary.push_str(&format!("\nbytes: {bytes}"));
+    }
+    add_note_message(&ctx.state.notice_container(), &summary);
+
+    let items = vec![
+        SelectItem::new("once", "Allow once")
+            .with_description("Write this file once; ask again next time"),
+        SelectItem::new("session", "Allow for this session")
+            .with_description("Keep this path writable until rpi exits"),
+        SelectItem::new("directory", "Allow this directory")
+            .with_description("Allow the containing directory for this session"),
+        SelectItem::new("deny", "Deny").with_description("Leave the path read-only"),
+    ];
+    let list = Arc::new(SelectList::new(items, 4));
+
+    let respond = Arc::new(std::sync::Mutex::new(Some(job.respond)));
+    let respond_select = respond.clone();
+    let state = ctx.state.clone();
+    let editor_container = ctx.editor_container.clone();
+    let editor = ctx.editor.clone();
+    let tui = ctx.tui.clone();
+    list.on_select(Arc::new(move |item| {
+        let decision = crate::sandbox_approval::decision_for(&item.value);
+        if let Some(tx) = respond_select.lock().unwrap().take() {
+            let _ = tx.send(decision);
+        }
+        close_selector(&state, &editor_container, &editor, &tui);
+    }));
+
+    let respond_cancel = respond;
+    let state_cancel = ctx.state.clone();
+    let ec_cancel = ctx.editor_container.clone();
+    let editor_cancel = ctx.editor.clone();
+    let tui_cancel = ctx.tui.clone();
+    list.on_cancel(Arc::new(move || {
+        if let Some(tx) = respond_cancel.lock().unwrap().take() {
+            let _ = tx.send(rpi_sandbox::ApprovalDecision::Deny);
+        }
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+
+    open_selector(
+        &ctx.state,
+        &ctx.editor_container,
+        &ctx.editor,
+        &ctx.tui,
+        list,
+        SelectorKind::Approval,
+    );
+}
+
 pub(super) fn open_ask_user_dialog(
     ctx: &CommandContext,
     bridge: AskUserBridge,

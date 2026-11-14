@@ -42,6 +42,39 @@ impl SlashCommand for HistoryCommand {
     }
 }
 
+pub(super) struct SandboxCommand;
+impl SlashCommand for SandboxCommand {
+    fn name(&self) -> &'static str {
+        "/sandbox"
+    }
+    fn description(&self) -> &'static str {
+        "Show sandbox status; /sandbox revoke <path> drops session approvals"
+    }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        if let Some(rest) = args.trim().strip_prefix("revoke") {
+            let path = rest.trim();
+            if path.is_empty() {
+                add_error_message(&ctx.chat, "Usage: /sandbox revoke <path>");
+                ctx.tui.request_render(false);
+                return;
+            }
+            let message = match crate::sandbox::broker_client() {
+                Some(client) => match client.revoke(std::path::Path::new(path), true) {
+                    Ok(()) => format!("Revoked sandbox approvals for {path}"),
+                    Err(error) => format!("Could not revoke {path}: {error}"),
+                },
+                None => "No approval broker is running in this mode".to_string(),
+            };
+            add_note_message(&ctx.chat, &message);
+            ctx.tui.request_render(false);
+            return;
+        }
+        let text = crate::sandbox::describe(&ctx.cwd, true);
+        add_note_message(&ctx.chat, &text);
+        ctx.tui.request_render(false);
+    }
+}
+
 pub(super) struct ClearChatCommand;
 impl SlashCommand for ClearChatCommand {
     fn name(&self) -> &'static str {
@@ -932,6 +965,7 @@ pub(super) fn build_builtin_registry() -> CommandRegistry {
     r.register(Arc::new(CopyCommand));
     r.register(Arc::new(HotkeysCommand));
     r.register(Arc::new(ContextCommand));
+    r.register(Arc::new(SandboxCommand));
     r.register(Arc::new(SkillsCommand));
     r.register(Arc::new(UsageCommand));
     // Recognized but inert in v1 (one struct backs them all). The TS builtins

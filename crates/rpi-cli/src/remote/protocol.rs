@@ -305,6 +305,10 @@ pub enum RemoteCommand {
     SetActiveTools { tools: Vec<String> },
     /// Liveness probe.
     Ping,
+    /// Ask the server to re-emit dialogs that are still waiting for an answer.
+    /// Used by a reconnecting client; the response carries no list, the server
+    /// re-broadcasts `ui_dialog_request` events instead.
+    GetPendingDialogs,
     /// Ask the server to end the session loop.
     Stop,
 }
@@ -404,6 +408,14 @@ pub struct PromptOutcome {
 mod tests {
     use super::*;
     use rpi_agent::types::AgentToolResult;
+
+    #[test]
+    fn get_pending_dialogs_has_a_stable_wire_shape() {
+        let value = serde_json::to_value(RemoteCommand::GetPendingDialogs).unwrap();
+        assert_eq!(value, serde_json::json!({"type": "get_pending_dialogs"}));
+        let back: RemoteCommand = serde_json::from_value(value).unwrap();
+        assert_eq!(back, RemoteCommand::GetPendingDialogs);
+    }
 
     fn signed_native_result() -> AgentToolResult {
         use rpi_agent::types::TextContentOrImage;

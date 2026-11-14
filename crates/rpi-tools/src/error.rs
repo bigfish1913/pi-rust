@@ -225,7 +225,13 @@ pub fn io_to_file_code(err: &std::io::Error) -> FileErrorCode {
 /// the source. `path` is attached when the caller knows it.
 pub fn io_to_file_error(err: std::io::Error, path: Option<&str>) -> FileError {
     let code = io_to_file_code(&err);
-    let message = err.to_string();
+    let mut message = err.to_string();
+    if code == FileErrorCode::PermissionDenied {
+        // The kernel cannot tell us whether a mode bit or a filesystem sandbox
+        // (Landlock, Seatbelt, restricted token) denied the write. Point at both
+        // possibilities so the model and the user can react correctly.
+        message.push_str(" (permission denied; the filesystem sandbox may be blocking this path)");
+    }
     let mut e = FileError::new(code, message).with_source(Box::new(err));
     if let Some(p) = path {
         e = e.with_path(p);
@@ -236,6 +242,17 @@ pub fn io_to_file_error(err: std::io::Error, path: Option<&str>) -> FileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_denied_messages_mention_the_sandbox_hint() {
+        let error = io_to_file_error(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            Some("/etc/hosts"),
+        );
+        assert_eq!(error.code, FileErrorCode::PermissionDenied);
+        assert!(error.message.contains("filesystem sandbox"));
+        assert_eq!(error.path.as_deref(), Some("/etc/hosts"));
+    }
 
     #[test]
     fn file_error_codes_round_trip() {

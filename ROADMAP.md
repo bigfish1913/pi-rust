@@ -88,6 +88,33 @@ global plugins.
 Still unmeasured and worth adding: tool-loop throughput, memory growth over a
 long session, compaction cost, and interactive TUI frame cost.
 
+### 6. Filesystem sandbox (rpi as the sandbox)
+
+Today the model can write anywhere the user can, including `~/.ssh` and
+`~/.rpi/agent/extensions`, and plugin hooks cannot enforce a boundary because
+plugins share the host process. The target is a filesystem-only sandbox: every
+path stays readable, the project directory and temp directories are writable,
+everything else is read-only unless the user approves a one-off or
+session-scoped exception. The sandbox applies to `rpi` itself, so built-in
+tools, extensions and `bash` descendants inherit one boundary.
+
+See [Filesystem sandbox](docs/architecture/fs-sandbox.md) for the design,
+policy schema, approval protocol and known gaps.
+
+- **M0 – Policy model.** New `rpi-sandbox` crate with path rules, config merge
+  and capability probing; project settings may only tighten the policy. (1–2 days)
+- **M1 – Linux enforcement.** Apply Landlock to the whole process before the
+  Tokio runtime starts; map `EACCES` to a structured sandbox denial; child
+  processes inherit automatically. Opt-in at first. (2–3 days)
+- **M2 – Approvals.** Supervisor + broker, `ApprovalFrontend` (TUI, headless,
+  RPC), audit log, revocable scopes and replayable pending requests. (3–5 days)
+- **M3 – macOS.** Seatbelt profile applied at startup. (2–3 days)
+- **M4 – Windows.** Restricted token + synthetic SID + ACL transaction and
+  crash cleanup; switch the rustls crypto provider to drop the `bcrypt.dll`
+  shim. (5–8 days)
+- **M5 – External clients.** Desktop/IDE clients consume
+  `approval.request`/`response` over the remote protocol.
+
 ## Provider packages
 
 Provider boundary cleanup keeps Anthropic and OpenAI in core. DeepSeek,

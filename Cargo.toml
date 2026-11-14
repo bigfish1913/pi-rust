@@ -12,6 +12,7 @@ members = [
     "crates/rpi-tui",
     "crates/rpi-plugin-sdk",
     "crates/rpi-extensions",
+    "crates/rpi-sandbox",
     "examples/minimal",
     "examples/tools",
     "examples/tui",
@@ -87,6 +88,7 @@ rpi-tui = { path = "crates/rpi-tui", version = "0.24.0" }
 
 rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.24.0" }
 rpi-extensions = { path = "crates/rpi-extensions", version = "0.24.0" }
+rpi-sandbox = { path = "crates/rpi-sandbox", version = "0.24.0" }
 
 [profile.release]
 lto = "thin"

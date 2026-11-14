@@ -1,0 +1,28 @@
+[package]
+name = "rpi-sandbox"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rpi-sandbox"
+description = "Filesystem sandbox policy and platform capability probing for rpi"
+readme = "README.md"
+keywords = ["sandbox", "landlock", "filesystem", "agent"]
+categories = ["filesystem", "os"]
+
+[dependencies]
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

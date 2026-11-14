@@ -1107,6 +1107,9 @@ pub async fn interactive_tui(
     // of returning a fabricated answer. The mailbox is session-scoped (held in
     // `ReloadContext`) so in-flight prompts survive a `/reload`.
     let ask_user_bridge = AskUserBridge::new(reload_context.ui_dialog.clone());
+    // Filesystem-sandbox approvals: tool tasks queue a request here and the key
+    // loop renders the dialog. Headless modes never install it, so they deny.
+    let approval_bridge = crate::sandbox_approval::install();
     if !ask_user_bridge.attach() {
         eprintln!(
             "[rpi] interactive dialog bridge attachment was rejected; refusing to start the TUI"
@@ -1239,6 +1242,9 @@ pub async fn interactive_tui(
     }
     footer.set_cwd(&cwd.to_string_lossy());
     footer.set_git_branch(git_branch_for(&cwd).as_deref());
+    if let Some(label) = crate::sandbox::active_status().and_then(|status| status.footer_label()) {
+        footer.set_sandbox(Some(&label));
+    }
     if let Some(m) = model_catalog.iter().find(|m| m.id == lane_model_id) {
         footer.set_context_window(m.context_window as i64);
     }
@@ -1843,6 +1849,7 @@ pub async fn interactive_tui(
     let state_for_key = state.clone();
     let model_catalog_for_key = model_catalog_arc.clone();
     let ask_user_for_key = ask_user_bridge.clone();
+    let approval_for_key = approval_bridge.clone();
     // Ctrl+L routes through the same registry as `/model` (one path, not two),
     // so the key loop needs the same `CommandContext` + registry the submit
     // handler uses. All fields are `Arc`/cheap, so this clone is free.
@@ -1903,6 +1910,12 @@ pub async fn interactive_tui(
                         windows_paste_run.end_paste_session();
                     }
                     open_ask_user_dialog(&ctx_for_key, ask_user_for_key.clone(), request);
+                }
+                while !state_for_key.selector_open() {
+                    let Some(job) = approval_for_key.take_pending() else {
+                        break;
+                    };
+                    open_approval_dialog(&ctx_for_key, job);
                 }
             }
             let ev = if let Some(ev) = pending_event.take() {
@@ -3819,6 +3832,7 @@ pub async fn interactive_tui(
         lane.drain_session().await;
     }
 
+    approval_bridge.cancel_all();
     ask_user_bridge.shutdown();
     *running.lock().unwrap() = false;
     for handle in update_check_handles {

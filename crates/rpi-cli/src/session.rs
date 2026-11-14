@@ -736,9 +736,8 @@ pub async fn build_prepared(
     action_host.set_catalog(catalog.clone());
 
     // ---- Execution env + tools ----
-    let env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
-    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+    let base_env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
+    let (env_dyn, mut_env) = crate::sandbox_env::for_session(base_env);
     let _registry = Arc::new(MutationQueueRegistry::new());
     // `env_dyn` is shared between the tool context (moved in) and the resource
     // loaders below (borrowed); clone one branch so both hold a reference.

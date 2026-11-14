@@ -8,6 +8,7 @@
 | --- | --- |
 | 安装、命令、配置与日常使用 | [用户指南](guides/user-guide.md) |
 | SDK 分层与 crate 职责 | [架构概览](architecture/overview.md) |
+| 文件系统沙箱（rpi 自身即沙箱） | [文件系统沙箱](architecture/fs-sandbox.md) |
 | Provider 边界、独立 package 与迁移 | [Provider packages](architecture/provider-packages.md) |
 | Provider 接入、认证、流式与验收规范 | [Provider 接入规范](extensions/provider-integration.md) |
 | 创建 Agent、复用工具与嵌入 SDK | [项目结构](agent/project-structure.md) |

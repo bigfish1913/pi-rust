@@ -64,6 +64,8 @@ pub(super) enum SelectorKind {
     Settings,
     /// `/tree` — navigate to an existing entry in the current session.
     Tree,
+    /// Filesystem-sandbox approval prompt (allow once/session or deny).
+    Approval,
     /// Extension-provided selector; uses the same keyboard contract.
     Extension,
 }

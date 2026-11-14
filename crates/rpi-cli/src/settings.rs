@@ -186,6 +186,12 @@ pub struct Settings {
     /// are enabled. When present, only the named tools are enabled.
     #[serde(default)]
     pub default_tools: Option<Vec<String>>,
+    /// Filesystem sandbox configuration. Parsed and surfaced today; enforcement
+    /// arrives with the sandbox milestones (see
+    /// `docs/architecture/fs-sandbox.md`). Project settings may only tighten
+    /// this block — see [`crate::sandbox::effective_policy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<rpi_sandbox::SandboxSettings>,
     /// Hide the body of thinking blocks while retaining a compact label.
     #[serde(default)]
     pub hide_thinking_block: Option<bool>,
@@ -800,6 +806,43 @@ mod tests {
         assert_eq!(s.show_terminal_progress, Some(false));
         assert_eq!(s.editor_padding_x, Some(3));
         assert_eq!(s.autocomplete_max_visible, Some(7));
+    }
+
+    #[test]
+    fn reads_sandbox_settings() {
+        let settings = parse_settings(
+            r#"{
+                "sandbox": {
+                    "enabled": true,
+                    "mode": "auto",
+                    "writable": ["${cwd}/target"],
+                    "protected": ["${home}/.ssh"],
+                    "allowFileWrites": ["/dev/null"],
+                    "approval": { "enabled": true, "defaultScope": "session" },
+                    "auditLog": "${home}/.rpi/audit/sandbox.jsonl"
+                }
+            }"#,
+        )
+        .unwrap();
+        let sandbox = settings.sandbox.expect("sandbox block");
+        assert_eq!(sandbox.enabled, Some(true));
+        assert_eq!(sandbox.mode, Some(rpi_sandbox::SandboxMode::Auto));
+        assert_eq!(sandbox.writable, vec!["${cwd}/target".to_string()]);
+        assert_eq!(sandbox.protected, vec!["${home}/.ssh".to_string()]);
+        assert_eq!(sandbox.allow_file_writes, vec!["/dev/null".to_string()]);
+        assert_eq!(
+            sandbox
+                .approval
+                .as_ref()
+                .and_then(|approval| approval.default_scope),
+            Some(rpi_sandbox::ApprovalScope::Session)
+        );
+    }
+
+    #[test]
+    fn missing_sandbox_block_is_none() {
+        let settings = parse_settings(r#"{"theme":"dark"}"#).unwrap();
+        assert!(settings.sandbox.is_none());
     }
 
     #[test]
