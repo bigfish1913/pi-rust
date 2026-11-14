@@ -1,7 +1,7 @@
 //! The startup brand lockup, generated from the README logo with RASCII.
 //!
 //! Regenerate with `cargo install rascii_art --version 0.4.5 --locked`, then:
-//! `rascii docs/images/rpi-logo.jpg --width 44 --height 18 --invert --charset " .:-=+*#%@"`.
+//! `rascii docs/images/rpi-logo.jpg --width 64 --height 32 --invert --charset " .:-=+*#%@"`.
 //!
 //! The logo is kept as text rather than loading the README JPEG so it works in
 //! plain terminals, remote sessions, and terminals without image protocols.
@@ -14,25 +14,39 @@ use rpi_tui::{ansi::visible_width, theme as current_theme, Component};
 /// The full gear is rendered by [`render_lockup`].
 pub const MARK: &str = "@";
 
-const LOGO_ROWS: [&str; 18] = [
-    "                                            ",
-    "                   .---:                    ",
-    "            :=+-  .#-::%:. .+=:.            ",
-    "           +*..-+==-...:-==+..=%.           ",
-    "       ::..+*..-++++===++++=: =*:..:        ",
-    "      =*-==::*+-.          :=*=.==-=*.      ",
-    "     .++- .**.     .   ..    .=#: .++:      ",
-    "       *= #+     .=%+++#*:     :%:.%.       ",
-    "    +*==.:%.    :%:-+++=.*+     +* :==#     ",
-    "    +*--.:%.    :: @+:-%:-% .:  +* :-=%     ",
-    "     ..*-.#= *%++- @=---+*: -+ :%:.%:.      ",
-    "     .=+= .*+*+    @-:@-.   -#-#: :*+.      ",
-    "      =*:-=::*+:.  @-:@   ..-#=.=-:=*.      ",
-    "       :-:.=*. :+++%-:@++++-. +*:.:-        ",
-    "           -#. -+==-   :====..+#            ",
-    "            .=+=. .#=::%.  :+=:.            ",
-    "                   .::::                    ",
-    "                                            ",
+const LOGO_ROWS: [&str; 32] = [
+    "                                                                ",
+    "                                                                ",
+    "                                                                ",
+    "                            +%###%*                             ",
+    "                  .-+*:    .@=   -@.    :**-.                   ",
+    "                -*#+:-%*=*###.   .###*=+%=:+##-                 ",
+    "                -@:   .=-:.         .:-=.   :@=                 ",
+    "                .#%.   .:=*#%%%%%%%#*=:.   .##.                 ",
+    "          .+=:.-#*: .-*%#+-:.     ..-+#%*-. :*%-.:-+:           ",
+    "         :%+=+*#- .=%#-.               .-#%+. :##+=+@:          ",
+    "        :@=      -%#:                     :#@-      =@:         ",
+    "        :*%=.   =@=                         =@+.  .=%*:         ",
+    "          .@*  =@=         -#-----*-         -@+  +@:           ",
+    "          =@: :@*        .=#%*+++*%#=.        +@- .@=           ",
+    "      :+*##+  *@.       :%%-..-=-: :#%:       .@*  +##*+-       ",
+    "      *%..    %%        #%..+@*=*@*..#%.       *%    ..#*.      ",
+    "      *%     .%%       .#= :@+   =@: +@:       *@      #*.      ",
+    "      -###*=  *@.  ....::. :@@*+*@*..#%. -*-  .%#  =*###=       ",
+    "          =@. :@+ .+@%#*#+ :@+---..-%%:  :+:  =@- .@+           ",
+    "          .%*  +@-.+@=     :@= :+*%#=.   -@- :@*  +@.           ",
+    "        .-#*-   +@=+@:     :@= -@=.      -@--@*.  :*%=.         ",
+    "        :@+      -%@@:     :@= -@-       -@%@-      =@:         ",
+    "         :%+:=+*- .=%::.   :@= -@-     ..-%=. :*+=:+@-          ",
+    "          .**=:-%#:  .=%#+--@= -@-.:-+#%-.. :*%-:=+*.           ",
+    "                .+@.    :=+*#= :%%#*+=:.   .@*.                 ",
+    "                .@=   .-=-..        .-==.   =@.                 ",
+    "                :*%*-:##=+*#%.   .%#*+-*%--+#*:                 ",
+    "                  .:+#-    .@+   =@.    -#+-.                   ",
+    "                            =#####+                             ",
+    "                                                                ",
+    "                                                                ",
+    "                                                                ",
 ];
 
 /// The startup lockup flattened into a terminal window/tab title.
@@ -108,11 +122,11 @@ mod tests {
     #[test]
     fn logo_has_the_readme_lockup_shape() {
         let rows = plain();
-        assert_eq!(rows.len(), 18);
+        assert_eq!(rows.len(), 32);
         assert!(rows.iter().any(|row| row.contains("#")));
         assert!(rows.iter().any(|row| row.contains("+=")));
-        assert!(rows[1].contains("---:"));
-        assert!(rows[16].contains("::::"));
+        assert!(rows[3].contains("+%###%*"));
+        assert!(rows[28].contains("=#####+"));
     }
 
     #[test]
@@ -120,7 +134,7 @@ mod tests {
         let rows = plain();
         let widths: Vec<usize> = rows.iter().map(|row| visible_width(row)).collect();
         assert!(widths.iter().all(|width| *width == widths[0]));
-        assert_eq!(widths[0], 44);
+        assert_eq!(widths[0], 64);
     }
 
     #[test]
