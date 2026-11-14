@@ -585,6 +585,9 @@ where
     // `{"type":"ui_dialog_response",…}` on stdin. Without this a headless run
     // leaves the mailbox detached and every `UiDialog` call fails.
     ui_dialog.attach();
+    // Filesystem-sandbox approvals use the same mailbox, so a connected client
+    // renders and answers them through the existing ui_dialog protocol.
+    crate::sandbox_approval::install_remote(ui_dialog.clone());
     let dialog_task = {
         let mailbox = ui_dialog.clone();
         let out = stdout.clone();

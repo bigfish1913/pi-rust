@@ -91,17 +91,28 @@ impl SandboxedEnv {
         operations: &[WriteOp],
         bytes: Option<u64>,
     ) -> Result<(), FileError> {
-        let Some(bridge) = crate::sandbox_approval::bridge() else {
+        let operation = operations.first().copied().unwrap_or(WriteOp::Overwrite);
+        // An existing session/directory approval short-circuits the prompt.
+        if self.broker.is_approved(abs, operation) {
+            return Ok(());
+        }
+        let Some(decision) = crate::sandbox_approval::ask(operation, abs, raw, bytes).await else {
             return Err(self.denied(
                 raw,
                 "the filesystem sandbox blocked this write and no approval prompt is available",
             ));
         };
-        let operation = operations.first().copied().unwrap_or(WriteOp::Overwrite);
-        match bridge.ask(operation, abs, raw, bytes).await {
-            ApprovalDecision::Allow(scope) => {
+        match decision {
+            ApprovalDecision::Allow { scope, recursive } => {
+                // A directory approval is recorded on the containing directory
+                // so siblings are covered too.
+                let approve_path = if recursive {
+                    abs.parent().unwrap_or(abs).to_path_buf()
+                } else {
+                    abs.to_path_buf()
+                };
                 self.broker
-                    .approve(abs, operations, scope)
+                    .approve(&approve_path, operations, scope, recursive)
                     .map_err(|error| {
                         self.denied(raw, &format!("approval could not be recorded: {error}"))
                     })

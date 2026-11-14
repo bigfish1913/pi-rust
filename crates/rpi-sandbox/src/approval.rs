@@ -96,8 +96,14 @@ impl ApprovalRequest {
 /// Decision returned by a frontend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalDecision {
-    /// Allow with the given scope.
-    Allow(ApprovalScope),
+    /// Allow with the given scope. `recursive` covers the containing directory
+    /// instead of only the exact path.
+    Allow {
+        /// Lifetime of the approval.
+        scope: ApprovalScope,
+        /// Whether the whole directory was approved.
+        recursive: bool,
+    },
     /// Deny the request.
     Deny,
 }
@@ -105,7 +111,7 @@ pub enum ApprovalDecision {
 impl ApprovalDecision {
     /// Whether the decision allows the operation.
     pub fn is_allowed(self) -> bool {
-        matches!(self, Self::Allow(_))
+        matches!(self, Self::Allow { .. })
     }
 }
 

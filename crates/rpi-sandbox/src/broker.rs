@@ -44,6 +44,9 @@ pub enum BrokerRequest {
         operations: Vec<WriteOp>,
         /// Lifetime of the approval.
         scope: ApprovalScope,
+        /// Whether the approval covers the containing directory subtree.
+        #[serde(default)]
+        recursive: bool,
     },
     /// Write (or append to) a file.
     Write {
@@ -72,6 +75,25 @@ pub enum BrokerRequest {
         /// Destination path.
         target: String,
     },
+    /// Check whether an approval exists without consuming it.
+    Query {
+        /// Request id.
+        id: u64,
+        /// Absolute path to check.
+        path: String,
+        /// Operation to check.
+        operation: WriteOp,
+    },
+    /// Revoke approvals for a path (and its subtree when recursive).
+    Revoke {
+        /// Request id.
+        id: u64,
+        /// Absolute path to revoke.
+        path: String,
+        /// Also drop directory approvals rooted at this path.
+        #[serde(default)]
+        recursive: bool,
+    },
     /// Truncate a file to `len` bytes.
     Truncate {
         /// Request id.
@@ -98,6 +120,8 @@ impl BrokerRequest {
             | Self::Write { id, .. }
             | Self::Delete { id, .. }
             | Self::Rename { id, .. }
+            | Self::Revoke { id, .. }
+            | Self::Query { id, .. }
             | Self::Truncate { id, .. }
             | Self::Mkdir { id, .. } => *id,
         }
@@ -109,6 +133,8 @@ impl BrokerRequest {
             | Self::Write { path, .. }
             | Self::Delete { path, .. }
             | Self::Rename { path, .. }
+            | Self::Revoke { path, .. }
+            | Self::Query { path, .. }
             | Self::Truncate { path, .. }
             | Self::Mkdir { path, .. } => path,
         }
@@ -120,6 +146,8 @@ impl BrokerRequest {
             Self::Write { .. } => "write",
             Self::Delete { .. } => "delete",
             Self::Rename { .. } => "rename",
+            Self::Revoke { .. } => "revoke",
+            Self::Query { .. } => "query",
             Self::Truncate { .. } => "truncate",
             Self::Mkdir { .. } => "mkdir",
         }
@@ -160,6 +188,7 @@ impl BrokerResponse {
 struct Entry {
     operations: BTreeSet<WriteOp>,
     scope: ApprovalScope,
+    recursive: bool,
 }
 
 /// Session-scoped approval store owned by the broker (not the sandboxed agent).
@@ -170,7 +199,7 @@ pub struct ApprovalStore {
 
 impl ApprovalStore {
     /// Record an approval. `ops` must be non-empty.
-    pub fn approve(&mut self, path: &Path, ops: &[WriteOp], scope: ApprovalScope) {
+    pub fn approve(&mut self, path: &Path, ops: &[WriteOp], scope: ApprovalScope, recursive: bool) {
         let operations: BTreeSet<WriteOp> = ops.iter().copied().collect();
         if operations.is_empty() {
             return;
@@ -180,25 +209,62 @@ impl ApprovalStore {
             .and_modify(|entry| {
                 entry.operations.extend(operations.iter().copied());
                 entry.scope = scope;
+                entry.recursive |= recursive;
             })
-            .or_insert(Entry { operations, scope });
+            .or_insert(Entry {
+                operations,
+                scope,
+                recursive,
+            });
     }
 
     /// Revoke every approval for `path`.
-    pub fn revoke(&mut self, path: &Path) {
-        self.entries.remove(&normalize_and_resolve(path));
+    pub fn revoke(&mut self, path: &Path, recursive: bool) {
+        let key = normalize_and_resolve(path);
+        self.entries.remove(&key);
+        if recursive {
+            self.entries
+                .retain(|root, entry| !(entry.recursive && root.starts_with(&key)));
+        }
+    }
+
+    /// Whether an approval covers `path` (no consumption).
+    pub fn check(&self, path: &Path, operation: WriteOp) -> bool {
+        let key = normalize_and_resolve(path);
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.operations.contains(&operation))
+        {
+            return true;
+        }
+        self.entries.iter().any(|(root, entry)| {
+            entry.recursive && entry.operations.contains(&operation) && key.starts_with(root)
+        })
     }
 
     /// Check and consume one use of an approval.
     pub fn allow(&mut self, path: &Path, operation: WriteOp) -> bool {
         let key = normalize_and_resolve(path);
-        let Some(entry) = self.entries.get(&key) else {
+        let mut matched: Option<(PathBuf, ApprovalScope)> = None;
+        if let Some(entry) = self.entries.get(&key) {
+            if entry.operations.contains(&operation) {
+                matched = Some((key.clone(), entry.scope));
+            }
+        }
+        if matched.is_none() {
+            // Directory approvals cover any descendant.
+            for (root, entry) in &self.entries {
+                if entry.recursive && entry.operations.contains(&operation) && key.starts_with(root)
+                {
+                    matched = Some((root.clone(), entry.scope));
+                    break;
+                }
+            }
+        }
+        let Some((key, scope)) = matched else {
             return false;
         };
-        if !entry.operations.contains(&operation) {
-            return false;
-        }
-        let scope = entry.scope;
         if scope == ApprovalScope::Once {
             self.entries.remove(&key);
         }
@@ -249,10 +315,11 @@ fn handle(
             path,
             operations,
             scope,
+            recursive,
             ..
         } => match absolute_path(&path) {
             Some(path) => {
-                store.approve(&path, &operations, scope);
+                store.approve(&path, &operations, scope, recursive);
                 Ok(())
             }
             None => Err(format!("approval path must be absolute: {path}")),
@@ -321,6 +388,21 @@ fn handle(
                 _ => Err("rename requires absolute source and target".to_string()),
             }
         }
+        BrokerRequest::Query {
+            path, operation, ..
+        } => with_absolute(&path, |path| {
+            if store.check(path, operation) {
+                Ok(())
+            } else {
+                Err("not approved".to_string())
+            }
+        }),
+        BrokerRequest::Revoke {
+            path, recursive, ..
+        } => with_absolute(&path, |path| {
+            store.revoke(path, recursive);
+            Ok(())
+        }),
         BrokerRequest::Truncate { path, len, .. } => with_absolute(&path, |path| {
             if !store.allow(path, WriteOp::Overwrite) {
                 return Err(format!("truncate of {} is not approved", path.display()));
@@ -402,7 +484,14 @@ pub trait WriteBroker: Send + Sync {
         path: &Path,
         operations: &[WriteOp],
         scope: ApprovalScope,
+        recursive: bool,
     ) -> Result<(), String>;
+    /// Drop approvals for a path (and its subtree when `recursive`).
+    fn revoke(&self, path: &Path, recursive: bool) -> Result<(), String>;
+    /// Whether an approval already covers `path` (no consumption).
+    fn is_approved(&self, _path: &Path, _operation: WriteOp) -> bool {
+        false
+    }
     /// Write bytes.
     fn write(&self, path: &Path, data: &[u8]) -> Result<(), String>;
     /// Append bytes.
@@ -458,12 +547,33 @@ impl BrokerClient {
         path: &Path,
         operations: &[WriteOp],
         scope: ApprovalScope,
+        recursive: bool,
     ) -> Result<(), String> {
         self.send(BrokerRequest::Approve {
             id: self.id(),
             path: path.to_string_lossy().into_owned(),
             operations: operations.to_vec(),
             scope,
+            recursive,
+        })
+    }
+
+    /// Whether the broker already covers `path` for `operation`.
+    pub fn is_approved(&self, path: &Path, operation: WriteOp) -> bool {
+        self.send(BrokerRequest::Query {
+            id: self.id(),
+            path: path.to_string_lossy().into_owned(),
+            operation,
+        })
+        .is_ok()
+    }
+
+    /// Revoke approvals for `path` (and its subtree when `recursive`).
+    pub fn revoke(&self, path: &Path, recursive: bool) -> Result<(), String> {
+        self.send(BrokerRequest::Revoke {
+            id: self.id(),
+            path: path.to_string_lossy().into_owned(),
+            recursive,
         })
     }
 
@@ -565,8 +675,16 @@ impl WriteBroker for BrokerClient {
         path: &Path,
         operations: &[WriteOp],
         scope: ApprovalScope,
+        recursive: bool,
     ) -> Result<(), String> {
-        BrokerClient::approve(self, path, operations, scope)
+        BrokerClient::approve(self, path, operations, scope, recursive)
+    }
+
+    fn revoke(&self, path: &Path, recursive: bool) -> Result<(), String> {
+        BrokerClient::revoke(self, path, recursive)
+    }
+    fn is_approved(&self, path: &Path, operation: WriteOp) -> bool {
+        BrokerClient::is_approved(self, path, operation)
     }
 
     fn write(&self, path: &Path, data: &[u8]) -> Result<(), String> {
@@ -605,8 +723,15 @@ impl WriteBroker for SharedBroker {
         path: &Path,
         operations: &[WriteOp],
         scope: ApprovalScope,
+        recursive: bool,
     ) -> Result<(), String> {
-        self.0.approve(path, operations, scope)
+        self.0.approve(path, operations, scope, recursive)
+    }
+    fn revoke(&self, path: &Path, recursive: bool) -> Result<(), String> {
+        self.0.revoke(path, recursive)
+    }
+    fn is_approved(&self, path: &Path, operation: WriteOp) -> bool {
+        self.0.is_approved(path, operation)
     }
     fn write(&self, path: &Path, data: &[u8]) -> Result<(), String> {
         self.0.write(path, data)
@@ -677,6 +802,7 @@ mod tests {
                     path: target.to_string_lossy().into_owned(),
                     operations: vec![WriteOp::Create, WriteOp::Overwrite],
                     scope: ApprovalScope::Session,
+                    recursive: false,
                 },
                 BrokerRequest::Write {
                     id: 2,
@@ -704,6 +830,7 @@ mod tests {
                     path: path.clone(),
                     operations: vec![WriteOp::Create, WriteOp::Overwrite],
                     scope: ApprovalScope::Once,
+                    recursive: false,
                 },
                 BrokerRequest::Write {
                     id: 2,
@@ -752,6 +879,7 @@ mod tests {
                     path: path.clone(),
                     operations: vec![WriteOp::Create],
                     scope: ApprovalScope::Session,
+                    recursive: false,
                 },
                 BrokerRequest::Write {
                     id: 2,
@@ -771,6 +899,67 @@ mod tests {
         assert!(text.contains("\"ok\":true"));
         assert!(text.contains("\"op\":\"delete\""));
         assert!(text.contains("\"ok\":false"));
+    }
+
+    #[test]
+    fn recursive_approval_covers_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("nested/deep/file.txt");
+        let responses = serve_bytes(
+            &[
+                BrokerRequest::Approve {
+                    id: 1,
+                    path: dir.path().to_string_lossy().into_owned(),
+                    operations: vec![WriteOp::Create, WriteOp::Overwrite],
+                    scope: ApprovalScope::Session,
+                    recursive: true,
+                },
+                BrokerRequest::Write {
+                    id: 2,
+                    path: child.to_string_lossy().into_owned(),
+                    data: base64::engine::general_purpose::STANDARD.encode(b"deep"),
+                    append: false,
+                },
+            ],
+            None,
+        );
+        assert!(responses[0].ok);
+        assert!(responses[1].ok, "{:?}", responses[1]);
+        assert_eq!(std::fs::read_to_string(&child).unwrap(), "deep");
+    }
+
+    #[test]
+    fn revoke_drops_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("revoked.txt");
+        let path = target.to_string_lossy().into_owned();
+        let responses = serve_bytes(
+            &[
+                BrokerRequest::Approve {
+                    id: 1,
+                    path: path.clone(),
+                    operations: vec![WriteOp::Create],
+                    scope: ApprovalScope::Session,
+                    recursive: false,
+                },
+                BrokerRequest::Revoke {
+                    id: 2,
+                    path: path.clone(),
+                    recursive: true,
+                },
+                BrokerRequest::Write {
+                    id: 3,
+                    path,
+                    data: base64::engine::general_purpose::STANDARD.encode(b"x"),
+                    append: false,
+                },
+            ],
+            None,
+        );
+        assert!(responses[0].ok);
+        assert!(responses[1].ok);
+        assert!(!responses[2].ok);
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]
@@ -799,6 +988,7 @@ mod tests {
                 &target,
                 &[WriteOp::Create, WriteOp::Overwrite],
                 ApprovalScope::Session,
+                false,
             )
             .unwrap();
         client.write(&target, b"yes").unwrap();

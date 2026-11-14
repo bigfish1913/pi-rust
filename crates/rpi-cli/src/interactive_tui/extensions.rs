@@ -862,6 +862,8 @@ pub(super) fn open_approval_dialog(
             .with_description("Write this file once; ask again next time"),
         SelectItem::new("session", "Allow for this session")
             .with_description("Keep this path writable until rpi exits"),
+        SelectItem::new("directory", "Allow this directory")
+            .with_description("Allow the containing directory for this session"),
         SelectItem::new("deny", "Deny").with_description("Leave the path read-only"),
     ];
     let list = Arc::new(SelectList::new(items, 4));

@@ -27,6 +27,7 @@ impl WriteBroker for FakeBroker {
         path: &Path,
         operations: &[WriteOp],
         scope: ApprovalScope,
+        _recursive: bool,
     ) -> Result<(), String> {
         assert!(!operations.is_empty());
         self.approvals
@@ -42,6 +43,10 @@ impl WriteBroker for FakeBroker {
         }
         std::fs::write(path, data).map_err(|error| error.to_string())?;
         self.writes.lock().unwrap().push(path.to_path_buf());
+        Ok(())
+    }
+
+    fn revoke(&self, _path: &Path, _recursive: bool) -> Result<(), String> {
         Ok(())
     }
 
@@ -121,7 +126,10 @@ async fn approved_write_uses_the_broker_and_denied_write_stays_put() {
     assert_eq!(job.request.operation, WriteOp::Create);
     assert_eq!(job.request.path, target);
     job.respond
-        .send(rpi_sandbox::ApprovalDecision::Allow(ApprovalScope::Once))
+        .send(rpi_sandbox::ApprovalDecision::Allow {
+            scope: ApprovalScope::Once,
+            recursive: false,
+        })
         .unwrap();
     task.await.unwrap().expect("approved write must succeed");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "approved");
