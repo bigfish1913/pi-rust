@@ -1089,7 +1089,7 @@ pub type BeforeAgentStartFn =
 /// observes.
 ///
 /// `event_json` is a borrowed envelope `{"toolCallId", "toolName", "input",
-/// "content", "details"}`: `input` holds the arguments the tool ran with,
+/// "content", "details", "isError"}`: `input` holds the arguments the tool ran with,
 /// `content` is the result in the shape a plugin tool returns (`text` and
 /// `image` blocks, `image` carrying base64 `data` and `mimeType`). `out` is
 /// plugin-produced JSON with the fields to replace, `{"content": [...]}`,
@@ -1098,9 +1098,15 @@ pub type BeforeAgentStartFn =
 ///
 /// Handlers chain in registration order, each seeing the previous one's
 /// result. A nonzero return or a panic leaves the result as it was and the
-/// fan-out continues. Only successful results are offered: a tool that fails
-/// reports an error, not content. Handlers run on a blocking thread, so slow
-/// work (re-encoding an image) does not stall the runtime.
+/// fan-out continues. The `rpi` host offers every finished result, error
+/// results included (`"isError": true`, for example a bash exit != 0 with its
+/// output); a transform cannot change whether the call failed. The reason of a
+/// call vetoed by a `ToolCall` handler is offered too, as the text of an error
+/// result with `"details": {"blocked": true}`; the first non-empty `text` block
+/// returned becomes the reason the model reads. If the transforms cannot run,
+/// the host withholds the result rather than pass it on. Handlers run on a
+/// blocking thread, so slow work (re-encoding an image) does not stall the
+/// runtime.
 ///
 /// SAFETY: the plugin warrants `user_data` is valid for the registry's lifetime
 /// and the handler is callable from any thread.
