@@ -7,6 +7,13 @@ rpi 支持把 agent 跑在**一个无头服务端**上，然后从**另一个进
 > `packages/coding-agent/src/modes/rpc/` 与 `src/client/`（`RemoteSession` + transcript）
 > 的分层思想，但协议与会话模型都是 rpi 自己的 Rust 实现，**不依赖任何 pi 运行时组件**。
 
+## 未决对话框的重连重放
+
+客户端连接（或重连）到同一个服务端会话时，会发送 `get_pending_dialogs`。
+服务端把仍等待回答的对话框重新广播为普通的 `ui_dialog_request` 事件，
+客户端按 `request_id` 去重即可。作用域仅限**同一个服务端会话**：`rpi`
+进程退出后未决请求随之丢弃，不会持久化到磁盘。
+
 ## 快速开始
 
 ```bash

@@ -588,10 +588,15 @@ where
     // Filesystem-sandbox approvals use the same mailbox, so a connected client
     // renders and answers them through the existing ui_dialog protocol.
     crate::sandbox_approval::install_remote(ui_dialog.clone());
+    // A reconnecting client asks for still-pending dialogs; the dialog task
+    // re-broadcasts them as ordinary `ui_dialog_request` events (command
+    // responses are not forwarded through the event pump).
+    let resend_dialogs = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dialog_task = {
         let mailbox = ui_dialog.clone();
         let out = stdout.clone();
         let stop = pump_stop.clone();
+        let resend = resend_dialogs.clone();
         tokio::spawn(async move {
             let mut shown = std::collections::HashSet::new();
             while !stop.is_cancelled() {
@@ -611,6 +616,19 @@ where
                     };
                     write_line(&out, &serde_json::to_value(event).unwrap()).await;
                     shown.insert(request.request_id);
+                }
+                if resend.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    for request_id in &shown {
+                        let Some(request) = mailbox.pending_request_by_id(request_id) else {
+                            continue;
+                        };
+                        let event = crate::remote::protocol::RemoteEvent::UiDialogRequest {
+                            request_id: request.request_id,
+                            tool_call_id: request.tool_call_id,
+                            ui: request.ui,
+                        };
+                        write_line(&out, &serde_json::to_value(event).unwrap()).await;
+                    }
                 }
                 let closed: Vec<String> = shown
                     .iter()
@@ -1171,6 +1189,10 @@ where
                 } else {
                     crate::resource_selection::get_resource_state(harness).await
                 }
+            }
+            "get_pending_dialogs" => {
+                resend_dialogs.store(true, std::sync::atomic::Ordering::Release);
+                Ok(serde_json::json!({"queued": true}))
             }
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
             "get_commands" => {
@@ -4880,6 +4902,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_replays_pending_dialogs_on_request() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, _provider) = rpc_test_harness("must not be called", 0.0).await;
+        let ui = rpi_extensions::UiDialogMailbox::new();
+        let (mut client, output, task) = start_test_rpc(harness, ui.clone());
+        output.wait_for(|m| m["type"] == "ready").await;
+
+        ui.handle(serde_json::json!({
+            "op": "open",
+            "requestId": "replay-1",
+            "toolCallId": "t1",
+            "ui": {"question": "ok?"}
+        }))
+        .unwrap();
+
+        let count = |output: &RpcOutput| {
+            output
+                .messages()
+                .iter()
+                .filter(|m| m["type"] == "ui_dialog_request" && m["requestId"] == "replay-1")
+                .count()
+        };
+        output
+            .wait_for(|m| m["type"] == "ui_dialog_request" && m["requestId"] == "replay-1")
+            .await;
+        assert_eq!(count(&output), 1);
+
+        // A reconnecting client asks for a replay.
+        let command = crate::remote::protocol::RemoteCommand::GetPendingDialogs.with_id(9);
+        client
+            .write_all(format!("{command}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while count(&output) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replayed dialog event");
+
+        // Answering it removes it from the replay set.
+        ui.respond("replay-1", serde_json::json!({"values": ["Yes"]}))
+            .unwrap();
+        let command = crate::remote::protocol::RemoteCommand::GetPendingDialogs.with_id(10);
+        client
+            .write_all(format!("{command}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(count(&output), 2);
+
+        client.shutdown().await.unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rpc_accepts_native_dialog_responses_without_consuming_plugin_answers() {
         use crate::remote::protocol::RemoteCommand;
         use tokio::io::AsyncWriteExt;

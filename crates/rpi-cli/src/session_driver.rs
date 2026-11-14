@@ -264,6 +264,14 @@ impl RemoteDriver {
             let _ = tx.send(DriverEvent::Ended);
         });
 
+        // Reconnect replay: ask the server to re-broadcast dialogs that are
+        // still waiting for an answer. Responses are not forwarded by the event
+        // pump, so this is deliberately fire-and-forget; the re-emitted
+        // `ui_dialog_request` events arrive through the normal stream.
+        let _ = client
+            .send_command(&session_id, RemoteCommand::GetPendingDialogs.with_id(0_u64))
+            .await;
+
         let driver = Self {
             client: tokio::sync::Mutex::new(client),
             session_id,

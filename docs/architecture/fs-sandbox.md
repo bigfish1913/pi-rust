@@ -3,9 +3,9 @@
 > 状态：**M1 已实现**（Linux Landlock 全进程强制）；**M2 已实现核心链路**
 > （broker 进程、授权协议、审计、headless 默认拒绝、TUI 授权弹窗、
 > `Allow once` / `Allow for this session` / `Allow this directory`、
-> `/sandbox revoke`，以及复用 `ui_dialog` 事件的远程授权）。真正的
-> “断线重放未决请求”仍待远程客户端握手协议支持。macOS / Windows 后端尚未实现。
-> 实现进度以 [ROADMAP](../../ROADMAP.md) 为准。
+> `/sandbox revoke`，以及复用 `ui_dialog` 事件的远程授权）。远程客户端重连后
+> 会请求服务端重播仍未回答的对话框（会话内有效；进程重启不保留）。macOS /
+> Windows 后端尚未实现。实现进度以 [ROADMAP](../../ROADMAP.md) 为准。
 
 ## 1. 目标与非目标
 
@@ -418,7 +418,7 @@ pub struct ApprovalDecision {
 | --- | --- | --- |
 | M0（已实现） | `rpi-sandbox` 策略模型、路径展开、优先级、能力探测桩；`settings.rs` 增加 `sandbox` 段与“项目只能收紧”合并；同步 `bootstrap()` 空实现 | 配置可解析、可展示、行为不变 |
 | M1（已实现） | Linux Landlock 全进程应用（入口改为同步预检）；`EACCES` 映射为带沙箱提示的错误；bash 后代继承 | 基础语义与逃逸用例通过；默认 `auto` |
-| M2（核心已实现） | supervisor + broker、审计、headless 默认拒绝、TUI 弹窗、目录授权、撤销、远程 `ui_dialog` 授权已落地；断线重放未决请求待远程握手支持 | 授权链路完整；多客户端仲裁正确 |
+| M2（核心已实现） | supervisor + broker、审计、headless 默认拒绝、TUI 弹窗、目录授权、撤销、远程 `ui_dialog` 授权、会话内重连重播已落地 | 授权链路完整；多客户端仲裁正确 |
 | M3 | macOS Seatbelt | 同一测试矩阵通过 |
 | M4 | Windows restricted token + ACL 事务 + 崩溃清理 + crypto provider 切换 | 测试矩阵通过；无残留 ACL |
 | M5 | 外部客户端（GUI/IDE）消费授权事件；远程模式下的授权认证 | 协议兼容性测试 |
