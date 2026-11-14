@@ -101,13 +101,24 @@ pub enum PathRule {
 
 支持展开：`${cwd}`、`${home}`、`${tmp}`、`~`。相对路径相对于 `cwd` 解析。
 
+**默认值**：`enabled` 缺省为 `true`（沙箱默认开启），`mode` 缺省为 `auto`。关闭方式：
+
+```bash
+rpi --no-sandbox                 # 本次运行
+export RPI_SANDBOX=0             # 整个 shell
+```
+
+或在全局 `settings.json` 写 `"sandbox": { "enabled": false }`（项目配置无权关闭）。
+
 ### 4.3 配置来源与提权规则
 
 | 来源 | 追加 `writable` | 关闭沙箱 | 说明 |
 | --- | --- | --- | --- |
 | 全局 `~/.rpi/agent/settings.json` | 允许 | 允许 | 用户自己的配置 |
 | 项目 `.rpi/settings.json` | **禁止** | **禁止** | 仓库不可信，只能追加 `protected` |
-| 命令行 `--sandbox` / `--no-sandbox` / `--allow-write <path>` | 允许 | 允许 | 用户显式意图 |
+| 命令行 `--sandbox` / `--no-sandbox` | 允许 | 允许 | 用户显式意图 |
+| 命令行 `--sandbox-mode off\|auto\|required` | — | 允许 | 控制能力缺失时的行为 |
+| 命令行 `--allow-write <path>`（可重复） | 允许 | — | 追加可写根，不关闭沙箱 |
 | 环境变量 `RPI_SANDBOX=0` | 允许 | 允许 | 与命令行等价 |
 
 ### 4.4 自动纳入的可写路径
@@ -343,9 +354,10 @@ pub struct ApprovalDecision {
 
 | 位置 | 内容 |
 | --- | --- |
-| 启动横幅 | `🔒 sandbox: landlock · rw: <cwd>, /tmp · protected: 3` 或 `🔓 sandbox: off (unsupported: no landlock)` |
-| TUI 页脚 | 常驻锁标记：`🔒` 有沙箱 / `🔓` 无沙箱 / `⏸` 维护命令绕过 |
-| `/sandbox` | 展示后端、模式、可写根、保护项、本会话已授权路径、最近拒绝记录 |
+| TUI 页脚 | 常驻徽标（M1 已实现）：`🔒 landlock` / `🔓 sandbox off` / `🔓 sandbox unavailable` / `⏸ sandbox bypassed` |
+| `/sandbox` | 展示状态、模式、后端、可写根、保护项与嵌套告警（M1 已实现） |
+| 启动横幅 | 计划中：`🔒 sandbox: landlock · rw: <cwd>, /tmp` |
+| 审批面板 | M2：本会话已授权路径、最近拒绝记录 |
 | 拒绝弹窗 | 显示原始路径与真实路径、操作类型、字节数，提供“仅本次 / 本会话 / 拒绝” |
 | `--mode json` | 启动事件包含 `sandbox: { enabled, backend, writable }` |
 | 日志 | `auto` 回退时在 stderr 打印一行原因；不得静默降级 |

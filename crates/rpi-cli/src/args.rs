@@ -161,6 +161,15 @@ pub struct Args {
     /// project; `--no-approve` keeps project-local resources disabled.
     pub trust_override: Option<bool>,
 
+    /// `--sandbox` / `--no-sandbox`: force the filesystem sandbox on or off for
+    /// this run. `None` keeps the configured default (enabled).
+    pub sandbox: Option<bool>,
+    /// `--sandbox-mode off|auto|required`: behavior when the platform cannot
+    /// enforce the sandbox.
+    pub sandbox_mode: Option<rpi_sandbox::SandboxMode>,
+    /// `--allow-write <path>`: extra writable root for this run (repeatable).
+    pub allow_write: Vec<String>,
+
     pub continue_session: bool,
     pub resume: bool,
     pub session: Option<String>,
@@ -532,6 +541,33 @@ pub fn parse_args(args: &[String]) -> Args {
                 result.list_models = Some(search);
             }
             "--offline" => result.offline = true,
+            "--sandbox" => result.sandbox = Some(true),
+            "--no-sandbox" => result.sandbox = Some(false),
+            "--sandbox-mode" => {
+                if let Some(value) = take_value(&mut result, "--sandbox-mode") {
+                    match value.as_str() {
+                        "off" => result.sandbox_mode = Some(rpi_sandbox::SandboxMode::Off),
+                        "auto" => result.sandbox_mode = Some(rpi_sandbox::SandboxMode::Auto),
+                        "required" => {
+                            result.sandbox_mode = Some(rpi_sandbox::SandboxMode::Required)
+                        }
+                        other => result.errors.push(format!(
+                            "Invalid --sandbox-mode \"{other}\". Valid: off, auto, required"
+                        )),
+                    }
+                }
+            }
+            "--allow-write" => {
+                if let Some(value) = take_value(&mut result, "--allow-write") {
+                    if value.trim().is_empty() {
+                        result
+                            .errors
+                            .push("--allow-write requires a path".to_string());
+                    } else {
+                        result.allow_write.push(value);
+                    }
+                }
+            }
             "--export" => {
                 if let Some(value) = take_value(&mut result, &flag_key) {
                     result.export = Some(PathBuf::from(value));
@@ -691,6 +727,9 @@ pub fn print_help() {
   --tui-mode <mode>              TUI buffer: regular or fullscreen (macOS default: regular)
   --list-models [search]         List available models (with optional fuzzy search)
   --offline                      Disable startup network operations (same as RPI_OFFLINE=1)
+  --sandbox / --no-sandbox       Enable or disable the filesystem sandbox (default: enabled)
+  --sandbox-mode <mode>          off, auto, or required (default: auto)
+  --allow-write <path>           Extra writable root for the sandbox (repeatable)
   --export <file>                Export a JSONL session to HTML and exit
   --approve, -a                  Force-enable current-project resources
   --no-approve, -na              Disable current-project resources
@@ -984,6 +1023,38 @@ mod tests {
 
         let inline = parse_args(&s(&["--list-models=gpt"]));
         assert_eq!(inline.list_models.as_deref(), Some("gpt"));
+    }
+
+    #[test]
+    fn sandbox_flags_parse() {
+        let defaults = parse_args(&[]);
+        assert_eq!(defaults.sandbox, None);
+        assert!(defaults.allow_write.is_empty());
+        assert!(defaults.ignored.is_empty());
+
+        let args = parse_args(&s(&[
+            "--sandbox-mode",
+            "required",
+            "--allow-write",
+            "/srv/a",
+            "--allow-write=/srv/b",
+            "--no-sandbox",
+        ]));
+        assert_eq!(args.sandbox, Some(false));
+        assert_eq!(args.sandbox_mode, Some(rpi_sandbox::SandboxMode::Required));
+        assert_eq!(args.allow_write, vec!["/srv/a", "/srv/b"]);
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+
+        let forced_on = parse_args(&s(&["--sandbox"]));
+        assert_eq!(forced_on.sandbox, Some(true));
+    }
+
+    #[test]
+    fn sandbox_mode_rejects_unknown_values() {
+        let args = parse_args(&s(&["--sandbox-mode", "paranoid"]));
+        assert_eq!(args.sandbox_mode, None);
+        assert_eq!(args.errors.len(), 1);
+        assert!(args.errors[0].contains("--sandbox-mode"));
     }
 
     #[test]

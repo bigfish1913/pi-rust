@@ -105,8 +105,7 @@ policy schema, approval protocol and known gaps.
   and capability probing; project settings may only tighten the policy. (1–2 days)
 - **M1 – Linux enforcement.** Apply Landlock to the whole process before the
   Tokio runtime starts; map `EACCES` to a structured sandbox denial; child
-  processes inherit automatically. Linux defaults to `auto` once stable.
-  (2–3 days)
+  processes inherit automatically. Linux defaults to on. (2–3 days)
 - **M2 – Approvals.** Supervisor + broker, `ApprovalFrontend` (TUI, headless,
   RPC), audit log, revocable scopes and replayable pending requests. (3–5 days)
 - **M3 – macOS.** Seatbelt profile applied at startup. (2–3 days)

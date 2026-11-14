@@ -58,7 +58,7 @@ pub struct ApprovalSettings {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SandboxSettings {
-    /// Master switch. Absent means disabled (M0 default: opt-in only).
+    /// Master switch. Absent means enabled (the sandbox is on by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Whether a missing backend is fatal.
@@ -264,7 +264,7 @@ pub fn compile_policy(
     let enabled = overrides
         .enabled
         .or_else(|| global.and_then(|settings| settings.enabled))
-        .unwrap_or(false);
+        .unwrap_or(true);
     let mode = overrides
         .mode
         .or_else(|| global.and_then(|settings| settings.mode))
@@ -461,10 +461,22 @@ mod tests {
     }
 
     #[test]
-    fn disabled_by_default() {
+    fn enabled_by_default() {
         let policy = compile_policy(None, None, &PolicyOverrides::default(), &context(), &[]);
-        assert!(!policy.enabled);
+        assert!(policy.enabled);
         assert_eq!(policy.mode, SandboxMode::Auto);
+    }
+
+    #[test]
+    fn settings_can_disable() {
+        let policy = compile_policy(
+            Some(&settings(r#"{"enabled": false}"#)),
+            None,
+            &PolicyOverrides::default(),
+            &context(),
+            &[],
+        );
+        assert!(!policy.enabled);
     }
 
     #[test]

@@ -295,6 +295,40 @@ rpi --connect 127.0.0.1:9899
 `/name`、`/reload` 依赖本地 harness，在远程模式下不可用。完整协议、可用命令与
 限制见 [`remote-mode.md`](../remote/user-guide.md)。
 
+### 文件系统沙箱（Linux）
+
+rpi 默认在 Linux 上启用文件系统沙箱：所有路径可读，写操作只允许落在项目目录、
+系统临时目录、会话目录和显式配置的路径内；其它位置只读。沙箱在进程启动时应用，
+`bash` 及其所有子进程自动继承，工具调用本身没有额外开销。
+
+```bash
+rpi --no-sandbox                  # 本次运行关闭
+rpi --sandbox-mode required       # 无法强制时拒绝启动（默认 auto：回退并提示）
+rpi --allow-write /srv/data       # 临时追加可写根（可重复）
+export RPI_SANDBOX=0              # 整个 shell 关闭
+```
+
+全局 `~/.rpi/agent/settings.json` 可持久配置：
+
+```jsonc
+{
+  "sandbox": {
+    "enabled": true,
+    "mode": "auto",
+    "writable": ["${cwd}", "${tmp}"],
+    "protected": ["${home}/.ssh", "${home}/.rpi/agent"]
+  }
+}
+```
+
+- 项目 `.rpi/settings.json` 只能追加 `protected`，不能放宽 `writable` 或关闭沙箱。
+- 会话内用 `/sandbox` 查看当前状态、后端、可写根与保护项。
+- TUI 页脚常驻显示徽标：`🔒 landlock`、`🔓 sandbox off`、`⏸ sandbox bypassed`。
+- `install`/`update`/`auth`/`dev` 等维护命令会自动绕过沙箱并打印一行提示。
+- 当前仅 Linux 有强制后端；macOS/Windows 会按 `auto` 回退为无沙箱并提示，直到对应
+  后端实现。`protected` 落在 `writable` 根内部时 Landlock 无法扣除子树，启动会告警
+  （`required` 模式直接拒绝启动）。
+
 ## 4. 内置工具
 
 默认工具包含 Pi 的 `read`、`bash`、`edit`、`write`，以及 rpi 自带的只读 `docs` 文档查询工具。Windows 上还会默认注册 `powershell`。`docs` 可以查询使用手册、扩展开发、Agent 项目结构、Rust 调试和架构说明；`grep`、`find`、`ls` 仍保留为库实现，但不由 CLI 默认注册。

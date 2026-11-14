@@ -17,11 +17,17 @@
 //!   fails and `mode = "auto"`.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use rpi_sandbox::{
     compile_policy, probe, PolicyContext, PolicyOverrides, SandboxMode, SandboxPolicy,
     SandboxSupport,
 };
+
+/// Process-wide outcome recorded by [`prepare_from_argv`]. `None` in embedded
+/// hosts and library tests that never call the CLI preflight.
+static ACTIVE: OnceLock<SandboxStatus> = OnceLock::new();
+static ACTIVE_POLICY: OnceLock<SandboxPolicy> = OnceLock::new();
 
 /// Whether this build has a working enforcement backend.
 pub const ENFORCEMENT_IMPLEMENTED: bool = cfg!(target_os = "linux");
@@ -76,6 +82,11 @@ pub fn prepare_from_argv(argv: &[String]) -> Result<Prepared, String> {
         if sandbox_requested_in_settings() {
             eprintln!("sandbox: bypassed ({reason})");
         }
+        record_status(SandboxStatus {
+            state: SandboxState::Bypassed,
+            mode: SandboxMode::Auto,
+            detail: reason.to_string(),
+        });
         return Ok(Prepared::Bypassed { reason });
     }
 
@@ -83,8 +94,14 @@ pub fn prepare_from_argv(argv: &[String]) -> Result<Prepared, String> {
     let parsed = crate::args::parse_args(argv);
     let trusted = crate::session::resolve_project_trust(&parsed, &cwd);
     let policy = policy_for_posture(&parsed, &cwd, trusted);
+    let _ = ACTIVE_POLICY.set(policy.clone());
 
     if !policy.enabled || policy.mode == SandboxMode::Off {
+        record_status(SandboxStatus {
+            state: SandboxState::Disabled,
+            mode: policy.mode,
+            detail: "disabled".to_string(),
+        });
         return Ok(Prepared::Disabled);
     }
 
@@ -115,21 +132,44 @@ pub fn prepare_from_argv(argv: &[String]) -> Result<Prepared, String> {
 
     match support {
         SandboxSupport::Unsupported { reason } => fallback(&policy, reason),
-        SandboxSupport::Supported(_) => {
+        SandboxSupport::Supported(backend) => {
             let outcome = apply_backend(&policy)
                 .map_err(|error| format!("failed to apply the filesystem sandbox: {error}"));
             match outcome {
-                Ok(()) => Ok(Prepared::Applied),
+                Ok(()) => {
+                    record_status(SandboxStatus {
+                        state: SandboxState::Applied,
+                        mode: policy.mode,
+                        detail: format!("{} (abi {})", backend.name(), abi_of(backend)),
+                    });
+                    Ok(Prepared::Applied)
+                }
                 Err(error) => match policy.mode {
                     SandboxMode::Required => Err(error),
                     _ => {
                         eprintln!("warning: {error}; running without a sandbox");
+                        record_status(SandboxStatus {
+                            state: SandboxState::Unavailable,
+                            mode: policy.mode,
+                            detail: error,
+                        });
                         Ok(Prepared::Disabled)
                     }
                 },
             }
         }
     }
+}
+
+fn abi_of(backend: rpi_sandbox::SandboxBackend) -> u32 {
+    match backend {
+        rpi_sandbox::SandboxBackend::Landlock { abi } => abi,
+        _ => 0,
+    }
+}
+
+fn record_status(status: SandboxStatus) {
+    let _ = ACTIVE.set(status);
 }
 
 #[cfg(target_os = "linux")]
@@ -144,6 +184,11 @@ fn apply_backend(_policy: &SandboxPolicy) -> Result<(), String> {
 }
 
 fn fallback(policy: &SandboxPolicy, reason: String) -> Result<Prepared, String> {
+    let _ = ACTIVE.set(SandboxStatus {
+        state: SandboxState::Unavailable,
+        mode: policy.mode,
+        detail: reason.clone(),
+    });
     match policy.mode {
         SandboxMode::Required => Err(format!(
             "sandbox is required but cannot be enforced: {reason}"
@@ -162,7 +207,7 @@ fn sandbox_requested_in_settings() -> bool {
         .ok()
         .and_then(|settings| settings.sandbox)
         .and_then(|sandbox| sandbox.enabled)
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Compile the effective policy without command-line context.
@@ -203,15 +248,36 @@ fn policy(cwd: &Path, project_trusted: bool, args: Option<&crate::args::Args>) -
         auto_writable.push(file);
     }
 
+    let overrides = args
+        .map(policy_overrides)
+        .unwrap_or_else(|| policy_overrides(&crate::args::Args::default()));
     compile_policy(
         global.sandbox.as_ref(),
         project
             .as_ref()
             .and_then(|settings| settings.sandbox.as_ref()),
-        &PolicyOverrides::default(),
+        &overrides,
         &context,
         &auto_writable,
     )
+}
+
+fn policy_overrides(args: &crate::args::Args) -> PolicyOverrides {
+    PolicyOverrides {
+        enabled: args.sandbox.or_else(env_sandbox_override),
+        mode: args.sandbox_mode,
+        writable: args.allow_write.clone(),
+        protected: Vec::new(),
+        allow_file_writes: Vec::new(),
+    }
+}
+
+fn env_sandbox_override() -> Option<bool> {
+    let value = std::env::var("RPI_SANDBOX").ok()?;
+    Some(!matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    ))
 }
 
 fn runtime_agent_files(settings: &crate::settings::Settings) -> Vec<PathBuf> {
@@ -289,27 +355,150 @@ pub fn startup_check(cwd: &Path, project_trusted: bool) -> Result<Option<String>
     startup_message(&policy, &probe())
 }
 
-/// Snapshot used by future UI surfaces (banner, footer, `/sandbox`).
+/// What the startup preflight actually did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxState {
+    /// The sandbox is turned off by configuration or a CLI flag.
+    Disabled,
+    /// The process is confined by the kernel backend.
+    Applied,
+    /// A sandbox was requested but the platform/build cannot enforce it.
+    Unavailable,
+    /// A maintenance subcommand runs without a sandbox on purpose.
+    Bypassed,
+}
+
+impl SandboxState {
+    /// Stable lowercase label for diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Applied => "applied",
+            Self::Unavailable => "unavailable",
+            Self::Bypassed => "bypassed",
+        }
+    }
+}
+
+/// Snapshot used by the TUI footer, the `/sandbox` panel and diagnostics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxStatus {
-    /// Whether the user asked for a sandbox.
-    pub enabled: bool,
-    /// Whether this build can enforce it.
-    pub enforced: bool,
-    /// Human-readable backend description, or the reason it is unavailable.
+    /// What the preflight did.
+    pub state: SandboxState,
+    /// Configured failure behavior.
+    pub mode: SandboxMode,
+    /// Backend description (for example `landlock (abi 6)`) or the reason the
+    /// sandbox is off.
     pub detail: String,
 }
 
-/// Build a status snapshot for display.
+impl SandboxStatus {
+    /// Whether the process is actually confined.
+    pub fn enforced(&self) -> bool {
+        self.state == SandboxState::Applied
+    }
+
+    /// Compact badge for the TUI footer. `None` means "do not render one".
+    pub fn footer_label(&self) -> Option<String> {
+        Some(match self.state {
+            SandboxState::Applied => format!("🔒 {}", short_backend(&self.detail)),
+            SandboxState::Bypassed => "⏸ sandbox bypassed".to_string(),
+            SandboxState::Disabled => "🔓 sandbox off".to_string(),
+            SandboxState::Unavailable => "🔓 sandbox unavailable".to_string(),
+        })
+    }
+
+    /// Multi-line description for `/sandbox`.
+    pub fn describe(&self) -> String {
+        format!(
+            "sandbox: {}\nmode: {}\nbackend: {}",
+            self.state.as_str(),
+            mode_label(self.mode),
+            self.detail
+        )
+    }
+}
+
+fn short_backend(detail: &str) -> &str {
+    detail.split(' ').next().unwrap_or(detail)
+}
+
+fn mode_label(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::Off => "off",
+        SandboxMode::Auto => "auto",
+        SandboxMode::Required => "required",
+    }
+}
+
+/// The status recorded by the CLI preflight, when this process ran it.
+pub fn active_status() -> Option<&'static SandboxStatus> {
+    ACTIVE.get()
+}
+
+/// The compiled policy recorded by the CLI preflight, when available.
+pub fn active_policy() -> Option<&'static SandboxPolicy> {
+    ACTIVE_POLICY.get()
+}
+
+/// Build a status snapshot: the recorded preflight outcome when present,
+/// otherwise a best-effort recomputation for embedded callers.
 pub fn status(cwd: &Path, project_trusted: bool) -> SandboxStatus {
+    if let Some(status) = ACTIVE.get() {
+        return status.clone();
+    }
     let policy = effective_policy(cwd, project_trusted);
     let support = probe();
     let requested = policy.enabled && policy.mode != SandboxMode::Off;
     SandboxStatus {
-        enabled: requested,
-        enforced: requested && ENFORCEMENT_IMPLEMENTED && support.is_supported(),
+        state: if !requested {
+            SandboxState::Disabled
+        } else if ENFORCEMENT_IMPLEMENTED && support.is_supported() {
+            SandboxState::Applied
+        } else {
+            SandboxState::Unavailable
+        },
+        mode: policy.mode,
         detail: support.describe(),
     }
+}
+
+/// Full description for `/sandbox`, including the effective writable and
+/// protected rules.
+pub fn describe(cwd: &Path, project_trusted: bool) -> String {
+    let status = status(cwd, project_trusted);
+    let mut out = status.describe();
+    let policy = ACTIVE_POLICY
+        .get()
+        .cloned()
+        .unwrap_or_else(|| effective_policy(cwd, project_trusted));
+    out.push_str("\n\nwritable:");
+    for rule in &policy.writable {
+        out.push_str(&format!("\n  {}", rule.path().display()));
+    }
+    if policy.protected.is_empty() {
+        out.push_str("\n\nprotected: none");
+    } else {
+        out.push_str("\n\nprotected:");
+        for rule in &policy.protected {
+            out.push_str(&format!("\n  {}", rule.path().display()));
+        }
+    }
+    let nested = policy.nested_protected();
+    if !nested.is_empty() {
+        out.push_str("\n\nnested (not kernel-enforced):");
+        for (protected, writable) in nested {
+            out.push_str(&format!(
+                "\n  {} inside {}",
+                protected.display(),
+                writable.display()
+            ));
+        }
+    }
+    out.push_str(
+        "\n\nRPI_SANDBOX=0 or --no-sandbox disables it; --sandbox-mode required fails closed.",
+    );
+    out
 }
 
 #[cfg(test)]
@@ -419,5 +608,32 @@ mod tests {
     #[test]
     fn linux_builds_advertise_enforcement() {
         assert_eq!(ENFORCEMENT_IMPLEMENTED, cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn footer_labels_cover_every_state() {
+        let base = |state| SandboxStatus {
+            state,
+            mode: SandboxMode::Auto,
+            detail: "landlock (abi 6)".to_string(),
+        };
+        assert_eq!(
+            base(SandboxState::Applied).footer_label().as_deref(),
+            Some("🔒 landlock")
+        );
+        assert_eq!(
+            base(SandboxState::Disabled).footer_label().as_deref(),
+            Some("🔓 sandbox off")
+        );
+        assert_eq!(
+            base(SandboxState::Unavailable).footer_label().as_deref(),
+            Some("🔓 sandbox unavailable")
+        );
+        assert_eq!(
+            base(SandboxState::Bypassed).footer_label().as_deref(),
+            Some("⏸ sandbox bypassed")
+        );
+        assert!(base(SandboxState::Applied).enforced());
+        assert!(!base(SandboxState::Unavailable).enforced());
     }
 }

@@ -110,6 +110,8 @@ pub struct FooterComponent {
     git_branch: Mutex<Option<String>>,
     /// Session name.
     session_name: Mutex<Option<String>>,
+    /// Filesystem sandbox badge (for example `🔒 landlock`); `None` hides it.
+    sandbox: Mutex<Option<String>>,
     /// Aggregated usage totals.
     usage: Mutex<UsageTotals>,
     /// Latest prompt-cache hit rate (0..=100), when known.
@@ -143,6 +145,7 @@ impl FooterComponent {
             ),
             git_branch: Mutex::new(None),
             session_name: Mutex::new(None),
+            sandbox: Mutex::new(None),
             usage: Mutex::new(UsageTotals::default()),
             cache_hit_rate: Mutex::new(None),
             context_percent: Mutex::new(None),
@@ -214,6 +217,14 @@ impl FooterComponent {
     pub fn set_session_name(&self, name: Option<&str>) {
         if let Ok(mut n) = self.session_name.lock() {
             *n = name.map(|s| s.to_string());
+        }
+    }
+
+    /// Set the filesystem sandbox badge shown at the end of line 1. `None`
+    /// hides it (embedded hosts and tests that do not model a sandbox).
+    pub fn set_sandbox(&self, label: Option<&str>) {
+        if let Ok(mut s) = self.sandbox.lock() {
+            *s = label.map(|value| value.to_string());
         }
     }
 
@@ -323,6 +334,7 @@ impl FooterComponent {
         let home = self.home.lock().unwrap().clone();
         let branch = self.git_branch.lock().unwrap().clone();
         let name = self.session_name.lock().unwrap().clone();
+        let sandbox = self.sandbox.lock().unwrap().clone();
 
         let mut parts = Vec::new();
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
@@ -337,6 +349,9 @@ impl FooterComponent {
         }
         if let Some(name) = name.filter(|n| !n.is_empty()) {
             parts.push(name);
+        }
+        if let Some(sandbox) = sandbox.filter(|s| !s.is_empty()) {
+            parts.push(sandbox);
         }
         parts.join(" • ")
     }

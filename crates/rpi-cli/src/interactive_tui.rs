@@ -1239,6 +1239,9 @@ pub async fn interactive_tui(
     }
     footer.set_cwd(&cwd.to_string_lossy());
     footer.set_git_branch(git_branch_for(&cwd).as_deref());
+    if let Some(label) = crate::sandbox::active_status().and_then(|status| status.footer_label()) {
+        footer.set_sandbox(Some(&label));
+    }
     if let Some(m) = model_catalog.iter().find(|m| m.id == lane_model_id) {
         footer.set_context_window(m.context_window as i64);
     }
