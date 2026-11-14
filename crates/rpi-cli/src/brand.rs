@@ -1,5 +1,7 @@
-//! The startup brand lockup, rendered from the README logo with the same
-//! black-and-white ASCII palette as https://neucrack.com/tools/ascii.
+//! The startup brand lockup, generated from the README logo with RASCII.
+//!
+//! Regenerate with `cargo install rascii_art --version 0.4.5 --locked`, then:
+//! `rascii docs/images/rpi-logo.jpg --width 44 --height 18 --invert --charset " .:-=+*#%@"`.
 //!
 //! The logo is kept as text rather than loading the README JPEG so it works in
 //! plain terminals, remote sessions, and terminals without image protocols.
@@ -14,22 +16,22 @@ pub const MARK: &str = "@";
 
 const LOGO_ROWS: [&str; 18] = [
     "                                            ",
-    "                    :::.                    ",
-    "             -=:   *=..#:   ==:             ",
-    "           =#. -=--:   .--==. -%            ",
-    "        .  =#  :===========-. -*:  .        ",
-    "      :*--=..++-           .=*- ---=*       ",
-    "      =+:  +*.                -#:  =+:      ",
-    "       == ++      -%===**:     .%. %.       ",
-    "    -+--  @     .#:.+===.++     =* :--#     ",
-    "    =*-: .@     .: %*.:%..@  .  =* .:-%     ",
-    "      .+- *= =#==- %=--:=*: :+  %: %:       ",
-    "      :+=  *++*    %-.@-.   :%:#: .+=.      ",
-    "      -*.:-..*+    %-.@    .:%= --.-*.      ",
-    "       .-..=*. .===%-.@====-  =*:.::        ",
-    "           :%. .=--:   .--==  =#            ",
-    "            .-==   *=..#.  .==:             ",
-    "                    :::.                    ",
+    "                   .---:                    ",
+    "            :=+-  .#-::%:. .+=:.            ",
+    "           +*..-+==-...:-==+..=%.           ",
+    "       ::..+*..-++++===++++=: =*:..:        ",
+    "      =*-==::*+-.          :=*=.==-=*.      ",
+    "     .++- .**.     .   ..    .=#: .++:      ",
+    "       *= #+     .=%+++#*:     :%:.%.       ",
+    "    +*==.:%.    :%:-+++=.*+     +* :==#     ",
+    "    +*--.:%.    :: @+:-%:-% .:  +* :-=%     ",
+    "     ..*-.#= *%++- @=---+*: -+ :%:.%:.      ",
+    "     .=+= .*+*+    @-:@-.   -#-#: :*+.      ",
+    "      =*:-=::*+:.  @-:@   ..-#=.=-:=*.      ",
+    "       :-:.=*. :+++%-:@++++-. +*:.:-        ",
+    "           -#. -+==-   :====..+#            ",
+    "            .=+=. .#=::%.  :+=:.            ",
+    "                   .::::                    ",
     "                                            ",
 ];
 
@@ -109,8 +111,8 @@ mod tests {
         assert_eq!(rows.len(), 18);
         assert!(rows.iter().any(|row| row.contains("#")));
         assert!(rows.iter().any(|row| row.contains("+=")));
-        assert!(rows[1].contains(":::"));
-        assert!(rows[16].contains(":::"));
+        assert!(rows[1].contains("---:"));
+        assert!(rows[16].contains("::::"));
     }
 
     #[test]

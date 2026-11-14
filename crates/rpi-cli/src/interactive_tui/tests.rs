@@ -1386,7 +1386,7 @@ fn test_layout_renders_welcome_message() {
 
     let all: String = frame.lines.join("\n");
     assert!(
-        all.contains(":::"),
+        all.contains("---:"),
         "Welcome logo not found. Rendered: {}",
         all
     );
@@ -1496,7 +1496,7 @@ fn welcome_header_renders_the_brand_mark() {
 
     // The fixed-width ASCII logo is rendered with single-cell characters.
     assert!(
-        lines.iter().any(|l| l.contains(":::")),
+        lines.iter().any(|l| l.contains("---:")),
         "brand logo missing: {all}"
     );
     assert!(
