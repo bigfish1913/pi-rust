@@ -1,7 +1,7 @@
 # 文件系统沙箱（rpi 自身即沙箱）
 
-> 状态：**M0 已实现**（策略模型、配置解析、平台能力探测）；强制后端尚未实现。
-> 当前版本的 `rpi` 仍不会实际限制写操作；实现进度以 [ROADMAP](../../ROADMAP.md) 为准。
+> 状态：**M1 已实现**（Linux Landlock 全进程强制）；macOS / Windows 后端尚未实现。
+> 当前版本在 Linux 上可用，其它平台会按 `auto` 回退为无沙箱并提示；实现进度以 [ROADMAP](../../ROADMAP.md) 为准。
 
 ## 1. 目标与非目标
 
@@ -200,6 +200,8 @@ fn main() -> ExitCode {
 - 规则绑定 **inode**：启动后若可写目录被删除重建，新 inode 不在规则内，写会被拒绝；重启 rpi 恢复。
 - 沙箱建立前已打开的 fd 仍可写（rpi 自身的会话/日志 fd 属于预期情况）。
 - `chmod`/`chown`/`utimes` 不受约束（见第 10 节）。
+- **Landlock 只能累加权限，不能从已允许的目录中扣除子树**：`protected` 落在某个 `writable` 根内部时，内核无法排除该子目录。M1 在启动时明确警告（`auto`）或拒绝启动（`required`），嵌套保护留给进程内层。
+- 运行时簿记文件（`.resource-lease`、`update-check.json`）以**文件级**规则加入白名单；agent 目录本身保持只读，模型无法写入插件或改策略。
 
 ### 6.2 macOS：Seatbelt
 
@@ -371,6 +373,7 @@ pub struct ApprovalDecision {
 5. Windows ACL 修改是全局副作用，异常退出可能残留，需要清理机制。
 6. 若把 `~/.rpi/agent` 配置为可写，模型可持久化恶意插件；默认必须保护该目录。
 7. 沙箱建立前已打开的 fd 不受约束。
+8. Landlock 无法从可写的父目录中排除 `protected` 子目录；M1 只能警告或拒绝，嵌套保护尚未强制。
 
 ## 11. 测试计划
 
@@ -391,7 +394,7 @@ pub struct ApprovalDecision {
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
 | M0（已实现） | `rpi-sandbox` 策略模型、路径展开、优先级、能力探测桩；`settings.rs` 增加 `sandbox` 段与“项目只能收紧”合并；同步 `bootstrap()` 空实现 | 配置可解析、可展示、行为不变 |
-| M1 | Linux Landlock 全进程应用（入口改为同步预检）；`EACCES → SandboxDenied`；bash 后代继承 | 基础语义与逃逸用例通过；默认 `auto` |
+| M1（已实现） | Linux Landlock 全进程应用（入口改为同步预检）；`EACCES` 映射为带沙箱提示的错误；bash 后代继承 | 基础语义与逃逸用例通过；默认 `auto` |
 | M2 | supervisor + broker、`ApprovalFrontend`（TUI/headless/RPC）、审计、撤销、pending 持久化 | 授权链路完整；多客户端仲裁正确 |
 | M3 | macOS Seatbelt | 同一测试矩阵通过 |
 | M4 | Windows restricted token + ACL 事务 + 崩溃清理 + crypto provider 切换 | 测试矩阵通过；无残留 ACL |
@@ -404,8 +407,8 @@ pub struct ApprovalDecision {
 | 变更 | 位置 |
 | --- | --- |
 | 新增 crate | `crates/rpi-sandbox/`（策略、平台后端、能力探测、broker 客户端/服务端；不依赖其它 `rpi-*`） |
-| 启动接线 | `crates/rpi-cli/src/sandbox.rs`（策略编译、探测与启动提示）；M1 再把应用点前移到 `crates/rpi-cli/src/bin/rpi.rs` |
-| 启动接线（M1） | `crates/rpi-cli/src/bin/rpi.rs`（同步预检 + 应用沙箱 + 建 runtime） |
+| 启动接线 | `crates/rpi-cli/src/bin/rpi.rs`（同步预检 + 应用沙箱 + 建 runtime） |
+| 启动逻辑 | `crates/rpi-cli/src/sandbox.rs`（策略编译、探测、维护命令绕过、启动提示） |
 | 配置合并 | `crates/rpi-cli/src/settings.rs`、`crates/rpi-cli/src/config.rs` |
 | 工具层 | `crates/rpi-tools/src/os_env.rs`（捕获 `EACCES`、映射 `SandboxDenied`、broker 重试） |
 | 授权 UI | `crates/rpi-cli/src/interactive_tui/`（弹窗、`/sandbox`、页脚） |

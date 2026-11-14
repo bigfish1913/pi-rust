@@ -19,6 +19,9 @@
 pub mod policy;
 pub mod probe;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+
 pub use policy::{
     compile_policy, expand_configured_path, normalize_and_resolve, Access, ApprovalScope,
     ApprovalSettings, PathRule, PolicyContext, PolicyOverrides, SandboxMode, SandboxPolicy,

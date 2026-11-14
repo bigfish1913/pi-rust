@@ -1,21 +1,35 @@
-//! The `pi` binary entry point. Mirrors the TS
-//! `packages/coding-agent/src/cli.ts` (the `#!/usr/bin/env node` shebang file
-//! whose `bin` entry in `package.json` resolves to `dist/cli.js`, which just
-//! calls `main(process.argv.slice(2))`).
+//! The `rpi` binary entry point.
 //!
-//! Rust's analogue: a thin `#[tokio::main]` wrapper that boots the multi-thread
-//! runtime the harness needs (the harness's `StreamFn` bridge uses
-//! `block_in_place`, which requires the multi-thread flavor) and hands control
-//! to [`rpi_cli::main::run`], exiting with its returned code.
+//! The entry point is deliberately synchronous: the filesystem sandbox
+//! (Linux Landlock in M1) must be applied **before** Tokio creates worker
+//! threads, because Landlock domains are per-thread and inherited by children.
+//! [`rpi_cli::sandbox::prepare_from_argv`] does the synchronous preflight
+//! (args, trust, policy, backend) and then we build the multi-thread runtime the
+//! harness needs (`block_in_place` in the stream bridge requires it).
 
 use std::process::ExitCode;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
-    // The harness run loop uses `block_in_place` to drive the provider stream
-    // synchronously inside the async lane; that requires the multi-thread
-    // runtime (configured above). `run` does everything else: arg parse, model
-    // resolution, harness build, mode dispatch.
-    let code = rpi_cli::app::run().await;
-    ExitCode::from(code as u8)
+fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    match rpi_cli::sandbox::prepare_from_argv(&argv) {
+        Ok(_prepared) => {}
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: failed to start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    ExitCode::from(runtime.block_on(rpi_cli::app::run()) as u8)
 }

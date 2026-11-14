@@ -211,6 +211,34 @@ impl SandboxPolicy {
     pub fn is_writable(&self, path: &Path) -> bool {
         self.classify(path).is_writable()
     }
+
+    /// Protected rules that fall inside a writable directory rule.
+    ///
+    /// Landlock and Seatbelt only add rights; they cannot subtract a subtree
+    /// from an allowed parent. Callers must surface these pairs (warn in
+    /// `auto`, fail closed in `required`) until nested protection is enforced
+    /// by the in-process layer.
+    pub fn nested_protected(&self) -> Vec<(PathBuf, PathBuf)> {
+        let mut nested: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for protected in &self.protected {
+            if nested
+                .iter()
+                .any(|(existing, _)| existing == protected.path())
+            {
+                continue;
+            }
+            for writable in &self.writable {
+                if matches!(writable, PathRule::Dir(_)) && writable.matches(protected.path()) {
+                    nested.push((
+                        protected.path().to_path_buf(),
+                        writable.path().to_path_buf(),
+                    ));
+                    break;
+                }
+            }
+        }
+        nested
+    }
 }
 
 /// Compile global, project, and CLI settings into one policy.
@@ -250,7 +278,7 @@ pub fn compile_policy(
     writable.push(PathRule::Dir(normalize_and_resolve(&context.cwd)));
     writable.push(PathRule::Dir(normalize_and_resolve(&context.temp)));
     for root in auto_writable {
-        writable.push(PathRule::Dir(normalize_and_resolve(root)));
+        writable.push(auto_rule(root));
     }
 
     let mut protected = Vec::new();
@@ -296,6 +324,17 @@ pub fn compile_policy(
         allow_file_writes,
         approval,
         audit_log,
+    }
+}
+
+/// Automatic roots come from runtime bookkeeping (session dir, agent-dir
+/// files) and are not user configuration. Existing regular files become
+/// single-file rules so Landlock gets a write/truncate mask it accepts.
+fn auto_rule(path: &Path) -> PathRule {
+    let normalized = normalize_and_resolve(path);
+    match std::fs::metadata(&normalized) {
+        Ok(metadata) if metadata.is_file() => PathRule::File(normalized),
+        _ => PathRule::Dir(normalized),
     }
 }
 
@@ -447,6 +486,28 @@ mod tests {
     }
 
     #[test]
+    fn file_auto_roots_become_file_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = dir.path().join("lease");
+        std::fs::write(&lease, b"").unwrap();
+        let policy = compile_policy(
+            Some(&settings(r#"{"enabled": true}"#)),
+            None,
+            &PolicyOverrides::default(),
+            &context(),
+            std::slice::from_ref(&lease),
+        );
+        let normalized = normalize_and_resolve(&lease);
+        assert!(
+            policy
+                .writable
+                .iter()
+                .any(|rule| matches!(rule, PathRule::File(path) if path == &normalized)),
+            "existing auto roots that are files must become file rules"
+        );
+    }
+
+    #[test]
     fn dir_rules_are_recursive_and_file_rules_are_exact() {
         let dir = PathRule::Dir(PathBuf::from("/data/cache"));
         assert!(dir.matches(Path::new("/data/cache")));
@@ -520,6 +581,26 @@ mod tests {
             policy.classify(&PathBuf::from("/work/project/secrets/key")),
             Access::Protected
         );
+    }
+
+    #[test]
+    fn nested_protection_is_reported() {
+        let policy = compile_policy(
+            Some(&settings(
+                r#"{
+                    "enabled": true,
+                    "writable": ["${cwd}"],
+                    "protected": ["${cwd}/.rpi/agent", "${home}/.ssh"]
+                }"#,
+            )),
+            None,
+            &PolicyOverrides::default(),
+            &context(),
+            &[],
+        );
+        let nested = policy.nested_protected();
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].0, PathBuf::from("/work/project/.rpi/agent"));
     }
 
     #[test]

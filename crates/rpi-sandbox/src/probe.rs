@@ -112,7 +112,7 @@ fn probe_linux() -> SandboxSupport {
 /// anything.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn landlock_abi() -> Result<u32, String> {
+pub(crate) fn landlock_abi() -> Result<u32, String> {
     // Every architecture uses the same generic syscall number for Landlock
     // tools; x86_64/aarch64/riscv/mips all map it to 444.
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
