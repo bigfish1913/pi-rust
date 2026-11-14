@@ -76,6 +76,8 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(unix)'.dependencies]
 # `nix::sys::signal::raise` for the Ctrl+Z suspend (`app.suspend`).
 nix = { version = "0.29", features = ["signal"] }
+# fork/socketpair/waitpid for the filesystem-sandbox approval supervisor.
+libc = "0.2"
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

@@ -16,15 +16,20 @@
 
 #![warn(missing_docs)]
 
+pub mod approval;
+pub mod broker;
 pub mod policy;
 pub mod probe;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+pub use approval::{
+    ApprovalDecision, ApprovalError, ApprovalOption, ApprovalRequest, ApprovalScope, WriteOp,
+};
+pub use broker::{serve, ApprovalStore, BrokerClient, BrokerConfig, BrokerRequest, BrokerResponse};
 pub use policy::{
-    compile_policy, expand_configured_path, normalize_and_resolve, Access, ApprovalScope,
-    ApprovalSettings, PathRule, PolicyContext, PolicyOverrides, SandboxMode, SandboxPolicy,
-    SandboxSettings,
+    compile_policy, expand_configured_path, normalize_and_resolve, Access, ApprovalSettings,
+    PathRule, PolicyContext, PolicyOverrides, SandboxMode, SandboxPolicy, SandboxSettings,
 };
 pub use probe::{probe, SandboxBackend, SandboxSupport};

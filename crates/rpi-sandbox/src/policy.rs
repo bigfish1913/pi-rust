@@ -12,6 +12,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use crate::approval::ApprovalScope;
+
 /// Whether the sandbox is disabled, opportunistic, or mandatory.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -23,19 +25,6 @@ pub enum SandboxMode {
     Auto,
     /// Refuse to start when the platform cannot enforce the sandbox.
     Required,
-}
-
-/// Default scope for an approved write.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ApprovalScope {
-    /// The single operation only.
-    Once,
-    /// Until the current process exits.
-    #[default]
-    Session,
-    /// Persisted for the project.
-    Project,
 }
 
 /// `sandbox.approval` settings block.

@@ -2172,6 +2172,7 @@ dependencies = [
  "futures",
  "globset",
  "indexmap 2.11.4",
+ "libc",
  "nix",
  "percent-encoding",
  "png 0.18.1",
@@ -2294,6 +2295,7 @@ dependencies = [
 name = "rpi-sandbox"
 version = "0.24.0"
 dependencies = [
+ "base64",
  "libc",
  "serde",
  "serde_json",

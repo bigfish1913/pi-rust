@@ -28,6 +28,8 @@ use rpi_sandbox::{
 /// hosts and library tests that never call the CLI preflight.
 static ACTIVE: OnceLock<SandboxStatus> = OnceLock::new();
 static ACTIVE_POLICY: OnceLock<SandboxPolicy> = OnceLock::new();
+/// Broker connection inherited from the supervisor (Linux, M2).
+static BROKER: OnceLock<rpi_sandbox::BrokerClient> = OnceLock::new();
 
 /// Whether this build has a working enforcement backend.
 pub const ENFORCEMENT_IMPLEMENTED: bool = cfg!(target_os = "linux");
@@ -133,6 +135,14 @@ pub fn prepare_from_argv(argv: &[String]) -> Result<Prepared, String> {
     match support {
         SandboxSupport::Unsupported { reason } => fallback(&policy, reason),
         SandboxSupport::Supported(backend) => {
+            if let Err(error) = start_broker(&policy) {
+                match policy.mode {
+                    SandboxMode::Required => {
+                        return Err(format!("cannot start the approval broker: {error}"))
+                    }
+                    _ => eprintln!("warning: {error}; approvals are unavailable"),
+                }
+            }
             let outcome = apply_backend(&policy)
                 .map_err(|error| format!("failed to apply the filesystem sandbox: {error}"));
             match outcome {
@@ -170,6 +180,93 @@ fn abi_of(backend: rpi_sandbox::SandboxBackend) -> u32 {
 
 fn record_status(status: SandboxStatus) {
     let _ = ACTIVE.set(status);
+}
+
+/// Fork the unconfined broker before the sandbox is applied.
+///
+/// The child keeps the sandboxed path (returning normally), the parent becomes
+/// the supervisor: it serves approval requests, waits for the child and exits
+/// with its status. Must run while the process is still single-threaded.
+#[cfg(target_os = "linux")]
+fn start_broker(policy: &SandboxPolicy) -> Result<(), String> {
+    use std::io::BufReader;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::net::UnixStream;
+
+    if policy.approval.enabled == Some(false) {
+        return Ok(());
+    }
+
+    let mut fds = [0_i32; 2];
+    // SAFETY: `fds` is a valid two-element array for socketpair(2).
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(format!(
+            "socketpair for the approval broker failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // SAFETY: fork(2) in a single-threaded process; the child only builds the
+    // client and returns to the caller, the parent never returns.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        // SAFETY: both fds are owned by this process on the error path.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(format!(
+            "fork for the approval broker failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    if pid == 0 {
+        // Child: keep the agent end and continue into the sandboxed startup.
+        // SAFETY: fds[0] belongs to the parent.
+        unsafe { libc::close(fds[0]) };
+        // SAFETY: fds[1] is a connected Unix stream owned by this process.
+        let client = unsafe { rpi_sandbox::BrokerClient::from_raw_fd(fds[1]) }
+            .map_err(|error| format!("cannot attach to the approval broker: {error}"))?;
+        let _ = BROKER.set(client);
+        return Ok(());
+    }
+
+    // Parent: become the supervisor. Ignore terminal signals so the TUI child
+    // owns Ctrl+C / termination; exit with the child's status.
+    // SAFETY: fds[1] belongs to the child; the signal dispositions are
+    // process-wide and the supervisor has no UI.
+    unsafe {
+        libc::close(fds[1]);
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+    // SAFETY: fds[0] is a connected Unix stream owned by this process.
+    let stream = unsafe { UnixStream::from_raw_fd(fds[0]) };
+    let reader = match stream.try_clone() {
+        Ok(clone) => BufReader::new(clone),
+        Err(error) => {
+            eprintln!("warning: approval broker cannot read its socket: {error}");
+            std::process::exit(1);
+        }
+    };
+    let _ = rpi_sandbox::broker::serve(
+        reader,
+        stream,
+        rpi_sandbox::BrokerConfig {
+            audit: policy.audit_log.clone(),
+        },
+    );
+    let mut status = 0;
+    // SAFETY: `pid` is the child created above; `status` is a valid out pointer.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        1
+    };
+    std::process::exit(code);
 }
 
 #[cfg(target_os = "linux")]
@@ -439,6 +536,11 @@ pub fn active_status() -> Option<&'static SandboxStatus> {
 /// The compiled policy recorded by the CLI preflight, when available.
 pub fn active_policy() -> Option<&'static SandboxPolicy> {
     ACTIVE_POLICY.get()
+}
+
+/// The inherited broker connection, when the supervisor is running.
+pub fn broker_client() -> Option<&'static rpi_sandbox::BrokerClient> {
+    BROKER.get()
 }
 
 /// Build a status snapshot: the recorded preflight outcome when present,
