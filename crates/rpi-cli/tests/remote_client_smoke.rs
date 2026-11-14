@@ -226,6 +226,9 @@ async fn native_driver_receives_answers_and_cancels_remote_approvals() {
                             }
                         }
                         "get_state" => {}
+                        // Sent once on connect so a reconnecting client can
+                        // replay dialogs that are still pending on the server.
+                        "get_pending_dialogs" => {}
                         other => panic!("unexpected command {other}"),
                     }
                 }
