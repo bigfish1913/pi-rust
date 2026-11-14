@@ -476,7 +476,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.23.0](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
+| Current release | **[0.24.0](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.88 |
 | Platforms | Linux (GNU and musl), macOS, Windows (CI runs the suite on Linux) |
@@ -557,7 +557,7 @@ Join us to ask questions, share ideas and try early builds.
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-13"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-13" width="230" alt="微信交流群二维码 / WeChat group QR code"></a><br>
+      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-14"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-14" width="230" alt="微信交流群二维码 / WeChat group QR code"></a><br>
       <sub><b>WeChat / 微信交流群</b> — 扫码加入 / Scan to join</sub>
     </td>
     <td align="center" width="50%">

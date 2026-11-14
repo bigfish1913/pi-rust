@@ -11,6 +11,22 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/bigfish1913/pi-rust/compare/v0.23.0...v0.24.0) - 2026-11-13
+
+### Added
+
+- *(tui)* render README logo as ASCII
+
+### Fixed
+
+- *(install)* locate cdylib artifacts from Cargo JSON messages
+- *(cli)* remove obsolete no-emoji help entry
+
+### Other
+
+- Merge branch 'main' into fix/cargo-1.100-build-dir
+- Merge branch 'main' into feat/tui-logo-ascii
+
 ## [0.23.0](https://github.com/bigfish1913/pi-rust/compare/v0.22.1...v0.23.0) - 2026-11-13
 
 ### Added
