@@ -147,6 +147,9 @@ impl RemoteApproval {
         );
         let tool_call_id = format!("sandbox-{}-{id}", std::process::id());
         let mut question = format!("Allow {} of {raw_path}?", operation.as_str());
+        if path != Path::new(raw_path) {
+            question.push_str(&format!("\nresolved: {}", path.display()));
+        }
         if let Some(bytes) = bytes {
             question.push_str(&format!("\n{bytes} bytes"));
         }
