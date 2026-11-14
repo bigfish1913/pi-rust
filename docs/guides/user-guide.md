@@ -297,12 +297,12 @@ rpi --connect 127.0.0.1:9899
 
 ### 文件系统沙箱（Linux）
 
-rpi 默认在 Linux 上启用文件系统沙箱：所有路径可读，写操作只允许落在项目目录、
+Linux 上可启用文件系统沙箱（opt-in）：所有路径可读，写操作只允许落在项目目录、
 系统临时目录、会话目录和显式配置的路径内；其它位置只读。沙箱在进程启动时应用，
 `bash` 及其所有子进程自动继承，工具调用本身没有额外开销。
 
 ```bash
-rpi --no-sandbox                  # 本次运行关闭
+rpi --sandbox                     # 本次运行开启
 rpi --sandbox-mode required       # 无法强制时拒绝启动（默认 auto：回退并提示）
 rpi --allow-write /srv/data       # 临时追加可写根（可重复）
 export RPI_SANDBOX=0              # 整个 shell 关闭

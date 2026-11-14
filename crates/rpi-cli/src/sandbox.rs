@@ -8,7 +8,7 @@
 //!
 //! Behavior matrix:
 //!
-//! - sandbox disabled (the default): stay silent, do nothing;
+//! - sandbox disabled (the default, opt-in): stay silent, do nothing;
 //! - maintenance subcommand (`install`, `update`, `auth`, `dev`, ...): bypass
 //!   and say so once;
 //! - enabled but unavailable: warn and keep running (`auto`), or refuse to
@@ -307,7 +307,7 @@ fn sandbox_requested_in_settings() -> bool {
         .ok()
         .and_then(|settings| settings.sandbox)
         .and_then(|sandbox| sandbox.enabled)
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 /// Compile the effective policy without command-line context.

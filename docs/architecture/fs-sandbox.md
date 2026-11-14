@@ -105,14 +105,14 @@ pub enum PathRule {
 
 支持展开：`${cwd}`、`${home}`、`${tmp}`、`~`。相对路径相对于 `cwd` 解析。
 
-**默认值**：`enabled` 缺省为 `true`（沙箱默认开启），`mode` 缺省为 `auto`。关闭方式：
+**默认值**：上游 `enabled` 缺省为 `false`（opt-in），`mode` 缺省为 `auto`。开启方式：
 
 ```bash
-rpi --no-sandbox                 # 本次运行
-export RPI_SANDBOX=0             # 整个 shell
+rpi --sandbox                    # 本次运行
 ```
 
-或在全局 `settings.json` 写 `"sandbox": { "enabled": false }`（项目配置无权关闭）。
+或在全局 `settings.json` 写 `"sandbox": { "enabled": true }`（项目配置无权关闭或放宽）。
+本仓库的本地实验构建可以在自己的配置里显式开启，从而保持“默认运行即沙箱”的体验。
 
 ### 4.3 配置来源与提权规则
 
@@ -120,7 +120,7 @@ export RPI_SANDBOX=0             # 整个 shell
 | --- | --- | --- | --- |
 | 全局 `~/.rpi/agent/settings.json` | 允许 | 允许 | 用户自己的配置 |
 | 项目 `.rpi/settings.json` | **禁止** | **禁止** | 仓库不可信，只能追加 `protected` |
-| 命令行 `--sandbox` / `--no-sandbox` | 允许 | 允许 | 用户显式意图 |
+| 命令行 `--sandbox` / `--no-sandbox` | 允许 | 允许 | 用户显式意图（`--sandbox` 是主要开启方式） |
 | 命令行 `--sandbox-mode off\|auto\|required` | — | 允许 | 控制能力缺失时的行为 |
 | 命令行 `--allow-write <path>`（可重复） | 允许 | — | 追加可写根，不关闭沙箱 |
 | 环境变量 `RPI_SANDBOX=0` | 允许 | 允许 | 与命令行等价 |
