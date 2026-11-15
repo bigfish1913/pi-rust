@@ -15,6 +15,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 - *(extensions)* add `UiDialogMailbox::forget` and the `forget` op for runtime action 17 / `RelayUiDialog`. A plugin that abandons a dialog (timeout, tool cancellation, abort) can now explicitly release the terminal entry that would otherwise remain in `active` for the host's lifetime, because no further `poll` is coming. Pending requests are never removed.
 
+## [0.24.1](https://github.com/bigfish1913/pi-rust/compare/v0.24.0...v0.24.1) - 2026-11-14
+
+### Added
+
+- *(tui)* render README logo with RASCII at 64x32 ([#327](https://github.com/bigfish1913/pi-rust/pull/327))
+
 ## [0.24.0](https://github.com/bigfish1913/pi-rust/compare/v0.23.0...v0.24.0) - 2026-11-13
 
 ### Added
