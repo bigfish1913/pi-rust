@@ -1151,7 +1151,15 @@ impl TuiAltScreen {
             // a forced/resize frame. Only real forward overflow saves rows;
             // repairing an equal-sized live suffix never advances scrollback.
             terminal.write("\x1b[?2026h");
-            terminal.write("\x1b[2J\x1b[H");
+            // ED(2) archives the entire live screen in iTerm2, including the
+            // editor/status dock. Erase each live row in place instead; CUD
+            // never scrolls, even at the bottom, and saved rows stay untouched.
+            let mut clear = String::from("\x1b[H\x1b[2K");
+            for _ in 1..height {
+                clear.push_str("\x1b[1B\x1b[2K");
+            }
+            clear.push_str("\x1b[H");
+            terminal.write(&clear);
             self.invalidate_kitty_uploads();
             terminal.write(&lines[next_top..].join("\r\n"));
             terminal.write("\x1b[?2026l");
@@ -2838,7 +2846,8 @@ mod tests {
             *size.lock().unwrap() = dimensions;
             tui.request_render(false);
             let frame = output.lock().unwrap().clone();
-            assert!(frame.contains("\x1b[2J"));
+            assert_eq!(frame.matches("\x1b[2K").count(), dimensions.1);
+            assert!(!frame.contains("\x1b[2J"));
             assert!(!frame.contains("\x1b[3J"));
             assert!(!frame.contains("saved-message-000"));
             assert!(frame.contains("saved-message-079"));
@@ -2848,7 +2857,8 @@ mod tests {
         *pixels.lock().unwrap() = Some((400, 160));
         tui.request_render(false);
         let frame = output.lock().unwrap().clone();
-        assert!(frame.contains("\x1b[2J"));
+        assert_eq!(frame.matches("\x1b[2K").count(), 8);
+        assert!(!frame.contains("\x1b[2J"));
         assert!(!frame.contains("\x1b[3J"));
         assert!(!frame.contains("saved-message-000"));
         output.lock().unwrap().clear();
@@ -2863,7 +2873,8 @@ mod tests {
         *size.lock().unwrap() = (40, 8);
         tui.request_render(false);
         let frame = output.lock().unwrap().clone();
-        assert!(frame.contains("\x1b[2J"));
+        assert_eq!(frame.matches("\x1b[2K").count(), 8);
+        assert!(!frame.contains("\x1b[2J"));
         assert!(!frame.contains("\x1b[3J"));
         assert!(!frame.contains("saved-message-000"));
         assert!(!tui.resize_dirty.load(Ordering::Acquire));
