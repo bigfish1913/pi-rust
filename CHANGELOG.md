@@ -11,6 +11,16 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.24.2](https://github.com/bigfish1913/pi-rust/compare/v0.24.1...v0.24.2) - 2026-11-15
+
+### Added
+
+- *(extensions)* reclaim abandoned UI dialog mailbox entries ([#332](https://github.com/bigfish1913/pi-rust/pull/332))
+
+### Fixed
+
+- *(tui)* keep input dock out of native scrollback ([#334](https://github.com/bigfish1913/pi-rust/pull/334))
+
 ### Added
 
 - *(extensions)* add `UiDialogMailbox::forget` and the `forget` op for runtime action 17 / `RelayUiDialog`. A plugin that abandons a dialog (timeout, tool cancellation, abort) can now explicitly release the terminal entry that would otherwise remain in `active` for the host's lifetime, because no further `poll` is coming. Pending requests are never removed.
