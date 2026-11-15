@@ -499,9 +499,37 @@ impl UiDialogMailbox {
         Ok(result)
     }
 
+    /// Reclaim a terminal request that nobody will `poll` again.
+    ///
+    /// `cancel()` deliberately keeps the terminal entry visible so the owning
+    /// plugin can observe `cancelled` on its next `poll`, and `poll()` removes
+    /// it at that point. But a plugin that abandons a question (timeout, tool
+    /// cancellation, process abort) never polls again, leaving the entry in
+    /// `active` for the lifetime of the host. Callers that know no further
+    /// poll is coming use this to release it. Pending requests are never
+    /// removed: deleting one would silently strand the UI that is still
+    /// waiting for an answer.
+    /// Returns `true` when a terminal entry was actually removed.
+    pub fn forget(&self, request_id: &str) -> Result<bool, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+        let Some(entry) = state.active.get(request_id) else {
+            return Ok(false);
+        };
+        if !entry.cancelled && entry.answer.is_none() {
+            return Err(format!("UI request `{request_id}` is still pending"));
+        }
+        state.active.remove(request_id);
+        state.pending.retain(|id| id != request_id);
+        Ok(true)
+    }
+
     /// Parse and execute the JSON action envelope used by runtime action 17.
-    /// Supported operations are `open`, `poll`, `cancel`; `response` is also
-    /// accepted as a convenience for hosts that proxy answers through JSON.
+    /// Supported operations are `open`, `poll`, `cancel`, `forget`; `response`
+    /// is also accepted as a convenience for hosts that proxy answers through
+    /// JSON.
     pub fn handle(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
         let op = args
             .get("op")
@@ -570,6 +598,11 @@ impl UiDialogMailbox {
                 let id = request_id()?;
                 self.cancel(&id)?;
                 Ok(serde_json::json!({"status":"cancelled","requestId":id}))
+            }
+            "forget" => {
+                let id = request_id()?;
+                let removed = self.forget(&id)?;
+                Ok(serde_json::json!({"status":"forgotten","requestId":id,"removed":removed}))
             }
             "response" | "respond" => {
                 let id = request_id()?;
@@ -1389,7 +1422,7 @@ fn dispatch_relay_ui_dialog(
             Ok(serde_json::json!({ "requeued": requeued }))
         }
         // Same request ids, same semantics as `UiDialog`.
-        "respond" | "cancel" => ui_dialog.handle(args),
+        "respond" | "cancel" | "forget" => ui_dialog.handle(args),
         other => Err(format!("RelayUiDialog does not support op `{other}`")),
     }
 }
@@ -2499,6 +2532,47 @@ mod tests {
         assert_eq!(answered["answer"], "7890");
         // Polling consumes the terminal entry.
         assert!(mailbox.poll("r1").is_err());
+    }
+
+    #[test]
+    fn ui_dialog_forget_reclaims_terminal_entries_without_stranding_pending_ones() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+
+        // A live request cannot be forgotten: the UI is still waiting for an
+        // answer and deleting it would strand the question.
+        mailbox.handle(open_args("r1", "c1")).unwrap();
+        assert_eq!(
+            mailbox.forget("r1"),
+            Err("UI request `r1` is still pending".to_string())
+        );
+        assert_eq!(mailbox.poll("r1").unwrap()["status"], "pending");
+
+        // A cancelled request that the plugin will never poll again is
+        // reclaimed explicitly, so `active` does not grow for the host's life.
+        mailbox.cancel("r1").unwrap();
+        assert_eq!(mailbox.forget("r1"), Ok(true));
+        assert_eq!(mailbox.forget("r1"), Ok(false)); // idempotent
+        assert!(mailbox.poll("r1").is_err());
+
+        // The same works for an answered request, and through the JSON
+        // `forget` op used across the ABI boundary.
+        mailbox.handle(open_args("r2", "c2")).unwrap();
+        mailbox
+            .respond("r2", serde_json::json!({"values": ["Linux"]}))
+            .unwrap();
+        let forgotten = mailbox
+            .handle(serde_json::json!({"op": "forget", "requestId": "r2"}))
+            .unwrap();
+        assert_eq!(forgotten["status"], "forgotten");
+        assert_eq!(forgotten["removed"], true);
+        assert!(mailbox.poll("r2").is_err());
+
+        // Unknown ids are a no-op, and a forgotten id can be opened again
+        // without replaying the old terminal state.
+        assert_eq!(mailbox.forget("missing"), Ok(false));
+        let reopened = mailbox.handle(open_args("r1", "c1")).unwrap();
+        assert_eq!(reopened["status"], "pending");
     }
 
     #[test]
