@@ -27,7 +27,9 @@ use crate::file_io::{
 };
 use crate::file_mutation_queue::MutatingEnv;
 use crate::path_utils::resolve_tool_path;
-use crate::tools::edit_diff::{generate_diff_string, generate_unified_patch};
+use crate::tools::edit_diff::{
+    generate_diff_string_budgeted, generate_unified_patch_budgeted, DIFF_TIME_BUDGET,
+};
 use crate::tools::tool_context::ExecutionToolContext;
 
 /// Input for the write tool. Mirrors TS `WriteToolInput`.
@@ -202,7 +204,27 @@ impl AgentTool for WriteTool {
         .await;
 
         let pre = pre_image.map_err(file_err_to_agent)?;
-        let details = write_diff_details(&path_for_msg, &pre, &content);
+        // Diff generation is CPU-bound (two Myers passes). Run it on the
+        // blocking pool so a large write never occupies an async worker, and
+        // give each pass a hard wall-clock budget (spawn_blocking alone does
+        // not bound runtime): over budget the result is an explicit
+        // `diff_skipped: timeout`, never a suboptimal/fabricated diff.
+        check_abort(&signal).map_err(file_err_to_agent)?;
+        let path_for_diff = path_for_msg.clone();
+        let diff_cancel = signal.clone();
+        let pre_text = pre.text.clone();
+        let pre_read_error = pre.read_error.clone();
+        let new_text = content.clone();
+        let details = tokio::task::spawn_blocking(move || {
+            let pre = PreImage {
+                text: pre_text,
+                read_error: pre_read_error,
+            };
+            write_diff_details(&path_for_diff, &pre, &new_text, &diff_cancel)
+        })
+        .await
+        .map_err(|e| AgentError::Tool(format!("write diff task failed: {e}")))?
+        .map_err(file_err_to_agent)?;
 
         Ok(AgentToolResult {
             content: vec![TextContentOrImage::text(format!(
@@ -230,21 +252,37 @@ const MAX_DIFF_INPUT_BYTES: usize = 2 * 1024 * 1024;
 /// Build the `details` payload. Mirrors the edit tool's shape (`diff` is the
 /// display diff with line-number prefixes, `patch` is a unified patch) so hosts
 /// render write rows with the same diff card as edit rows.
-fn write_diff_details(path: &str, pre: &PreImage, new: &str) -> serde_json::Value {
+///
+/// Budgeted + cancellable: both Myers passes get [`DIFF_TIME_BUDGET`]; a
+/// budget violation becomes `diff_skipped: "timeout"`. Cancellation before or
+/// between passes propagates as `Err(Aborted)`.
+fn write_diff_details(
+    path: &str,
+    pre: &PreImage,
+    new: &str,
+    cancel: &CancellationToken,
+) -> Result<serde_json::Value, FileError> {
+    check_abort(cancel)?;
     if let Some(reason) = &pre.read_error {
-        return serde_json::json!({ "diff_skipped": reason });
+        return Ok(serde_json::json!({ "diff_skipped": reason }));
     }
     let old = pre.text.as_deref().unwrap_or("");
     if old.len().saturating_add(new.len()) > MAX_DIFF_INPUT_BYTES {
-        return serde_json::json!({ "diff_skipped": "content_too_large" });
+        return Ok(serde_json::json!({ "diff_skipped": "content_too_large" }));
     }
-    let diff = generate_diff_string(old, new, 4);
-    let patch = generate_unified_patch(path, old, new);
-    serde_json::json!({
+    let Some(diff) = generate_diff_string_budgeted(old, new, 4, DIFF_TIME_BUDGET) else {
+        return Ok(serde_json::json!({ "diff_skipped": "timeout" }));
+    };
+    check_abort(cancel)?;
+    let Some(patch) = generate_unified_patch_budgeted(path, old, new, DIFF_TIME_BUDGET) else {
+        return Ok(serde_json::json!({ "diff_skipped": "timeout" }));
+    };
+    check_abort(cancel)?;
+    Ok(serde_json::json!({
         "diff": diff.diff,
         "patch": patch,
         "first_changed_line": diff.first_changed_line,
-    })
+    }))
 }
 
 /// Check the cancel token, returning `Err(FileError::aborted())` when set.
@@ -258,4 +296,22 @@ fn check_abort(cancel: &CancellationToken) -> Result<(), FileError> {
 
 fn file_err_to_agent(e: FileError) -> AgentError {
     AgentError::Tool(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_diff_details_aborts_before_compute_when_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let pre = PreImage {
+            text: Some("old\n".to_string()),
+            read_error: None,
+        };
+        let err = write_diff_details("note.txt", &pre, "new\n", &cancel)
+            .expect_err("cancelled diff must abort");
+        assert_eq!(err.code, FileErrorCode::Aborted);
+    }
 }

@@ -7,11 +7,13 @@
 //! in collapsed tool rows, so the property must stay in the tool schema.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rpi_agent::agent_tool::AgentTool;
+use rpi_tools::tools::edit_diff::{generate_diff_string_budgeted, generate_unified_patch_budgeted};
 use rpi_tools::{
-    create_bash_tool, create_powershell_tool, create_write_tool, ExecutionEnv,
-    ExecutionToolContext, FileSystem, InMemoryExecutionEnv,
+    create_bash_tool, create_powershell_tool, create_write_tool, ExecutionToolContext, FileSystem,
+    InMemoryExecutionEnv,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -80,23 +82,89 @@ async fn overwrite_diff_reports_real_adds_and_removes() {
 async fn unchanged_overwrite_has_empty_diff() {
     let (env, ctx) = fresh_context();
     let abs = env.absolute_path("same.txt", None).await.unwrap();
-    env.seed_file(&abs.to_string_lossy(), b"same\n".to_vec()).await;
+    env.seed_file(&abs.to_string_lossy(), b"same\n".to_vec())
+        .await;
 
     let tool = create_write_tool(&ctx);
     let result = run_write(tool, "same.txt", "same\n").await;
 
     assert_eq!(result.details["diff"], json!(""));
-    assert_eq!(result.details["first_changed_line"], serde_json::Value::Null);
+    assert_eq!(
+        result.details["first_changed_line"],
+        serde_json::Value::Null
+    );
+}
+
+/// 20k lines of completely different content per side (~1 MB total, well
+/// under the 2 MiB cap). This is the size class the PR review measured at
+/// multiple seconds for two Myers passes.
+fn wide_replacement(lines: usize) -> (String, String) {
+    let old = (0..lines)
+        .map(|i| format!("old line {i:05} lorem ipsum dolor sit amet"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let new = (0..lines)
+        .map(|i| format!("new line {i:05} consectetur adipiscing elit"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (old, new)
+}
+
+#[test]
+fn budgeted_diffs_bail_out_on_exhausted_budget() {
+    let (old, new) = wide_replacement(20_000);
+    assert!(
+        old.len() + new.len() < 2 * 1024 * 1024,
+        "fixture must stay under MAX_DIFF_INPUT_BYTES"
+    );
+
+    let started = Instant::now();
+    assert!(
+        generate_diff_string_budgeted(&old, &new, 4, Duration::from_millis(1)).is_none(),
+        "display diff must be skipped when the budget is exhausted"
+    );
+    assert!(
+        generate_unified_patch_budgeted("big.txt", &old, &new, Duration::from_millis(1)).is_none(),
+        "unified patch must be skipped when the budget is exhausted"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "budgeted diffs must return promptly, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn write_large_full_replacement_skips_diff() {
+    let (env, ctx) = fresh_context();
+    let abs = env.absolute_path("big.txt", None).await.unwrap();
+    let (old, new) = wide_replacement(20_000);
+    env.seed_file(&abs.to_string_lossy(), old.into_bytes())
+        .await;
+
+    let tool = create_write_tool(&ctx);
+    let started = Instant::now();
+    let result = run_write(tool, "big.txt", &new).await;
+
+    assert_eq!(
+        result.details["diff_skipped"],
+        json!("timeout"),
+        "large replacement must report diff_skipped=timeout; details: {}",
+        result.details
+    );
+    assert!(result.details["diff"].is_null());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "write must not spend unbounded time on the diff, took {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
 async fn bash_and_powershell_schemas_expose_description() {
     let (_env, ctx) = fresh_context();
 
-    for tool in [
-        create_bash_tool(&ctx, None),
-        create_powershell_tool(&ctx),
-    ] {
+    for tool in [create_bash_tool(&ctx, None), create_powershell_tool(&ctx)] {
         let schema = &tool.schema().parameters.0;
         let prop = &schema["properties"]["description"];
         assert!(
@@ -105,9 +173,7 @@ async fn bash_and_powershell_schemas_expose_description() {
             tool.schema().name
         );
         assert!(
-            prop["description"]
-                .as_str()
-                .is_some_and(|d| !d.is_empty()),
+            prop["description"].as_str().is_some_and(|d| !d.is_empty()),
             "{} description property needs a schema description",
             tool.schema().name
         );
