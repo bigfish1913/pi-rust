@@ -31,6 +31,8 @@ struct VtState {
     /// Native scrollback browsing is independent of the application's cursor.
     history_view_top: Option<usize>,
     scrollback_erase_count: usize,
+    /// iTerm2 archives the live screen before ED(2), including any input dock.
+    save_screen_on_display_erase: bool,
     cursor_row: usize,
     cursor_col: usize,
     cursor_visible: bool,
@@ -55,6 +57,7 @@ impl VirtualTerminal {
             viewport_top: 0,
             history_view_top: None,
             scrollback_erase_count: 0,
+            save_screen_on_display_erase: false,
             cursor_row: 0,
             cursor_col: 0,
             cursor_visible: true,
@@ -264,7 +267,13 @@ impl VirtualTerminal {
                                         st.viewport_top = 0;
                                         continue;
                                     }
-                                    // Clear screen (2J): blank the visible rows.
+                                    if nums.first() == Some(&2) && st.save_screen_on_display_erase {
+                                        // iTerm2's eraseInDisplayBeforeCursor:afterCursor:
+                                        // calls scrollScreenIntoHistory before clearing ED(2).
+                                        st.viewport_top += st.rows;
+                                        Self::limit_scrollback(&mut st);
+                                    }
+                                    // Blank the live rows after any terminal-owned archive.
                                     let top = st.viewport_top;
                                     for row in top..top + st.rows {
                                         self.ensure_row(&mut st, row);
@@ -795,3 +804,6 @@ fn long_transcript_stream_rewrite_keeps_dock_visible() {
 
 #[path = "main_screen_scroll_up/acceptance.rs"]
 mod acceptance;
+
+#[path = "main_screen_scroll_up/dock_history.rs"]
+mod dock_history;
