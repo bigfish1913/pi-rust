@@ -5,7 +5,9 @@ use std::sync::Mutex;
 
 use crate::component::Component;
 use crate::theme::theme;
+use crate::utils::visible_width;
 
+const SEARCH_ICON: &str = "⌕";
 /// Search bar component that displays search query and match count.
 pub struct SearchBar {
     query: Mutex<String>,
@@ -61,8 +63,9 @@ impl Component for SearchBar {
         let theme = theme();
         let colors = &theme.colors;
 
-        // Build search bar text
-        let search_icon = "🔍";
+        // Keep this as a text glyph rather than the emoji `🔍`: macOS
+        // terminals render the emoji with a larger/color font fallback.
+        let search_icon = SEARCH_ICON;
         let match_info = if match_count == 0 {
             if query.is_empty() {
                 String::new()
@@ -77,8 +80,8 @@ impl Component for SearchBar {
         let right = match_info;
 
         // Calculate padding
-        let left_len = left.chars().count();
-        let right_len = right.chars().count();
+        let left_len = visible_width(&left);
+        let right_len = visible_width(&right);
         let padding = if width > left_len + right_len + 2 {
             width - left_len - right_len - 2
         } else {
@@ -125,5 +128,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("test"));
         assert!(lines[0].contains("1/5"));
+        assert!(lines[0].contains(SEARCH_ICON));
+        assert_eq!(visible_width(&lines[0]), 80);
     }
 }
