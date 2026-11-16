@@ -46,8 +46,10 @@ main-branch CI passes:
 3. A reusable workflow builds all six platforms (including the static
    `x86_64-unknown-linux-musl` Linux binary), verifies the archives, uploads
    their checksums and publishes `rpi-release.json` last.
-4. Homebrew and Scoop are updated independently; a new-version PR is submitted
-   to `microsoft/winget-pkgs`. Microsoft review/CLA completion remains external.
+4. npm, Homebrew and Scoop are updated independently; a new-version PR is submitted
+   to `microsoft/winget-pkgs`. npm first tests installation of its packed archive
+   and the native command, then publishes `@bigfishnpm/rpi` using OIDC.
+   Microsoft review/CLA completion remains external.
 
 No release runs in fork repositories or on PR events. Publication additionally
 requires a merged PR from an upstream `release-plz-*` branch whose merge commit
@@ -58,7 +60,7 @@ Do not use `pull_request_target` to execute contribution code with release secre
 
 A preview merge on the `preview` branch runs only the prebuilt binary workflow. It creates a
 GitHub prerelease with a `vX.Y.Z-preview.N` tag and does **not** run release-plz, publish any
-crate to crates.io, or update Homebrew/Scoop/winget channels. The preview binary is available
+crate to crates.io, publish to npm, or update Homebrew/Scoop/winget channels. The preview binary is available
 through the explicit `rpi update preview` command; normal stable update checks never select a
 prerelease. A preview binary still checks crates.io for the stable line and therefore tells the
 user to run `rpi update` when a formal release is available.
@@ -164,7 +166,106 @@ merge; only Release PRs receive automatic merge requests from repository bots.
 - Each run saves `channel-manifests-vX.Y.Z` as an artifact. The checked-in
   `packaging/` files are the baseline; generated manifests carry the actual
   published version/checksums. No bot commits directly to protected `main`.
+- For an npm failure, run **Release npm package** from Actions on `main` with the
+  already-published stable tag. It verifies the release again, skips an existing
+  npm version, and never downgrades `latest` when backfilling an older version.
 - Website deployment remains the separate `task rpi-deploy` operation.
+
+## npm distribution
+
+The npm package `@bigfishnpm/rpi` installs the `rpi` command using the prebuilt GitHub
+Release for the workspace version. Node.js 20+ is required to install and launch
+it. No npm dependencies or Rust compiler are needed. The package pins
+`rpi-release.json`; the installer checks the archive size and SHA-256 as well as
+the extracted executable SHA-256 before installing it.
+
+Stable binary releases automatically call
+[Release npm package](../../.github/workflows/release-npm.yml) after uploading all
+six distributions and the manifest. The npm job runs independently of the other
+install channels. Preview releases skip it. Normal CI also runs the npm tests
+offline, including fork PRs, without publish permissions.
+
+### One-time npm trusted publisher setup
+
+In [the package settings](https://www.npmjs.com/package/@bigfishnpm/rpi/access),
+add a GitHub Actions trusted publisher with organization/user `bigfish1913`,
+repository `pi-rust`, and workflow filename `ci.yml` for normal releases. Each
+additional entry point needs its own configuration when first used:
+
+| Workflow filename | Entry point |
+| --- | --- |
+| `ci.yml` | Automatic Release PR → binaries → npm publishing |
+| `release-binaries.yml` | Direct tag builds and manual binary recovery |
+| `release-npm.yml` | Manual npm-only recovery |
+
+Select **Allow npm publish** for each configuration; the newer npm default of
+allowing only staged publishing does not permit this workflow's direct publish.
+Leave the optional environment name empty. npm checks the **calling workflow**
+for reusable workflows, so configuring only `release-npm.yml` does not authorize
+the normal `ci.yml` release chain. The workflows pass `id-token: write` through
+the complete call chain, while ordinary test jobs retain read-only permissions.
+
+This uses GitHub-hosted runners, Node.js 24 and npm 11.12.1. npm exchanges OIDC
+for a short-lived credential and publishes provenance; no `NPM_TOKEN` secret or
+interactive 2FA is needed in GitHub Actions. Create each configuration shortly
+before its first new-version publication: npm requires the first successful
+publication from each new configuration within two days. Add the recovery
+configurations when needed; skipping an already-published version does not
+validate a new trusted publisher. See
+[npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
+
+### Automatic publication and recovery
+
+The job validates a stable `vX.Y.Z` tag, its source commit, and every distribution
+against the GitHub Release. `RPI_NPM_RELEASE_VERSION` and
+`RPI_NPM_RELEASE_MANIFEST` pin preparation to that release independently of the
+checked-out workspace version. Before publishing, it runs the npm tests, packs
+the package, installs the archive into a temporary prefix, and checks the native
+`rpi --version` output. Download or checksum failures prevent publication.
+
+Publication is serialized across versions. An already-published version is
+skipped without changing tags. A previously unpublished version older than
+`latest` is published under `backfill`, preserving `latest`. Registry connection,
+authentication and server failures stop the job rather than being treated as an
+absent version. The publisher waits for the new version endpoint when npm accepts
+a release asynchronously.
+
+To retry npm alone, use **Actions → Release npm package → Run workflow**, select
+`main` and supply the existing stable tag. Tags predating npm support can be
+published this way without rebuilding their Rust binaries or changing Cargo.
+
+### Local publication
+
+After the matching GitHub Release has all six distributions and its manifest:
+
+```bash
+npm run prepare:release   # sync package.json to Cargo.toml and pin the release manifest
+npm test
+npm pack --dry-run       # inspect the package file list
+npm publish --dry-run
+npm whoami               # authenticate with npm login if necessary
+npm publish
+npm view @bigfishnpm/rpi version
+```
+
+`npm publish` runs preparation again and fails if the matching release manifest
+is unavailable or incomplete. Publishing requires npm permissions for the
+`bigfishnpm` user scope and the package, and may require browser authentication
+or a one-time password. Run `npm profile get "two-factor auth"` to confirm 2FA
+is enabled. Browser authentication requires an interactive terminal. GitHub
+Actions uses the trusted publishers above; other headless environments need their
+own supported OIDC configuration or an appropriately scoped npm token. Never
+commit authentication tokens or one-time passwords.
+
+A first publication may return HTTP 202 and report that the package is being
+processed. Do not republish or bump the version solely because `npm view` still
+returns 404. Check `npm dist-tag ls @bigfishnpm/rpi` and the registry's version
+endpoint and tarball, then wait for package metadata to become available.
+
+For an installation smoke test, run `npm pack --pack-destination .deploy`, install
+the resulting tarball into a temporary prefix, and execute that prefix's `rpi`
+command with `--version`. This installation smoke test also runs before every
+automated npm publication.
 
 ## Manual release and recovery tools
 

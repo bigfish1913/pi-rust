@@ -53,9 +53,9 @@ v0.22.1 已包含 PR #303 的写入时序修复，但等待 `drain_session()` �
    用来在插入旧提示、页面淘汰、重排后重新定位当前可写区域。
 2. 若旧 live 行全部被移除，使用仍存活的唯一 saved 三行块确定已输出边界，防止
    折叠或“大幅缩短 + 更早行编辑”把旧消息再次拉回 live screen。重复/空白块不作身份锚点。
-3. 在当前可写后缀内增量更新；需要重绘时，只清理 live screen（`ED 2`），不清 saved
-   scrollback（不发 `ED 3`）。可靠锚点之后的新增输出全部写出，不能仅截最后一屏：
-   resize/强制重绘和大量输出可以被合并进同一帧。
+3. 在当前可写后缀内增量更新；需要重绘时，用逐行 `EL 2` 清理 live screen，不清 saved
+   scrollback（不发 `ED 3`），也不发会在 iTerm2 中保存旧屏幕的 `ED 2`。可靠锚点之后的新增
+   输出全部写出，不能仅截最后一屏：resize/强制重绘和大量输出可以被合并进同一帧。
 4. 已初始化后变为空文档不能重新走首次全量输出。零行列窗口推迟绘制，保留重绘义务；
    窗口回到相同行列的 resize 通知也必须修复 live cells。移除逻辑页只删除 live 的 Kitty
    placement，不删除已归档图像的 placement。
@@ -68,6 +68,43 @@ v0.22.1 已包含 PR #303 的写入时序修复，但等待 `drain_session()` �
 “输出时自动滚动到底部”设置不受应用控制。已滚出区域是历史快照，不保证能看到后来
 重写的旧正文；需查看最新完整正文时使用 fullscreen。仍需用户在实际使用的终端复测，
 协议测试不能代替实机视觉验收。
+
+## 后续报告：输入框和状态栏留进原生历史
+
+截图显示旧输入框、工作路径及 token/model 状态行夹在回复和后续 Bash 输出之间。
+排查确认 regular 的重绘分支仍使用 `CSI 2 J`（ED 2）。在 iTerm2 中，这个操作会先
+将当前屏幕保存到 scrollback，再清屏，输入区因此也被归档。强制重绘、resize 和
+工具结果缩短均可进入此分支，不需要会话存储中真的出现输入框。
+
+上游证据：iTerm2 的
+[`eraseInDisplayBeforeCursor:afterCursor:decProtect:`](https://github.com/gnachman/iTerm2/blob/master/sources/VT100Screen/VT100ScreenMutableState.m)
+在 `before && after`（ED 2）分支中调用 `scrollScreenIntoHistory`。旧虚拟终端只将
+ED 2 模拟为置空 live cells，没有覆盖这个终端副作用，因此原有 32 项测试全部通过。
+
+修复将 regular 的清屏换成 HOME、逐行 `EL 2` 与不滚动的光标下移，再 HOME 重画。
+不使用换行擦屏，不发送 ED 2/ED 3。fullscreen 的独立缓冲区绘制逻辑保持原有行为。
+
+新增 `main_screen_scroll_up/dock_history.rs`，通过可选的 ED 2 归档模型验证：
+
+- 模型自身区分 ED 2 的归档与 EL 2 的原地擦除。
+- 强制重绘、同尺寸 resize、工具结果缩短各重复三次，保存前缀、回看位置及历史行数保持不变。
+- 随后继续追加 100 行工具输出，新增行完整且各出现一次，草稿/footer 各一份且均不在 saved rows 中。
+
+RED/GREEN：旧生产实现为 **1 通过、3 失败**，每次重绘均意外保存一整屏（12 行）；
+替换擦除指令后新增 **4 项全部通过**，整个 `main_screen_scroll_up` 为 **36 通过**。
+完整 TUI 检查命令：
+
+```bash
+cargo test -p rpi-tui --locked -- --test-threads=1 \
+  --skip streaming_burst_paints_at_most_one_frame_per_interval \
+  --skip completed_panel_reports_total_elapsed
+```
+
+最新 `main`（`740d65a`）基线上的结果为 **572 通过、1 项已有 ignored、2 项过滤**。
+调度计时测试已在未修改的 `668d7d7` 独立 worktree 中复现失败；完成耗时测试也出现
+计时波动（预期 0.1–0.2 秒，实际 0.3 秒），此前单独运行及完整检查中均曾通过。
+两个计时测试均未修改。格式与 diff 检查通过。
+这是协议复现，仍需在用户实际终端中做下面的人工验收。
 
 ## 自动验收
 

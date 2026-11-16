@@ -346,6 +346,16 @@ jobs:
           echo "::warning::RustFS/CDN mirror failed; the GitHub Release remains canonical."
           echo "- WARNING: RustFS/CDN mirror failed; GitHub Release remains canonical." >> "$GITHUB_STEP_SUMMARY"
 
+  npm:
+    if: inputs.preview != true
+    needs: release
+    uses: ./.github/workflows/release-npm.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+
   channels:
     if: inputs.preview != true
     needs: release

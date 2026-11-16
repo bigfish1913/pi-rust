@@ -1,0 +1,78 @@
+name: Release npm package
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable release tag to publish or retry (for example v0.23.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize all npm versions so concurrent retries cannot race the latest tag.
+concurrency:
+  group: release-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'bigfish1913/pi-rust' &&
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Keep provenance tied to the workflow commit. Dispatch from main to
+          # recover older tags using packaging code that already supports npm.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.12.1 --ignore-scripts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify the stable release and all six distributions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
+          manifest="$RUNNER_TEMP/rpi-release.json"
+          gh release download "$TAG" --repo bigfish1913/pi-rust \
+            --pattern rpi-release.json --output "$manifest"
+          python3 scripts/verify-channel-release.py "$TAG" "$manifest"
+          echo "RPI_NPM_RELEASE_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          echo "RPI_NPM_RELEASE_MANIFEST=$manifest" >> "$GITHUB_ENV"
+      - name: Prepare the npm version and pinned manifest
+        run: npm run prepare:release
+      - name: Test npm packaging and retry behavior
+        run: npm test
+      - name: Smoke test the packaged installer and native command
+        run: |
+          set -euo pipefail
+          npm pack --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/npm-pack.json"
+          archive="$(node -e 'console.log(require(process.argv[1])[0].filename)' "$RUNNER_TEMP/npm-pack.json")"
+          npm install --global --prefix "$RUNNER_TEMP/npm-smoke" "$RUNNER_TEMP/$archive" \
+            --foreground-scripts --no-audit --no-fund
+          actual_version="$("$RUNNER_TEMP/npm-smoke/bin/rpi" --version)"
+          [[ "$actual_version" == "rpi $RPI_NPM_RELEASE_VERSION" ]]
+      - name: Publish with npm trusted publishing
+        # OIDC supplies a short-lived publish credential; no npm token secret.
+        run: node scripts/publish-npm.mjs
