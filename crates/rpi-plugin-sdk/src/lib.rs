@@ -1098,15 +1098,18 @@ pub type BeforeAgentStartFn =
 ///
 /// Handlers chain in registration order, each seeing the previous one's
 /// result. A nonzero return or a panic leaves the result as it was and the
-/// fan-out continues. The `rpi` host offers every finished result, error
-/// results included (`"isError": true`, for example a bash exit != 0 with its
-/// output); a transform cannot change whether the call failed. The reason of a
-/// call vetoed by a `ToolCall` handler is offered too, as the text of an error
-/// result with `"details": {"blocked": true}`; the first non-empty `text` block
-/// returned becomes the reason the model reads. If the transforms cannot run,
-/// the host withholds the result rather than pass it on. Handlers run on a
-/// blocking thread, so slow work (re-encoding an image) does not stall the
-/// runtime.
+/// fan-out continues. The `rpi` host offers every finished result, including
+/// error results and immediate preparation failures such as argument-schema
+/// validation or a missing tool (`"isError": true`, for example a bash exit
+/// != 0 with its output); a transform cannot change whether the call failed.
+/// The reason of a call vetoed by a `ToolCall` handler is offered too, as the
+/// text of an error result with `"details": {"blocked": true}`; the first
+/// non-empty `text` block returned becomes the reason the model reads. If the
+/// transforms cannot run, including when `/reload` invalidates the captured
+/// snapshot before dispatch, the host withholds the result rather than pass it
+/// on. Recorded calls keep their recorded result without running hooks again.
+/// Handlers run on a blocking thread, so slow work (re-encoding an image) does
+/// not stall the runtime.
 ///
 /// SAFETY: the plugin warrants `user_data` is valid for the registry's lifetime
 /// and the handler is callable from any thread.

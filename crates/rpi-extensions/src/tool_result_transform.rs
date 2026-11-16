@@ -57,8 +57,9 @@ pub fn with_tool_result_transform(
 }
 
 /// Run every `tool_result` transform over one successful result. `None` means
-/// no handler changed anything (or the snapshot is stale), so the caller keeps
-/// `result`. Same as [`emit_tool_result_with_status`] with `is_error: false`.
+/// no handler changed anything (including when the snapshot is stale), so the
+/// SDK tool wrapper keeps `result`. Same as
+/// [`emit_tool_result_with_status`] with `is_error: false`.
 pub fn emit_tool_result(
     tool_call_id: &str,
     tool_name: &str,
@@ -66,13 +67,21 @@ pub fn emit_tool_result(
     result: &AgentToolResult,
     snapshot: &RegistrySnapshot,
 ) -> Option<AgentToolResult> {
+    if !snapshot.is_active() {
+        return None;
+    }
     emit_tool_result_with_status(tool_call_id, tool_name, input, result, false, snapshot)
+        .ok()
+        .flatten()
 }
 
 /// Run every `tool_result` transform over one result, success or error. The
-/// envelope carries `"isError"` so a handler can tell them apart. `None` means
-/// no handler changed anything (or the snapshot is stale), so the caller keeps
-/// `result`.
+/// envelope carries `"isError"` so a handler can tell them apart.
+///
+/// Returns `Err(())` when a stale snapshot prevented dispatch, so a caller
+/// can fail closed instead of mistaking it for "no transform changed the
+/// result". `Ok(None)` means the snapshot was active but no handler changed
+/// anything.
 pub fn emit_tool_result_with_status(
     tool_call_id: &str,
     tool_name: &str,
@@ -80,13 +89,13 @@ pub fn emit_tool_result_with_status(
     result: &AgentToolResult,
     is_error: bool,
     snapshot: &RegistrySnapshot,
-) -> Option<AgentToolResult> {
+) -> Result<Option<AgentToolResult>, ()> {
     if !assert_active(snapshot.active_flag()) {
-        return None;
+        return Err(());
     }
     let handlers = snapshot.tool_result();
     if handlers.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut content = content_to_json(&result.content);
     let mut details = result.details.clone();
@@ -129,7 +138,7 @@ pub fn emit_tool_result_with_status(
             ),
         }
     }
-    changed.then(|| AgentToolResult {
+    Ok(changed.then(|| AgentToolResult {
         content: if content_replaced {
             content_from_json(&content)
         } else {
@@ -137,7 +146,7 @@ pub fn emit_tool_result_with_status(
         },
         details,
         ..result.clone()
-    })
+    }))
 }
 
 struct TransformedTool {
@@ -376,6 +385,7 @@ mod tests {
         for is_error in [false, true] {
             let changed =
                 emit_tool_result_with_status("c1", "bash", &input, &result(), is_error, &snap)
+                    .unwrap()
                     .unwrap();
             assert_eq!(changed.details, json!({"isError": is_error}));
         }

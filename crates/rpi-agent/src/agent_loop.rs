@@ -1005,11 +1005,16 @@ async fn execute_tool_calls_sequential(
 
     for tool_call in tool_calls {
         if let Some(reason) = invalid_tool_call_reason(tool_call) {
-            let finalized = FinalizedToolCall {
-                tool_call: tool_call.clone(),
-                result: create_error_tool_result(&reason),
-                is_error: true,
-            };
+            let finalized = finalize_tool_call(
+                current_context,
+                assistant_message,
+                tool_call,
+                &tool_call.arguments,
+                create_error_tool_result(&reason),
+                true,
+                config,
+            )
+            .await;
             emit_tool_execution_end(emit, &finalized).await;
             let trm = create_tool_result_message(tool_call, &finalized.result, true);
             emit_tool_result_message(emit, &trm).await;
@@ -1083,6 +1088,7 @@ async fn execute_tool_calls_parallel(
                 return Prepared::Immediate {
                     result: create_error_tool_result(&reason),
                     is_error: true,
+                    run_result_hooks: true,
                 };
             }
             emit_event(
@@ -1099,11 +1105,28 @@ async fn execute_tool_calls_parallel(
         // Preparation remains sequential, but ready peers must keep running
         // while a later authorization/preparation hook is awaiting them.
         match drive_tool_calls_while(preparation, &mut running, &mut completed).await {
-            Prepared::Immediate { result, is_error } => {
-                let finalized = FinalizedToolCall {
-                    tool_call: tool_call.clone(),
-                    result,
-                    is_error,
+            Prepared::Immediate {
+                result,
+                is_error,
+                run_result_hooks,
+            } => {
+                let finalized = if run_result_hooks {
+                    finalize_tool_call(
+                        current_context,
+                        assistant_message,
+                        tool_call,
+                        &tool_call.arguments,
+                        result,
+                        is_error,
+                        config,
+                    )
+                    .await
+                } else {
+                    FinalizedToolCall {
+                        tool_call: tool_call.clone(),
+                        result,
+                        is_error,
+                    }
                 };
                 drive_tool_calls_while(
                     emit_tool_execution_end(emit, &finalized),
@@ -1208,11 +1231,31 @@ pub(crate) async fn run_one_tool_call(
     emit: &Arc<dyn AgentEmitter>,
 ) -> Result<FinalizedToolCall, AgentError> {
     match prepare_tool_call(current_context, assistant_message, tool_call, config).await {
-        Prepared::Immediate { result, is_error } => Ok(FinalizedToolCall {
-            tool_call: tool_call.clone(),
+        Prepared::Immediate {
             result,
             is_error,
-        }),
+            run_result_hooks,
+        } => {
+            let finalized = if run_result_hooks {
+                finalize_tool_call(
+                    current_context,
+                    assistant_message,
+                    tool_call,
+                    &tool_call.arguments,
+                    result,
+                    is_error,
+                    config,
+                )
+                .await
+            } else {
+                FinalizedToolCall {
+                    tool_call: tool_call.clone(),
+                    result,
+                    is_error,
+                }
+            };
+            Ok(finalized)
+        }
         Prepared::Ready { tool, args } => {
             let executed = execute_prepared_tool_call(
                 tool_call,
@@ -1241,8 +1284,13 @@ pub(crate) async fn run_one_tool_call(
 enum Prepared {
     /// Resolved without executing (not-found / blocked / aborted / validation error).
     Immediate {
+        /// A fresh failure produced by this run. The result transforms run
+        /// on it before it reaches the model, transcript or session.
         result: AgentToolResult,
         is_error: bool,
+        /// Recorded calls have already run upstream: never execute them,
+        /// invoke hooks on them or transform their recorded result.
+        run_result_hooks: bool,
     },
     /// Validated and ready to execute.
     Ready {
@@ -1267,6 +1315,7 @@ async fn prepare_tool_call(
         return Prepared::Immediate {
             result: create_error_tool_result(&reason),
             is_error: true,
+            run_result_hooks: true,
         };
     }
 
@@ -1279,7 +1328,11 @@ async fn prepare_tool_call(
             Ok(decoded) => decoded,
             Err(reason) => (create_error_tool_result(&reason), true),
         };
-        return Prepared::Immediate { result, is_error };
+        return Prepared::Immediate {
+            result,
+            is_error,
+            run_result_hooks: false,
+        };
     }
 
     let tool = current_context
@@ -1293,6 +1346,7 @@ async fn prepare_tool_call(
             return Prepared::Immediate {
                 result: create_error_tool_result(&format!("Tool {} not found", tool_call.name)),
                 is_error: true,
+                run_result_hooks: true,
             };
         }
     };
@@ -1304,6 +1358,7 @@ async fn prepare_tool_call(
             return Prepared::Immediate {
                 result: create_error_tool_result(&e.to_string()),
                 is_error: true,
+                run_result_hooks: true,
             };
         }
     };
@@ -1316,6 +1371,7 @@ async fn prepare_tool_call(
             return Prepared::Immediate {
                 result: create_error_tool_result(&e.to_string()),
                 is_error: true,
+                run_result_hooks: true,
             };
         }
     };
@@ -1339,6 +1395,7 @@ async fn prepare_tool_call(
             return Prepared::Immediate {
                 result: create_error_tool_result("Operation aborted"),
                 is_error: true,
+                run_result_hooks: true,
             };
         }
         if let Some(br) = before_result {
@@ -1356,6 +1413,9 @@ async fn prepare_tool_call(
                 return Prepared::Immediate {
                     result,
                     is_error: true,
+                    // The CLI already offered a veto reason to the result
+                    // transforms; running them again would transform it twice.
+                    run_result_hooks: false,
                 };
             }
         }
@@ -1365,6 +1425,7 @@ async fn prepare_tool_call(
         return Prepared::Immediate {
             result: create_error_tool_result("Operation aborted"),
             is_error: true,
+            run_result_hooks: true,
         };
     }
 
@@ -1593,14 +1654,7 @@ async fn execute_prepared_tool_call(
     outcome
 }
 
-/// Result of `execute` before `after_tool_call` overrides. Mirrors TS
-/// `ExecutedToolCallOutcome`.
-struct ExecutedToolCallOutcome {
-    result: AgentToolResult,
-    is_error: bool,
-}
-
-/// Apply `after_tool_call` overrides. Mirrors TS `finalizeExecutedToolCall`.
+/// Apply `after_tool_call` overrides to a tool's executed result.
 async fn finalize_executed_tool_call(
     current_context: &AgentContext,
     assistant_message: &AssistantMessage,
@@ -1609,9 +1663,37 @@ async fn finalize_executed_tool_call(
     executed: ExecutedToolCallOutcome,
     config: &AgentLoopConfig,
 ) -> FinalizedToolCall {
-    let mut result = executed.result;
-    let mut is_error = executed.is_error;
+    finalize_tool_call(
+        current_context,
+        assistant_message,
+        tool_call,
+        args,
+        executed.result,
+        executed.is_error,
+        config,
+    )
+    .await
+}
 
+/// Result of `execute` before `after_tool_call` overrides. Mirrors TS
+/// `ExecutedToolCallOutcome`.
+struct ExecutedToolCallOutcome {
+    result: AgentToolResult,
+    is_error: bool,
+}
+
+/// Apply `after_tool_call` overrides to any model-visible result,
+/// whether it came from an executed tool or an immediate failure.
+/// Mirrors TS `finalizeExecutedToolCall`.
+async fn finalize_tool_call(
+    current_context: &AgentContext,
+    assistant_message: &AssistantMessage,
+    tool_call: &ToolCall,
+    args: &serde_json::Value,
+    mut result: AgentToolResult,
+    mut is_error: bool,
+    config: &AgentLoopConfig,
+) -> FinalizedToolCall {
     if let Some(after) = &config.after_tool_call {
         let ctx = AfterToolCallContext {
             assistant_message,

@@ -1513,7 +1513,9 @@ const TOOL_RESULT_WITHHELD: &str =
     "[tool result withheld: the extension tool_result transforms could not run]";
 
 /// Run the plugin `tool_result` transforms over one result on a blocking
-/// thread. `None` means no transform is registered or none changed anything.
+/// thread. `None` means no transform is registered. When a transform ran, an
+/// unchanged result is still returned so the caller can distinguish it from a
+/// skipped dispatch.
 async fn run_tool_result_transforms(
     session: &ExtensionSession,
     tool_call_id: String,
@@ -1527,30 +1529,43 @@ async fn run_tool_result_transforms(
         return None;
     }
     let keepalive = session.keepalive();
+    let withheld = rpi_agent::AgentToolResult::error_text(TOOL_RESULT_WITHHELD);
     let transformed = tokio::task::spawn_blocking(move || {
         // A started blocking callback outlives a dropped awaiter: keep the
         // plugin libraries loaded until every handler has returned.
         let _keepalive = keepalive;
-        rpi_extensions::emit_tool_result_with_status(
+        if !snapshot.is_active() {
+            return rpi_agent::AgentToolResult::error_text(TOOL_RESULT_WITHHELD);
+        }
+        match rpi_extensions::emit_tool_result_with_status(
             &tool_call_id,
             &tool_name,
             &input,
             &result,
             is_error,
             &snapshot,
-        )
+        ) {
+            Ok(Some(changed)) => changed,
+            Ok(None) => result,
+            // A concurrent /reload invalidated the snapshot before the
+            // blocking callback could dispatch. Never pass the unchecked
+            // output to the model: it may still contain secrets that a
+            // plugin's transform was supposed to remove.
+            Err(()) => rpi_agent::AgentToolResult::error_text(TOOL_RESULT_WITHHELD),
+        }
     })
     .await;
     match transformed {
-        Ok(changed) => changed,
-        Err(_) => Some(rpi_agent::AgentToolResult::error_text(TOOL_RESULT_WITHHELD)),
+        Ok(changed) => Some(changed),
+        Err(_) => Some(withheld),
     }
 }
 
 /// `after_tool_call` hook: pass every finished tool result, success or error
-/// (a bash exit != 0 returns its output as an error result), through the
-/// plugin `tool_result` transforms. Resolves the session per call, like the
-/// tool-call hook, so it follows `/reload`; child harnesses inherit it.
+/// (a bash exit != 0 returns its output as an error result), and every fresh
+/// immediate failure through the plugin `tool_result` transforms. Resolves the
+/// session per call, like the tool-call hook, so it follows `/reload`; child
+/// harnesses inherit it. A stale or unavailable session fails closed.
 fn extension_tool_result_hook(sessions: ExtensionSessionCell) -> rpi_agent::AfterToolCall {
     Arc::new(move |ctx: rpi_agent::AfterToolCallContext<'_>, _signal| {
         let session = sessions.lock().map(|session| session.clone()).ok();
@@ -1562,7 +1577,7 @@ fn extension_tool_result_hook(sessions: ExtensionSessionCell) -> rpi_agent::Afte
         Box::pin(async move {
             let changed = match session {
                 Some(session) => {
-                    run_tool_result_transforms(
+                    match run_tool_result_transforms(
                         &session,
                         tool_call_id,
                         tool_name,
@@ -1570,7 +1585,13 @@ fn extension_tool_result_hook(sessions: ExtensionSessionCell) -> rpi_agent::Afte
                         result,
                         is_error,
                     )
-                    .await?
+                    .await
+                    {
+                        Some(changed) => changed,
+                        // No transform is registered: leave the tool's result
+                        // untouched, including its usage and terminate fields.
+                        None => return None,
+                    }
                 }
                 // A poisoned session lock: withhold rather than pass unchecked.
                 None => rpi_agent::AgentToolResult::error_text(TOOL_RESULT_WITHHELD),
@@ -1610,11 +1631,12 @@ async fn veto_reason_via_transforms(
     changed
         .and_then(|result| {
             result.content.into_iter().find_map(|part| match part {
-                rpi_agent::TextContentOrImage::Text(text) => Some(text.text),
+                rpi_agent::TextContentOrImage::Text(text) => {
+                    (!text.text.trim().is_empty()).then_some(text.text)
+                }
                 _ => None,
             })
         })
-        .filter(|text| !text.trim().is_empty())
         .unwrap_or(reason)
 }
 
@@ -4470,6 +4492,37 @@ mod tests {
         0
     }
 
+    extern "C" fn whitespace_then_reason_transform(
+        event: rpi_plugin_sdk::StbStringRef,
+        out: *mut rpi_plugin_sdk::StbString,
+        _: *mut std::ffi::c_void,
+    ) -> i32 {
+        // SAFETY: the host keeps the envelope and output slot live for the call.
+        let event: serde_json::Value = serde_json::from_str(unsafe { event.as_str() }).unwrap();
+        let reason = format!("REASON: {}", event["content"][0]["text"].as_str().unwrap());
+        let patch = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "   "},
+                {"type": "text", "text": reason}
+            ]
+        });
+        unsafe { *out = rpi_plugin_sdk::StbString::from_string(patch.to_string()) };
+        0
+    }
+
+    extern "C" fn redacting_test_tool_result(
+        _event: rpi_plugin_sdk::StbStringRef,
+        out: *mut rpi_plugin_sdk::StbString,
+        _: *mut std::ffi::c_void,
+    ) -> i32 {
+        let patch = serde_json::json!({
+            "content": [{"type": "text", "text": "REVIEW-REDACTED"}]
+        });
+        // SAFETY: the host keeps the output slot live for the callback.
+        unsafe { *out = rpi_plugin_sdk::StbString::from_string(patch.to_string()) };
+        0
+    }
+
     /// A session with a `ToolCall` gate that vetoes every call and/or the
     /// labelling `tool_result` transform.
     fn test_session(gate: bool, transform: bool) -> ExtensionSession {
@@ -4497,11 +4550,11 @@ mod tests {
         )
     }
 
-    async fn invoke_test_result_hook(
+    fn invoke_test_result_hook_future(
         hook: &rpi_agent::AfterToolCall,
         result: &rpi_agent::AgentToolResult,
         is_error: bool,
-    ) -> Option<rpi_agent::AfterToolCallResult> {
+    ) -> futures::future::BoxFuture<'static, Option<rpi_agent::AfterToolCallResult>> {
         let message = rpi_ai::providers::faux::faux_assistant_message(
             "result",
             rpi_ai::types::StopReason::ToolUse,
@@ -4522,7 +4575,14 @@ mod tests {
             },
             tokio_util::sync::CancellationToken::new(),
         )
-        .await
+    }
+
+    async fn invoke_test_result_hook(
+        hook: &rpi_agent::AfterToolCall,
+        result: &rpi_agent::AgentToolResult,
+        is_error: bool,
+    ) -> Option<rpi_agent::AfterToolCallResult> {
+        invoke_test_result_hook_future(hook, result, is_error).await
     }
 
     fn first_text(content: &[rpi_agent::TextContentOrImage]) -> &str {
@@ -4601,6 +4661,210 @@ mod tests {
             result.reason.unwrap(),
             format!("isError=true blocked=true text={host_reason}")
         );
+    }
+
+    #[tokio::test]
+    async fn review_reload_between_snapshot_capture_and_dispatch_withholds_result() {
+        let old_session = test_session(false, true);
+        let old_snapshot = old_session.snapshot_arc().expect("test transform");
+        let sessions = Arc::new(Mutex::new(old_session));
+        let hook = extension_tool_result_hook(sessions.clone());
+        let output = rpi_agent::AgentToolResult::text("secret output");
+        // Capture the hook's future without polling it: the session snapshot
+        // is already fixed, exactly as it is before dispatch to the blocking
+        // callback.
+        let pending = invoke_test_result_hook_future(&hook, &output, false);
+
+        // Invalidate/swap as /reload does before the captured future runs.
+        old_snapshot.active_flag().store(false, Ordering::SeqCst);
+        *sessions.lock().unwrap() = test_session(false, true);
+
+        let changed = pending.await.expect("stale dispatch fails closed");
+        assert_eq!(
+            first_text(changed.content.as_deref().unwrap()),
+            TOOL_RESULT_WITHHELD
+        );
+    }
+
+    #[tokio::test]
+    async fn review_veto_uses_first_nonempty_text() {
+        let sessions = Arc::new(Mutex::new(test_session(true, false)));
+        let hook =
+            extension_tool_call_hook(sessions.clone(), rpi_extensions::UiDialogMailbox::new());
+        let host_reason = invoke_test_tool_hook(&hook).await.unwrap().reason.unwrap();
+
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        registry.register_event_handler(
+            "gate".into(),
+            rpi_plugin_sdk::EventTag::ToolCall,
+            deny_test_tool_call,
+            std::ptr::null_mut(),
+        );
+        registry.register_tool_result(
+            whitespace_then_reason_transform,
+            rpi_plugin_sdk::callbacks::free_string,
+            std::ptr::null_mut(),
+        );
+        *sessions.lock().unwrap() = ExtensionSession::from_parts(
+            Arc::new(registry.snapshot()),
+            rpi_extensions::PluginKeepalive::empty(),
+            Vec::new(),
+            None,
+        );
+
+        let result = invoke_test_tool_hook(&hook).await.unwrap();
+        assert!(result.block);
+        assert_eq!(result.reason.unwrap(), format!("REASON: {host_reason}"));
+    }
+
+    #[tokio::test]
+    async fn review_validation_error_passes_through_cli_result_transform() {
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        registry.register_tool_result(
+            redacting_test_tool_result,
+            rpi_plugin_sdk::callbacks::free_string,
+            std::ptr::null_mut(),
+        );
+        let sessions = Arc::new(Mutex::new(ExtensionSession::from_parts(
+            Arc::new(registry.snapshot()),
+            rpi_extensions::PluginKeepalive::empty(),
+            Vec::new(),
+            None,
+        )));
+        let after = extension_tool_result_hook(sessions);
+        let mut context = rpi_agent::AgentContext::default();
+        context.tools = vec![Arc::new(SchemaTool {
+            schema: rpi_ai::types::Tool {
+                name: "integer".into(),
+                description: "accepts an integer".into(),
+                parameters: rpi_ai::types::Schema::new(serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "integer"}},
+                    "required": ["value"]
+                })),
+                constrained_sampling: None,
+            },
+        })];
+        let tool_call = match rpi_ai::types::Content::tool_call(
+            "call",
+            "integer",
+            serde_json::json!({"value": "invalid-secret"}),
+        ) {
+            rpi_ai::types::Content::ToolCall(call) => call,
+            _ => unreachable!(),
+        };
+        let assistant = rpi_ai::providers::faux::faux_assistant_message(
+            rpi_ai::providers::faux::FauxBlock::ToolCall {
+                name: "integer".into(),
+                id: "call".into(),
+                arguments: tool_call.arguments.clone(),
+            },
+            rpi_ai::types::StopReason::ToolUse,
+        );
+        context
+            .messages
+            .push(rpi_agent::message::AgentMessage::Assistant(Box::new(
+                assistant,
+            )));
+        let (collector, events) = rpi_agent::events::CollectorEmitter::new();
+        let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
+        let config = rpi_agent::hooks::AgentLoopConfig {
+            model: rpi_ai::model::Model::new(
+                "test",
+                "test",
+                rpi_ai::types::Api::Other("test".into()),
+                "test",
+                "",
+            ),
+            convert_to_llm: rpi_agent::hooks::default_convert_to_llm_fn(),
+            convert_to_llm_incremental: None,
+            transform_context: None,
+            get_api_key: None,
+            should_stop_after_turn: None,
+            prepare_next_turn: None,
+            after_tool_results: None,
+            get_steering_messages: None,
+            get_follow_up_messages: None,
+            pending_message_count: None,
+            before_tool_call: None,
+            after_tool_call: Some(after),
+            tool_execution: rpi_agent::types::ToolExecutionMode::Sequential,
+            thinking_level: rpi_ai::types::ThinkingLevel::default(),
+            api_key: None,
+            timeout: None,
+            stream_idle_timeout: None,
+            max_retries: None,
+            max_retry_delay: None,
+            cache_retention: rpi_ai::provider::CacheRetention::default(),
+            session_id: None,
+            signal: tokio_util::sync::CancellationToken::new(),
+        };
+        // Only the pending assistant's tool calls run; the empty stream fn is
+        // never called before the loop finishes this batch.
+        let stream_fn = rpi_agent::stream_fn::stream_fn(|_, _, opts| {
+            let (mut producer, stream) =
+                rpi_ai::event_stream::create_assistant_message_event_stream_with_cancellation(
+                    &opts.signal,
+                );
+            tokio::spawn(async move {
+                let message = rpi_ai::types::AssistantMessage::terminal(
+                    rpi_ai::types::Api::Other("test".into()),
+                    "test",
+                    "test",
+                    rpi_ai::types::StopReason::Stop,
+                    "done",
+                    0,
+                );
+                producer
+                    .push(rpi_ai::types::AssistantMessageEvent::Done {
+                        reason: rpi_ai::types::DoneReason::Stop,
+                        message,
+                    })
+                    .await;
+            });
+            stream
+        });
+        rpi_agent::run_agent_loop_from_assistant(context, config, emit, stream_fn)
+            .await
+            .expect("agent loop finishes");
+
+        let events = events.lock().unwrap();
+        let result = events.iter().find_map(|event| match event {
+            rpi_agent::AgentEvent::ToolExecutionEnd { result, .. } => Some(result),
+            _ => None,
+        });
+        let result = result.expect("validation failure reaches tool execution end");
+        let text = match &result.content[0] {
+            rpi_agent::TextContentOrImage::Text(text) => &text.text,
+            _ => panic!("expected a text result"),
+        };
+        assert_eq!(text, "REVIEW-REDACTED");
+        assert!(!text.contains("invalid-secret"));
+        assert!(!text.contains("Received arguments"));
+    }
+
+    /// Minimal schema-only tool for the immediate-validation regression.
+    struct SchemaTool {
+        schema: rpi_ai::types::Tool,
+    }
+
+    #[async_trait::async_trait]
+    impl rpi_agent::AgentTool for SchemaTool {
+        fn schema(&self) -> &rpi_ai::types::Tool {
+            &self.schema
+        }
+        fn label(&self) -> &str {
+            "schema tool"
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _params: serde_json::Value,
+            _signal: tokio_util::sync::CancellationToken,
+            _on_update: Arc<dyn Fn(rpi_agent::types::ToolResultPartial) + Send + Sync>,
+        ) -> Result<rpi_agent::types::AgentToolResult, rpi_agent::AgentError> {
+            unreachable!("invalid arguments must not execute this tool")
+        }
     }
 
     /// A unique scratch file for one summary test.
