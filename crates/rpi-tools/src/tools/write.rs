@@ -22,9 +22,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::env::FileContent;
 use crate::error::{FileError, FileErrorCode};
-use crate::file_io::{resolve_client_path, FileIOOperation, FileIORouter};
-use crate::file_mutation_queue::{with_file_mutation_queue, MutatingEnv};
+use crate::file_io::{
+    resolve_client_path, with_tool_mutation_queue, FileIOOperation, FileIORouter,
+};
+use crate::file_mutation_queue::MutatingEnv;
 use crate::path_utils::resolve_tool_path;
+use crate::tools::edit_diff::{
+    generate_diff_string_budgeted, generate_unified_patch_budgeted, DIFF_TIME_BUDGET,
+};
 use crate::tools::tool_context::ExecutionToolContext;
 
 /// Input for the write tool. Mirrors TS `WriteToolInput`.
@@ -93,86 +98,191 @@ impl AgentTool for WriteTool {
     ) -> Result<AgentToolResult, AgentError> {
         let input: WriteInput = serde_json::from_value(params)
             .map_err(|e| AgentError::Validation(format!("write input invalid: {e}")))?;
+        let path_for_msg = input.path.clone();
+        let content = input.content;
 
         // Freeze authority before any local path resolution or queue access.
-        if let Some(router) = &self.file_io {
-            if let Some(client) = router
+        let client = match &self.file_io {
+            Some(router) => router
                 .select(FileIOOperation::Write)
                 .await
+                .map_err(|e| file_err_to_agent(e.into()))?,
+            None => None,
+        };
+        let abs = if client.is_some() {
+            resolve_client_path(self.env.as_env().cwd(), &path_for_msg)
                 .map_err(|e| file_err_to_agent(e.into()))?
-            {
-                let abs = resolve_client_path(self.env.as_env().cwd(), &input.path)
-                    .map_err(|e| file_err_to_agent(e.into()))?;
-                let path_for_msg = input.path;
-                let abs_for_closure = abs.clone();
-                router
-                    .with_mutation_queue(&abs, &signal, move |cancel| {
-                        async move {
-                            client
-                                .write_text(&abs_for_closure, input.content, cancel)
-                                .await
-                                .map_err(FileError::from)
-                        }
-                        .boxed()
-                    })
-                    .await
-                    .map_err(file_err_to_agent)?;
-                return Ok(AgentToolResult {
-                    content: vec![TextContentOrImage::text(format!(
-                        "Successfully wrote to {path_for_msg}"
-                    ))],
-                    details: serde_json::Value::Null,
-                    ..Default::default()
-                });
-            }
-        }
+        } else {
+            resolve_tool_path(self.env.as_env(), &path_for_msg, Some(&signal))
+                .await
+                .map_err(file_err_to_agent)?
+        };
+        let abs_str = abs;
+        let client_selected = client.is_some();
 
-        let abs = resolve_tool_path(self.env.as_env(), &input.path, Some(&signal))
-            .await
-            .map_err(file_err_to_agent)?;
-        let abs_str = abs.clone();
-        let path_for_msg = input.path.clone();
-
-        // The mutation-queue closure. Abort does NOT unblock the queue: we still
-        // acquire the lock, then check the token before+after the write.
-        let content = input.content;
+        // The pre-image read and the write run in the *same* per-path mutation
+        // queue: the diff must describe exactly the bytes this call replaced,
+        // not a racing snapshot.
         let env = self.env.clone();
-        // `with_file_mutation_queue` borrows the env for the whole call, so keep
-        // a separate owned clone for the borrow reference and let the closure
-        // capture/move the other.
         let env_ref = env.clone();
         let abs_for_closure = abs_str.clone();
-        let result: Result<(), FileError> = with_file_mutation_queue(
+        let write_content = content.clone();
+        let pre_image: Result<PreImage, FileError> = with_tool_mutation_queue(
+            if client_selected {
+                self.file_io.as_deref()
+            } else {
+                None
+            },
             &*env_ref,
             &abs_str,
             &signal,
-            move |cancel: &CancellationToken| -> BoxFuture<'_, Result<(), FileError>> {
+            move |cancel: &CancellationToken| -> BoxFuture<'_, Result<PreImage, FileError>> {
                 let env = env.clone();
-                let content = content.clone();
+                let client = client.clone();
                 let abs_str = abs_for_closure.clone();
+                let content = write_content.clone();
                 async move {
                     check_abort(cancel)?;
-                    env.as_env()
-                        .write_file(&abs_str, FileContent::Text(content), Some(cancel))
-                        .await?;
+                    // Absent file = empty pre-image (a real "create" diff).
+                    // A read that fails for any other reason is surfaced as
+                    // `diff_skipped` in details; the write itself proceeds
+                    // (the pre-image is metadata, not part of the operation).
+                    let pre = if client.is_some() {
+                        // Client-owned files: the write transport has no
+                        // read-pre-image contract yet, so report the diff as
+                        // unavailable instead of paying an extra round-trip
+                        // or fabricating one from the new content.
+                        PreImage {
+                            text: None,
+                            read_error: Some("client_backend".to_string()),
+                        }
+                    } else {
+                        match env.as_env().file_info(&abs_str, Some(cancel)).await {
+                            Ok(info) if info.size as usize <= MAX_DIFF_INPUT_BYTES => {
+                                match env.as_env().read_text_file(&abs_str, Some(cancel)).await {
+                                    Ok(text) => PreImage {
+                                        text: Some(text),
+                                        read_error: None,
+                                    },
+                                    Err(e) => PreImage {
+                                        text: None,
+                                        read_error: Some(e.code.as_str().to_string()),
+                                    },
+                                }
+                            }
+                            Ok(_) => PreImage {
+                                text: None,
+                                read_error: Some("content_too_large".to_string()),
+                            },
+                            Err(e) if e.code == FileErrorCode::NotFound => PreImage {
+                                text: None,
+                                read_error: None,
+                            },
+                            Err(e) => PreImage {
+                                text: None,
+                                read_error: Some(e.code.as_str().to_string()),
+                            },
+                        }
+                    };
                     check_abort(cancel)?;
-                    Ok(())
+                    if let Some(client) = &client {
+                        client
+                            .write_text(&abs_str, content, cancel)
+                            .await
+                            .map_err(FileError::from)?;
+                    } else {
+                        env.as_env()
+                            .write_file(&abs_str, FileContent::Text(content), Some(cancel))
+                            .await?;
+                    }
+                    check_abort(cancel)?;
+                    Ok(pre)
                 }
                 .boxed()
             },
         )
         .await;
 
-        result.map_err(file_err_to_agent)?;
+        let pre = pre_image.map_err(file_err_to_agent)?;
+        // Diff generation is CPU-bound (two Myers passes). Run it on the
+        // blocking pool so a large write never occupies an async worker, and
+        // give each pass a hard wall-clock budget (spawn_blocking alone does
+        // not bound runtime): over budget the result is an explicit
+        // `diff_skipped: timeout`, never a suboptimal/fabricated diff.
+        check_abort(&signal).map_err(file_err_to_agent)?;
+        let path_for_diff = path_for_msg.clone();
+        let diff_cancel = signal.clone();
+        let pre_text = pre.text.clone();
+        let pre_read_error = pre.read_error.clone();
+        let new_text = content.clone();
+        let details = tokio::task::spawn_blocking(move || {
+            let pre = PreImage {
+                text: pre_text,
+                read_error: pre_read_error,
+            };
+            write_diff_details(&path_for_diff, &pre, &new_text, &diff_cancel)
+        })
+        .await
+        .map_err(|e| AgentError::Tool(format!("write diff task failed: {e}")))?
+        .map_err(file_err_to_agent)?;
 
         Ok(AgentToolResult {
             content: vec![TextContentOrImage::text(format!(
                 "Successfully wrote to {path_for_msg}"
             ))],
-            details: serde_json::Value::Null,
+            details,
             ..Default::default()
         })
     }
+}
+
+/// Pre-write snapshot used to build a real diff for the host.
+struct PreImage {
+    /// `None` = the file did not exist (a genuine create diff from "").
+    text: Option<String>,
+    /// Why the pre-image could not be read (non-NotFound). Hosts receive
+    /// `diff_skipped` instead of a fabricated diff.
+    read_error: Option<String>,
+}
+
+/// Cap for old+new content fed to the differ. Larger writes still succeed;
+/// only `details.diff` is omitted (`diff_skipped: content_too_large`).
+const MAX_DIFF_INPUT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Build the `details` payload. Mirrors the edit tool's shape (`diff` is the
+/// display diff with line-number prefixes, `patch` is a unified patch) so hosts
+/// render write rows with the same diff card as edit rows.
+///
+/// Budgeted + cancellable: both Myers passes get [`DIFF_TIME_BUDGET`]; a
+/// budget violation becomes `diff_skipped: "timeout"`. Cancellation before or
+/// between passes propagates as `Err(Aborted)`.
+fn write_diff_details(
+    path: &str,
+    pre: &PreImage,
+    new: &str,
+    cancel: &CancellationToken,
+) -> Result<serde_json::Value, FileError> {
+    check_abort(cancel)?;
+    if let Some(reason) = &pre.read_error {
+        return Ok(serde_json::json!({ "diff_skipped": reason }));
+    }
+    let old = pre.text.as_deref().unwrap_or("");
+    if old.len().saturating_add(new.len()) > MAX_DIFF_INPUT_BYTES {
+        return Ok(serde_json::json!({ "diff_skipped": "content_too_large" }));
+    }
+    let Some(diff) = generate_diff_string_budgeted(old, new, 4, DIFF_TIME_BUDGET) else {
+        return Ok(serde_json::json!({ "diff_skipped": "timeout" }));
+    };
+    check_abort(cancel)?;
+    let Some(patch) = generate_unified_patch_budgeted(path, old, new, DIFF_TIME_BUDGET) else {
+        return Ok(serde_json::json!({ "diff_skipped": "timeout" }));
+    };
+    check_abort(cancel)?;
+    Ok(serde_json::json!({
+        "diff": diff.diff,
+        "patch": patch,
+        "first_changed_line": diff.first_changed_line,
+    }))
 }
 
 /// Check the cancel token, returning `Err(FileError::aborted())` when set.
@@ -186,4 +296,22 @@ fn check_abort(cancel: &CancellationToken) -> Result<(), FileError> {
 
 fn file_err_to_agent(e: FileError) -> AgentError {
     AgentError::Tool(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_diff_details_aborts_before_compute_when_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let pre = PreImage {
+            text: Some("old\n".to_string()),
+            read_error: None,
+        };
+        let err = write_diff_details("note.txt", &pre, "new\n", &cancel)
+            .expect_err("cancelled diff must abort");
+        assert_eq!(err.code, FileErrorCode::Aborted);
+    }
 }

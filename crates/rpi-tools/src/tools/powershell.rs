@@ -22,6 +22,11 @@ use crate::tools::tool_context::ExecutionToolContext;
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 pub struct PowerShellInput {
     pub command: String,
+    /// Brief description of what this command does (5–10 words), shown to the
+    /// user in the collapsed tool row. Optional; the host falls back to the
+    /// command text when omitted.
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub timeout: Option<f64>,
 }
@@ -35,7 +40,7 @@ impl PowerShellTool {
     fn schema() -> Tool {
         Tool {
             name: "powershell".into(),
-            description: "Execute a PowerShell command on Windows. Returns stdout and stderr. Prefer bash for file/text work; use this only for PowerShell object operations (registry, COM/WMI, scheduled tasks, .NET)."
+            description: "Execute a PowerShell command on Windows. Returns stdout and stderr. Prefer bash for file/text work; use this only for PowerShell object operations (registry, COM/WMI, scheduled tasks, .NET). Always pass `description`: a concise 5-10 word summary of the command's purpose; hosts show it in the collapsed tool row."
                 .into(),
             parameters: rpi_ai::types::Schema::new(
                 serde_json::to_value(schemars::schema_for!(PowerShellInput)).unwrap_or_default(),

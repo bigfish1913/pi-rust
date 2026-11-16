@@ -38,11 +38,19 @@ const BASH_UPDATE_THROTTLE_MS: u64 = 2_000;
 /// Default Bash deadline when neither the caller nor the host specifies one.
 pub const DEFAULT_BASH_TIMEOUT_SECONDS: f64 = 120.0;
 
-/// Input for the bash tool. Mirrors TS `BashToolInput`. `timeout` is in seconds.
+/// Input for the bash tool. Mirrors TS `BashToolInput` plus a host-side
+/// extension: `description` (optional) lets the model state the command's
+/// intent in 5–10 words. Collapsed tool rows show it instead of the raw
+/// command (ZCode's Bash row reads `input.description` the same way).
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 pub struct BashInput {
     /// Bash command to execute.
     pub command: String,
+    /// Brief description of what this command does (5–10 words), shown to the
+    /// user in the collapsed tool row. Optional; the host falls back to the
+    /// command text when omitted.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Timeout in seconds (optional; uses the host default, otherwise 120 seconds).
     #[serde(default)]
     pub timeout: Option<f64>,
@@ -131,7 +139,9 @@ impl BashTool {
                  Defaults to a {default_timeout}-second timeout; provide timeout in seconds to override it. \
                  A non-zero exit code is a command result: probe commands such as grep (no match) or \
                  git config --get (missing key) legitimately return 1. Read the output before deciding \
-                 whether to retry; details carries exit_code and failure_kind.",
+                 whether to retry; details carries exit_code and failure_kind. \
+                 Always pass `description`: a concise 5-10 word summary of the command's purpose \
+                 (e.g. \"Run the test suite\"); hosts show it in the collapsed tool row.",
                 kb = DEFAULT_MAX_BYTES / 1024
             ),
             parameters: rpi_ai::types::Schema::new(params),

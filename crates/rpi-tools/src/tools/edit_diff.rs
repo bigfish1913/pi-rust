@@ -6,9 +6,18 @@
 //! no-change errors, line-preserving replacement when fuzzy) →
 //! `restore_line_endings` → `generate_diff_string` + `generate_unified_patch`.
 
+use std::time::{Duration, Instant};
+
 use similar::{udiff::unified_diff, Algorithm, TextDiff};
 
 use crate::error::FileError;
+
+/// Max wall-clock budget for one diff computation (display diff or unified
+/// patch). `similar`'s Myers search accepts a deadline, and the elapsed check
+/// makes a budget violation observable to callers (`diff_skipped: timeout`).
+/// The 2 MiB input cap alone does not bound runtime: ~440 KB of completely
+/// different lines can take seconds in an optimized build.
+pub const DIFF_TIME_BUDGET: Duration = Duration::from_millis(250);
 
 /// Result of [`strip_bom`].
 pub struct BomResult<'a> {
@@ -437,6 +446,39 @@ pub fn generate_diff_string(
     context_lines: usize,
 ) -> DiffResult {
     let parts = TextDiff::from_lines(old_content, new_content);
+    build_diff_result(&parts, old_content, new_content, context_lines)
+}
+
+/// Budgeted display diff: `None` when the Myers search does not finish inside
+/// `budget` (similar stops at the deadline; the elapsed check turns that into
+/// an explicit skip instead of a suboptimal diff).
+pub fn generate_diff_string_budgeted(
+    old_content: &str,
+    new_content: &str,
+    context_lines: usize,
+    budget: Duration,
+) -> Option<DiffResult> {
+    let started = Instant::now();
+    let parts = TextDiff::configure()
+        .timeout(budget)
+        .diff_lines(old_content, new_content);
+    if started.elapsed() > budget {
+        return None;
+    }
+    Some(build_diff_result(
+        &parts,
+        old_content,
+        new_content,
+        context_lines,
+    ))
+}
+
+fn build_diff_result(
+    parts: &TextDiff<'_, '_, '_, str>,
+    old_content: &str,
+    new_content: &str,
+    context_lines: usize,
+) -> DiffResult {
     let ops: Vec<_> = parts.ops().to_vec();
     let old_lines: Vec<&str> = old_content.split('\n').collect();
     let new_lines: Vec<&str> = new_content.split('\n').collect();
@@ -619,6 +661,25 @@ pub fn generate_unified_patch(path: &str, old_content: &str, new_content: &str) 
         4,
         Some((path, path)),
     )
+}
+
+/// Budgeted unified patch: `None` when the diff exceeds `budget`.
+pub fn generate_unified_patch_budgeted(
+    path: &str,
+    old_content: &str,
+    new_content: &str,
+    budget: Duration,
+) -> Option<String> {
+    let started = Instant::now();
+    let parts = TextDiff::configure()
+        .timeout(budget)
+        .diff_lines(old_content, new_content);
+    if started.elapsed() > budget {
+        return None;
+    }
+    let mut diff = parts.unified_diff();
+    diff.context_radius(4).header(path, path);
+    Some(diff.to_string())
 }
 
 // --- error-message builders (mirror the TS single-vs-multi variants) ---
