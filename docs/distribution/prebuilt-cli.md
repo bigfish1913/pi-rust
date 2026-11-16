@@ -92,7 +92,9 @@ For a persistent user default, add this to `~/.rpi/agent/settings.json`:
 }
 ```
 
-The precedence is `--cdn` > `RPI_CDN_BASE_URL` > `settings.json`.
+A project-local `.rpi/settings.json` may use the same key and overrides the
+user default for commands run in that project. The precedence is `--cdn` >
+`RPI_CDN_BASE_URL` > project `cdnBaseUrl` > global `cdnBaseUrl`.
 
 The CLI still obtains and validates `rpi-release.json` from GitHub. When the
 CDN is selected, it derives the archive path from the validated release tag and
