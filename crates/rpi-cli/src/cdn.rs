@@ -1,6 +1,7 @@
 use crate::prebuilt_extensions::{body_limited, check_hash};
 use percent_encoding::percent_decode_str;
 use reqwest::Url;
+use std::path::Path;
 
 const CDN_ENV: &str = "RPI_CDN_BASE_URL";
 const CLI_REPOSITORY: &str = "https://github.com/bigfish1913/pi-rust";
@@ -9,13 +10,27 @@ const PACKAGE_REPOSITORY: &str = "https://github.com/pi-rust/rpi-package";
 /// Resolve and validate the optional CDN base. The CDN is only a transport;
 /// manifests and all release identity fields still come from GitHub.
 ///
-/// Precedence is explicit CLI (`--cdn`), environment (`RPI_CDN_BASE_URL`), then
-/// global `settings.json` (`cdnBaseUrl`). Settings are a convenience default;
-/// they never override an explicit invocation or environment configuration.
+/// Precedence is explicit CLI (`--cdn`), environment (`RPI_CDN_BASE_URL`),
+/// project `.rpi/settings.json` (`cdnBaseUrl`), then global `settings.json`
+/// (`cdnBaseUrl`). Settings are convenience defaults; they never override an
+/// explicit invocation or environment configuration.
 pub(crate) fn resolve_base(cli_value: Option<&str>) -> Result<Option<Url>, String> {
-    let configured_setting = crate::settings::load_settings()
+    let cwd = std::env::current_dir().ok();
+    resolve_base_in(cli_value, cwd.as_deref())
+}
+
+fn resolve_base_in(cli_value: Option<&str>, cwd: Option<&Path>) -> Result<Option<Url>, String> {
+    let global_setting = crate::settings::load_settings()
         .ok()
         .and_then(|settings| settings.cdn_base_url);
+    let project_setting = cwd
+        .and_then(|path| {
+            crate::settings::load_active_project_settings(path)
+                .ok()
+                .flatten()
+        })
+        .and_then(|(_, settings)| settings.cdn_base_url);
+    let configured_setting = project_setting.or(global_setting);
     let value = cli_value
         .map(str::to_owned)
         .or_else(|| std::env::var(CDN_ENV).ok())
@@ -170,7 +185,7 @@ pub(crate) async fn download_with_fallback(
     label: &str,
 ) -> Result<Vec<u8>, String> {
     if let Some(cdn_url) = cdn_url {
-        if let Ok(bytes) = download_one(
+        match download_one(
             client,
             cdn_url.as_str(),
             limit,
@@ -179,7 +194,10 @@ pub(crate) async fn download_with_fallback(
         )
         .await
         {
-            return Ok(bytes);
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                eprintln!("warning: CDN archive failed ({error}); falling back to GitHub")
+            }
         }
     }
     download_one(client, github_url, limit, expected_hash, label).await
@@ -222,6 +240,38 @@ mod tests {
             scoped_url.as_str(),
             "https://assets.example.test/rpi/releases/v1.2.3/rpi.zip"
         );
+    }
+
+    #[test]
+    fn project_settings_provide_the_cdn_default() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".rpi")).unwrap();
+        std::fs::write(
+            project.path().join(".rpi/settings.json"),
+            r#"{"cdnBaseUrl":"https://project.example.test/mirror"}"#,
+        )
+        .unwrap();
+
+        let base = resolve_base_in(None, Some(project.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(base.as_str(), "https://project.example.test/mirror");
+    }
+
+    #[test]
+    fn explicit_value_beats_project_settings() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".rpi")).unwrap();
+        std::fs::write(
+            project.path().join(".rpi/settings.json"),
+            r#"{"cdnBaseUrl":"https://project.example.test"}"#,
+        )
+        .unwrap();
+
+        let explicit = resolve_base_in(Some("https://explicit.example.test"), Some(project.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(explicit.as_str(), "https://explicit.example.test/");
     }
 
     #[tokio::test]
