@@ -1382,12 +1382,12 @@ fn test_layout_renders_welcome_message() {
         StackChild::Entry(StackEntry::new(footer)),
     ]);
 
-    // The 16-row logo and welcome hints need a taller viewport.
+    // The 5-row rpi logo and welcome hints need a taller viewport.
     let frame = rpi_tui::render_layout_frame(Arc::new(root), 80, 48);
 
     let all: String = frame.lines.join("\n");
     assert!(
-        all.contains("+==="),
+        all.contains("RRR"),
         "Welcome logo not found. Rendered: {}",
         all
     );
@@ -1497,7 +1497,7 @@ fn welcome_header_renders_the_brand_mark() {
 
     // The fixed-width ASCII logo is rendered with single-cell characters.
     assert!(
-        lines.iter().any(|l| l.contains("+===")),
+        lines.iter().any(|l| l.contains("RRR")),
         "brand logo missing: {all}"
     );
     assert!(
