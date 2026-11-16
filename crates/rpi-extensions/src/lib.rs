@@ -100,7 +100,9 @@ pub use registry::{
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
-pub use tool_result_transform::{emit_tool_result, with_tool_result_transform};
+pub use tool_result_transform::{
+    emit_tool_result, emit_tool_result_with_status, with_tool_result_transform,
+};
 mod panel;
 pub use panel::{ExtensionPanel, PanelAnchor, PanelHighlight, PanelHighlightColor, PanelLayout};
 pub use tool::{PluginToolAdapter, PluginToolHandle, ToolCallContext};
