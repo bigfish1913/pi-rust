@@ -1,8 +1,11 @@
-//! The compact startup brand lockup, inspired by pi's native 4×2 terminal logo.
+//! The compact startup brand lockup, generated from the README logo with RASCII.
+//!
+//! Regenerate with `cargo install rascii_art --version 0.4.5 --locked`, then:
+//! `rascii docs/images/rpi-logo.jpg --width 32 --height 16 --invert --charset " .:-=+*#%@"`.
 //!
 //! The logo is kept as text rather than loading the README JPEG so it works in
 //! plain terminals, remote sessions, and terminals without image protocols.
-//! Its rows use fixed single-cell geometry.
+//! Its rows use fixed single-cell geometry and preserve the original logo shape.
 
 use rpi_tui::{ansi::visible_width, theme as current_theme, Component};
 
@@ -10,7 +13,24 @@ use rpi_tui::{ansi::visible_width, theme as current_theme, Component};
 /// The full gear is rendered by [`render_lockup`].
 pub const MARK: &str = "@";
 
-const LOGO_ROWS: [&str; 2] = ["▀▀█ ", "█▀ █"];
+const LOGO_ROWS: [&str; 16] = [
+    "                                ",
+    "              -==:              ",
+    "        -===-=+ .*--+==.        ",
+    "        +- .--====--. *.        ",
+    "    .+===:++-..  .:=+=:+==-     ",
+    "    +=. =+.          :*: .#.    ",
+    "     *:=+   .-*==*.   .#.*:     ",
+    "   +== %.   *-==+:*-   ==:=+-   ",
+    "   *=- %....-.%-++-+.: ==.=+-   ",
+    "     +:==-%=-.#:=++..+.#.*:     ",
+    "    =+. =**  .#:#.  :%*: :*.    ",
+    "    .+===:-=-:#:#.:=:=:+=+-     ",
+    "        == .---.==--..#.        ",
+    "        :==+:=* .*--+==.        ",
+    "              -==:              ",
+    "                                ",
+];
 
 /// The startup lockup flattened into a terminal window/tab title.
 pub fn window_title(status: &str) -> String {
@@ -83,9 +103,11 @@ mod tests {
     }
 
     #[test]
-    fn logo_has_the_compact_pi_shape() {
+    fn logo_has_the_compact_readme_shape() {
         let rows = plain();
-        assert_eq!(rows, ["▀▀█ ", "█▀ █"]);
+        assert_eq!(rows.len(), 16);
+        assert!(rows.iter().any(|row| row.contains("+===")));
+        assert!(rows.iter().any(|row| row.contains("-==:")));
     }
 
     #[test]
@@ -93,7 +115,7 @@ mod tests {
         let rows = plain();
         let widths: Vec<usize> = rows.iter().map(|row| visible_width(row)).collect();
         assert!(widths.iter().all(|width| *width == widths[0]));
-        assert_eq!(widths[0], 4);
+        assert_eq!(widths[0], 32);
     }
 
     #[test]
