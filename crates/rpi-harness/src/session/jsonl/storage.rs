@@ -65,6 +65,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use rpi_tools::active_session_guard::WriterCapability;
 use rpi_tools::env::{FileContent, FileSystem, WriterLease};
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
@@ -169,6 +170,10 @@ pub struct JsonlSessionStorage {
     /// Once explicitly released, this storage binding is retired and may not
     /// silently reacquire a new lease. Reopen creates a fresh binding.
     writer_lease_revoked: Arc<AtomicBool>,
+    /// Explicit capability proving this binding, not a built-in/extension tool,
+    /// owns the active session's three files. Kept alive for the binding's
+    /// whole lifetime; the guard ignores it for `InMemoryExecutionEnv` backends.
+    _active_writer_capability: Arc<WriterCapability>,
     needs_reconcile: Arc<std::sync::atomic::AtomicBool>,
     /// Set when a failed append cannot be proven/truncated safely.
     uncertain: Arc<AtomicBool>,
@@ -191,6 +196,7 @@ impl Clone for JsonlSessionStorage {
             append: self.append.clone(),
             writer_lease: self.writer_lease.clone(),
             writer_lease_revoked: self.writer_lease_revoked.clone(),
+            _active_writer_capability: self._active_writer_capability.clone(),
             needs_reconcile: self.needs_reconcile.clone(),
             uncertain: self.uncertain.clone(),
             generation: self.generation.clone(),
@@ -252,6 +258,13 @@ impl JsonlSessionStorage {
         ids: Arc<dyn IdGenerator>,
     ) -> Self {
         let generation = metadata.history_generation();
+        // This storage binding is the harness-owned writer. Grant it the
+        // explicit capability that lets it append/repair/publish the active
+        // session files while every other `OsExecutionEnv` (and any extension
+        // sharing one) is refused by the process-level guard. The token is
+        // keyed by the `FileSystem` object's identity, so the progress store
+        // and clones of this Arc are covered by the same grant.
+        let capability = rpi_tools::active_session_guard::grant_writer(fs.as_ref());
         Self {
             progress: super::progress::JsonlProgressStore::new(
                 fs.clone(),
@@ -268,6 +281,7 @@ impl JsonlSessionStorage {
             append: Arc::new(Mutex::new(None)),
             writer_lease: Arc::new(StdMutex::new(None)),
             writer_lease_revoked: Arc::new(AtomicBool::new(false)),
+            _active_writer_capability: capability,
             needs_reconcile: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             uncertain: Arc::new(AtomicBool::new(false)),
             generation: Arc::new(AtomicU64::new(generation)),
@@ -1832,6 +1846,10 @@ impl SessionStorage for JsonlSessionStorage {
     }
     fn metadata(&self) -> SessionMetadata {
         self.metadata.to_base()
+    }
+
+    fn active_session_jsonl_path(&self) -> Option<String> {
+        Some(self.metadata.path.clone())
     }
 
     fn writer_lease_held(&self) -> bool {

@@ -784,6 +784,11 @@ pub async fn build_prepared(
     crate::resource_selection::bind_session(&session, resource_selection.as_ref())
         .await
         .map_err(BuildError::SessionOpen)?;
+    // Default-on active-session protection. `None` (ephemeral / --no-session)
+    // disables the guard; a durable JSONL binding supplies its canonical path.
+    rpi_tools::active_session_guard::activate_session_guard(
+        session.storage().active_session_jsonl_path().as_deref(),
+    );
     // Plugin tools now know which session they serve: `todo` and friends key
     // their per-session state off it. A session without an id (ephemeral) leaves
     // the field unset and a plugin is expected to fall back to project scope.
@@ -3820,10 +3825,13 @@ pub(crate) async fn set_active_session(
     tool_context: Option<&rpi_extensions::ToolCallContext>,
 ) -> Result<(), String> {
     let metadata = session.get_metadata().await.ok();
+    let guard_path = session.storage().active_session_jsonl_path();
     harness
         .set_session(session)
         .await
         .map_err(|e| e.to_string())?;
+    // Re-point the process-level guard at the session that is now active.
+    rpi_tools::active_session_guard::activate_session_guard(guard_path.as_deref());
     if let Some(metadata) = metadata {
         std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, &metadata.id);
         if let Some(context) = tool_context {
