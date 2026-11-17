@@ -1165,6 +1165,34 @@ pub async fn build_prepared(
             )
         });
 
+    // Host-integrated approval gate: composes AFTER the extension hook (an
+    // extension veto wins; the host gate only sees calls that would run).
+    let approval_binding = Arc::clone(&durable_binding);
+    let before_tool_call: Option<rpi_agent::hooks::BeforeToolCall> = match before_tool_call {
+        Some(extension_hook) => Some(Arc::new(
+            move |context: rpi_agent::types::BeforeToolCallContext<'_>,
+                  signal: tokio_util::sync::CancellationToken| {
+                let extension_hook = Arc::clone(&extension_hook);
+                let binding = Arc::clone(&approval_binding);
+                let tool = context.tool_call.name.clone();
+                let args = context.args.clone();
+                // Call synchronously: the extension hook copies what it needs and
+                // returns a 'static future, so the borrowed context never enters
+                // our boxed future.
+                let first = extension_hook(context, signal.clone());
+                Box::pin(async move {
+                    if let Some(result) = first.await {
+                        if result.block {
+                            return Some(result);
+                        }
+                    }
+                    crate::approval_gate::evaluate(&binding, &tool, &args).await
+                })
+            },
+        )),
+        None => Some(crate::approval_gate::hook(approval_binding)),
+    };
+
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),
         thinking_level: resolved.thinking_level,
@@ -1268,9 +1296,14 @@ pub async fn build_prepared(
         .snapshot()
         .await
         .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
-        // Populate the weak tool binding before resource selection is published.
-        let _ = durable_binding.set(harness.downgrade());
     }
+    // Populate the weak tool binding before resource selection is published.
+    // Unconditional: host-integrated tools (approval gate session id,
+    // message_agent caller resolution) need the owning harness even when the
+    // native DurableService path is off — host embeddings never set
+    // `native_durable`, so an `if args.native_durable`-scoped set left the
+    // binding permanently empty for them.
+    let _ = durable_binding.set(harness.downgrade());
 
     // Retain read leases even for resource-only/--no-extensions hosts.
     let harness_leases = resource_leases.clone();
@@ -2881,7 +2914,7 @@ fn build_tools_bound(
         all.push((
             "durable",
             HarnessTool::new(Arc::new(crate::native_durable::NativeDurableTool::new(
-                durable_binding,
+                durable_binding.clone(),
             ))),
         ));
     }
@@ -2898,6 +2931,20 @@ fn build_tools_bound(
                 all.retain(|(name, _)| default_tools.iter().any(|t| t == name));
             }
         }
+    }
+
+    // Host-integrated agent-to-agent messaging: only when the embedding host
+    // installed a delivery door. A bare CLI session never advertises a tool it
+    // cannot service.
+    if crate::message_agent::handler_installed()
+        && tool_name_allowed(crate::message_agent::MESSAGE_AGENT_TOOL_NAME, args)
+    {
+        all.push((
+            crate::message_agent::MESSAGE_AGENT_TOOL_NAME,
+            HarnessTool::new(crate::message_agent::create_message_agent_tool(
+                durable_binding.clone(),
+            )),
+        ));
     }
 
     // `--no-builtin-tools` disables the built-in set but would keep

@@ -28,6 +28,7 @@ pub mod session;
 pub mod settle;
 pub mod skills;
 pub mod system_prompt;
+pub mod task_lease;
 mod tool_execution;
 pub mod tool_program_body;
 mod tool_program_journal;

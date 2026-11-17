@@ -29,6 +29,7 @@
 
 pub mod agent_session;
 pub mod app;
+pub mod approval_gate;
 pub mod args;
 pub mod auth;
 pub mod auth_guidance;
@@ -52,6 +53,7 @@ pub mod interactive_tui;
 pub mod key_trace;
 pub mod model_registry;
 pub mod modes;
+pub mod message_agent;
 mod native_durable;
 pub mod packages;
 pub mod prebuilt_extensions;
