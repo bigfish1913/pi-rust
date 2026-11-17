@@ -1683,6 +1683,13 @@ pub trait SessionStorage: Send + Sync {
         false
     }
 
+    /// Canonical path of this binding's durable JSONL history, when applicable.
+    /// The host uses it to install the process-level active-session guard; the
+    /// default `None` keeps `--no-session` / in-memory runs unprotected.
+    fn active_session_jsonl_path(&self) -> Option<String> {
+        None
+    }
+
     /// Retire a backend writer binding. Compatibility backends may treat this
     /// as a no-op; durable bindings must not silently reacquire afterwards.
     fn release_writer_lease(&self) {}

@@ -509,6 +509,13 @@ impl FileSystem for OsExecutionEnv {
     ) -> Result<Option<Box<dyn WriterLease>>, FileError> {
         let session_path = Self::resolve_path(&self.cwd, path);
         let lock_path = PathBuf::from(format!("{}.lock", session_path.display()));
+        // A tool cannot create/overwrite the active session's `.jsonl.lock`:
+        // that file is part of the three-file protected set.
+        crate::active_session_guard::check_write(
+            &lock_path.to_string_lossy(),
+            |p| Self::resolve_path(&self.cwd, p),
+            self,
+        )?;
         let display_path = session_path.to_string_lossy().into_owned();
         tokio::task::spawn_blocking(move || {
             use fs2::FileExt;
@@ -640,6 +647,7 @@ impl FileSystem for OsExecutionEnv {
         &self,
         path: &str,
     ) -> Result<Option<Box<dyn crate::env::AppendFile>>, FileError> {
+        crate::active_session_guard::check_write(path, |p| Self::resolve_path(&self.cwd, p), self)?;
         let path = Self::resolve_path(&self.cwd, path);
         Ok(Some(Box::new(append::OsAppendFile::open(path).await?)))
     }
@@ -659,6 +667,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
+        crate::active_session_guard::check_write(path, |p| Self::resolve_path(&self.cwd, p), self)?;
         let abs = Self::resolve_path(&self.cwd, path);
         let error_path = abs.to_string_lossy().into_owned();
         tokio::task::spawn_blocking(move || {
@@ -752,6 +761,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
+        crate::active_session_guard::check_write(path, |p| Self::resolve_path(&self.cwd, p), self)?;
         let abs = Self::resolve_path(&self.cwd, path);
         // mkdir parent (recursive).
         if let Some(parent) = abs.parent() {
@@ -772,6 +782,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
+        crate::active_session_guard::check_write(path, |p| Self::resolve_path(&self.cwd, p), self)?;
         let abs = Self::resolve_path(&self.cwd, path);
         if let Some(parent) = abs.parent() {
             if !parent.as_os_str().is_empty() {
@@ -806,6 +817,12 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(source))?;
+        crate::active_session_guard::check_write(
+            source,
+            |p| Self::resolve_path(&self.cwd, p),
+            self,
+        )?;
+        crate::active_session_guard::check_write(dest, |p| Self::resolve_path(&self.cwd, p), self)?;
         let src = Self::resolve_path(&self.cwd, source);
         let dst = Self::resolve_path(&self.cwd, dest);
         tokio::fs::rename(&src, &dst)
@@ -964,6 +981,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
+        crate::active_session_guard::check_write(path, |p| Self::resolve_path(&self.cwd, p), self)?;
         let abs = Self::resolve_path(&self.cwd, path);
         let res = if recursive {
             tokio::fs::remove_dir_all(&abs).await
@@ -1088,6 +1106,17 @@ impl Shell for OsExecutionEnv {
     ) -> Result<ShellOutput, ExecutionError> {
         // Pre-flight abort.
         check_cancel_exec(options.cancel)?;
+        // Reject write-intent commands that name one of the active session's
+        // three files before spawning the child. See active_session_guard.rs
+        // for the documented scope/limitations of this tool-layer barrier.
+        let guard_cwd = match &options.cwd {
+            Some(c) => Self::resolve_path(&self.cwd, &c.to_string_lossy()),
+            None => self.cwd.clone(),
+        };
+        if let Err(e) = crate::active_session_guard::check_bash_command(command, &guard_cwd) {
+            return Err(ExecutionError::new(ExecutionErrorCode::Unknown, e.message)
+                .with_source_message(e.path.unwrap_or_else(|| "<bash command>".to_string())));
+        }
         // Resolve timeout.
         let timeout = match resolve_timeout(options.timeout) {
             Ok(t) => t,
@@ -1151,6 +1180,38 @@ impl Shell for OsExecutionEnv {
         if let Some(extra) = &options.env {
             for (k, v) in extra {
                 cmd.env(k, v);
+            }
+        }
+        // OS-level child barrier. Applied AFTER every caller-supplied env so
+        // the guard cannot be accidentally overridden; a hostile caller that
+        // deliberately unsets it is outside this guard's threat model (the PR
+        // body documents that boundary). Build failure is a hard refusal, not
+        // a silent spawn without the shield.
+        #[cfg(target_os = "linux")]
+        {
+            let existing = options
+                .env
+                .as_ref()
+                .and_then(|m| m.get("LD_PRELOAD"))
+                .map(std::ffi::OsStr::new)
+                .or_else(|| {
+                    self.shell_env
+                        .as_ref()
+                        .and_then(|m| m.get("LD_PRELOAD"))
+                        .map(std::ffi::OsStr::new)
+                });
+            match crate::active_session_guard::child_barrier_env(existing) {
+                Ok(Some((ld, paths))) => {
+                    cmd.env("LD_PRELOAD", ld);
+                    cmd.env(crate::active_session_guard::CHILD_BARRIER_ENV, paths);
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    return Err(ExecutionError::new(
+                        ExecutionErrorCode::SpawnError,
+                        format!("active session child write barrier unavailable: {reason}"),
+                    ));
+                }
             }
         }
         // stdio.
