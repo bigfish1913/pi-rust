@@ -1,55 +1,21 @@
-//! The startup brand lockup, generated from the README logo with RASCII.
+//! 启动时的品牌标志：一枚会自转的 3D 齿轮徽章。
 //!
-//! Regenerate with `cargo install rascii_art --version 0.4.5 --locked`, then:
-//! `rascii docs/images/rpi-logo.jpg --width 64 --height 32 --invert --charset " .:-=+*#%@"`.
-//!
-//! The logo is kept as text rather than loading the README JPEG so it works in
-//! plain terminals, remote sessions, and terminals without image protocols.
-//! Its rows use fixed single-cell geometry and are scaled down for the
-//! terminal's character aspect ratio.
+//! 形状由 [`shape`] 描述，[`render`] 负责光栅化，[`spin`] 提供片头动画的时钟。
+//! 输出是纯 ASCII（单宽字符 + 主题色），所以纯文本终端、远程会话、
+//! 没有图片协议的终端里都能显示。
 
-use rpi_tui::{ansi::visible_width, theme as current_theme, Component};
+pub(crate) mod render;
+mod shape;
+mod spin;
 
-/// A compact ASCII approximation used in the terminal window/tab title.
-/// The full gear is rendered by [`render_lockup`].
+use rpi_tui::Component;
+
+pub use spin::{animating, replay, set_enabled};
+
+/// 终端窗口/标签标题里的紧凑标记。
 pub const MARK: &str = "@";
 
-const LOGO_ROWS: [&str; 32] = [
-    "                                                                ",
-    "                                                                ",
-    "                                                                ",
-    "                            +%###%*                             ",
-    "                  .-+*:    .@=   -@.    :**-.                   ",
-    "                -*#+:-%*=*###.   .###*=+%=:+##-                 ",
-    "                -@:   .=-:.         .:-=.   :@=                 ",
-    "                .#%.   .:=*#%%%%%%%#*=:.   .##.                 ",
-    "          .+=:.-#*: .-*%#+-:.     ..-+#%*-. :*%-.:-+:           ",
-    "         :%+=+*#- .=%#-.               .-#%+. :##+=+@:          ",
-    "        :@=      -%#:                     :#@-      =@:         ",
-    "        :*%=.   =@=                         =@+.  .=%*:         ",
-    "          .@*  =@=         -#-----*-         -@+  +@:           ",
-    "          =@: :@*        .=#%*+++*%#=.        +@- .@=           ",
-    "      :+*##+  *@.       :%%-..-=-: :#%:       .@*  +##*+-       ",
-    "      *%..    %%        #%..+@*=*@*..#%.       *%    ..#*.      ",
-    "      *%     .%%       .#= :@+   =@: +@:       *@      #*.      ",
-    "      -###*=  *@.  ....::. :@@*+*@*..#%. -*-  .%#  =*###=       ",
-    "          =@. :@+ .+@%#*#+ :@+---..-%%:  :+:  =@- .@+           ",
-    "          .%*  +@-.+@=     :@= :+*%#=.   -@- :@*  +@.           ",
-    "        .-#*-   +@=+@:     :@= -@=.      -@--@*.  :*%=.         ",
-    "        :@+      -%@@:     :@= -@-       -@%@-      =@:         ",
-    "         :%+:=+*- .=%::.   :@= -@-     ..-%=. :*+=:+@-          ",
-    "          .**=:-%#:  .=%#+--@= -@-.:-+#%-.. :*%-:=+*.           ",
-    "                .+@.    :=+*#= :%%#*+=:.   .@*.                 ",
-    "                .@=   .-=-..        .-==.   =@.                 ",
-    "                :*%*-:##=+*#%.   .%#*+-*%--+#*:                 ",
-    "                  .:+#-    .@+   =@.    -#+-.                   ",
-    "                            =#####+                             ",
-    "                                                                ",
-    "                                                                ",
-    "                                                                ",
-];
-
-/// The startup lockup flattened into a terminal window/tab title.
+/// 把标志压成一行终端窗口标题。
 pub fn window_title(status: &str) -> String {
     if status.is_empty() {
         format!("{MARK} rpi")
@@ -58,30 +24,7 @@ pub fn window_title(status: &str) -> String {
     }
 }
 
-/// Apply the current theme to the monochrome ASCII output.
-fn style_logo_row(row: &str) -> String {
-    current_theme().colors.dim.fg(row)
-}
-
-fn render_lockup() -> Vec<String> {
-    let width = LOGO_ROWS
-        .iter()
-        .map(|row| visible_width(row))
-        .max()
-        .unwrap_or(0);
-    LOGO_ROWS
-        .iter()
-        .map(|row| {
-            let padded = format!(
-                "{row}{}",
-                " ".repeat(width.saturating_sub(visible_width(row)))
-            );
-            style_logo_row(&padded)
-        })
-        .collect()
-}
-
-/// The startup logo. Add one to the welcome header.
+/// 启动标志。加到欢迎页 header 里。
 pub struct BrandLockup;
 
 impl BrandLockup {
@@ -98,7 +41,7 @@ impl Default for BrandLockup {
 
 impl Component for BrandLockup {
     fn render(&self, _width: usize) -> Vec<String> {
-        render_lockup()
+        render::lockup(spin::angle())
     }
 
     fn invalidate(&self) {
@@ -113,28 +56,11 @@ impl Component for BrandLockup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpi_tui::ansi::{strip_ansi, visible_width};
-
-    fn plain() -> Vec<String> {
-        render_lockup().iter().map(|r| strip_ansi(r)).collect()
-    }
 
     #[test]
-    fn logo_has_the_readme_lockup_shape() {
-        let rows = plain();
-        assert_eq!(rows.len(), 32);
-        assert!(rows.iter().any(|row| row.contains("#")));
-        assert!(rows.iter().any(|row| row.contains("+=")));
-        assert!(rows[3].contains("+%###%*"));
-        assert!(rows[28].contains("=#####+"));
-    }
-
-    #[test]
-    fn logo_rows_have_stable_terminal_geometry() {
-        let rows = plain();
-        let widths: Vec<usize> = rows.iter().map(|row| visible_width(row)).collect();
-        assert!(widths.iter().all(|width| *width == widths[0]));
-        assert_eq!(widths[0], 64);
+    fn lockup_fits_the_welcome_header() {
+        let rows = BrandLockup::new().render(80);
+        assert_eq!(rows.len(), render::ROWS);
     }
 
     #[test]

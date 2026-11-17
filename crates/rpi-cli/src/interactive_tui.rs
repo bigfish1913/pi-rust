@@ -1114,6 +1114,8 @@ pub async fn interactive_tui(
         return 1;
     }
     tui.set_main_screen_mode(matches!(args.tui_mode, crate::args::TuiMode::Regular));
+    // regular 模式把内容写进终端 scrollback，逐帧重绘会刷屏，所以那边只出静态帧。
+    crate::brand::set_enabled(!matches!(args.tui_mode, crate::args::TuiMode::Regular));
 
     // Keep startup output in the retained header, not loose chat children:
     // settling the first reply replaces the chat's history page.
@@ -1764,8 +1766,17 @@ pub async fn interactive_tui(
             rpi_tui::loader::SPINNER_FRAME_MS,
         ));
         interval.tick().await; // discard immediate
+
+        // 片头是否还在转。结束的那一帧也要画出来：否则画面会停在上一次请求
+        // 时的中间角度，而不是精确的终态。
+        let mut logo_spinning = true;
         loop {
             interval.tick().await;
+            let spinning = crate::brand::animating();
+            if spinning || logo_spinning {
+                tui_tick.request_render(false);
+            }
+            logo_spinning = spinning;
             // Size watchdog: re-read the window and repaint when it differs
             // from what is on screen. A resize event is only a hint (on Windows
             // its record can be delivered before the window rectangle moves),
