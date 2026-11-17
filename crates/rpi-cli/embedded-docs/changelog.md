@@ -11,6 +11,17 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.25.0](https://github.com/bigfish1913/pi-rust/compare/v0.24.2...v0.25.0) - 2026-11-17
+
+### Added
+
+- *(tools)* bash description param + real write diffs ([#333](https://github.com/bigfish1913/pi-rust/pull/333))
+
+### Fixed
+
+- *(cli)* honor project CDN settings ([#341](https://github.com/bigfish1913/pi-rust/pull/341))
+- *(cli)* run plugin tool_result transforms on every tool result ([#323](https://github.com/bigfish1913/pi-rust/pull/323))
+
 ## [0.24.2](https://github.com/bigfish1913/pi-rust/compare/v0.24.1...v0.24.2) - 2026-11-15
 
 ### Added
