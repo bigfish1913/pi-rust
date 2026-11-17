@@ -73,6 +73,8 @@ pub(super) fn add_welcome_message_with_capabilities(
     skills: &[String],
     context_files: &[String],
 ) -> Arc<Container> {
+    // 重建欢迎页（/new、/session、/fork）时重播一次标志的片头动画。
+    crate::brand::replay();
     let c = current_theme().colors;
     // The mark, wordmark and language mark live in `crate::brand`. See that
     // module for why the layout is built from single-width characters only.

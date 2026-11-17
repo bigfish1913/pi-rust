@@ -1382,13 +1382,18 @@ fn test_layout_renders_welcome_message() {
         StackChild::Entry(StackEntry::new(footer)),
     ]);
 
-    // The 32-row logo and welcome hints need a taller viewport.
+    // The badge and welcome hints need a taller viewport.
     let frame = rpi_tui::render_layout_frame(Arc::new(root), 80, 48);
 
     let all: String = frame.lines.join("\n");
+    let logo_rows = all
+        .lines()
+        .take(crate::brand::render::ROWS)
+        .filter(|l| !l.trim().is_empty())
+        .count();
     assert!(
-        all.contains("=#####+"),
-        "Welcome logo not found. Rendered: {}",
+        logo_rows >= 12,
+        "Welcome logo not found (only {logo_rows} inked rows). Rendered: {}",
         all
     );
     assert!(
@@ -1495,10 +1500,17 @@ fn welcome_header_renders_the_brand_mark() {
     let lines: Vec<String> = chat.render(80).iter().map(|l| strip_ansi(l)).collect();
     let all = lines.join("\n");
 
-    // The fixed-width ASCII logo is rendered with single-cell characters.
+    // The fixed-width 3D badge is rendered with single-cell characters and
+    // spans the first rows of the welcome header.
+    let logo: Vec<&String> = lines.iter().take(22).collect();
     assert!(
-        lines.iter().any(|l| l.contains("=#####+")),
+        logo.iter().filter(|l| !l.trim().is_empty()).count() >= 14,
         "brand logo missing: {all}"
+    );
+    assert!(
+        logo.iter()
+            .any(|l| l.contains('#') || l.contains('%') || l.contains('*')),
+        "brand logo has no solid shading: {all}"
     );
     assert!(
         all.contains("interactive TUI"),
