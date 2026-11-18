@@ -49,7 +49,10 @@ main-branch CI passes:
 4. npm, Homebrew and Scoop are updated independently; a new-version PR is submitted
    to `microsoft/winget-pkgs`. npm first tests installation of its packed archive
    and the native command, then publishes `@bigfishnpm/rpi` using OIDC.
-   Microsoft review/CLA completion remains external.
+   Microsoft review/CLA completion remains external. The channels do not block each
+   other, so a channel can be left behind by one failed job; the scheduled
+   **Release channel drift** workflow compares every channel with the newest stable
+   release and keeps an issue open until the gap closes.
 
 No release runs in fork repositories or on PR events. Publication additionally
 requires a merged PR from an upstream `release-plz-*` branch whose merge commit
@@ -171,6 +174,15 @@ failure fails visibly.
 - For an npm failure, run **Release npm package** from Actions on `main` with the
   already-published stable tag. It verifies the release again, skips an existing
   npm version, and never downgrades `latest` when backfilling an older version.
+  The publish job first asks npm to exchange this workflow's OIDC token for a
+  publish token, so a misconfigured trusted publisher fails before packaging with
+  the claims npm compared instead of a bare `404` after a signed provenance
+  statement. That preflight is skipped when the version is already published,
+  because only a new version needs the binding.
+- **Release channel drift** runs daily and on demand. It exits non-zero, creates or
+  updates one `Release channel drift` issue with the recovery command per lagging
+  channel, and closes that issue when every tracked channel matches again. winget
+  is reported but never fails the check, because it waits on an upstream review.
 - Website deployment remains the separate `task rpi-deploy` operation.
 
 ## npm distribution
@@ -191,30 +203,41 @@ offline, including fork PRs, without publish permissions.
 
 In [the package settings](https://www.npmjs.com/package/@bigfishnpm/rpi/access),
 add a GitHub Actions trusted publisher with organization/user `bigfish1913`,
-repository `pi-rust`, and workflow filename `ci.yml` for normal releases. Each
-additional entry point needs its own configuration when first used:
+repository `pi-rust`, and these workflow filenames. Each configuration is one
+connection for exactly one filename; a value that holds several filenames matches
+no workflow and every exchange fails. npm compares the OIDC claims of the
+publishing job, and a job defined by a reusable workflow reports that file as its
+`job_workflow_ref`, so `release-npm.yml` is the entry that authorizes the publish
+step itself. The calling workflows are added as separate connections because they
+are cheap (npm allows up to ten) and cover a token whose `workflow_ref` is the
+workflow that started the run:
 
-| Workflow filename | Entry point |
-| --- | --- |
-| `ci.yml` | Automatic Release PR → binaries → npm publishing |
-| `release-binaries.yml` | Direct tag builds and manual binary recovery |
-| `release-npm.yml` | Manual npm-only recovery |
+| Workflow filename | OIDC claim | Entry point |
+| --- | --- | --- |
+| `release-npm.yml` | `job_workflow_ref` (defines the publish job) | Every path |
+| `ci.yml` | `workflow_ref` | Automatic Release PR → binaries → npm publishing |
+| `release-binaries.yml` | `workflow_ref` | Direct tag builds and manual binary recovery |
 
-Select **Allow npm publish** for each configuration; the newer npm default of
-allowing only staged publishing does not permit this workflow's direct publish.
-Leave the optional environment name empty. npm checks the **calling workflow**
-for reusable workflows, so configuring only `release-npm.yml` does not authorize
-the normal `ci.yml` release chain. The workflows pass `id-token: write` through
-the complete call chain, while ordinary test jobs retain read-only permissions.
+Select **Allow npm publish** for each configuration; configurations created after
+2026-09-03 default to allowing only staged publishing, which does not permit this
+workflow's direct `npm publish`. Leave the optional environment name empty: a
+configured environment that the job does not declare never matches. The workflows
+pass `id-token: write` through the complete call chain, while ordinary test jobs
+retain read-only permissions.
 
 This uses GitHub-hosted runners, Node.js 24 and npm 11.12.1. npm exchanges OIDC
 for a short-lived credential and publishes provenance; no `NPM_TOKEN` secret or
 interactive 2FA is needed in GitHub Actions. Create each configuration shortly
 before its first new-version publication: npm requires the first successful
-publication from each new configuration within two days. Add the recovery
-configurations when needed; skipping an already-published version does not
-validate a new trusted publisher. See
+publication from each new connection within two days, and publishing an
+already-published version validates nothing. Every later release reuses the
+configuration that its own publish validated. See
 [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
+
+`scripts/npm-oidc-preflight.mjs` prints the claims this repository actually sends
+and the registry's rejection, so a rejected binding names the mismatching values
+instead of an unexplained `404`; read it in the
+**Verify npm accepts this workflow before packaging** step of a failing run.
 
 ### Automatic publication and recovery
 
@@ -231,6 +254,15 @@ skipped without changing tags. A previously unpublished version older than
 authentication and server failures stop the job rather than being treated as an
 absent version. The publisher waits for the new version endpoint when npm accepts
 a release asynchronously.
+
+Before packaging, the job looks the version up on the registry and, only when the
+version is still unpublished, runs `scripts/npm-oidc-preflight.mjs`. The preflight
+performs the same OIDC exchange as the CLI, so a trusted publisher mismatch fails
+in seconds with the claims npm compared; the CLI itself treats a rejected exchange
+as "no OIDC here" and then publishes anonymously, which the registry answers with
+`404 PUT /@scope%2Fname`. Do not remove the preflight: without it the only symptom
+is that bare 404 after a signed provenance statement, which is what left
+`@bigfishnpm/rpi` on 0.22.1 through the 0.23.0, 0.24.x and 0.25.0 releases.
 
 To retry npm alone, use **Actions → Release npm package → Run workflow**, select
 `main` and supply the existing stable tag. Tags predating npm support can be
