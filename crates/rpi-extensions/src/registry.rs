@@ -15,9 +15,10 @@ use std::sync::Arc;
 use rpi_agent::error::AgentError;
 use rpi_ai::types::Tool;
 use rpi_plugin_sdk::{
-    BeforeAgentStartFn, CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn,
-    OAuthRequestControlFn, OAuthRequestFn, ProviderRequestFn, ProviderStreamRequestFn, RenderFn,
-    ResourcesDiscoverFn, ToolResultFn, EVENT_TAG_COUNT,
+    AutocompleteProviderFn, BeforeAgentStartFn, CommandArgumentCompletionFn, CommandHandlerFn,
+    EventHandlerFn, EventTag, FreeStringFn, OAuthRequestControlFn, OAuthRequestFn,
+    ProviderRequestFn, ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn, ToolResultFn,
+    EVENT_TAG_COUNT,
 };
 
 use crate::tool::PluginToolHandle;
@@ -115,6 +116,27 @@ pub struct RegisteredCommand {
     pub description: String,
     pub handler: CommandHandlerFn,
     pub user_data: *mut std::ffi::c_void,
+    /// Argument completions for this command, when the plugin attached them
+    /// (pi's `getArgumentCompletions`). `None` — the common case — means the
+    /// editor keeps its default behavior after the command name.
+    pub completions: Option<RegisteredCommandCompletions>,
+}
+
+/// A plugin's argument-completion callback for one slash command.
+#[derive(Clone, Copy)]
+pub struct RegisteredCommandCompletions {
+    pub handler: CommandArgumentCompletionFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+
+/// A plugin autocomplete provider stacked ahead of the host's built-in ones
+/// (pi's `ui.addAutocompleteProvider`).
+#[derive(Clone, Copy)]
+pub struct RegisteredAutocompleteProvider {
+    pub handler: AutocompleteProviderFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
 }
 
 /// A keyboard shortcut declared by a native extension (e.g. `"space"` for
@@ -135,6 +157,17 @@ pub struct RegisteredShortcut {
 // and plugin callbacks support invocation from any host thread.
 unsafe impl Send for RegisteredCommand {}
 unsafe impl Sync for RegisteredCommand {}
+
+// SAFETY: same contract as `RegisteredCommand` — the handler only reads
+// `plugin_free_string` + its opaque `user_data`, and the plugin makes the
+// callback safe to invoke from any host thread.
+unsafe impl Send for RegisteredCommandCompletions {}
+unsafe impl Sync for RegisteredCommandCompletions {}
+
+// SAFETY: same contract as `RegisteredCommand`; the TUI invokes the provider
+// from its own thread, so the plugin-side handler must be thread-safe.
+unsafe impl Send for RegisteredAutocompleteProvider {}
+unsafe impl Sync for RegisteredAutocompleteProvider {}
 
 /// A CLI flag declared by a native extension. Values are supplied by the
 /// host's parsed `Args::unknown_flags` map and read by the plugin through the
@@ -411,6 +444,10 @@ pub struct ExtensionRegistry {
     before_agent_start: Vec<BeforeAgentStartHandler>,
     /// `tool_result` transforms, chained in registration order.
     tool_result: Vec<ToolResultHandler>,
+    /// Autocomplete providers registered by plugins (pi's
+    /// `ui.addAutocompleteProvider`). Consulted ahead of the built-in
+    /// file/slash providers, in registration order.
+    autocomplete: Vec<RegisteredAutocompleteProvider>,
     /// Registered custom providers (B5c). The host wraps each in a
     /// [`PluggableProvider`](crate::PluggableProvider). First-registration-wins on
     /// `provider_id`.
@@ -459,6 +496,7 @@ impl ExtensionRegistry {
             resources_discover: Vec::new(),
             before_agent_start: Vec::new(),
             tool_result: Vec::new(),
+            autocomplete: Vec::new(),
             providers: Vec::new(),
             provider_manifests: std::collections::BTreeMap::new(),
             oauth_providers: Vec::new(),
@@ -512,8 +550,53 @@ impl ExtensionRegistry {
             description,
             handler,
             user_data,
+            completions: None,
         });
         false
+    }
+
+    /// Attach argument completions to a command this plugin registered.
+    ///
+    /// Attaches to the command already in the registry, so it never creates a
+    /// command that does not exist. Returns `false` when no command of that
+    /// name is registered (including the case where a different plugin won the
+    /// name first-wins, whose command therefore has no such callback).
+    pub fn set_command_completions(
+        &mut self,
+        name: &str,
+        handler: CommandArgumentCompletionFn,
+        plugin_free_string: FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool {
+        let Some(command) = self.commands.iter_mut().find(|c| c.name == name) else {
+            return false;
+        };
+        command.completions = Some(RegisteredCommandCompletions {
+            handler,
+            plugin_free_string,
+            user_data,
+        });
+        true
+    }
+
+    /// Register an autocomplete provider for the editor (append order).
+    pub fn register_autocomplete_provider(
+        &mut self,
+        handler: AutocompleteProviderFn,
+        plugin_free_string: FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    ) {
+        self.autocomplete.push(RegisteredAutocompleteProvider {
+            handler,
+            plugin_free_string,
+            user_data,
+        });
+    }
+
+    /// Autocomplete providers in registration order (empty when no plugin
+    /// registered one — the TUI then keeps its built-in providers only).
+    pub fn autocomplete_providers(&self) -> &[RegisteredAutocompleteProvider] {
+        &self.autocomplete
     }
 
     /// Register a CLI flag (first-wins by name). Returns `true` when an
@@ -824,6 +907,7 @@ impl ExtensionRegistry {
             resources_discover: self.resources_discover.clone(),
             before_agent_start: self.before_agent_start.clone(),
             tool_result: self.tool_result.clone(),
+            autocomplete: self.autocomplete.clone(),
             providers: self.providers.clone(),
             provider_manifests: self.provider_manifests.clone(),
             oauth_providers: self.oauth_providers.clone(),
@@ -905,6 +989,7 @@ impl ExtensionRegistry {
         self.before_agent_start
             .append(&mut other.before_agent_start);
         self.tool_result.append(&mut other.tool_result);
+        self.autocomplete.append(&mut other.autocomplete);
         for p in other.providers.drain(..) {
             if self
                 .providers
@@ -981,6 +1066,7 @@ pub struct RegistrySnapshot {
     resources_discover: Vec<ResourcesDiscoverHandler>,
     before_agent_start: Vec<BeforeAgentStartHandler>,
     tool_result: Vec<ToolResultHandler>,
+    autocomplete: Vec<RegisteredAutocompleteProvider>,
     providers: Vec<RegisteredProvider>,
     provider_manifests: std::collections::BTreeMap<String, ProviderManifest>,
     oauth_providers: Vec<RegisteredOAuthProvider>,
@@ -1058,6 +1144,13 @@ impl RegistrySnapshot {
     /// registered one, in which case tools are not wrapped at all.
     pub fn tool_result(&self) -> &[ToolResultHandler] {
         &self.tool_result
+    }
+
+    /// The plugin autocomplete providers, registration order. The TUI stacks
+    /// them ahead of its built-in file/slash providers; empty when no plugin
+    /// asked to contribute candidates.
+    pub fn autocomplete_providers(&self) -> &[RegisteredAutocompleteProvider] {
+        &self.autocomplete
     }
 
     /// The registered custom providers (B5c), registration order. The host wraps

@@ -22,6 +22,18 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+/// The editor's current draft, published by the TUI each tick so a plugin can
+/// read it on demand (`GetEditorText`, pi's `ui.getEditorText`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EditorDraft {
+    /// The draft as shown (folded pastes compressed), same source as
+    /// [`crate::EventTag::EditorChange`]'s `chars`.
+    pub text: String,
+    /// Caret position as a **byte** offset into `text` (UTF-8 boundary
+    /// aligned).
+    pub cursor: usize,
+}
+
 /// How a pending edit combines with what the editor already holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorTextMode {
@@ -74,10 +86,11 @@ impl EditorTextEdit {
     }
 }
 
-/// Shared, cloneable handle to the pending-edit queue.
+/// Shared, cloneable handle to the pending-edit queue plus the current draft.
 #[derive(Clone, Default)]
 pub struct EditorTextMailbox {
     pending: Arc<Mutex<VecDeque<EditorTextEdit>>>,
+    draft: Arc<Mutex<EditorDraft>>,
 }
 
 impl EditorTextMailbox {
@@ -104,6 +117,36 @@ impl EditorTextMailbox {
     /// Remove and return the next queued edit, or `None` when idle.
     pub fn take_pending(&self) -> Option<EditorTextEdit> {
         self.pending.lock().ok()?.pop_front()
+    }
+
+    /// Publish the editor's current draft. Called by the TUI whenever the draft
+    /// may have changed; cheap enough to call every tick (one mutex + one
+    /// compare on the common unchanged path).
+    pub fn set_draft(&self, text: &str, cursor: usize) {
+        let Ok(mut draft) = self.draft.lock() else {
+            return;
+        };
+        if draft.text == text && draft.cursor == cursor {
+            return;
+        }
+        draft.text.clear();
+        draft.text.push_str(text);
+        draft.cursor = cursor.min(text.len());
+    }
+
+    /// The last published draft (empty on a host with no editor).
+    pub fn draft(&self) -> EditorDraft {
+        self.draft.lock().map(|d| d.clone()).unwrap_or_default()
+    }
+
+    /// Handle the `GetEditorText` runtime action payload (`{}`).
+    ///
+    /// Never an error: a host without an editor (RPC, print, headless) has an
+    /// empty draft, which is a real answer — a plugin degrades instead of
+    /// branching on a failure.
+    pub fn handle_get(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let draft = self.draft();
+        Ok(serde_json::json!({ "text": draft.text, "cursor": draft.cursor }))
     }
 }
 
@@ -179,5 +222,30 @@ mod tests {
             .handle(serde_json::json!({"text": "x", "autoSendMs": 0}))
             .expect("ok");
         assert_eq!(mailbox.take_pending().unwrap().auto_send_ms, None);
+    }
+
+    #[test]
+    fn get_editor_text_returns_the_published_draft() {
+        let mailbox = EditorTextMailbox::new();
+        // No editor yet: an empty draft is a real answer, not an error.
+        let out = mailbox.handle_get(serde_json::json!({})).expect("ok");
+        assert_eq!(out["text"], serde_json::json!(""));
+        assert_eq!(out["cursor"], serde_json::json!(0));
+
+        mailbox.set_draft("hello #Bud", 10);
+        let out = mailbox.handle_get(serde_json::json!({})).expect("ok");
+        assert_eq!(out["text"], serde_json::json!("hello #Bud"));
+        assert_eq!(out["cursor"], serde_json::json!(10));
+        // Reading does not consume or clear the draft.
+        assert_eq!(mailbox.draft().text, "hello #Bud");
+    }
+
+    #[test]
+    fn set_draft_clamps_the_cursor_to_the_text() {
+        let mailbox = EditorTextMailbox::new();
+        mailbox.set_draft("abc", 99);
+        assert_eq!(mailbox.draft().cursor, 3);
+        mailbox.set_draft("你", 1);
+        assert_eq!(mailbox.draft().cursor, 1);
     }
 }

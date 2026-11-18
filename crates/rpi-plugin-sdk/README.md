@@ -79,6 +79,34 @@ schema still makes it callable. Older plugins remain compatible: neither
 is `None`; skip metadata registration, **not** tool registration. The CLI does not
 invent rules for external tools (including `todo`); extensions must opt in.
 
+## Editor draft and completion
+
+Pi exposes `ui.getEditorText()` and `ui.addAutocompleteProvider()`; rpi mirrors
+both, plus pi's `RegisteredCommand.getArgumentCompletions`.
+
+- `RuntimeActionId::GetEditorText` (`32`): `{}` → `{"text": "...", "cursor": N}`
+  where `cursor` is a byte offset. Never an error — a host without an editor
+  (RPC, print, headless) returns an empty draft, so degrade instead of branching
+  on a failure. The TUI republishes the draft every tick, including cursor-only
+  moves. `EventTag::EditorChange` still carries no text by design.
+- `PluginApi::register_autocomplete_provider` (helper:
+  `register_autocomplete_provider`): the handler receives
+  `{"text","cursor","line","linePrefix"}` and returns
+  `{"items":[{"text","label"?,"description"?,"insertSpace"?,"isDirectory"?}]}`.
+  Return `0` with candidates, or `1` (or an empty list) for "no opinion" — the
+  host then asks the next plugin and finally falls back to the built-in
+  file/slash providers. Plugin providers run *before* the built-ins. `out` is
+  plugin-owned and reclaimed with the `plugin_free_string` registered alongside.
+- `PluginApi::register_command_completions` (helper:
+  `register_command_completions`): attach `getArgumentCompletions` to a command
+  this plugin already registered. The handler receives
+  `{"argumentPrefix":"con"}`; status is `0`, `1` (unknown command) or `-1`
+  (outside registration / older host).
+
+Both slots are appended to the vtable without changing the ABI version, so an
+older host leaves them `None`: skip the registration, never abort the plugin's
+own registration over it.
+
 ## Safe plugin helpers
 
 `handles::ToolHandles<T>` keeps tool state inside the plugin and returns opaque
