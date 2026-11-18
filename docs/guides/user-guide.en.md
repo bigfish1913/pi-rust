@@ -188,6 +188,26 @@ API's skill list. Unknown skills and read/parse failures pass the original comma
 through the normal input path.
 `/skills` still lists skills; `/skills name [instructions]` remains compatible.
 
+### Math rendering
+
+LaTeX in assistant replies is rendered as readable text; no image-capable
+terminal is required:
+
+- Inline math: `$e^{i\pi}+1=0$` → `e^(iπ)+1=0`.
+- Display math: `$$ … $$`, `\[ … \]`, and environments such as
+  `\begin{aligned}`, `\begin{pmatrix}`, and `\begin{cases}`. `\\` row breaks
+  and `&` alignment points survive as multiple rows/columns, and the matrix
+  family keeps its brackets (`()`, `[]`, `{}`, `|`, `‖`).
+- Supported constructs include Greek letters and common operators, `\frac`,
+  `\sqrt`, scripts, `\mathbb`/`\mathcal`, `\text`/`\operatorname`, and
+  `\hat`/`\vec`/`\overline` decorations.
+
+Rendering is a best-effort Unicode approximation: a terminal cannot typeset TeX
+(fraction bars, integral sizes), scripts Unicode cannot express degrade to
+`^(…)`/`_(…)`, and an unknown command keeps its name instead of failing. `$`
+inside code fences and code spans stays literal, and currency such as `$5` is
+not treated as math.
+
 ### Headless server and remote client
 
 Run the agent without a local TUI and connect from another process:

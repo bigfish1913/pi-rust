@@ -12,6 +12,7 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use super::component::{Component, RenderedDocument};
 use super::mermaid::Mermaid;
 use crate::ansi::{bold, italic, underline};
+use crate::latex::RenderLatexOptions;
 use crate::theme::theme;
 use crate::utils::{
     apply_background_to_line, visible_width, widest_char_width, wrap_text_with_ansi,
@@ -305,6 +306,41 @@ impl Markdown {
                 continue;
             }
 
+            // ---- Display math ----
+            // `$$ … $$`, `\[ … \]` and `\begin{…}` environments are
+            // lowered to Unicode text (terminals cannot typeset TeX). Code
+            // fences above already claimed their content, so `$` inside a
+            // code block stays literal.
+            if let Some((opener, first_line)) =
+                display_math_open(line, raw_lines.get(i + 1..).unwrap_or(&[]))
+            {
+                list_continuation_indent = None;
+                let mut source = opener.prefix();
+                i += 1;
+                match opener.strip_close(&first_line) {
+                    Some(inner) => source.push_str(&inner),
+                    None => {
+                        source.push_str(&first_line);
+                        // Unterminated blocks (a streaming response, or a
+                        // missing `$$`) render what has arrived so far instead
+                        // of leaking raw LaTeX for a frame.
+                        while i < raw_lines.len() {
+                            let candidate = raw_lines[i];
+                            i += 1;
+                            if let Some(inner) = opener.strip_close(candidate) {
+                                source.push('\n');
+                                source.push_str(&inner);
+                                break;
+                            }
+                            source.push('\n');
+                            source.push_str(candidate);
+                        }
+                    }
+                }
+                self.push_math_block(&source, &pad, cwidth, &mut lines);
+                continue;
+            }
+
             // ---- Tables ----
             if is_table_separator(raw_lines.get(i + 1)) && is_table_row(line) {
                 list_continuation_indent = None;
@@ -428,11 +464,29 @@ impl Markdown {
         lines
     }
 
+    /// Lay out one display-math block as centered, math-colored lines.
+    fn push_math_block(&self, source: &str, pad: &str, cwidth: usize, out: &mut Vec<String>) {
+        let colors = theme().colors;
+        let rendered = crate::latex::render_latex_block(source, &RenderLatexOptions::default());
+        let rows: Vec<&String> = rendered.iter().filter(|l| !l.trim().is_empty()).collect();
+        // Center the block as a unit, not line by line: `aligned` rows and
+        // matrix brackets only line up if every row starts at the same column.
+        let widest = rows.iter().map(|l| visible_width(l)).max().unwrap_or(0);
+        let left = cwidth.saturating_sub(widest) / 2;
+        let indent = " ".repeat(left);
+        for line in rows {
+            out.push(format!("{pad}{indent}{}", colors.md_code.fg(line)));
+        }
+    }
+
     /// Render inline CommonMark/GFM with terminal-specific ANSI styling.
     fn render_inline(&self, text: &str) -> String {
         let colors = theme().colors;
         let mut options = Options::empty();
         options.insert(Options::ENABLE_STRIKETHROUGH);
+        // Math is opt-in in pulldown-cmark; without it `$…$` would reach us as
+        // plain text and stay raw LaTeX in the transcript.
+        options.insert(Options::ENABLE_MATH);
 
         // pulldown-cmark parses complete documents and has no inline-only
         // entry point. A plain prefix keeps block-looking text in inline
@@ -481,16 +535,31 @@ impl Markdown {
                         .text
                         .push_str(&colors.md_code_bg.bg(&chip));
                 }
-                Event::InlineMath(value) => frames
-                    .last_mut()
-                    .expect("root inline frame")
-                    .text
-                    .push_str(&format!("${value}$")),
-                Event::DisplayMath(value) => frames
-                    .last_mut()
-                    .expect("root inline frame")
-                    .text
-                    .push_str(&format!("$${value}$$")),
+                Event::InlineMath(value) => {
+                    let rendered =
+                        crate::latex::render_latex(value.as_ref(), &RenderLatexOptions::default());
+                    let styled = colors.md_code.fg(&rendered);
+                    frames
+                        .last_mut()
+                        .expect("root inline frame")
+                        .text
+                        .push_str(&styled);
+                }
+                Event::DisplayMath(value) => {
+                    // A display-math run inside a paragraph/table cell: keep it
+                    // on one line rather than breaking the enclosing layout.
+                    let rendered = crate::latex::render_latex_block(
+                        value.as_ref(),
+                        &RenderLatexOptions::default(),
+                    )
+                    .join("   ");
+                    let styled = colors.md_code.fg(&rendered);
+                    frames
+                        .last_mut()
+                        .expect("root inline frame")
+                        .text
+                        .push_str(&styled);
+                }
                 Event::Html(value) | Event::InlineHtml(value) => frames
                     .last_mut()
                     .expect("root inline frame")
@@ -676,6 +745,69 @@ fn fence_info(line: &str) -> Option<(char, String)> {
     } else {
         None
     }
+}
+
+/// Opening delimiter of a display-math block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MathOpener {
+    /// `$$ … $$`
+    Dollars,
+    /// `\[ … \]`
+    Bracket,
+    /// `\begin{env} … \end{env}`
+    Environment(String),
+}
+
+impl MathOpener {
+    /// Seed text for the collected source. Delimiter forms hand only the body
+    /// to the renderer; an environment keeps its `\begin{…}` so the block
+    /// renderer can recognize (and lay out) the environment.
+    fn prefix(&self) -> String {
+        match self {
+            MathOpener::Dollars | MathOpener::Bracket => String::new(),
+            MathOpener::Environment(env) => format!("\\begin{{{env}}}"),
+        }
+    }
+
+    /// Remove the closing delimiter from `line`, if it is the last line.
+    fn strip_close(&self, line: &str) -> Option<String> {
+        match self {
+            MathOpener::Dollars => line.trim_end().strip_suffix("$$").map(ToString::to_string),
+            MathOpener::Bracket => line.split_once("\\]").map(|(head, _)| head.to_string()),
+            MathOpener::Environment(env) => line
+                .find(&format!("\\end{{{env}}}"))
+                .map(|at| line[..at].to_string()),
+        }
+    }
+}
+
+/// Detect the opening line of a display-math block.
+///
+/// Only block-level openers are recognized here (`$$`, `\[`, and `\begin{…}`
+/// math environments). Inline `$…$` is left to the inline parser so a currency
+/// amount inside a sentence is not swallowed as math.
+fn display_math_open(line: &str, rest: &[&str]) -> Option<(MathOpener, String)> {
+    let trimmed = line.trim_start();
+    if let Some(remainder) = trimmed.strip_prefix("$$") {
+        return Some((MathOpener::Dollars, remainder.to_string()));
+    }
+    if let Some(remainder) = trimmed.strip_prefix("\\[") {
+        // `\[` is also CommonMark's escape for a literal `[`. Only claim the
+        // line as display math when a closing `\]` exists, so an accidental
+        // (or streaming-truncated) escape keeps its bracket.
+        if remainder.contains("\\]") || rest.iter().any(|line| line.contains("\\]")) {
+            return Some((MathOpener::Bracket, remainder.to_string()));
+        }
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("\\begin{") {
+        let (env, tail) = rest.split_once('}')?;
+        let env = env.trim();
+        if crate::latex::is_math_environment(env) {
+            return Some((MathOpener::Environment(env.to_string()), tail.to_string()));
+        }
+    }
+    None
 }
 
 /// Render one physical code line on a subtle surface, without an outer frame.
@@ -1198,6 +1330,125 @@ mod tests {
         assert!(plain.contains("echo hello"));
         assert!(!plain.contains("text"), "text label leaked: {plain}");
         assert!(!plain.contains("bash"), "bash label leaked: {plain}");
+    }
+
+    #[test]
+    fn test_inline_math_renders_unicode_without_delimiters() {
+        let md = Markdown::new("Euler: $e^{i\\pi}+1=0$ and $\\alpha \\leq \\beta$", 0, 0);
+        let rendered = md.render(80).join("\n");
+        let plain = crate::ansi::strip_ansi(&rendered);
+        assert!(plain.contains('π'), "greek letter missing: {plain}");
+        assert!(plain.contains("e"), "base missing: {plain}");
+        assert!(plain.contains('≤'), "relation missing: {plain}");
+        assert!(!plain.contains('$'), "raw math delimiters leaked: {plain}");
+        assert!(!plain.contains('\\'), "raw command leaked: {plain}");
+    }
+
+    #[test]
+    fn test_currency_is_not_swallowed_as_math() {
+        let md = Markdown::new("It costs $5 and $10 for the pair.", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert_eq!(plain, "It costs $5 and $10 for the pair.");
+    }
+
+    #[test]
+    fn test_display_math_block_renders_body_only() {
+        let md = Markdown::new("$$\n\\frac{a+b}{c} = \\sqrt{2}\n$$", 0, 0);
+        let lines = md.render(80);
+        let plain: Vec<String> = lines
+            .iter()
+            .map(|line| crate::ansi::strip_ansi(line).trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(plain, vec!["(a+b)/c = √2"]);
+        assert!(lines[0].contains('\x1b'), "display math should be styled");
+    }
+
+    #[test]
+    fn test_display_math_matrix_keeps_rows_and_columns() {
+        let md = Markdown::new(
+            "$$\n\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}\n$$",
+            0,
+            0,
+        );
+        let plain: Vec<String> = md
+            .render(80)
+            .iter()
+            .map(|line| crate::ansi::strip_ansi(line).trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(plain.len(), 2, "matrix rows collapsed: {plain:?}");
+        assert!(
+            plain[0].starts_with('⎛') && plain[0].contains('a'),
+            "{plain:?}"
+        );
+        assert!(
+            plain[1].starts_with('⎝') && plain[1].contains('d'),
+            "{plain:?}"
+        );
+        assert_eq!(visible_width(&plain[0]), visible_width(&plain[1]));
+    }
+
+    #[test]
+    fn test_display_math_bracket_and_aligned_forms() {
+        let md = Markdown::new("\\[ a = 1 \\\\ b = 2 \\]", 0, 0);
+        let plain: Vec<String> = md
+            .render(80)
+            .iter()
+            .map(|line| crate::ansi::strip_ansi(line).trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(plain, vec!["a = 1", "b = 2"]);
+
+        let md = Markdown::new(
+            "$$\n\\begin{aligned}\nx &= 1 \\\\\ny &= 2\n\\end{aligned}\n$$",
+            0,
+            0,
+        );
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains('='), "aligned body missing: {plain}");
+        assert!(!plain.contains("begin"), "environment leaked: {plain}");
+    }
+
+    #[test]
+    fn test_unclosed_bracket_escape_is_not_math() {
+        // `\[` without a closing `\]` is a CommonMark escape, not display math.
+        let md = Markdown::new("Use \\[1\\] style labels here", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(
+            plain.contains("[1]"),
+            "escape was swallowed as math: {plain}"
+        );
+
+        let md = Markdown::new("\\[ x + 1", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains("[ x + 1"), "unclosed bracket lost: {plain}");
+    }
+
+    #[test]
+    fn test_math_inside_code_is_literal() {
+        let md = Markdown::new("```\n$x^2$ and $$y$$\n```", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains("$x^2$"), "fenced math changed: {plain}");
+        assert!(
+            plain.contains("$$y$$"),
+            "fenced display math changed: {plain}"
+        );
+
+        let md = Markdown::new("Use `$HOME` and `$x^2$` literally.", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains("$HOME"), "code span changed: {plain}");
+        assert!(plain.contains("$x^2$"), "code span math changed: {plain}");
+    }
+
+    #[test]
+    fn test_partial_streamed_math_block_renders_progressively() {
+        // Streaming: the closing `$$` has not arrived yet. The body renders
+        // instead of leaking the raw delimiter.
+        let md = Markdown::new("$$\n\\alpha + \\beta", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains("α + β"), "partial math missing: {plain}");
+        assert!(!plain.contains("$$"), "raw delimiter leaked: {plain}");
     }
 
     #[test]
