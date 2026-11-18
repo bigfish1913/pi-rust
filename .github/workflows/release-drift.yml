@@ -1,0 +1,87 @@
+name: Release channel drift
+
+# A release run can finish crates.io, the GitHub Release and the taps and still
+# fail one channel; nothing then forces a retry, so the channel silently falls
+# further behind (npm stayed on 0.22.1 for three releases). This scheduled check
+# compares every channel with the newest stable release and keeps one issue open
+# until the gap is closed.
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-channel-drift
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Compare channels with the latest stable release
+    if: github.repository == 'bigfish1913/pi-rust'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test the drift monitor offline
+        run: python3 -B scripts/test_channel_drift.py
+      - name: Compare every install channel
+        id: drift
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          python3 scripts/check-channel-drift.py \
+            --json "$RUNNER_TEMP/drift.json" | tee "$RUNNER_TEMP/drift.md"
+          status="${PIPESTATUS[0]}"
+          cat "$RUNNER_TEMP/drift.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Keep one open issue for the current gap
+        if: steps.drift.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title='Release channel drift'
+          {
+            echo 'At least one install channel still serves an older version than the latest stable release. Release automation only warns once; this issue stays open until the channel catches up.'
+            echo
+            cat "$RUNNER_TEMP/drift.md"
+          } > "$RUNNER_TEMP/issue.md"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$title\"" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            # Update in place: a multi-day gap must not produce one comment per run.
+            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/issue.md"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/issue.md"
+          fi
+      - name: Close the issue once every tracked channel matches
+        if: steps.drift.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          body='Every tracked channel now matches the latest stable release.'
+          gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search 'in:title "Release channel drift"' --json number --jq '.[].number' \
+            | while read -r number; do
+                gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+                gh issue close "$number" --repo "$GITHUB_REPOSITORY"
+              done
+      - name: Fail when a channel lags
+        if: steps.drift.outcome == 'failure'
+        run: |
+          echo "::error::An install channel lags the latest stable release; see the drift issue."
+          exit 1
