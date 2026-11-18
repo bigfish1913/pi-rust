@@ -10,6 +10,17 @@
 仅作 advisory 记录，不会阻止宿主操作。生命周期事件使用无 payload 的 `EventEmpty`，
 不是旧设计稿中的 Rust 资源注入总线。
 
+上述 session-tree 标签在本宿主里**不带 payload**：`EventTag` 把它们列在 `data_text()`
+的可读集合里（Pi 会给 `{"reason":…}` 之类的 JSON），但 rpi 发出的是空数据，
+`EventView::data_text()` 得到 `Some("")`。订阅者应当把“空”当作正常状态，不要直接
+`serde_json::from_str` 后 `unwrap`。要判断具体是哪一种切换，用自己缓存的最新分支
+状态（`GetSessionBranch`）或后续事件，不要依赖这些标签的参数。
+
+`SessionTree` 与 `SessionCompact` 只在分支真的变了之后才会发：导航被取消或失败、
+压缩被拒绝（没有写入 compaction entry）时都不会发，所以订阅者可以把它们当成
+“缓存已失效”的可靠信号。`--fork` 启动路径和插件通过 runtime action 发起的
+fork/switch/navigate 目前不发这些事件。
+
 宿主在 blocking 线程中调用 handler，并在 FFI 边界捕获 panic。分发使用以下超时预算：
 
 | 事件 | 单个 handler 的超时 |
