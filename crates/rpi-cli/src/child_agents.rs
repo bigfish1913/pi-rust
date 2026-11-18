@@ -19,6 +19,13 @@ const MAX_JOBS: usize = 16;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Default)]
 pub(crate) struct ChildAgents {
     jobs: Mutex<HashMap<String, Arc<Job>>>,
@@ -48,40 +55,68 @@ struct State {
     turns: u32,
     result: Option<Value>,
     error: Option<String>,
+    /// Supervisory metadata (host UI roster): when the child started/finished
+    /// (unix ms) and what it was asked to do. Written once at start; timing
+    /// fields are set by `mark_finished`.
+    ///
+    /// `u64` (not `u128`): the roster serializes these into JSON and reads them
+    /// back with `as_u64`, so the type must not be able to exceed that range.
+    started_ms: u64,
+    finished_ms: Option<u64>,
+    role: String,
+    task_preview: String,
 }
 
 impl Job {
+    /// Record the terminal timestamp exactly once (first finish wins; a later
+    /// dispose/cancel must not rewrite history).
+    fn mark_finished(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.finished_ms.is_none() {
+            state.finished_ms = Some(now_ms());
+        }
+    }
+
     fn fail(&self, error: impl Into<String>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.result.is_none() && state.error.is_none() {
             state.error = Some(error.into());
         }
+        drop(state);
+        self.mark_finished();
         self.cancel.cancel();
     }
 
     fn observe(&self, event: AgentEvent) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.result.is_some() || state.error.is_some() {
-            return;
-        }
-        match event {
-            AgentEvent::TurnEnd { .. } => state.turns += 1,
-            AgentEvent::MessageUpdate {
-                assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
-                ..
-            } => {
-                if state.bytes.saturating_add(delta.len()) > MAX_OUTPUT
-                    || state.events >= MAX_EVENTS
-                {
-                    state.error = Some("child output limit exceeded".into());
-                    self.cancel.cancel();
-                } else {
-                    state.bytes += delta.len();
-                    state.events += 1;
-                    state.deltas.push_back(delta);
-                }
+        let mut limit_hit = false;
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.result.is_some() || state.error.is_some() {
+                return;
             }
-            _ => {}
+            match event {
+                AgentEvent::TurnEnd { .. } => state.turns += 1,
+                AgentEvent::MessageUpdate {
+                    assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
+                    ..
+                } => {
+                    if state.bytes.saturating_add(delta.len()) > MAX_OUTPUT
+                        || state.events >= MAX_EVENTS
+                    {
+                        state.error = Some("child output limit exceeded".into());
+                        limit_hit = true;
+                    } else {
+                        state.bytes += delta.len();
+                        state.events += 1;
+                        state.deltas.push_back(delta);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if limit_hit {
+            self.mark_finished();
+            self.cancel.cancel();
         }
     }
 }
@@ -126,6 +161,63 @@ impl ChildAgents {
         for job in self.jobs.lock().unwrap_or_else(|e| e.into_inner()).values() {
             job.fail("parent session closed or changed");
         }
+    }
+
+    /// Supervisory roster for the host UI: every child this host still holds
+    /// (running **and** terminated-but-not-disposed), newest first. Each row is
+    /// self-contained — `childId`/`status`/`turns`/`startedMs`/`finishedMs`/
+    /// `role`/`taskPreview` — so a panel can render without polling each child.
+    ///
+    /// Status vocabulary matches `poll`: `running` / `done` / `failed`.
+    pub(crate) fn roster(&self) -> Vec<Value> {
+        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<Value> = jobs
+            .iter()
+            .map(|(id, job)| {
+                let state = job.state.lock().unwrap_or_else(|e| e.into_inner());
+                let status = if state.error.is_some() {
+                    "failed"
+                } else if state.result.is_some() {
+                    "done"
+                } else {
+                    "running"
+                };
+                json!({
+                    "childId": id,
+                    "status": status,
+                    "turns": state.turns,
+                    "startedMs": state.started_ms,
+                    "finishedMs": state.finished_ms,
+                    "role": state.role,
+                    "taskPreview": state.task_preview,
+                    "error": state.error,
+                })
+            })
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row["startedMs"].as_u64()));
+        rows
+    }
+
+    /// Host-initiated stop of one child by id (the panel's Stop button).
+    ///
+    /// Unlike `handle_existing` this is **not** owner-scoped: the caller is the
+    /// host itself (one registry per host), not a plugin. Unknown id = `Err`
+    /// (never a silent success).
+    pub(crate) fn stop(&self, child_id: &str) -> Result<Value, String> {
+        let job = {
+            let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            jobs.get(child_id).cloned()
+        };
+        let job = job.ok_or_else(|| format!("unknown childId `{child_id}`"))?;
+        let already_finished = {
+            let state = job.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.result.is_some() || state.error.is_some()
+        };
+        job.fail("child cancelled by user");
+        Ok(json!({
+            "childId": child_id,
+            "status": if already_finished { "already-finished" } else { "cancelled" },
+        }))
     }
 
     pub(crate) async fn handle(
@@ -254,7 +346,12 @@ impl ChildAgents {
             owner,
             cancel: CancellationToken::new(),
             invocation_signal,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                started_ms: now_ms(),
+                role: role.to_string(),
+                task_preview: task.chars().take(200).collect(),
+                ..State::default()
+            }),
         });
         // Reserve before awaiting construction so concurrent starts cannot exceed the cap.
         let permit;
@@ -399,6 +496,9 @@ async fn run_child(child: ChildHarness, job: Arc<Job>, prompt: String, turns: u3
                     outcome["turns"] = json!(state.turns);
                     outcome["turnLimited"] = json!(state.turns >= turns);
                     state.result = Some(outcome);
+                    if state.finished_ms.is_none() {
+                        state.finished_ms = Some(now_ms());
+                    }
                 }
             }
             Err(error) => job.fail(format!("child run failed: {error}")),

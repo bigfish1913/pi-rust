@@ -566,6 +566,12 @@ impl RuntimeActionHost for HarnessActionHost {
     fn cancel_child_agents(&self, owner: u64) {
         self.children.cancel_owner(owner);
     }
+    fn child_agent_roster(&self) -> Vec<serde_json::Value> {
+        self.children.roster()
+    }
+    fn stop_child_agent(&self, child_id: &str) -> Result<serde_json::Value, String> {
+        self.children.stop(child_id)
+    }
     fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
         self.set_catalog(models);
     }

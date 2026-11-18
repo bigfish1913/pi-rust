@@ -678,6 +678,29 @@ pub trait RuntimeActionHost: Send + Sync {
     fn replace_model_catalog(&self, _models: Vec<rpi_ai::Model>) {}
     /// Invalidate child handles owned by an unloading/reloaded plugin.
     fn cancel_child_agents(&self, _owner: u64) {}
+    /// Supervisory roster of host-held child agents (newest first). Host-only
+    /// surface for a UI panel: the default is empty so hosts that never
+    /// launched children (or older hosts) report "no children" instead of
+    /// failing the call.
+    ///
+    /// **Not a plugin action.** This method is deliberately absent from
+    /// [`RuntimeActionId`] and from [`dispatch`]: it returns `taskPreview` /
+    /// `error` for children the caller may not own, so it must never be wired
+    /// into `run_action`. See [`RuntimeActionHost::stop_child_agent`].
+    fn child_agent_roster(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    /// Stop one host-held child by id (host-only, **not** owner-scoped). Unknown
+    /// id = `Err`; the default refuses so an unsupporting host is visible.
+    ///
+    /// **Not a plugin action.** Plugin-initiated cancellation is
+    /// owner-checked (`cancel_child_agents(owner)`); this entry point trusts
+    /// its caller to be the host. It must never be reachable from
+    /// `runtime_action`, which is the plugin ABI. If a future action needs it,
+    /// add an owner parameter first and expose *that* instead.
+    fn stop_child_agent(&self, _child_id: &str) -> Result<serde_json::Value, String> {
+        Err("child agent control is not supported by this host; upgrade rpi".into())
+    }
     /// `SendMessage` — Pi-compatible `triggerTurn` and `deliverAs` scheduling.
     /// Defaults append while idle and steer while running; explicit `true`
     /// starts an idle run, `false` only updates context, and `nextTurn` waits
@@ -1883,6 +1906,27 @@ fn run_action(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// Host-only child-agent control must stay unreachable from the plugin ABI.
+    ///
+    /// `run_action` only dispatches ids that [`RuntimeActionId::try_from`]
+    /// accepts, and `dispatch` matches exhaustively on that enum, so the enum is
+    /// the isolation primitive: no variant means no path from a plugin to
+    /// `child_agent_roster` / `stop_child_agent` (which are deliberately not
+    /// owner-scoped). Adding an action id is then a visible, test-breaking
+    /// change that forces whoever does it to re-check that boundary.
+    #[test]
+    fn host_child_agent_control_has_no_plugin_action_id() {
+        assert!(
+            RuntimeActionId::try_from(31).is_ok(),
+            "ReloadModels must remain a valid runtime action id"
+        );
+        assert!(
+            RuntimeActionId::try_from(32).is_err(),
+            "a new RuntimeActionId was added: re-verify that host-only child-agent control \
+             (un-owner-scoped roster/stop) is still unreachable from the plugin ABI"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn stdio_claim_is_exclusive_and_only_its_scoped_context_can_finish() {
