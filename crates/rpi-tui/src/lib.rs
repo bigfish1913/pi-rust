@@ -109,7 +109,10 @@ pub use keys::{
     set_kitty_protocol_active, Key, KeyEventType, KeyHelper, KeyId,
 };
 pub use kill_ring::{KillRing, PushOptions};
-pub use latex::{is_latex, render_latex, strip_latex, RenderLatexOptions};
+pub use latex::{
+    is_latex, is_math_environment, render_latex, render_latex_block, strip_latex,
+    RenderLatexOptions,
+};
 pub use layout::{
     composite_tui_line, extract_cursor_position, hit_test, render_layout_frame, LayoutBox,
     LayoutFrame, LayoutRect,

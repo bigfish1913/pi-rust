@@ -277,6 +277,21 @@ rpi 使用全局 `settings.json` 中的 `lastRpiChangelogVersion` 记录已读�
 可在 `settings.json` 的 `keybindings` 中设置 `"tui.altScreen.bottom": "ctrl+end"`。
 提示会显示实际快捷键；设置为 `null` 可禁用按键，点击入口仍可使用。
 
+### 数学公式渲染
+
+助手回复中的 LaTeX 公式会直接渲染成可读文本，不需要终端支持图片协议：
+
+- 行内公式：`$e^{i\pi}+1=0$` → `e^(iπ)+1=0`。
+- 独立公式：`$$ … $$`、`\[ … \]`，以及 `\begin{aligned}`、`\begin{pmatrix}`、
+  `\begin{cases}` 等环境。独立的 `\\` 换行和 `&` 对齐点会保留成多行、多列，
+  矩阵会带对应的括号（`()`、`[]`、`{}`、`|`、`‖`）。
+- 覆盖范围：常见希腊字母与运算符、`\frac`、`\sqrt`、上下标、`\mathbb`/`\mathcal`、
+  `\text`/`\operatorname`、`\hat`/`\vec`/`\overline` 等装饰。
+
+渲染是尽力而为的 Unicode 近似：终端无法排版 TeX，也没有绘制分式横线或积分号大小的
+能力，无法转换成 Unicode 的上下标会退化成 `^(…)`/`_(…)`；未知命令保留命令名而不是
+报错。代码块和行内代码里的 `$` 保持原样，`$5` 这类货币金额不会被当作公式。
+
 ### 远程模式（`--server` / `--connect`）
 
 把 agent 跑在无头服务端，另一个进程用 TUI 远程驱动。客户端**无任何本地 agent 资源**。
