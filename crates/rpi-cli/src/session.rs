@@ -1167,6 +1167,13 @@ pub async fn build_prepared(
 
     // Host-integrated approval gate: composes AFTER the extension hook (an
     // extension veto wins; the host gate only sees calls that would run).
+    //
+    // Field contract (harness `prepare_tool_call`): a returned
+    // `BeforeToolCallResult` may carry `block`/`terminate`/`args`, and a
+    // non-blocking result's `args` REPLACES the validated args for the call.
+    // So the composite must (a) keep an extension's non-blocking rewrite and
+    // `terminate` bit, and (b) run the approval gate against the *rewritten*
+    // args — not the originals (review follow-up).
     let approval_binding = Arc::clone(&durable_binding);
     let before_tool_call: Option<rpi_agent::hooks::BeforeToolCall> = match before_tool_call {
         Some(extension_hook) => Some(Arc::new(
@@ -1175,18 +1182,40 @@ pub async fn build_prepared(
                 let extension_hook = Arc::clone(&extension_hook);
                 let binding = Arc::clone(&approval_binding);
                 let tool = context.tool_call.name.clone();
-                let args = context.args.clone();
-                // Call synchronously: the extension hook copies what it needs and
-                // returns a 'static future, so the borrowed context never enters
-                // our boxed future.
+                let original_args = context.args.clone();
+                // Call synchronously: the extension hook copies what it needs
+                // and returns a 'static future, so the borrowed context never
+                // enters our boxed future.
                 let first = extension_hook(context, signal.clone());
                 Box::pin(async move {
-                    if let Some(result) = first.await {
+                    let extension_result = first.await;
+                    if let Some(result) = extension_result.as_ref() {
                         if result.block {
-                            return Some(result);
+                            return Some(result.clone());
                         }
                     }
-                    crate::approval_gate::evaluate(&binding, &tool, &args).await
+                    let rewritten = extension_result
+                        .as_ref()
+                        .and_then(|result| result.args.clone())
+                        .unwrap_or(original_args);
+                    match crate::approval_gate::evaluate(&binding, &tool, &rewritten, &signal).await
+                    {
+                        Some(blocked) => {
+                            // Keep the extension's own terminate intent when the
+                            // host gate denies (both are "stop here" signals).
+                            let terminate = extension_result
+                                .as_ref()
+                                .map(|result| result.terminate)
+                                .unwrap_or(false);
+                            Some(rpi_agent::types::BeforeToolCallResult {
+                                terminate,
+                                ..blocked
+                            })
+                        }
+                        // Allowed: hand the extension's own result back so the
+                        // harness applies its args rewrite / terminate bit.
+                        None => extension_result,
+                    }
                 })
             },
         )),

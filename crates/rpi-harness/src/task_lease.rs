@@ -11,22 +11,34 @@
 //!
 //! - [`TaskIdentity`] = `task_id` + `execution_generation` (the fencing epoch);
 //! - [`acquire`] takes a lease for one identity (conflict when another live
-//!   lease exists; an expired lease is retired as [`TaskStatus::Indeterminate`]);
-//! - [`begin`]/[`finish`] record status + terminal receipt (persisted next to
-//!   the session file: `<session>.tasks.json`, atomic write);
+//!   lease exists; an **expired** lease is never revived in place — the caller
+//!   must run [`recover`] or open a new generation);
+//! - [`renew`] extends a live lease (expired leases fail with [`TaskLeaseError::Expired`]);
+//! - [`finish`] records status + terminal receipt (persisted next to the
+//!   session file: `<session>.tasks.json`, atomic write under an OS file lock);
 //! - [`recover`] turns "running" records whose lease expired into
 //!   `Indeterminate` and returns them — the honest outcome when the process
 //!   died mid-turn;
-//! - [`interrupt_fenced`] aborts only when the caller names the exact identity
-//!   (stale tokens are refused, never silently applied to another turn).
+//! - [`ensure_live`] verifies that a caller names the exact, **unexpired**
+//!   identity before it acts (stale tokens are refused, never silently applied
+//!   to another turn).
+//!
+//! Every mutating operation (acquire / renew / finish / recover) serializes the
+//! whole read-modify-write under an advisory OS lock on
+//! `<session>.tasks.json.lock`, so two drivers in different processes cannot
+//! both pass the conflict check, and a stale writer cannot replace a newer
+//! lease or receipt. Atomic rename alone is not a fencing guarantee.
 //!
 //! The module is storage + policy only; the caller still owns "run the turn".
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,9 +116,16 @@ pub struct TaskRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskLeaseError {
     /// Another live lease holds this session for a different identity.
-    Conflict { holder_task: String, holder_generation: u64 },
+    Conflict {
+        holder_task: String,
+        holder_generation: u64,
+    },
     /// The identity no longer matches what this session is running.
     Stale,
+    /// The live lease's TTL has elapsed. The caller must recover the record
+    /// (→ Indeterminate) or start a new execution_generation; an expired lease
+    /// is never silently revived or allowed to renew/finish.
+    Expired,
     /// The lease id does not match the live lease.
     LeaseLost,
     /// The task already reached a terminal state.
@@ -127,6 +146,12 @@ impl std::fmt::Display for TaskLeaseError {
                 "session is leased by task {holder_task} (generation {holder_generation})"
             ),
             TaskLeaseError::Stale => write!(f, "stale task identity (generation moved)"),
+            TaskLeaseError::Expired => {
+                write!(
+                    f,
+                    "task lease expired (recover the task or open a new generation)"
+                )
+            }
             TaskLeaseError::LeaseLost => write!(f, "task lease was lost (expired or replaced)"),
             TaskLeaseError::AlreadyFinished(status) => {
                 write!(f, "task already finished ({})", status.as_wire())
@@ -155,6 +180,82 @@ fn lease_path(session_path: &Path) -> PathBuf {
     session_path.with_file_name(name)
 }
 
+fn lease_lock_path(session_path: &Path) -> PathBuf {
+    let mut name = session_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "session".into());
+    name.push_str(".tasks.json.lock");
+    session_path.with_file_name(name)
+}
+
+/// Unique temp name per write (pid + process-wide counter): two concurrent
+/// writers must never share `<file>.tasks.json.tmp`, which would let them
+/// clobber each other's bytes before the rename.
+fn unique_temp_path(path: &Path) -> PathBuf {
+    static WRITE_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let counter = WRITE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "tasks.json".into());
+    name.push_str(&format!(".{}.{}.tmp", std::process::id(), counter));
+    path.with_file_name(name)
+}
+
+/// Advisory OS lock guard for one session's task document.
+///
+/// The lock file is the ownership capability (fs2 keeps an OS advisory lock on
+/// the open handle); dropping the guard releases it. Every mutating operation
+/// holds this for the whole read-modify-write, so cross-process writers
+/// serialize instead of racing the conflict check.
+struct LeaseGuard {
+    file: File,
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn lock_session(session_path: &Path) -> Result<LeaseGuard, TaskLeaseError> {
+    let path = lease_lock_path(session_path);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| TaskLeaseError::Io(format!("{}: {e}", path.display())))?;
+    // Bounded wait: a competing writer holds the lock for one small JSON
+    // rewrite; 2s is generous, and exceeding it is a genuine error (never a
+    // silent un-serialized write).
+    let deadline = now_secs() + 2.0;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(LeaseGuard { file }),
+            Err(e) if lock_busy(&e) && now_secs() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(TaskLeaseError::Io(format!(
+                    "task lease lock {} unavailable: {e}",
+                    path.display()
+                )))
+            }
+        }
+    }
+}
+
+/// `fs2` reports a held lock as `WouldBlock` on Unix; Windows surfaces
+/// `ERROR_LOCK_VIOLATION` (33) / `ERROR_SHARING_VIOLATION` (32) whose `kind()`
+/// is not `WouldBlock`, so both are treated as "busy, retry".
+fn lock_busy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || matches!(error.raw_os_error(), Some(32) | Some(33))
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TaskDocument {
     #[serde(default)]
@@ -175,7 +276,7 @@ fn store(session_path: &Path, document: &TaskDocument) -> Result<(), TaskLeaseEr
     let path = lease_path(session_path);
     let text = serde_json::to_string_pretty(document)
         .map_err(|e| TaskLeaseError::Io(format!("serialize: {e}")))?;
-    let tmp = path.with_extension("tasks.json.tmp");
+    let tmp = unique_temp_path(&path);
     fs::write(&tmp, text).map_err(|e| TaskLeaseError::Io(format!("write: {e}")))?;
     fs::rename(&tmp, &path).map_err(|e| TaskLeaseError::Io(format!("rename: {e}")))?;
     Ok(())
@@ -220,6 +321,9 @@ pub fn acquire_with_meta(
     if lease_id.trim().is_empty() {
         return Err(TaskLeaseError::Invalid("lease_id is empty".into()));
     }
+    // Serialize the whole read-modify-write: two processes must not both pass
+    // the live-lease conflict check below.
+    let _guard = lock_session(session_path)?;
     let mut document = load(session_path)?;
     let now = now_secs();
     let key = identity.key();
@@ -245,14 +349,16 @@ pub fn acquire_with_meta(
                 let Some(existing) = record.lease.clone() else {
                     return Err(TaskLeaseError::LeaseLost);
                 };
+                // An expired lease is never revived in place: the caller must
+                // run recover() (→ Indeterminate) or open a new generation.
+                if existing.expires_at <= now {
+                    return Err(TaskLeaseError::Expired);
+                }
                 if existing.lease_id != lease_id {
-                    if existing.expires_at > now {
-                        return Err(TaskLeaseError::Conflict {
-                            holder_task: existing.task_id.clone(),
-                            holder_generation: existing.execution_generation,
-                        });
-                    }
-                    // Expired: the old attempt is indeterminate; replace it.
+                    return Err(TaskLeaseError::Conflict {
+                        holder_task: existing.task_id.clone(),
+                        holder_generation: existing.execution_generation,
+                    });
                 }
             }
             terminal => return Err(TaskLeaseError::AlreadyFinished(terminal)),
@@ -297,6 +403,7 @@ pub fn renew(
     ttl_secs: f64,
 ) -> Result<TaskLease, TaskLeaseError> {
     validate(identity)?;
+    let _guard = lock_session(session_path)?;
     let mut document = load(session_path)?;
     let key = identity.key();
     let now = now_secs();
@@ -312,6 +419,11 @@ pub fn renew(
     };
     if lease.lease_id != lease_id {
         return Err(TaskLeaseError::LeaseLost);
+    }
+    // Expiry is a fence: an expired lease must not be extendable (the driver
+    // may already have lost the turn to another owner after recover()).
+    if lease.expires_at <= now {
+        return Err(TaskLeaseError::Expired);
     }
     lease.expires_at = now + ttl_secs.max(1.0);
     let out = lease.clone();
@@ -339,6 +451,7 @@ pub fn finish(
             )))
         }
     }
+    let _guard = lock_session(session_path)?;
     let mut document = load(session_path)?;
     let key = identity.key();
     let record = document
@@ -353,6 +466,9 @@ pub fn finish(
     };
     if lease.lease_id != lease_id {
         return Err(TaskLeaseError::LeaseLost);
+    }
+    if lease.expires_at <= now_secs() {
+        return Err(TaskLeaseError::Expired);
     }
     record.status = status;
     record.lease = None;
@@ -381,6 +497,7 @@ pub fn list(session_path: &Path) -> Result<Vec<TaskRecord>, TaskLeaseError> {
 /// Retire expired running leases as `Indeterminate` and return the records that
 /// were retired. A driver calls this on startup before planning new work.
 pub fn recover(session_path: &Path) -> Result<Vec<TaskRecord>, TaskLeaseError> {
+    let _guard = lock_session(session_path)?;
     let mut document = load(session_path)?;
     let now = now_secs();
     let mut retired = Vec::new();
@@ -410,7 +527,8 @@ pub fn recover(session_path: &Path) -> Result<Vec<TaskRecord>, TaskLeaseError> {
 }
 
 /// Fencing check for interrupts: returns Ok(()) only when `identity` is the
-/// live running task. A stale token is refused — never applied to another turn.
+/// live **unexpired** running task. A stale or expired token is refused —
+/// never applied to another turn.
 pub fn ensure_live(
     session_path: &Path,
     identity: &TaskIdentity,
@@ -426,7 +544,13 @@ pub fn ensure_live(
     if record.status != TaskStatus::Running {
         return Err(TaskLeaseError::AlreadyFinished(record.status));
     }
-    if let (Some(expected), Some(lease)) = (lease_id, record.lease.as_ref()) {
+    let Some(lease) = record.lease.as_ref() else {
+        return Err(TaskLeaseError::LeaseLost);
+    };
+    if lease.expires_at <= now_secs() {
+        return Err(TaskLeaseError::Expired);
+    }
+    if let Some(expected) = lease_id {
         if expected != lease.lease_id {
             return Err(TaskLeaseError::LeaseLost);
         }
@@ -547,5 +671,103 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let retired = recover(&p).unwrap();
         assert_eq!(retired[0].meta.as_ref(), Some(&meta));
+    }
+
+    /// Expiry fences renewal: after the TTL a stale driver cannot extend the
+    /// lease (reviewer blocker #1).
+    #[test]
+    fn renew_after_expiry_fails() {
+        let dir = session_file();
+        let p = path(&dir);
+        acquire(&p, &TaskIdentity::new("t1", 1), "lease-a", 1.0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let error = renew(&p, &TaskIdentity::new("t1", 1), "lease-a", 60.0).unwrap_err();
+        assert_eq!(error, TaskLeaseError::Expired);
+    }
+
+    /// Expiry fences finishing: an expired lease cannot record a terminal
+    /// receipt as the live owner.
+    #[test]
+    fn finish_after_expiry_fails() {
+        let dir = session_file();
+        let p = path(&dir);
+        acquire(&p, &TaskIdentity::new("t1", 1), "lease-a", 1.0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let error = finish(
+            &p,
+            &TaskIdentity::new("t1", 1),
+            "lease-a",
+            TaskStatus::Settled,
+            None,
+            Some("r"),
+        )
+        .unwrap_err();
+        assert_eq!(error, TaskLeaseError::Expired);
+    }
+
+    /// Expiry fences the interrupt path: `ensure_live` must not bless an
+    /// expired lease.
+    #[test]
+    fn ensure_live_after_expiry_fails() {
+        let dir = session_file();
+        let p = path(&dir);
+        acquire(&p, &TaskIdentity::new("t1", 1), "lease-a", 1.0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let error = ensure_live(&p, &TaskIdentity::new("t1", 1), Some("lease-a")).unwrap_err();
+        assert_eq!(error, TaskLeaseError::Expired);
+    }
+
+    /// Same-identity acquire does not revive an expired lease in place; the
+    /// caller must recover first or open a new generation.
+    #[test]
+    fn same_identity_acquire_does_not_revive_expired_lease() {
+        let dir = session_file();
+        let p = path(&dir);
+        acquire(&p, &TaskIdentity::new("t1", 1), "lease-a", 1.0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let error = acquire(&p, &TaskIdentity::new("t1", 1), "lease-a", 60.0).unwrap_err();
+        assert_eq!(error, TaskLeaseError::Expired);
+        // After recover() marks it indeterminate, a new generation may run.
+        let retired = recover(&p).unwrap();
+        assert_eq!(retired.len(), 1);
+        acquire(&p, &TaskIdentity::new("t1", 2), "lease-b", 60.0).unwrap();
+    }
+
+    /// Concurrent writers serialize on the task-document lock: exactly one of
+    /// N racing acquires wins, the rest get a conflict (never an un-serialized
+    /// double lease) (reviewer blocker #2).
+    #[test]
+    fn concurrent_acquires_yield_exactly_one_lease() {
+        let dir = session_file();
+        let p = path(&dir);
+        // Seed the document so the file exists before the race; the acquire
+        // TTL floor is 1s, so wait past it before the racers start.
+        acquire(&p, &TaskIdentity::new("seed", 1), "lease-seed", 0.05).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for index in 0..8usize {
+            let session = p.clone();
+            let gate = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                gate.wait();
+                acquire(
+                    &session,
+                    &TaskIdentity::new(format!("race-{index}"), 1),
+                    &format!("lease-race-{index}"),
+                    60.0,
+                )
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let winners = results.iter().filter(|result| result.is_ok()).count();
+        assert_eq!(winners, 1, "exactly one concurrent acquire may win");
+        assert!(results
+            .iter()
+            .filter(|result| result.is_err())
+            .all(|result| matches!(result, Err(TaskLeaseError::Conflict { .. }))));
     }
 }

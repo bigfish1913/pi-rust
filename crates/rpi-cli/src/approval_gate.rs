@@ -161,10 +161,15 @@ async fn session_id(binding: &OnceLock<WeakAgentHarness>) -> String {
 ///
 /// Owned inputs only: the `before_tool_call` future must be `'static`, so the
 /// hook copies the tool name/args before awaiting.
+///
+/// Cancellation is propagated (reviewer blocker #4): once the handler door is
+/// open, a stale UI prompt must not hold the tool turn forever — if `signal`
+/// fires first the call fails **closed** (blocked), never open.
 pub async fn evaluate(
     binding: &OnceLock<WeakAgentHarness>,
     tool: &str,
     args: &serde_json::Value,
+    signal: &CancellationToken,
 ) -> Option<BeforeToolCallResult> {
     if !needs_approval(mode(), tool) {
         return None;
@@ -179,7 +184,18 @@ pub async fn evaluate(
         tool: tool.to_owned(),
         args: args.clone(),
     };
-    match handler.request(request).await {
+    let decision = tokio::select! {
+        biased;
+        _ = signal.cancelled() => {
+            return Some(BeforeToolCallResult {
+                block: true,
+                reason: Some(format!("approval for {tool} cancelled before a decision")),
+                ..Default::default()
+            });
+        }
+        decision = handler.request(request) => decision,
+    };
+    match decision {
         ApprovalDecision::Allow => None,
         ApprovalDecision::Deny { reason } => Some(BeforeToolCallResult {
             block: true,
@@ -206,7 +222,7 @@ pub fn hook(binding: Arc<OnceLock<WeakAgentHarness>>) -> BeforeToolCall {
                         ..Default::default()
                     });
                 }
-                evaluate(&binding, &tool, &args).await
+                evaluate(&binding, &tool, &args, &signal).await
             })
         },
     )
@@ -218,7 +234,11 @@ mod tests {
 
     #[test]
     fn mode_roundtrip() {
-        for mode in [ApprovalMode::AlwaysAsk, ApprovalMode::Write, ApprovalMode::Yolo] {
+        for mode in [
+            ApprovalMode::AlwaysAsk,
+            ApprovalMode::Write,
+            ApprovalMode::Yolo,
+        ] {
             assert_eq!(ApprovalMode::parse(mode.as_wire()), Some(mode));
         }
         assert_eq!(ApprovalMode::parse("bogus"), None);
@@ -244,5 +264,44 @@ mod tests {
         }
         assert!(!read_only_tool("bash"));
         assert!(!write_tool("bash"));
+    }
+
+    struct NeverDecides;
+    #[async_trait]
+    impl ApprovalHandler for NeverDecides {
+        async fn request(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            std::future::pending::<ApprovalDecision>().await
+        }
+    }
+
+    struct AlwaysAllows;
+    #[async_trait]
+    impl ApprovalHandler for AlwaysAllows {
+        async fn request(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            ApprovalDecision::Allow
+        }
+    }
+
+    /// A cancelled tool signal must win over a handler that never answers:
+    /// fail closed instead of holding the tool turn forever (reviewer #4).
+    #[test]
+    fn cancelled_signal_fails_closed_before_a_decision() {
+        if HANDLER.get().is_none() {
+            let _ = set_handler(Arc::new(NeverDecides));
+        }
+        set_mode(ApprovalMode::AlwaysAsk);
+        let token = CancellationToken::new();
+        token.cancel();
+        let binding = OnceLock::new();
+        let outcome =
+            futures::executor::block_on(evaluate(&binding, "bash", &serde_json::json!({}), &token));
+        let blocked = matches!(outcome, Some(result) if result.block);
+        assert!(blocked, "cancelled signal must return a blocking result");
+
+        // And an allowing handler is not consulted once the signal is up.
+        let _ = set_handler(Arc::new(AlwaysAllows));
+        let outcome =
+            futures::executor::block_on(evaluate(&binding, "bash", &serde_json::json!({}), &token));
+        assert!(matches!(outcome, Some(result) if result.block));
     }
 }
