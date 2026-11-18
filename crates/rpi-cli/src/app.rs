@@ -683,6 +683,7 @@ async fn run_inner() -> i32 {
                         model_catalog,
                         reload_context.ui_dialog.clone(),
                         oauth_snapshot,
+                        Some(reload_context.extension_session.clone()),
                         parsed.rpc_message_updates,
                         parsed.native_durable,
                     )

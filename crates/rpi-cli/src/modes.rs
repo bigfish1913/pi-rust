@@ -362,6 +362,7 @@ pub async fn rpc(
         model_catalog,
         ui_dialog,
         oauth_snapshot,
+        None,
         message_updates,
         false,
     )
@@ -374,6 +375,7 @@ pub async fn rpc_with_durable(
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    extension_session: Option<crate::session::ExtensionSessionCell>,
     message_updates: crate::args::RpcMessageUpdates,
     native_durable: bool,
 ) -> i32 {
@@ -383,6 +385,7 @@ pub async fn rpc_with_durable(
         model_catalog,
         ui_dialog,
         oauth_snapshot,
+        extension_session,
         message_updates,
         native_durable,
         tokio::io::BufReader::new(tokio::io::stdin()),
@@ -468,12 +471,45 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
     W: Write + Send + 'static,
 {
+    rpc_with_io_and_lifecycle(
+        harness,
+        agent_events,
+        model_catalog,
+        ui_dialog,
+        oauth_snapshot,
+        None,
+        message_updates,
+        input,
+        output,
+    )
+    .await
+}
+
+/// RPC loop with an explicit extension-session cell, so a test can observe the
+/// session lifecycle events the loop dispatches.
+#[cfg(test)]
+async fn rpc_with_io_and_lifecycle<R, W>(
+    harness: &AgentHarness,
+    agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    model_catalog: Vec<rpi_ai::Model>,
+    ui_dialog: rpi_extensions::UiDialogMailbox,
+    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    extension_session: Option<crate::session::ExtensionSessionCell>,
+    message_updates: crate::args::RpcMessageUpdates,
+    input: R,
+    output: W,
+) -> i32
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: Write + Send + 'static,
+{
     rpc_with_native_durable_io(
         harness,
         agent_events,
         model_catalog,
         ui_dialog,
         oauth_snapshot,
+        extension_session,
         message_updates,
         false,
         input,
@@ -488,6 +524,7 @@ async fn rpc_with_native_durable_io<R, W>(
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    extension_session: Option<crate::session::ExtensionSessionCell>,
     message_updates: crate::args::RpcMessageUpdates,
     native_durable: bool,
     mut input: R,
@@ -968,6 +1005,7 @@ where
                 let active_task = Arc::clone(&run_active);
                 let mailbox_task = ui_dialog.clone();
                 let flush_events = event_flush.clone();
+                let lifecycle_session = extension_session.clone();
                 let instructions = msg
                     .get("customInstructions")
                     .and_then(|v| v.as_str())
@@ -1020,7 +1058,46 @@ where
                         let outcome_cancel = cancel_task.clone();
                         let execute_timing = RpcPhaseTiming::start(phase_diagnostics, "execute");
                         let result = if compact {
-                            rpc_compact_cancellable(&lane_task, instructions, cancel_task).await
+                            if let Some(session) = lifecycle_session.as_ref() {
+                                if let Some(reason) =
+                                    crate::session::dispatch_session_event_from_cell(
+                                        session,
+                                        rpi_plugin_sdk::EventTag::SessionBeforeCompact,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        %reason,
+                                        "extension vetoed SessionBeforeCompact (advisory)"
+                                    );
+                                }
+                            }
+                            let result =
+                                rpc_compact_cancellable(&lane_task, instructions, cancel_task)
+                                    .await;
+                            if result
+                                .as_ref()
+                                .ok()
+                                .and_then(|value| value.get("outcome"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some("compacted")
+                            {
+                                if let Some(session) = lifecycle_session.as_ref() {
+                                    if let Some(reason) =
+                                        crate::session::dispatch_session_event_from_cell(
+                                            session,
+                                            rpi_plugin_sdk::EventTag::SessionCompact,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            %reason,
+                                            "extension vetoed SessionCompact (advisory)"
+                                        );
+                                    }
+                                }
+                            }
+                            result
                         } else if resume {
                             rpc_resume_cancellable(&lane_task, cancel_task).await
                         } else {
@@ -1202,7 +1279,7 @@ where
             "queue_message" => rpc_queue_message(&lane, &msg).await,
             "cancel_queued" => rpc_cancel_queued(&lane, &msg).await,
             "clear_queue" => rpc_clear_queue(&lane).await,
-            "navigate" => rpc_navigate(&lane, &msg).await,
+            "navigate" => rpc_navigate(&lane, &msg, extension_session.as_ref()).await,
             "get_available_models" => Ok(rpc_get_available_models(&model_catalog)),
             "get_auth_status" => Ok(rpc_get_auth_status(&model_catalog, oauth_snapshot.as_ref())),
             "get_provider_models" => rpc_get_provider_models(&msg).await,
@@ -2310,6 +2387,7 @@ async fn rpc_clear_queue(lane: &Arc<dyn AgentLane>) -> Result<serde_json::Value,
 async fn rpc_navigate(
     lane: &Arc<dyn AgentLane>,
     msg: &serde_json::Value,
+    extension_session: Option<&crate::session::ExtensionSessionCell>,
 ) -> Result<serde_json::Value, String> {
     let target_id = msg
         .get("targetId")
@@ -2324,12 +2402,32 @@ async fn rpc_navigate(
     {
         return Err("cannot navigate while an operation is active".to_string());
     }
+    if let Some(session) = extension_session {
+        if let Some(reason) = crate::session::dispatch_session_event_from_cell(
+            session,
+            rpi_plugin_sdk::EventTag::SessionBeforeTree,
+        )
+        .await
+        {
+            tracing::warn!(%reason, "extension vetoed SessionBeforeTree (advisory)");
+        }
+    }
     let result = lane
         .navigate_tree(target_id, false, None, None)
         .await
         .map_err(|error| error.to_string())?;
     let (outcome, leaf_id, error) = match result.outcome {
         rpi_harness::agent_harness::NavigationOutcome::Completed { new_leaf_id, .. } => {
+            if let Some(session) = extension_session {
+                if let Some(reason) = crate::session::dispatch_session_event_from_cell(
+                    session,
+                    rpi_plugin_sdk::EventTag::SessionTree,
+                )
+                .await
+                {
+                    tracing::warn!(%reason, "extension vetoed SessionTree (advisory)");
+                }
+            }
             ("completed", new_leaf_id, None)
         }
         rpi_harness::agent_harness::NavigationOutcome::Declined { leaf_id } => {
@@ -4011,16 +4109,29 @@ mod tests {
         RpcOutput,
         tokio::task::JoinHandle<i32>,
     ) {
+        start_test_rpc_with_lifecycle(harness, ui, None)
+    }
+
+    pub(super) fn start_test_rpc_with_lifecycle(
+        harness: AgentHarness,
+        ui: rpi_extensions::UiDialogMailbox,
+        extension_session: Option<crate::session::ExtensionSessionCell>,
+    ) -> (
+        tokio::io::DuplexStream,
+        RpcOutput,
+        tokio::task::JoinHandle<i32>,
+    ) {
         let (client, input) = tokio::io::duplex(4096);
         let output = RpcOutput::default();
         let captured = output.clone();
         let task = tokio::spawn(async move {
-            rpc_with_io(
+            rpc_with_io_and_lifecycle(
                 &harness,
                 None,
                 vec![],
                 ui,
                 None,
+                extension_session,
                 crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input),
                 captured,
@@ -4142,6 +4253,136 @@ mod tests {
             message["type"] == "agent_settled" && message["outcome"] == "completed"
         }));
         assert!(!ui.is_attached());
+    }
+
+    /// An extension-session cell whose handlers record every session lifecycle
+    /// tag the host dispatches, so RPC tests can assert the actual fan-out.
+    fn lifecycle_probe_session() -> (
+        crate::session::ExtensionSessionCell,
+        Arc<std::sync::Mutex<Vec<rpi_plugin_sdk::EventTag>>>,
+    ) {
+        extern "C" fn record(
+            event: rpi_plugin_sdk::StablePluginEvent,
+            user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            // SAFETY: `user_data` is the live `Mutex<Vec<EventTag>>` below, kept
+            // alive by the caller for the whole dispatch.
+            let log =
+                unsafe { &*(user_data as *const std::sync::Mutex<Vec<rpi_plugin_sdk::EventTag>>) };
+            log.lock().unwrap().push(event.tag);
+            rpi_plugin_sdk::EVENT_HANDLER_CONTINUE
+        }
+
+        let log: Arc<std::sync::Mutex<Vec<rpi_plugin_sdk::EventTag>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        for tag in [
+            rpi_plugin_sdk::EventTag::SessionBeforeTree,
+            rpi_plugin_sdk::EventTag::SessionTree,
+            rpi_plugin_sdk::EventTag::SessionBeforeCompact,
+            rpi_plugin_sdk::EventTag::SessionCompact,
+        ] {
+            registry.register_event_handler(
+                "lifecycle-probe".to_string(),
+                tag,
+                record,
+                Arc::as_ptr(&log) as *mut std::ffi::c_void,
+            );
+        }
+        let session = rpi_extensions::ExtensionSession::from_parts(
+            Arc::new(registry.snapshot()),
+            Arc::new(rpi_extensions::PluginKeepalive::new(Vec::new(), None)),
+            Vec::new(),
+            None,
+        );
+        (Arc::new(std::sync::Mutex::new(session)), Arc::clone(&log))
+    }
+
+    /// The RPC `navigate` command dispatches `SessionBeforeTree` before the lane
+    /// call and `SessionTree` after a completed navigation, through the live
+    /// extension-session cell (so a `/reload`-swapped session is used).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_navigate_dispatches_session_tree_lifecycle_events() {
+        use tokio::io::AsyncWriteExt;
+
+        let (cell, log) = lifecycle_probe_session();
+        let (harness, _) = rpc_test_harness("unused", 0.0).await;
+        let (mut client, output, task) = start_test_rpc_with_lifecycle(
+            harness,
+            rpi_extensions::UiDialogMailbox::new(),
+            Some(cell),
+        );
+        client
+            .write_all(
+                br#"{"type":"append_entry","id":1,"customType":"lifecycle-probe","data":{"n":1}}
+"#,
+            )
+            .await
+            .unwrap();
+        let committed = output
+            .wait_for(|message| {
+                message["type"] == "session_entry_committed"
+                    && message["customType"] == "lifecycle-probe"
+            })
+            .await;
+        let leaf = committed["entryId"].as_str().unwrap().to_string();
+        assert!(log.lock().unwrap().is_empty());
+
+        client
+            .write_all(
+                format!("{{\"type\":\"navigate\",\"id\":2,\"targetId\":\"{leaf}\"}}\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = output.wait_for(|message| message["id"] == 2).await;
+        assert_eq!(response["command"], "navigate");
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(response["data"]["outcome"], "completed", "{response}");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                rpi_plugin_sdk::EventTag::SessionBeforeTree,
+                rpi_plugin_sdk::EventTag::SessionTree,
+            ]
+        );
+
+        client
+            .write_all(b"{\"type\":\"stop\",\"id\":3}\n")
+            .await
+            .unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    /// A compact that declines (nothing to compact) still runs the pre-event but
+    /// must not report `SessionCompact`: no branch entry changed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_declined_compaction_skips_session_compact() {
+        let (cell, log) = lifecycle_probe_session();
+        let (harness, _) = rpc_test_harness("unused", 0.0).await;
+        let output = RpcOutput::default();
+        let code = rpc_with_io_and_lifecycle(
+            &harness,
+            None,
+            vec![],
+            rpi_extensions::UiDialogMailbox::new(),
+            None,
+            Some(cell),
+            crate::args::RpcMessageUpdates::default(),
+            tokio::io::BufReader::new(&b"{\"type\":\"compact\",\"id\":1}\n"[..]),
+            output.clone(),
+        )
+        .await;
+        assert_eq!(code, 0);
+        let settled = output
+            .messages()
+            .into_iter()
+            .find(|message| message["type"] == "agent_settled")
+            .unwrap();
+        assert_eq!(settled["outcome"], "declined");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![rpi_plugin_sdk::EventTag::SessionBeforeCompact]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

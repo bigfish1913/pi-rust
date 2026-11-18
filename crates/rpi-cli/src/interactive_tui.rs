@@ -952,6 +952,15 @@ fn resolve_tui_startup_settings(
     }
 }
 
+async fn dispatch_observed_session_event(
+    reload_context: &crate::session::ReloadContext,
+    tag: rpi_plugin_sdk::EventTag,
+) {
+    if let Some(reason) = crate::session::dispatch_session_event_async(reload_context, tag).await {
+        tracing::warn!(?tag, %reason, "extension lifecycle veto is advisory");
+    }
+}
+
 /// TUI-based interactive mode.
 ///
 /// `event_rx` carries the live `AgentEvent` stream (installed by
@@ -3325,6 +3334,11 @@ pub async fn interactive_tui(
             }
             Some(TuiMessage::NavigateTree(entry_id)) => {
                 state.history_page.invalidate();
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeTree,
+                )
+                .await;
                 match lane.navigate_tree(Some(&entry_id), false, None, None).await {
                     Ok(result) => match result.outcome {
                         rpi_harness::agent_harness::NavigationOutcome::Completed { .. } => {
@@ -3339,6 +3353,11 @@ pub async fn interactive_tui(
                                 &context_files,
                             );
                             history::restore(harness, &state, &chat_container).await;
+                            dispatch_observed_session_event(
+                                reload_context,
+                                rpi_plugin_sdk::EventTag::SessionTree,
+                            )
+                            .await;
                             add_note_message(
                                 &state.notice_container(),
                                 "Moved to the selected session entry.",
@@ -3364,6 +3383,11 @@ pub async fn interactive_tui(
                 // the transcript: the harness swaps its JSONL backing, the
                 // banner is rebuilt from the real capability snapshot, and the
                 // footer counters are reset.
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeSwitch,
+                )
+                .await;
                 start_new_session(
                     harness,
                     &lane,
@@ -3376,7 +3400,18 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::Compact) => {
-                run_compact(&lane, &tui, &state).await;
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeCompact,
+                )
+                .await;
+                if run_compact(&lane, &tui, &state).await {
+                    dispatch_observed_session_event(
+                        reload_context,
+                        rpi_plugin_sdk::EventTag::SessionCompact,
+                    )
+                    .await;
+                }
             }
             Some(TuiMessage::Copy) => {
                 copy_last_assistant(&state);
@@ -3387,6 +3422,11 @@ pub async fn interactive_tui(
                 break;
             }
             Some(TuiMessage::SwitchSession(id)) => {
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeSwitch,
+                )
+                .await;
                 switch_to_session(
                     harness,
                     &lane,
@@ -3401,6 +3441,11 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ImportSession(path)) => {
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeSwitch,
+                )
+                .await;
                 import_session(
                     harness,
                     &lane,
@@ -3532,6 +3577,11 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ForkSession) => {
+                dispatch_observed_session_event(
+                    reload_context,
+                    rpi_plugin_sdk::EventTag::SessionBeforeFork,
+                )
+                .await;
                 fork_session(
                     harness,
                     &cwd,

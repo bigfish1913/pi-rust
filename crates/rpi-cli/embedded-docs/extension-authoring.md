@@ -415,6 +415,14 @@ extern "C" fn on_tool_result(
 `api_style` + `request_fn`）。`register_message_renderer`/`register_markdown_transformer`/
 `register_entry_renderer` 注册消息渲染能力。这些槽位都可能为 `None`，使用前必须检测。
 
+渲染器的 JSON 契约是：markdown transformer 接收并返回 `{"markdown":"..."}`；message
+renderer 接收消息或自定义消息 envelope（例如
+`{"customType":"token-usage","usage":{...}}`）；entry renderer 接收
+`{"customType":"...","data":...}`。message/entry renderer 返回
+`{"text":"...","markdown":true|false}` 或 `{"lines":["..."]}`。输出是一个
+transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿主通过注册时提供的
+`plugin_free_string` 回收。
+
 `api.register_streaming_provider` 注入**流式** Provider。注册时同样提供 provider ID、
 端点、API style 和字符串释放回调；流式 request fn 另有逐块回调 `emit`、
 `emit_user_data`、可选控制面 `control` 和当前宿主恒为 `None` 的 `completion`。

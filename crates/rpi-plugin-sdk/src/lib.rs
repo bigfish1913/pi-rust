@@ -1439,9 +1439,16 @@ pub type CommandHandlerFn =
     extern "C" fn(args_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
 /// A render/transform fn (for the renderer registrars). `input_json` is borrowed;
-/// `out` is owning output the plugin frees via host `free_string`. Markdown
-/// handlers return `{markdown:"..."}`; message/entry handlers return
-/// `{text:"...",markdown?:true}` or `{lines:["..."]}` for terminal UI.
+/// `out` is owning output the plugin frees via host `free_string`.
+///
+/// The host passes JSON envelopes: markdown transformers receive
+/// `{"markdown":"..."}`; message renderers receive the message/custom-entry
+/// payload (for example `{"customType":"token-usage","usage":{...}}`);
+/// entry renderers receive `{"customType":"...","data":...}`. Message and
+/// entry renderers return `{"text":"...","markdown":true|false}` or
+/// `{"lines":["..."]}` for terminal UI. Markdown transformers return
+/// `{"markdown":"..."}`. The rendered value is one transcript row/component,
+/// not an arbitrary component tree.
 pub type RenderFn =
     extern "C" fn(input_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
@@ -1802,6 +1809,11 @@ pub struct PluginApi {
             user_data: *mut c_void,
         ) -> i32,
     >,
+    /// Register a renderer for session custom entries. The host invokes it with
+    /// `{"customType":"...","data":...}` and accepts the same single-row
+    /// output as [`RenderFn`]: `{"text":"...","markdown":true|false}` or
+    /// `{"lines":["..."]}`. A renderer is tried in registration order; the
+    /// first valid JSON response wins.
     pub register_entry_renderer: Option<
         extern "C" fn(
             name: StbStringRef,

@@ -1862,37 +1862,42 @@ impl ReloadContext {
     }
 }
 
-/// Dispatch a no-payload lifecycle event (e.g. `SessionStart`, `SessionShutdown`,
-/// the rpi-specific `BeforeTuiStart`) to every extension handler subscribed to
-/// that tag, with **veto** + **timeout** semantics (P1).
+/// Dispatch a no-payload lifecycle event using the live extension-session cell.
 ///
-/// Resolves the **current** extension session from the reload cell so a
-/// `/reload`-swapped session is honored. Each handler runs on a blocking thread
-/// with a per-event timeout ([`rpi_extensions::lifecycle_timeout_for`]); a
-/// handler returning [`rpi_plugin_sdk::EVENT_HANDLER_ABORT`] vetoes the phase
-/// and this returns `Some(reason)`. No-op (`None`) when no plugins loaded, no
-/// handler subscribes, or the registry is stale.
-///
-/// The caller decides what a veto means: a `BeforeTuiStart` veto aborts startup
-/// (never enter the TUI); `SessionStart`/`SessionShutdown` vetoes are advisory
-/// (the session is already up or already closing).
-pub async fn dispatch_session_event_async(
-    reload_context: &ReloadContext,
+/// This is the cell-based counterpart to [`dispatch_session_event_async`]. It
+/// lets headless RPC tasks retain the live session without borrowing the larger
+/// [`ReloadContext`]. The snapshot and keepalive are cloned before awaiting so
+/// a concurrent reload cannot invalidate the plugin function pointers while a
+/// handler is still running.
+pub async fn dispatch_session_event_from_cell(
+    extension_session: &ExtensionSessionCell,
     tag: rpi_plugin_sdk::EventTag,
 ) -> Option<String> {
-    // Take the snapshot Arc + keepalive, drop the session lock, then dispatch —
-    // we must not hold the session cell's mutex across the await (a handler
-    // could re-enter a reload path that locks it). Holding the keepalive across
-    // the await keeps the cdylibs (owning the handler fn pointers) mapped even
-    // if a concurrent `/reload` swaps the session cell out.
     let (snapshot, keepalive) = {
-        let session = reload_context.extension_session.lock().unwrap();
+        // A poisoned cell must not panic the caller (the TUI loop dispatches
+        // these events between UI actions): the session contents are only ever
+        // replaced wholesale, so recovering the guard is safe.
+        let session = extension_session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         (session.snapshot_arc(), session.keepalive())
     };
     match snapshot {
         Some(snapshot) => rpi_extensions::dispatch_lifecycle_event(&snapshot, tag, keepalive).await,
         None => None,
     }
+}
+
+/// Dispatch a no-payload lifecycle event through the current reload context.
+///
+/// A `BeforeTuiStart` veto is handled by startup. Session transition events
+/// in the interactive TUI and RPC paths are currently advisory; callers log
+/// any returned reason and continue the host operation.
+pub async fn dispatch_session_event_async(
+    reload_context: &ReloadContext,
+    tag: rpi_plugin_sdk::EventTag,
+) -> Option<String> {
+    dispatch_session_event_from_cell(&reload_context.extension_session, tag).await
 }
 
 /// Join plugin teardown before unloading modules. A detached timed-out handler
