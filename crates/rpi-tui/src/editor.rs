@@ -137,6 +137,23 @@ fn snap_boundary(s: &str, idx: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// Convert a byte-column caret position into the char index that
+/// [`word_navigation`](crate::word_navigation) expects. `cursor_col` is a byte
+/// offset (see [`snap_boundary`]) while word navigation counts characters, so
+/// feeding the raw column panics (or lands mid-word) on multibyte lines.
+fn char_index_at_byte(line: &str, byte_col: usize) -> usize {
+    line[..snap_boundary(line, byte_col)].chars().count()
+}
+
+/// Convert a char index returned by word navigation back into a byte column,
+/// clamping to the line length and landing on a char boundary.
+fn byte_index_of_char(line: &str, char_index: usize) -> usize {
+    line.char_indices()
+        .nth(char_index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(line.len())
+}
+
 /// A folded store of a large paste, keyed by the id rendered in its marker.
 /// The document (`EditorState::lines`) only ever carries the short
 /// `[paste #id …]` marker; the real text lives here until the draft is
@@ -1391,7 +1408,13 @@ impl Editor {
         let killed = if let Ok(mut state) = self.state.lock() {
             let row = state.cursor_row;
             let col = state.cursor_col;
-            let start = crate::word_navigation::find_word_backward(&state.lines[row], col);
+            let start = byte_index_of_char(
+                &state.lines[row],
+                crate::word_navigation::find_word_backward(
+                    &state.lines[row],
+                    char_index_at_byte(&state.lines[row], col),
+                ),
+            );
             let dead: String = state.lines[row].drain(start..col).collect();
             state.cursor_col = start;
             dead
@@ -1410,7 +1433,13 @@ impl Editor {
             let col = state.cursor_col;
             // Kill only the current word (not the trailing delimiter) —
             // `find_word_end` stops at the last word char.
-            let end = crate::word_navigation::find_word_end(&state.lines[row], col);
+            let end = byte_index_of_char(
+                &state.lines[row],
+                crate::word_navigation::find_word_end(
+                    &state.lines[row],
+                    char_index_at_byte(&state.lines[row], col),
+                ),
+            );
             let dead: String = state.lines[row].drain(col..end).collect();
             dead
         } else {
@@ -1424,8 +1453,13 @@ impl Editor {
     fn cursor_word_left(&self) {
         if let Ok(mut state) = self.state.lock() {
             let row = state.cursor_row;
-            state.cursor_col =
-                crate::word_navigation::find_word_backward(&state.lines[row], state.cursor_col);
+            state.cursor_col = byte_index_of_char(
+                &state.lines[row],
+                crate::word_navigation::find_word_backward(
+                    &state.lines[row],
+                    char_index_at_byte(&state.lines[row], state.cursor_col),
+                ),
+            );
         }
     }
 
@@ -1433,8 +1467,13 @@ impl Editor {
     fn cursor_word_right(&self) {
         if let Ok(mut state) = self.state.lock() {
             let row = state.cursor_row;
-            state.cursor_col =
-                crate::word_navigation::find_word_forward(&state.lines[row], state.cursor_col);
+            state.cursor_col = byte_index_of_char(
+                &state.lines[row],
+                crate::word_navigation::find_word_forward(
+                    &state.lines[row],
+                    char_index_at_byte(&state.lines[row], state.cursor_col),
+                ),
+            );
         }
     }
 
@@ -2529,6 +2568,45 @@ l12",
             crossterm::event::KeyCode::Char('y'),
         ));
         assert_eq!(editor.get_text(), "alpha beta gamma");
+    }
+
+    #[test]
+    fn kill_word_ops_are_byte_safe_with_multibyte_lines() {
+        // Regression for #354: `cursor_col` is a byte offset but word
+        // navigation counts chars, so a wide line pasted with em dashes made
+        // Alt+Backspace index past the char vector and panic.
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mk = |m, c| crossterm::event::KeyEvent::new(c, m);
+        let editor = Editor::simple();
+        let line = "`rpi` is a library-first runtime — so the same code works";
+        editor.insert(line);
+        let (_, col) = editor.cursor_position();
+        assert_eq!(col, line.len());
+
+        editor.handle_key(mk(KeyModifiers::ALT, KeyCode::Backspace));
+        assert_eq!(
+            editor.get_text(),
+            "`rpi` is a library-first runtime — so the same code "
+        );
+        // Repeat until the line is empty, exercising every multibyte boundary.
+        for _ in 0..40 {
+            editor.handle_key(mk(KeyModifiers::ALT, KeyCode::Backspace));
+        }
+        assert_eq!(editor.get_text(), "");
+        assert_eq!(editor.cursor_position(), (0, 0));
+
+        // Alt+Left / Alt+Right must also land on char boundaries.
+        editor.insert("读 代码 editor ✓ done");
+        let text = editor.get_text();
+        editor.handle_key(mk(KeyModifiers::ALT, KeyCode::Left));
+        let (_, col) = editor.cursor_position();
+        assert!(
+            text.is_char_boundary(col),
+            "caret must stay on a char boundary"
+        );
+        assert_eq!(&text[col..], "done");
+        editor.handle_key(mk(KeyModifiers::ALT, KeyCode::Right));
+        assert_eq!(editor.cursor_position(), (0, text.len()));
     }
 
     #[test]
