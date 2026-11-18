@@ -21,11 +21,14 @@ pub fn is_word_char(c: char) -> bool {
 /// Find the start of the previous word from the given position.
 /// Returns the index of the start of the previous word.
 pub fn find_word_backward(text: &str, position: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    // Callers hold cursors in a mix of char counts and byte offsets; clamp so a
+    // stale or byte-based position can never index past `chars`.
+    let position = position.min(chars.len());
     if position == 0 {
         return 0;
     }
 
-    let chars: Vec<char> = text.chars().collect();
     let mut index = position.saturating_sub(1);
 
     // Skip any trailing whitespace or boundary characters
@@ -45,7 +48,7 @@ pub fn find_word_backward(text: &str, position: usize) -> usize {
 /// Returns the index of the start of the next word.
 pub fn find_word_forward(text: &str, position: usize) -> usize {
     let chars: Vec<char> = text.chars().collect();
-    let mut index = position;
+    let mut index = position.min(chars.len());
 
     // Skip current word characters
     while index < chars.len() && is_word_char(chars[index]) {
@@ -64,7 +67,7 @@ pub fn find_word_forward(text: &str, position: usize) -> usize {
 /// Returns the index just after the last character of the word.
 pub fn find_word_end(text: &str, position: usize) -> usize {
     let chars: Vec<char> = text.chars().collect();
-    let mut index = position;
+    let mut index = position.min(chars.len());
 
     // Skip any whitespace or boundary characters
     while index < chars.len() && (chars[index].is_whitespace() || is_word_boundary(chars[index])) {
@@ -82,11 +85,12 @@ pub fn find_word_end(text: &str, position: usize) -> usize {
 /// Find the end of the previous word.
 /// Returns the index just after the last character of the previous word.
 pub fn find_prev_word_end(text: &str, position: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let position = position.min(chars.len());
     if position == 0 {
         return 0;
     }
 
-    let chars: Vec<char> = text.chars().collect();
     let mut index = position.saturating_sub(1);
 
     // Skip any whitespace or boundary characters going backward
@@ -211,6 +215,26 @@ mod tests {
         assert_eq!(find_word_backward(text, 11), 6); // Before "world"
         assert_eq!(find_word_backward(text, 6), 0); // Before "hello"
         assert_eq!(find_word_backward(text, 0), 0); // At start
+    }
+
+    #[test]
+    fn test_word_navigation_clamps_out_of_range_positions() {
+        // Byte offsets handed in as char indices (multibyte text) must not
+        // panic: issue #354 reported `len is 82 but the index is 83`.
+        let text = "rpi—runtime ✓ end";
+        let chars = text.chars().count();
+        assert!(text.len() > chars);
+        for position in [chars + 1, chars + 2, text.len(), text.len() + 5] {
+            let _ = find_word_backward(text, position);
+            let _ = find_word_forward(text, position);
+            let _ = find_word_end(text, position);
+            let _ = find_prev_word_end(text, position);
+            let _ = get_current_word_range(text, position);
+            let _ = is_at_word_start(text, position);
+            let _ = is_at_word_end(text, position);
+        }
+        assert_eq!(find_word_backward(text, text.len()), 14);
+        assert_eq!(find_word_backward(text, chars), 14);
     }
 
     #[test]
