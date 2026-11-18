@@ -152,7 +152,7 @@ class ImagePRTests(unittest.TestCase):
                 self.assertEqual(command[-1], f"HEAD:{image_pr.REF}")
                 self.assertTrue(any(arg.startswith("--force-with-lease=") for arg in command))
 
-    def test_first_run_creates_branch_and_pr_without_skipping_ci(self):
+    def test_first_run_creates_branch_and_pr_without_skip_directive(self):
         self.refresh()
         image_pr.prepare(self.work)
         self.assert_main_untouched()
@@ -309,6 +309,13 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("[skip ci]", text)
         self.assertNotIn("HEAD:main", text)
         self.assertIn("scripts/prepare-readme-image-pr.py", text)
+        self.assertIn("gh pr merge", text)
+        self.assertIn("--admin", text)
+        self.assertIn("--squash", text)
+        self.assertIn("--delete-branch", text)
+        self.assertIn("without waiting for CI", text)
+        self.assertIn("automation/readme-images", text)
+        self.assertNotIn("--auto", text)
 
 
 if __name__ == "__main__":
