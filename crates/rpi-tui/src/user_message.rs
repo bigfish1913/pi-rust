@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use super::component::{Component, RenderedDocument};
 use crate::box_component::Box;
 use crate::markdown::Markdown;
-use crate::theme::{theme, theme_revision};
+use crate::theme::{theme, theme_revision, Color};
 
 const OSC133_ZONE_START: &str = "\x1b]133;A\x07";
 const OSC133_ZONE_END: &str = "\x1b]133;B\x07";
@@ -42,10 +42,20 @@ struct UserMessageState {
 }
 
 fn build_box(text: &str, output_pad: usize) -> Box {
-    let bg = theme().colors.surface;
+    let colors = theme().colors;
+    let bg = colors.surface;
     let content_box = Box::new(output_pad, 1);
     content_box.set_bg_fn(Some(std::sync::Arc::new(move |s: &str| bg.bg(s))));
-    let md = Markdown::new(text.to_string(), 0, 0);
+    let mut md = Markdown::new(text.to_string(), 0, 0);
+    if colors.user_message_text != Color::Default {
+        // The bubble paints its own background, so the text cannot rely on the
+        // terminal default foreground: on a dark terminal (light default fg)
+        // the light `userMessageBg` bubble turns light-on-light (issue #342).
+        // Use the pi `userMessageText` base style instead, which the markdown
+        // renderer re-opens after every nested SGR reset (inline code, links),
+        // so a single inline span cannot drop the bubble foreground mid-line.
+        md = md.with_base_style(colors.user_message_text.to_fg());
+    }
     content_box.add_child(std::sync::Arc::new(md));
     content_box
 }
