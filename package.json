@@ -45,7 +45,7 @@
     "prepare:release": "node scripts/prepare-npm.mjs",
     "prepublishOnly": "node scripts/prepare-npm.mjs",
     "postinstall": "node npm/install.cjs",
-    "test": "node --test scripts/test-npm.cjs scripts/test-npm-release.mjs"
+    "test": "node --test scripts/test-npm.cjs scripts/test-npm-release.mjs scripts/test-npm-oidc-preflight.mjs"
   },
   "publishConfig": {
     "access": "public",

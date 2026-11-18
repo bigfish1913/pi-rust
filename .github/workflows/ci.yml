@@ -237,6 +237,7 @@ jobs:
           python3 scripts/test_release_automation.py
           python3 scripts/test_release_pr_readiness.py
           python3 scripts/test_release_channels.py
+          python3 -B scripts/test_channel_drift.py
           python3 -B scripts/test_workflow_infrastructure.py
           python3 -B scripts/test_ci_transient_recovery.py
 

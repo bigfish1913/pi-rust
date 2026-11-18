@@ -60,6 +60,24 @@ jobs:
           python3 scripts/verify-channel-release.py "$TAG" "$manifest"
           echo "RPI_NPM_RELEASE_VERSION=${TAG#v}" >> "$GITHUB_ENV"
           echo "RPI_NPM_RELEASE_MANIFEST=$manifest" >> "$GITHUB_ENV"
+      - name: Check whether npm already has this version
+        id: npm-channel
+        # A retry of an already-published tag must not fail on trusted publisher
+        # configuration that is only needed to create a new version.
+        run: |
+          set -euo pipefail
+          status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            "https://registry.npmjs.org/@bigfishnpm%2Frpi/${RPI_NPM_RELEASE_VERSION}")"
+          case "$status" in
+            200) echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::npm registry lookup failed with HTTP $status"; exit 1 ;;
+          esac
+      - name: Verify npm accepts this workflow before packaging
+        # npm silently drops a rejected OIDC exchange and then fails the publish
+        # with a bare 404; this preflight reports the claims npm compared.
+        if: steps.npm-channel.outputs.published == 'false'
+        run: node scripts/npm-oidc-preflight.mjs
       - name: Prepare the npm version and pinned manifest
         run: npm run prepare:release
       - name: Test npm packaging and retry behavior
