@@ -1,8 +1,12 @@
 name: npm OIDC probe
 
-# Temporary diagnostic: print the exact OIDC claims GitHub sends and the raw
-# token-exchange response from the npm registry. No publish, no side effects.
+# Temporary diagnostic: print the exact OIDC claims GitHub sends, run the real
+# preflight script, and dump the registry's raw token-exchange response.
 on:
+  pull_request:
+    types: [opened]
+    paths:
+      - .github/workflows/npm-oidc-probe.yml
   workflow_dispatch:
 
 permissions:
@@ -14,29 +18,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Ask npm to exchange this workflow's OIDC token
+      - name: Run the real preflight
+        continue-on-error: true
+        run: node scripts/npm-oidc-preflight.mjs
+      - name: Dump claims and raw registry response
+        if: always()
         env:
           PACKAGE: '@bigfishnpm/rpi'
         run: |
           node --input-type=module -e '
-          const requestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-          const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-          if (!requestUrl || !requestToken) { console.log("no OIDC context"); process.exit(1); }
-          const url = new URL(requestUrl);
+          const url = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
           url.searchParams.append("audience", "npm:registry.npmjs.org");
-          const response = await fetch(url.href, { headers: { Accept: "application/json", Authorization: `Bearer ${requestToken}` } });
+          const response = await fetch(url.href, { headers: { Accept: "application/json", Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` } });
           const { value } = await response.json();
           const payload = JSON.parse(Buffer.from(value.split(".")[1], "base64url").toString("utf8"));
-          const interesting = ["iss","aud","sub","repository","repository_owner","repository_visibility","ref","sha","workflow","workflow_ref","job_workflow_ref","environment","event_name","run_id"];
-          console.log("--- claims ---");
-          for (const key of interesting) console.log(`${key}: ${payload[key]}`);
-          console.log("--- exchange ---");
-          const exchange = await fetch(`https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${encodeURIComponent(process.env.PACKAGE)}`, {
-            method: "POST", headers: { Authorization: `Bearer ${value}` },
-          });
-          console.log("status:", exchange.status);
-          console.log("body:", (await exchange.text()).slice(0, 600));
+          for (const key of ["repository","repository_owner","repository_visibility","ref","workflow_ref","job_workflow_ref","environment","event_name"]) console.log(`${key}: ${payload[key]}`);
+          const exchange = await fetch(`https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${encodeURIComponent(process.env.PACKAGE)}`, { method: "POST", headers: { Authorization: `Bearer ${value}` } });
+          console.log("exchange status:", exchange.status);
+          console.log("exchange body:", (await exchange.text()).slice(0, 800));
           '
