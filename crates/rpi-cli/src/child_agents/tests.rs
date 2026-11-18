@@ -283,6 +283,129 @@ async fn roster_reports_live_children_and_stop_terminates_by_id() {
     .unwrap();
 }
 
+/// Stopping an already-terminal child reports `already-finished` and must not
+/// rewrite its recorded outcome or terminal timestamp: the roster is a history,
+/// not a live view a late Stop click can corrupt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_on_a_finished_child_reports_already_finished_without_rewriting_it() {
+    let parent = parent(FauxScript::new().with_text("child report")).await;
+    let manager = ChildAgents::default();
+    let started = manager
+        .handle(&parent, 7, json!({"op":"start","task":"report"}))
+        .await
+        .unwrap();
+    let id = started["childId"].as_str().unwrap();
+    let finished = wait(&manager, &parent, id).await;
+    assert_eq!(finished["status"], "done");
+
+    let before = manager
+        .roster()
+        .into_iter()
+        .find(|row| row["childId"] == id)
+        .expect("finished child stays in the roster until dispose");
+    assert_eq!(before["status"], "done");
+    let finished_ms = before["finishedMs"].clone();
+    assert!(finished_ms.as_u64().unwrap() > 0);
+
+    let stopped = manager.stop(id).unwrap();
+    assert_eq!(stopped["status"], "already-finished");
+    let after = manager
+        .roster()
+        .into_iter()
+        .find(|row| row["childId"] == id)
+        .expect("still listed");
+    assert_eq!(
+        after["status"], "done",
+        "stop must not flip a done child to failed"
+    );
+    assert_eq!(
+        after["finishedMs"], finished_ms,
+        "the terminal timestamp is history"
+    );
+
+    manager
+        .handle(&parent, 7, json!({"op":"dispose","childId":id}))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while manager.active.load(Ordering::Acquire) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// `finished_ms` is first-write-wins: a later `fail()` (for example a Stop
+/// click) must not move the timestamp of a child that already settled.
+#[test]
+fn mark_finished_keeps_the_first_terminal_timestamp() {
+    let child = job(7);
+    {
+        let mut state = child.state.lock().unwrap();
+        state.finished_ms = Some(1_000);
+    }
+    child.mark_finished();
+    assert_eq!(
+        child.state.lock().unwrap().finished_ms,
+        Some(1_000),
+        "mark_finished must not overwrite an existing terminal timestamp"
+    );
+
+    let fresh = job(7);
+    fresh.mark_finished();
+    let first = fresh.state.lock().unwrap().finished_ms;
+    assert!(first.is_some());
+    fresh.mark_finished();
+    assert_eq!(fresh.state.lock().unwrap().finished_ms, first);
+}
+
+/// `stop` is the HOST path: it is intentionally not owner-scoped, unlike the
+/// plugin path (`handle_existing` / `cancel`), which rejects a foreign owner.
+/// Pin both halves so the missing owner filter stays a documented decision
+/// instead of an accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
+    let parent = parent(
+        FauxScript::new()
+            .with_text("slow report")
+            .with_tokens_per_second(0.1),
+    )
+    .await;
+    let manager = ChildAgents::default();
+    let started = manager
+        .handle(&parent, 7, json!({"op":"start","task":"report"}))
+        .await
+        .unwrap();
+    let id = started["childId"].as_str().unwrap();
+
+    // Plugin path: a different owner cannot cancel it.
+    assert!(
+        manager
+            .handle(&parent, 8, json!({"op":"cancel","childId":id}))
+            .await
+            .is_err(),
+        "a foreign owner must not cancel another plugin's child"
+    );
+    assert_eq!(manager.roster()[0]["status"], "running");
+
+    // Host path: the host itself may stop any child it holds.
+    assert_eq!(manager.stop(id).unwrap()["status"], "cancelled");
+    assert_eq!(manager.roster()[0]["status"], "failed");
+
+    manager
+        .handle(&parent, 7, json!({"op":"dispose","childId":id}))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while manager.active.load(Ordering::Acquire) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[test]
 fn child_limits_reject_wrong_types_and_out_of_range_values() {
     for value in [json!(-1), json!(0), json!(33), json!("8"), Value::Null] {

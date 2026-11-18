@@ -19,10 +19,10 @@ const MAX_JOBS: usize = 16;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
 
-fn now_ms() -> u128 {
+fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -58,8 +58,11 @@ struct State {
     /// Supervisory metadata (host UI roster): when the child started/finished
     /// (unix ms) and what it was asked to do. Written once at start; timing
     /// fields are set by `mark_finished`.
-    started_ms: u128,
-    finished_ms: Option<u128>,
+    ///
+    /// `u64` (not `u128`): the roster serializes these into JSON and reads them
+    /// back with `as_u64`, so the type must not be able to exceed that range.
+    started_ms: u64,
+    finished_ms: Option<u64>,
     role: String,
     task_preview: String,
 }
