@@ -1866,9 +1866,15 @@ impl ReloadContext {
 ///
 /// This is the cell-based counterpart to [`dispatch_session_event_async`]. It
 /// lets headless RPC tasks retain the live session without borrowing the larger
-/// [`ReloadContext`]. The snapshot and keepalive are cloned before awaiting so
-/// a concurrent reload cannot invalidate the plugin function pointers while a
-/// handler is still running.
+/// [`ReloadContext`]. The snapshot and keepalive are cloned before awaiting, so
+/// a concurrent `/reload` neither invalidates the plugin function pointers
+/// mid-dispatch nor keeps a swapped-out registry alive.
+///
+/// Each handler runs on a blocking thread with a per-event timeout
+/// ([`rpi_extensions::lifecycle_timeout_for`]); a handler returning
+/// [`rpi_plugin_sdk::EVENT_HANDLER_ABORT`] is reported as `Some(reason)`.
+/// Returns `None` when no plugins are loaded, no handler subscribes, or the
+/// registry is stale (a `/reload` swapped the session out).
 pub async fn dispatch_session_event_from_cell(
     extension_session: &ExtensionSessionCell,
     tag: rpi_plugin_sdk::EventTag,
@@ -1890,9 +1896,12 @@ pub async fn dispatch_session_event_from_cell(
 
 /// Dispatch a no-payload lifecycle event through the current reload context.
 ///
-/// A `BeforeTuiStart` veto is handled by startup. Session transition events
-/// in the interactive TUI and RPC paths are currently advisory; callers log
-/// any returned reason and continue the host operation.
+/// Resolves the **current** extension session from the reload cell so a
+/// `/reload`-swapped session is honored. The caller decides what a veto means:
+/// a `BeforeTuiStart` veto aborts startup (never enter the TUI);
+/// `SessionStart`/`SessionShutdown` and the session-tree events dispatched by
+/// the interactive TUI and RPC paths are advisory — the host logs the reason
+/// and continues.
 pub async fn dispatch_session_event_async(
     reload_context: &ReloadContext,
     tag: rpi_plugin_sdk::EventTag,
