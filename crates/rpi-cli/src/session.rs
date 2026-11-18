@@ -6209,12 +6209,24 @@ mod tests {
         let header = JsonlV4Header::new("legacycli001".into(), 1, cwd.clone(), None, None, None);
         std::fs::write(&path, encode_header(&header)).unwrap();
         assert!(!sidecar.exists());
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let restored = open_session_by_id_in_dir("legacycli001", &cwd, &sessions)
                 .await
                 .map_err(|e| e.to_string())
                 .unwrap();
-            assert_eq!(restored.session.storage().metadata().id, "legacycli001");
+            // Hold the binding so the OS writer lease can be retired explicitly
+            // below. Dropping the harness is NOT enough: any surviving `Arc` to
+            // the storage keeps the lease alive until the last handle goes away,
+            // so the next `open` of the SAME journal could still observe
+            // "writer lease is already held". That ordering is not
+            // deterministic, which is exactly how this test flaked under CI
+            // concurrency.
+            let storage = restored.session.storage();
+            assert_eq!(storage.metadata().id, "legacycli001");
+            assert!(
+                storage.writer_lease_held(),
+                "reopened binding must own the journal (attempt {attempt})"
+            );
             let provider =
                 FauxProvider::new(FauxScript::new().with_text("continued legacy session"));
             let harness = AgentHarness::create(AgentHarnessOptions {
@@ -6228,6 +6240,17 @@ mod tests {
             .unwrap();
             let run = harness.prompt_text("continue", vec![]).await.unwrap();
             assert!(matches!(run.outcome, HarnessRunOutcome::Completed { .. }));
+            // Retire this binding before the next iteration reopens the journal.
+            // `release_writer_lease` bumps the revocation flag and drops the OS
+            // lease box, so ownership is released now rather than whenever the
+            // last storage handle happens to be dropped.
+            drop(run);
+            drop(harness);
+            storage.release_writer_lease();
+            assert!(
+                !storage.writer_lease_held(),
+                "retired binding must not retain the writer lease"
+            );
         }
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.lines().next().unwrap().contains("progressFormat"));
