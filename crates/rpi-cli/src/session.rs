@@ -448,10 +448,25 @@ pub(crate) fn preflight_extension_startup(
                         if resources.as_ref().is_some_and(|r| r.transition.is_some()) && matches!(selection, SessionSelection::Fork { .. }) {
                             return Err(BuildError::SessionOpen("resource transition cannot fork".into()));
                         }
+                        let dir = selection_dir(&selection);
+                        // Only a declared resource selection consumes these facts.
+                        // Without one there is nothing to compare against, and
+                        // `bind_session` re-checks the accepted writer session after
+                        // the load, while the dev path preflights before it stages
+                        // code. Replaying the whole transcript here would only
+                        // duplicate that load and double every ordinary resume.
+                        if resources.is_none() {
+                            return Ok(match selection {
+                                SessionSelection::Fork { .. } => SessionSelection::Fork {
+                                    source: meta.path,
+                                    dir,
+                                },
+                                _ => SessionSelection::ByExactId { id: meta.id, dir },
+                            });
+                        }
                         use rpi_harness::session::jsonl::{
                             JsonlSessionRepo, JsonlSessionRepoOptions,
                         };
-                        let dir = selection_dir(&selection);
                         let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
                             fs: Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())),
                             sessions_root: dir.to_string_lossy().into_owned(),
