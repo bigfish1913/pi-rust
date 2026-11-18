@@ -678,6 +678,18 @@ pub trait RuntimeActionHost: Send + Sync {
     fn replace_model_catalog(&self, _models: Vec<rpi_ai::Model>) {}
     /// Invalidate child handles owned by an unloading/reloaded plugin.
     fn cancel_child_agents(&self, _owner: u64) {}
+    /// Supervisory roster of host-held child agents (newest first). Host-only
+    /// surface for a UI panel: the default is empty so hosts that never
+    /// launched children (or older hosts) report "no children" instead of
+    /// failing the call.
+    fn child_agent_roster(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    /// Stop one host-held child by id (host-only, not owner-scoped). Unknown
+    /// id = `Err`; the default refuses so an unsupporting host is visible.
+    fn stop_child_agent(&self, _child_id: &str) -> Result<serde_json::Value, String> {
+        Err("child agent control is not supported by this host; upgrade rpi".into())
+    }
     /// `SendMessage` — Pi-compatible `triggerTurn` and `deliverAs` scheduling.
     /// Defaults append while idle and steer while running; explicit `true`
     /// starts an idle run, `false` only updates context, and `nextTurn` waits

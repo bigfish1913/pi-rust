@@ -228,6 +228,61 @@ async fn capacity_is_bounded_even_while_disposed_children_are_cleaning_up() {
         .contains("capacity"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_reports_live_children_and_stop_terminates_by_id() {
+    let parent = parent(
+        FauxScript::new()
+            .with_text("slow report")
+            .with_tokens_per_second(0.1),
+    )
+    .await;
+    let manager = ChildAgents::default();
+    let started = manager
+        .handle(
+            &parent,
+            7,
+            json!({"op":"start","task":"survey the repo","role":"scout"}),
+        )
+        .await
+        .unwrap();
+    let id = started["childId"].as_str().unwrap();
+
+    let roster = manager.roster();
+    let row = roster
+        .iter()
+        .find(|row| row["childId"] == id)
+        .expect("the running child must be listed");
+    assert_eq!(row["status"], "running");
+    assert_eq!(row["role"], "scout");
+    assert_eq!(row["taskPreview"], "survey the repo");
+    assert!(row["startedMs"].as_u64().unwrap() > 0);
+    assert!(row["finishedMs"].is_null());
+
+    let stopped = manager.stop(id).unwrap();
+    assert_eq!(stopped["status"], "cancelled");
+    let row = manager
+        .roster()
+        .into_iter()
+        .find(|row| row["childId"] == id)
+        .expect("the terminated child stays in the roster until dispose");
+    assert_eq!(row["status"], "failed");
+    assert!(row["finishedMs"].as_u64().unwrap() > 0);
+    assert!(manager.stop("nope").is_err());
+
+    manager
+        .handle(&parent, 7, json!({"op":"dispose","childId":id}))
+        .await
+        .unwrap();
+    assert!(manager.roster().is_empty());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while manager.active.load(Ordering::Acquire) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[test]
 fn child_limits_reject_wrong_types_and_out_of_range_values() {
     for value in [json!(-1), json!(0), json!(33), json!("8"), Value::Null] {
