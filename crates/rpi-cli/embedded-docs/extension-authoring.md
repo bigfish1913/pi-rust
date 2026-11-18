@@ -300,8 +300,8 @@ if let Some(register_prompt) = api.register_tool_prompt {
 - **会话生命周期**：`SessionStart`、`SessionBeforeSwitch`、`SessionBeforeFork`、
   `SessionBeforeCompact`、`SessionCompact`、`SessionBeforeTree`、`SessionTree`、
   `SessionShutdown` 等。这些标签在 rpi 里都不带 payload（`data_text()` 为空串），
-  能用它们判断“分支变了”，但拿不到是新建、fork 还是导航；详见
-  [生命周期事件](lifecycle.md)。
+  能用它们判断“分支变了”，但拿不到是新建、fork 还是导航。
+  `SessionTree`/`SessionCompact` 只在分支真的变了之后才发。
 - **Agent 循环**：`BeforeAgentStart`、`AgentStart`、`AgentEnd`、`AgentSettled`、
   `TurnStart`、`TurnEnd`、`MessageStart`/`MessageUpdate`/`MessageEnd`、
   `ToolExecutionStart`/`Update`/`End`、`ToolCall`、`ToolResult`、`UserBash`、`Input`。

@@ -298,7 +298,10 @@ if let Some(register_prompt) = api.register_tool_prompt {
 通过 `api.register_event_handler` 按 `EventTag`（36 类）订阅：
 
 - **会话生命周期**：`SessionStart`、`SessionBeforeSwitch`、`SessionBeforeFork`、
-  `SessionBeforeCompact`、`SessionCompact`、`SessionShutdown` 等。
+  `SessionBeforeCompact`、`SessionCompact`、`SessionBeforeTree`、`SessionTree`、
+  `SessionShutdown` 等。这些标签在 rpi 里都不带 payload（`data_text()` 为空串），
+  能用它们判断“分支变了”，但拿不到是新建、fork 还是导航。
+  `SessionTree`/`SessionCompact` 只在分支真的变了之后才发。
 - **Agent 循环**：`BeforeAgentStart`、`AgentStart`、`AgentEnd`、`AgentSettled`、
   `TurnStart`、`TurnEnd`、`MessageStart`/`MessageUpdate`/`MessageEnd`、
   `ToolExecutionStart`/`Update`/`End`、`ToolCall`、`ToolResult`、`UserBash`、`Input`。
@@ -414,6 +417,14 @@ extern "C" fn on_tool_result(
 `api.register_provider` 注入自定义 LLM Provider（`provider_id`/`base_url`/
 `api_style` + `request_fn`）。`register_message_renderer`/`register_markdown_transformer`/
 `register_entry_renderer` 注册消息渲染能力。这些槽位都可能为 `None`，使用前必须检测。
+
+渲染器的 JSON 契约是：markdown transformer 接收并返回 `{"markdown":"..."}`；message
+renderer 接收消息或自定义消息 envelope（例如
+`{"customType":"token-usage","usage":{...}}`）；entry renderer 接收
+`{"customType":"...","data":...}`。message/entry renderer 返回
+`{"text":"...","markdown":true|false}` 或 `{"lines":["..."]}`。输出是一个
+transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿主通过注册时提供的
+`plugin_free_string` 回收。
 
 `api.register_streaming_provider` 注入**流式** Provider。注册时同样提供 provider ID、
 端点、API style 和字符串释放回调；流式 request fn 另有逐块回调 `emit`、
