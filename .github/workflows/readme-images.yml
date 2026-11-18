@@ -65,3 +65,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
         run: python -B scripts/prepare-readme-image-pr.py
+      # This is deliberately restricted to the exact upstream automation PR. It
+      # bypasses normal required checks because the script has already verified
+      # that the only changed path is README.md and that the branch is rebuilt
+      # from main. The automation token must be an explicit ruleset bypass actor.
+      - name: Merge the WeChat image PR without waiting for CI
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main \
+            --head automation/readme-images \
+            --json number,headRepositoryOwner,isCrossRepository,isDraft \
+            --jq '[.[] | select(.isCrossRepository == false) | select(.headRepositoryOwner.login == "bigfish1913")]')"
+          count="$(jq 'length' <<<"$prs")"
+          [[ "$count" == 1 ]] || { echo '::error::Expected exactly one upstream README image PR.'; exit 1; }
+          number="$(jq -r '.[0].number' <<<"$prs")"
+          is_draft="$(jq -r '.[0].isDraft' <<<"$prs")"
+          [[ "$is_draft" == false ]] || { echo '::error::README image PR must not be a draft.'; exit 1; }
+          gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --admin --squash --delete-branch

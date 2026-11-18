@@ -88,13 +88,14 @@ a documentation-only merge.
 ### One-time setup
 
 The repository already uses `CARGO_REGISTRY_TOKEN` for crates.io. Add one secret,
-`RELEASE_AUTOMATION_TOKEN`, for preparing PRs, refreshing README image dates via
-an ordinary PR, and writing the external channels.
+`RELEASE_AUTOMATION_TOKEN`, for preparing PRs, refreshing README image dates, and
+writing the external channels.
 Use a maintainer or dedicated bot **classic PAT with `public_repo`**, with access
 to these public repositories:
 
-- `bigfish1913/pi-rust`: create/update Release PRs. Using a user token also lets
-  those PRs and the documentation follow-up commit trigger their normal CI.
+- `bigfish1913/pi-rust`: create/update Release PRs and the restricted README image PR.
+  The token owner must be an explicit `main` ruleset bypass actor because the README
+  workflow administrator-merges that README-only PR without waiting for CI.
 - `bigfish1913/homebrew-tap` and `bigfish1913/scoop-bucket`: update channel files.
 - The token owner's fork of `microsoft/winget-pkgs`: create/sync the fork, push
   manifest branches, and submit upstream PRs. The upstream repository belongs to
@@ -144,11 +145,12 @@ recovery checks out an old tag that cannot contain a newly added helper script.
 A hosted runner can also be cancelled before it executes its first step, especially while a macOS runner is being allocated. The required `Release PR validation` check continues to reject `cancelled` validation jobs; it never treats infrastructure cancellation as a passing test. The separate `CI transient recovery` workflow watches only trusted upstream `main` CI runs from `schedule`, `push`, or explicit dispatch. If the first attempt has no failed validation family and has at least one cancelled validation job, it requests one complete rerun of the same CI run. It reruns the whole run rather than only failed jobs because the release job was skipped behind the failed aggregate. The second attempt is not automatically retried, preventing loops; maintainers must inspect and rerun a repeated runner outage manually. The recovery workflow checks job conclusions through the GitHub API and never checks out or executes the failed run source, so it cannot turn an untrusted PR into a privileged release action.
 
 The daily README image refresh updates `automation/readme-images` and creates or
-reuses an ordinary PR. It never pushes directly to protected `main`, requests
-a protection bypass, or uses `[skip ci]`. It reuses `RELEASE_AUTOMATION_TOKEN`
-because PRs created with `GITHUB_TOKEN` do not trigger normal CI. Missing token
-or API/push failure fails visibly. The PR still needs normal checks and a manual
-merge; only Release PRs receive automatic merge requests from repository bots.
+reuses a restricted upstream PR. The workflow verifies that the branch is rebuilt
+from `main` and that the only changed path is `README.md`, then administrator-merges
+that exact PR with squash without waiting for normal CI. This is intentionally a
+narrow bypass for the automated WeChat image cache-key update; ordinary and fork PRs
+remain subject to normal review and required checks. Missing token or API/push/merge
+failure fails visibly.
 
 ### Recovery and release records
 
