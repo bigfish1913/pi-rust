@@ -263,6 +263,34 @@ renderer 接收消息或自定义消息 envelope（例如
 transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿主通过注册时提供的
 `plugin_free_string` 回收。
 
+渲染器**只在交互式 TUI 中调用**：`--mode rpc` 和 `-p` 不调用任何渲染器，渲染结果也不进入
+事件流，所以远程客户端要自己渲染 transcript。会话建立时 stderr 上的
+`renderers: N markdown-transform, N message-render, N entry-render (active)` 只报告
+注册数量，不代表当前模式会用到它们。
+
+三个槽位的合并语义不同，不要混用：
+
+- `register_message_renderer` / `register_entry_renderer`：按注册顺序逐个尝试，
+  **第一个返回 `rc == 0` 且 JSON 可解析的响应胜出**，其余不再调用；返回非 0 或响应不可
+  解析表示「这个类型我不处理」，宿主继续问下一个 renderer。所以「不处理」要用非 0 返回码
+  表达，返回空对象不算弃权。
+- `register_markdown_transformer`：**链式**，每个 transformer 的输出是下一个的输入，最后
+  一个的输出交给 Markdown 渲染。返回非 0 或 panic 会**终止整条链**并保留当前文本；响应里
+  没有字符串 `markdown` 字段时只跳过这一个 transformer，链继续。
+
+其余固定行为：
+
+- entry renderer 的 `data` 可能为 `null`（自定义条目没带 `data` 时），不要假定它是对象。
+- TUI 在调用 entry renderer **之前**就跳过 `plan-mode`、`todo`、`todo-state`，为这三个
+  type 注册渲染器不会被调用。
+- `{"lines":[…]}` 会以 `\n` 拼成**一个**纯文本行，不是每行一个组件；需要多行时自己在
+  `text` 里带换行。
+- message renderer 的响应既没有 `text` 也没有 `lines` 时，TUI 降级显示 `[customType]`；
+  entry renderer 的响应缺这两个字段时不渲染，改由宿主自己的条目文案显示。
+- message renderer 除渲染自定义消息外，还会以
+  `{"customType":"token-usage","usage":{...}}` 被调用一次以生成用量文本，因此要能容忍这个
+  payload（没有匹配的 type 时返回非 0）。
+
 `api.register_streaming_provider` 注入**流式** Provider。注册时同样提供 provider ID、
 端点、API style 和字符串释放回调；流式 request fn 另有逐块回调 `emit`、
 `emit_user_data`、可选控制面 `control` 和当前宿主恒为 `None` 的 `completion`。
