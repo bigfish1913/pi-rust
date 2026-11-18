@@ -31,4 +31,33 @@ fork/switch/navigate 目前不发这些事件。
 
 超时后记录日志并跳过等待；已经运行的 blocking handler 仍可能继续执行，超时不会强制终止它。扩展应自行限制阻塞和资源占用，且不能让 panic 穿过 ABI 边界。
 
+## 卸载钩子：`register_plugin_lifecycle`
+
+事件之外还有一对**同步**的卸载钩子，由 `PluginApi::register_plugin_lifecycle` 注册
+（追加在 vtable 尾部，ABI 版本不变；旧宿主或旧 SDK 没有该槽位）。它解决的是事件
+表达不了的问题：宿主准备 `dlclose` 这个 cdylib 时，插件自己的后台线程还在执行它的代码。
+
+```rust
+extern "C" fn begin(_ud: *mut c_void) { /* 幂等、非阻塞：置停止标志、取消在飞请求 */ }
+extern "C" fn finish(_ud: *mut c_void) -> i32 { /* join 线程；0 = 可以卸载 */ }
+let _ = api.register_plugin_lifecycle.map(|register| register(begin, finish, api.user_data));
+```
+
+调用时序与语义：
+
+- `begin` 在宿主持有会话锁**之外**调用，必须幂等、非阻塞：只做「拒绝新工作 + 通知
+  在飞工作退出」，不得 join，也不得回调宿主（此时宿主动作已标记为 stale）。
+- `finish` 在宿主的 blocking 清理线程上调用，等所有在飞 FFI 调用与插件字符串释放
+   relinquish keepalive 之后执行；返回 `0` 才表示「不会再有插件代码被执行」。
+- `finish` 返回非 0 时，宿主**永久保留**该 library 与它的 runtime 上下文，进程退出前
+  不会再尝试卸载——宿主**不会**超时之后照样卸载活代码。因此返回非 0 是安全的
+  「我还没收干净」，但会泄漏一次加载。
+- 三条路径都会走这对钩子：`SessionShutdown`、`/new`（换会话）以及**插件 reload**
+  （`/reload` 与 `rpi dev` 的 watch）。纯插件 reload 不再需要另设 unload 事件。
+- 常驻线程的插件（回环服务、自管 Tokio 运行时）**必须**注册这对钩子；`finish` 里
+  join 线程并释放端口，否则 reload 会留下一个执行已卸载代码的线程。
+
+工具闭包与事件 handler 的保活由宿主负责（`PluginKeepalive` 持有 `Library`，直到最后
+一个工具适配器/事件分发器释放），所以不需要插件自己做引用计数。
+
 扩展注册、支持的事件与工具生命周期见 [扩展开发指南](authoring.md)。

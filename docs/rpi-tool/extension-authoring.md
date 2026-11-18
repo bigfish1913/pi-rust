@@ -244,6 +244,65 @@ if let Some(register_prompt) = api.register_tool_prompt {
   旧插件仍可加载；旧宿主槽位为 `None` 时跳过元数据注册，不能因此跳过工具注册。
 - 自定义 `SYSTEM.md` / `--system-prompt` 仍替换默认提示词；上述自动贡献只用于默认提示词。
 
+### 输入框草稿与补全（与 Pi 一致）
+
+Pi 通过 `ui.getEditorText()` 读取草稿、通过 `ui.addAutocompleteProvider()` 和
+`RegisteredCommand.getArgumentCompletions` 贡献候选。rpi 提供等价的三条通道。
+
+**读草稿：`GetEditorText`（32）**。`{}` → `{"text": "...", "cursor": N}`，
+`cursor` 是 `text` 内的字节偏移。永不报错：RPC/print/无界面宿主返回 `{"text":"", "cursor":0}`，
+插件应据此退化，而不是把空草稿当成失败。TUI 每个 tick 发布一次草稿（含仅移动光标），
+所以「调用时现在的草稿」是准确的；不要用 `EditorChange` 事件攒本地副本——
+该事件的 payload 只有 `{"chars","empty","source"}`，按设计不携带文本。
+
+**草稿候选：`api.register_autocomplete_provider`。**
+
+```rust
+use rpi_plugin_sdk::{AutocompleteProviderFn, StbString, StbStringRef, StbStringRef as Ref};
+
+extern "C" fn suggest(query: Ref, out: *mut StbString, _ud: *mut c_void) -> i32 {
+    let query = unsafe { query.as_str() };           // {"text","cursor","line","linePrefix"}
+    if !query.contains('#') { return 1; }            // 1 = 没有意见，回落内置 provider
+    unsafe { *out = StbString::from_string(
+        r##"{"items":[{"text":"#Budget.xlsx","label":"Budget.xlsx","description":"Excel","insertSpace":false}]}"##.into()) };
+    0
+}
+// 注册期：
+let _ = rpi_plugin_sdk::register_autocomplete_provider(&api, suggest, api.user_data);
+```
+
+- 查询信封：`text`（整段草稿）、`cursor`（字节偏移）、`line`（当前行）、`linePrefix`（该行光标前文本）。
+- 返回 `0` + `{"items":[...]}`；返回 `1`、空 `items` 或非法 JSON 都表示「没有意见」，
+  宿主继续问下一个插件，最后回落内置的 file/slash provider。任何非 0 返回值都不算错误。
+- 候选字段：`text`（插入文本，必填；兼容 `insertText`）、`label`、`description`、
+  `insertSpace`（默认 `true`；`#文档` 这类插入应为 `false`）、`isDirectory`（仅显示用）。
+  单次最多取 50 条。
+- `out` 是**插件**所有，宿主用注册时传入的 `plugin_free_string` 回收（与工具结果同一约定）。
+- 插件 provider 排在宿主内置 provider **之前**，所以它赢的是自己认得的那一段；
+  别的输入交给内置补全。
+
+**命令参数候选：`api.register_command_completions`。**
+
+```rust
+extern "C" fn office_args(args: Ref, out: *mut StbString, _ud: *mut c_void) -> i32 {
+    let args = unsafe { args.as_str() };             // {"argumentPrefix":"con"}
+    let _ = args;
+    unsafe { *out = StbString::from_string(
+        r#"{"items":[{"text":"connect","description":"Connect the bridge"}]}"#.into()) };
+    0
+}
+// 必须先注册命令，再挂补全：
+let rc = rpi_plugin_sdk::register_command_completions(&api, "office", office_args, api.user_data);
+```
+
+- `argumentPrefix` 是命令名与首个空格之后的全部文本（`/office con` → `"con"`）。
+- 返回 `0` 成功、`1` 该命令不属于本插件（或未注册）、`-1` 不在注册期/旧宿主无该槽位。
+- 同一次 Tab 里宿主先问命令参数（`/office con`），再问草稿 provider，最后才是内置 provider；
+  没有补全的命令保持原行为，`/office` 仍能按命令名补全。
+
+两个槽位都追加在 vtable 尾部，不改 ABI 版本：旧宿主给 `None` 时跳过即可，不能因此中止注册。
+补全在 TUI 线程调用，插件必须线程安全、快速返回（它是每帧询问的），不要在 handler 里阻塞等待网络。
+
 ## 4. 工具生命周期：execute → poll → cancel → destroy
 
 工具导出四个 `extern "C"` 函数，宿主按固定协议驱动：
