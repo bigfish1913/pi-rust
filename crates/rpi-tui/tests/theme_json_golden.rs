@@ -42,6 +42,7 @@ fn token_field(token: &str) -> Option<fn(&rpi_tui::theme::ThemeColors) -> Color>
         "thinkingText" => |c: &ThemeColors| c.thinking_text,
         "selectedBg" => |c: &ThemeColors| c.selection,
         "userMessageBg" => |c: &ThemeColors| c.surface,
+        "userMessageText" => |c: &ThemeColors| c.user_message_text,
         "customMessageBg" => |c: &ThemeColors| c.custom_message_bg,
         "customMessageText" => |c: &ThemeColors| c.custom_message_text,
         "customMessageLabel" => |c: &ThemeColors| c.custom_message_label,

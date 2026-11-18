@@ -149,6 +149,39 @@ fn user_message_invalidates_on_theme_change() {
 }
 
 #[test]
+fn light_theme_user_message_text_pins_an_explicit_foreground() {
+    // Issue #342: the light bubble must not inherit the terminal default
+    // foreground (white on a dark terminal → light-on-light).
+    let _g = lock();
+    let fg = rpi_tui::theme::Color::Ansi256(237).to_fg();
+
+    apply_theme_preset(ThemePreset::Light);
+    let light = UserMessageComponent::new("hi `code` there").render(60);
+    apply_theme_preset(ThemePreset::Dark);
+    let dark = UserMessageComponent::new("hi `code` there").render(60);
+
+    let body = light
+        .iter()
+        .find(|line| strip_ansi(line).contains("hi"))
+        .expect("light bubble row with the message text");
+    assert!(body.contains(&fg), "missing explicit light fg: {body:?}");
+    // The dark preset keeps inheriting the terminal foreground.
+    let dark_body = dark
+        .iter()
+        .find(|line| strip_ansi(line).contains("hi"))
+        .expect("dark bubble row with the message text");
+    assert!(!dark_body.contains(&fg), "dark must inherit: {dark_body:?}");
+
+    // An inner inline-code span closes with SGR 0; the bubble foreground must
+    // be re-opened afterwards so the rest of the row stays readable (one open
+    // at row start, at least one more after the nested span's reset).
+    assert!(
+        body.matches(fg.as_str()).count() >= 2,
+        "light bubble fg must survive nested resets: {body:?}"
+    );
+}
+
+#[test]
 fn assistant_message_renders_and_is_stable_across_repeated_frames() {
     let _g = lock();
     // The transcript benchmark lives on this path: a finalized assistant

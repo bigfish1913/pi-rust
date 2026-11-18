@@ -34,6 +34,13 @@ pub struct ThemeColors {
     pub background: Color,
     /// Primary surface color (pi `userMessageBg`).
     pub surface: Color,
+    /// Text color inside the user message bubble (pi `userMessageText`).
+    ///
+    /// Must contrast with [`surface`](Self::surface). Defaulting to the
+    /// terminal foreground only works while the bubble background matches the
+    /// terminal background, so the light palette pins an explicit dark color
+    /// (issue #342).
+    pub user_message_text: Color,
     /// Border color (pi `border`).
     pub border: Color,
     /// Accent border color (pi `borderAccent`).
@@ -124,7 +131,10 @@ impl Default for ThemeColors {
             info: Color::Ansi256(81),     // cyan
             background: Color::Default,
             surface: Color::Ansi256(236), // userMessageBg (#343541) ≈ 236
-            border: Color::Ansi256(67),   // border blue (#5f87ff) ≈ 67
+            // Dark bubbles on a dark terminal: the default foreground is the
+            // matching reading color, so keep it inherited.
+            user_message_text: Color::Default,
+            border: Color::Ansi256(67), // border blue (#5f87ff) ≈ 67
             border_accent: Color::Ansi256(45), // borderAccent cyan (#00d7ff) ≈ 45
             border_muted: Color::Ansi256(239), // borderMuted darkGray (#505050) ≈ 239
             selection: Color::Ansi256(60), // selectedBg (#3a3a4a) ≈ 60
@@ -406,6 +416,10 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
             colors.info = Color::Ansi256(67); // blue
             colors.background = Color::Default;
             colors.surface = Color::Ansi256(254); // userMsgBg (#e8e8e8)
+                                                  // pi light.json `userMessageText` is #3b3f41: the light bubble
+                                                  // cannot inherit the terminal foreground, because a dark terminal
+                                                  // (light default fg) would render light-on-light text (#342).
+            colors.user_message_text = Color::Ansi256(237); // #3b3f41 ≈ 237
             colors.border = Color::Ansi256(67); // blue (#547da7)
             colors.border_accent = Color::Ansi256(66); // teal
             colors.border_muted = Color::Ansi256(249); // lightGray (#b0b0b0)
@@ -461,6 +475,7 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
             colors.warning = Color::Ansi256(15);
             colors.info = Color::Ansi256(15);
             colors.surface = Color::Ansi256(236);
+            colors.user_message_text = Color::Default;
             colors.border = Color::Ansi256(244);
             colors.border_muted = Color::Ansi256(240);
             colors.selection = Color::Ansi256(244);
@@ -543,6 +558,20 @@ mod tests {
         let color = Color::Ansi256(196);
         let text = color.fg("Hello");
         assert!(text.contains("Hello"));
+    }
+
+    #[test]
+    fn light_preset_pins_an_explicit_user_message_foreground() {
+        // Issue #342: the light bubble (#e8e8e8) must not inherit the terminal
+        // default foreground, which is light on dark terminals.
+        let light = theme_for_preset(ThemePreset::Light);
+        assert_eq!(light.colors.user_message_text, Color::Ansi256(237));
+        assert!(matches!(light.colors.surface, Color::Ansi256(254)));
+        // Dark keeps inheriting: its bubble is dark, like the terminal.
+        assert_eq!(
+            theme_for_preset(ThemePreset::Dark).colors.user_message_text,
+            Color::Default
+        );
     }
 
     #[test]

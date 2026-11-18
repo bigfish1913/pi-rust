@@ -8,7 +8,7 @@
 //!
 //! Known v1 divergences from upstream, kept intentional:
 //! - Tokens without a [`ThemeColors`] consumer in rpi-tui yet (`scrollbar*`,
-//!   `searchMatch*`, `userMessageText`, `syntax*`, `thinkingOff`…`thinkingMax`)
+//!   `searchMatch*`, `syntax*`, `thinkingOff`…`thinkingMax`)
 //!   are parsed and validated so pi-authored files load unchanged, but do not
 //!   affect rendering. rpi's syntax highlighting and thinking-level borders
 //!   use their own palettes.
@@ -52,7 +52,7 @@ const TOKENS: &[(&str, Option<ColorSlot>)] = &[
     ("searchMatchBg", None),
     ("searchMatchText", None),
     ("userMessageBg", Some(|c, v| c.surface = v)),
-    ("userMessageText", None),
+    ("userMessageText", Some(|c, v| c.user_message_text = v)),
     ("customMessageBg", Some(|c, v| c.custom_message_bg = v)),
     ("customMessageText", Some(|c, v| c.custom_message_text = v)),
     (
@@ -596,6 +596,16 @@ mod tests {
         .unwrap();
         let colors = theme.to_theme_colors().unwrap();
         assert_eq!(colors.accent, Color::Rgb(17, 255, 153));
+    }
+
+    #[test]
+    fn user_message_text_token_feeds_the_bubble_foreground() {
+        let theme =
+            ThemeJson::parse(r##"{"name":"t","colors":{"userMessageText":"#3b3f41"}}"##).unwrap();
+        assert_eq!(
+            theme.to_theme_colors().unwrap().user_message_text,
+            Color::Rgb(0x3b, 0x3f, 0x41)
+        );
     }
 
     #[test]
