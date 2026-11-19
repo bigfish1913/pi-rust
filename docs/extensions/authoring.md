@@ -151,6 +151,7 @@ ABI 的字符串与步骤返回都是裸指针，SDK 提供一组宏把契约收
 | 调用 runtime action | `call_action!(api, id, args)` → `(rc, body)` |
 | 读 ABI 字符串（不释放） | `stb_text!(value)` |
 | 读并回收 ABI 字符串 | `stb_take!(value, free)` |
+| 回收工具步骤结果 | `take_step!(result)` / `take_step_with!(result, free)` |
 
 它们不改 C ABI，只是把 `unsafe` 收敛到 SDK 内部。仍然需要自己写 `unsafe` 的有三种：
 手写 trampoline；`ProviderRequestFn` / `ProviderStreamRequestFn`（读请求、写 `out`，见

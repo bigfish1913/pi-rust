@@ -153,6 +153,13 @@ underlying function; the macro cannot prove an arbitrary result's ownership.
 receiving a result from another plugin. These are ABI boundaries: the host must still honor
 buffer validity and producer allocation ownership.
 
+`take_step!` is that copy-and-reclaim without a caller-side `unsafe` block: it
+asserts the union-arm and ownership contract once, inside the SDK, and returns
+the pointer-free `callbacks::Step`. `take_step_with!` does the same with an
+explicit producer deallocator for a result from another plugin instance. Keep
+`take_step_result!` only for a call site that has to spell the ownership
+argument out itself.
+
 `call_action!` is the outbound counterpart: it calls a runtime action and returns
 `(status_code, body)`, doing the allocate/call/read/free dance inside the SDK:
 
