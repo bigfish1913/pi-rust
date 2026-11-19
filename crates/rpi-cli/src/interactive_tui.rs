@@ -47,6 +47,8 @@ use selectors::*;
 mod autocomplete;
 mod plugin_autocomplete;
 use autocomplete::*;
+mod extension_arguments;
+use extension_arguments::ExtensionArgumentProvider;
 mod rendering;
 use rendering::*;
 mod panels;
@@ -1316,9 +1318,16 @@ pub async fn interactive_tui(
     let autocomplete = AutocompleteManager::new();
     {
         let mut combined = CombinedAutocompleteProvider::new();
-        // Plugins get first refusal (pi's `addAutocompleteProvider` stacks on
-        // top of the built-in provider): their candidates are the specific ones
-        // (`#document`), and a plugin with no opinion falls through.
+        // Argument suggestions first: they own the popup once the caret is
+        // inside a plugin command's argument region (`/msg a|`); the slash
+        // provider takes over only inside the command token (`/m|sg`).
+        combined.add_provider(Arc::new(ExtensionArgumentProvider::new(
+            reload_context.extension_session.clone(),
+        )));
+        // Then plugin-contributed completion (pi's `addAutocompleteProvider`
+        // stacks on top of the built-in provider): their candidates are the
+        // specific ones (`#document`), and a plugin with no opinion falls
+        // through to the built-ins.
         for provider in plugin_autocomplete::providers(reload_context.extension_session.clone()) {
             combined.add_provider(provider);
         }
@@ -2875,12 +2884,23 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 5a-bis. ↑/↓ navigate the autocomplete list while it is open
-            //     (typed `/` or `@`), then Tab accepts the highlighted row.
-            if key.modifiers == KeyModifiers::NONE
-                && (key.code == KeyCode::Up || key.code == KeyCode::Down)
-            {
-                let direction = if key.code == KeyCode::Up { -1 } else { 1 };
+            // 5a-bis. ↑/↓ (or Alt-P/Alt-N, the emacs bindings — Ctrl-P is
+            //     taken by user-configurable model select) navigate the
+            //     autocomplete list while it is open (typed `/` or `@`), then
+            //     Tab accepts the highlighted row.
+            let navigate_direction =
+                if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Up {
+                    Some(-1)
+                } else if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Down {
+                    Some(1)
+                } else if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('p') {
+                    Some(-1)
+                } else if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('n') {
+                    Some(1)
+                } else {
+                    None
+                };
+            if let Some(direction) = navigate_direction {
                 if navigate_autocomplete(&state_for_key, &editor_for_key, direction) {
                     tui_for_key.request_render_reusing_scroll_content();
                     continue;

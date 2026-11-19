@@ -92,15 +92,16 @@ pub use prompt_transform::emit_before_agent_start;
 pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
-    assert_active, current_platform, platform_allows, BeforeAgentStartHandler, ExtensionRegistry,
-    ExtensionTool, ProviderManifest, RegisteredAutocompleteProvider, RegisteredCommand,
-    RegisteredCommandCompletions, RegisteredFlag, RegisteredHandler, RegisteredOAuthProvider,
-    RegisteredProvider, RegisteredRenderer, RegisteredRendererKind, RegisteredShortcut,
-    RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler, ToolPromptMetadata,
-    DEFAULT_PRIORITY,
+    assert_active, current_platform, platform_allows, ArgumentSuggester, BeforeAgentStartHandler,
+    ExtensionRegistry, ExtensionTool, ProviderManifest, RegisteredAutocompleteProvider,
+    RegisteredCommand, RegisteredCommandCompletions, RegisteredFlag, RegisteredHandler,
+    RegisteredOAuthProvider, RegisteredProvider, RegisteredRenderer, RegisteredRendererKind,
+    RegisteredShortcut, RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler,
+    ToolPromptMetadata, DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
+pub use suggest_service::{SuggestItem, SuggestService};
 pub use tool_result_transform::{
     emit_tool_result, emit_tool_result_with_status, with_tool_result_transform,
 };
@@ -125,6 +126,7 @@ mod registry;
 mod resources;
 mod status;
 mod stdio;
+mod suggest_service;
 mod tool;
 #[cfg(test)]
 mod tool_prompt_tests;
@@ -339,6 +341,7 @@ impl HostApi {
             register_tool_result: Some(trampoline_register_tool_result),
             register_autocomplete_provider: Some(trampoline_register_autocomplete_provider),
             register_command_completions: Some(trampoline_register_command_completions),
+            register_argument_suggester: Some(trampoline_register_argument_suggester),
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
@@ -1037,6 +1040,33 @@ extern "C" fn trampoline_register_autocomplete_provider(
     let ok = with_current_api(|api| {
         api.with_registry(|reg| {
             reg.register_autocomplete_provider(handler, plugin_free_string, user_data)
+        })
+        .is_some()
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// `register_argument_suggester` trampoline. The response string the handler
+/// later produces is plugin-owned, so the registration carries the plugin's
+/// own `plugin_free_string`.
+extern "C" fn trampoline_register_argument_suggester(
+    command: rpi_plugin_sdk::StbStringRef,
+    handler: rpi_plugin_sdk::ArgumentSuggesterFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    // SAFETY: the plugin guarantees the ref is valid for this call.
+    let command = unsafe { command.as_str().to_string() };
+    let ok = with_current_api(|api| {
+        api.with_registry(|reg| {
+            reg.register_argument_suggester(&command, handler, plugin_free_string, user_data)
         })
         .is_some()
     });

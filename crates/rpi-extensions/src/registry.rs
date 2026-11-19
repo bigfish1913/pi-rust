@@ -15,10 +15,10 @@ use std::sync::Arc;
 use rpi_agent::error::AgentError;
 use rpi_ai::types::Tool;
 use rpi_plugin_sdk::{
-    AutocompleteProviderFn, BeforeAgentStartFn, CommandArgumentCompletionFn, CommandHandlerFn,
-    EventHandlerFn, EventTag, FreeStringFn, OAuthRequestControlFn, OAuthRequestFn,
-    ProviderRequestFn, ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn, ToolResultFn,
-    EVENT_TAG_COUNT,
+    ArgumentSuggesterFn, AutocompleteProviderFn, BeforeAgentStartFn, CommandArgumentCompletionFn,
+    CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestControlFn,
+    OAuthRequestFn, ProviderRequestFn, ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn,
+    ToolResultFn, EVENT_TAG_COUNT,
 };
 
 use crate::tool::PluginToolHandle;
@@ -265,6 +265,21 @@ pub struct ToolResultHandler {
 unsafe impl Send for ToolResultHandler {}
 unsafe impl Sync for ToolResultHandler {}
 
+/// One argument suggester: command token it answers for + the JSON callback.
+/// The TUI picks the suggester whose command matches the draft's command token.
+#[derive(Clone)]
+pub struct ArgumentSuggester {
+    /// Command token WITHOUT the leading slash, lowercased (`msg`, `use`).
+    pub command: String,
+    pub handler: ArgumentSuggesterFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+// SAFETY: same contract as ToolResultHandler — the plugin warrants its
+// `user_data` is valid and the handler callable from any thread.
+unsafe impl Send for ArgumentSuggester {}
+unsafe impl Sync for ArgumentSuggester {}
+
 /// A registered custom provider (B5c). The host wraps `request_fn` in a
 /// [`PluggableProvider`](crate::PluggableProvider) impl of `rpi_ai::Provider`;
 /// its `stream_simple` drives `request_fn` on `spawn_blocking` (the sync fn
@@ -448,6 +463,11 @@ pub struct ExtensionRegistry {
     /// `ui.addAutocompleteProvider`). Consulted ahead of the built-in
     /// file/slash providers, in registration order.
     autocomplete: Vec<RegisteredAutocompleteProvider>,
+    /// Extension argument suggesters for the TUI autocomplete pipeline. Keyed
+    /// by the command token (`/msg`) so the TUI asks exactly the plugin that
+    /// registered the command. A bare list mirrors `tool_result`: the TUI
+    /// resolves the matching suggester by command name at call time.
+    argument_suggesters: Vec<ArgumentSuggester>,
     /// Registered custom providers (B5c). The host wraps each in a
     /// [`PluggableProvider`](crate::PluggableProvider). First-registration-wins on
     /// `provider_id`.
@@ -497,6 +517,7 @@ impl ExtensionRegistry {
             before_agent_start: Vec::new(),
             tool_result: Vec::new(),
             autocomplete: Vec::new(),
+            argument_suggesters: Vec::new(),
             providers: Vec::new(),
             provider_manifests: std::collections::BTreeMap::new(),
             oauth_providers: Vec::new(),
@@ -785,6 +806,49 @@ impl ExtensionRegistry {
         false
     }
 
+    /// Register an argument suggester for `command` (token without the slash).
+    /// Last-registration-wins per command token: re-registering `/msg`
+    /// replaces the previous suggester (mirrors command re-registration).
+    /// Returns `true` if a prior suggester for the same command was replaced.
+    pub fn register_argument_suggester(
+        &mut self,
+        command: &str,
+        handler: ArgumentSuggesterFn,
+        plugin_free_string: FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool {
+        let command = command.trim_start_matches('/').to_ascii_lowercase();
+        let prior = self
+            .argument_suggesters
+            .iter()
+            .position(|s| s.command == command);
+        let replaced = prior.is_some();
+        if let Some(index) = prior {
+            self.argument_suggesters[index] = ArgumentSuggester {
+                command,
+                handler,
+                plugin_free_string,
+                user_data,
+            };
+        } else {
+            self.argument_suggesters.push(ArgumentSuggester {
+                command,
+                handler,
+                plugin_free_string,
+                user_data,
+            });
+        }
+        replaced
+    }
+
+    /// The suggester registered for `command` (token without the slash), if any.
+    pub fn argument_suggester(&self, command: &str) -> Option<&ArgumentSuggester> {
+        let command = command.trim_start_matches('/').to_ascii_lowercase();
+        self.argument_suggesters
+            .iter()
+            .find(|s| s.command == command)
+    }
+
     /// Register a custom provider (B5c). First-registration-wins on `provider_id`
     /// (a later registration for an existing id is dropped, mirroring tool/command
     /// first-wins). Returns `true` if a prior provider of the same id was kept.
@@ -908,6 +972,7 @@ impl ExtensionRegistry {
             before_agent_start: self.before_agent_start.clone(),
             tool_result: self.tool_result.clone(),
             autocomplete: self.autocomplete.clone(),
+            argument_suggesters: self.argument_suggesters.clone(),
             providers: self.providers.clone(),
             provider_manifests: self.provider_manifests.clone(),
             oauth_providers: self.oauth_providers.clone(),
@@ -990,6 +1055,17 @@ impl ExtensionRegistry {
             .append(&mut other.before_agent_start);
         self.tool_result.append(&mut other.tool_result);
         self.autocomplete.append(&mut other.autocomplete);
+        for suggester in other.argument_suggesters.drain(..) {
+            if let Some(existing) = self
+                .argument_suggesters
+                .iter()
+                .position(|s| s.command == suggester.command)
+            {
+                self.argument_suggesters[existing] = suggester;
+            } else {
+                self.argument_suggesters.push(suggester);
+            }
+        }
         for p in other.providers.drain(..) {
             if self
                 .providers
@@ -1067,6 +1143,7 @@ pub struct RegistrySnapshot {
     before_agent_start: Vec<BeforeAgentStartHandler>,
     tool_result: Vec<ToolResultHandler>,
     autocomplete: Vec<RegisteredAutocompleteProvider>,
+    argument_suggesters: Vec<ArgumentSuggester>,
     providers: Vec<RegisteredProvider>,
     provider_manifests: std::collections::BTreeMap<String, ProviderManifest>,
     oauth_providers: Vec<RegisteredOAuthProvider>,
@@ -1092,6 +1169,17 @@ impl RegistrySnapshot {
     /// The registered slash commands.
     pub fn commands(&self) -> &[RegisteredCommand] {
         &self.commands
+    }
+
+    /// The argument suggester registered for `command` (token without the
+    /// slash), if any. The TUI asks exactly the plugin that registered the
+    /// command; a snapshot holds at most one suggester per token (absorb is
+    /// last-wins).
+    pub fn argument_suggester(&self, command: &str) -> Option<&ArgumentSuggester> {
+        let command = command.trim_start_matches('/').to_ascii_lowercase();
+        self.argument_suggesters
+            .iter()
+            .find(|s| s.command == command)
     }
 
     /// The registered CLI flags, insertion order.
