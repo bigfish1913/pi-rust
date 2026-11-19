@@ -1913,6 +1913,11 @@ impl TuiState {
     /// real keystroke.
     pub(super) fn take_editor_change(&self) -> Option<serde_json::Value> {
         let text = self.editor.get_text();
+        // Publish the draft for `GetEditorText` (pi's `ui.getEditorText`) on
+        // every tick, including a cursor-only move: a plugin that inserts at the
+        // caret must not see a stale position.
+        let cursor = super::autocomplete::editor_cursor_offset(&self.editor, &text);
+        self.editor_text.set_draft(&text, cursor);
         {
             let mut last = self.last_editor_text.lock().unwrap();
             if *last == text {

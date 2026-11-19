@@ -1284,6 +1284,19 @@ pub enum RuntimeActionId {
     ///
     /// Args: `{}`; result: `{"models": <count>}`.
     ReloadModels = 31,
+    /// Read the interactive prompt editor's current draft (pi's
+    /// `ui.getEditorText`).
+    ///
+    /// Args: `{}`; result: `{"text": "…"}`. Never an error: a host with no
+    /// editor (RPC, print, headless) returns an empty string, so a plugin can
+    /// degrade instead of branching on the failure.
+    ///
+    /// This is the pull counterpart of [`EventTag::EditorChange`], which
+    /// deliberately ships no draft text. An extension that needs the draft when
+    /// *it* decides to look (rather than on every keystroke) calls this; one
+    /// that wants to contribute candidates registers an autocomplete provider
+    /// through [`PluginApi::register_autocomplete_provider`].
+    GetEditorText = 32,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1336,6 +1349,7 @@ impl TryFrom<u32> for RuntimeActionId {
             29 => Ok(Self::StopRound),
             30 => Ok(Self::ToolProgram),
             31 => Ok(Self::ReloadModels),
+            32 => Ok(Self::GetEditorText),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1381,6 +1395,7 @@ impl RuntimeActionId {
         Self::StopRound,
         Self::ToolProgram,
         Self::ReloadModels,
+        Self::GetEditorText,
     ];
 
     /// The highest defined action id.
@@ -1436,6 +1451,50 @@ pub type RuntimeActionFn = extern "C" fn(
 /// runtime handle (or null when no action bridge exists), scoped to that
 /// registration. Pass it to runtime_action; never cache it across registrations.
 pub type CommandHandlerFn =
+    extern "C" fn(args_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
+/// A plugin autocomplete provider, stacked on top of the host's built-in one
+/// (pi's `ui.addAutocompleteProvider`).
+///
+/// `query_json` is a borrowed envelope:
+///
+/// ```json
+/// {"text":"#Bud","cursor":4,"line":"#Bud","linePrefix":"#Bud"}
+/// ```
+///
+/// `text` is the whole draft, `cursor` a **byte** offset into it (UTF-8 boundary
+/// aligned), `line` the current line, `linePrefix` the text before the caret on
+/// that line. Return code `0` means "here are suggestions" and `out` must hold
+/// (owning, reclaimed with the `plugin_free_string` passed to
+/// [`PluginApi::register_autocomplete_provider`]):
+///
+/// ```json
+/// {"items":[{"text":"#Budget.xlsx","label":"Budget.xlsx",
+///             "description":"Excel · focused","insertSpace":false}]}
+/// ```
+///
+/// Return code `1` (or an empty `items` array) means "no opinion": the host
+/// falls through to its built-in provider, so a plugin only wins the candidates
+/// it actually produces. Any other return code is logged and treated as `1`.
+///
+/// `insertSpace` defaults to `true` when absent, matching the editor's
+/// file/slash acceptance; a `#`-style insertion sets it to `false` so the caret
+/// lands right after the inserted name. `isDirectory` defaults to `false` and
+/// only affects display.
+pub type AutocompleteProviderFn =
+    extern "C" fn(query_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
+/// Argument completions for one registered slash command (pi's
+/// `RegisteredCommand.getArgumentCompletions`).
+///
+/// `args_json` is a borrowed `{"argumentPrefix":"con"}` envelope holding the
+/// text after the command name and its trailing space. `out` is owning and
+/// reclaimed with the `plugin_free_string` passed to
+/// [`PluginApi::register_command_completions`]. Return `0` with
+/// `{"items":[{"text":"connect","description":"Connect the bridge"}]}`, or
+/// `1` (or empty `items`) for "no completions" — which is not an error and
+/// leaves the editor's default behavior alone.
+pub type CommandArgumentCompletionFn =
     extern "C" fn(args_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
 /// A render/transform fn (for the renderer registrars). `input_json` is borrowed;
@@ -1953,6 +2012,45 @@ pub struct PluginApi {
             user_data: *mut c_void,
         ) -> i32,
     >,
+    /// Stack an autocomplete provider on top of the host's built-in one
+    /// (pi's `ui.addAutocompleteProvider`). Appended after
+    /// `register_tool_result` so every earlier offset stays valid; older hosts
+    /// supply `None`.
+    ///
+    /// The handler (see [`AutocompleteProviderFn`]) is consulted **before** the
+    /// built-in providers, so a plugin can win the candidates it recognizes
+    /// while everything else keeps the file/slash behavior. `plugin_free_string`
+    /// reclaims the handler's `out` strings — the same producer-owns convention
+    /// as tools, not the host-owns one used by command handlers.
+    ///
+    /// Returns `0` once registered, `-1` outside registration.
+    pub register_autocomplete_provider: Option<
+        extern "C" fn(
+            handler: AutocompleteProviderFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+    /// Attach argument completions to a slash command this plugin already
+    /// registered (pi's `getArgumentCompletions`). Appended after
+    /// `register_autocomplete_provider`; older hosts supply `None`.
+    ///
+    /// Args for [`CommandArgumentCompletionFn`] are the text after the command
+    /// name and its trailing space, so `/office con` yields
+    /// `{"argumentPrefix":"con"}`. Re-registering the same name replaces the
+    /// previous handler (the last registration wins, matching how a command
+    /// handler is replaced).
+    ///
+    /// Returns `0` on success, `1` for a command this plugin never registered,
+    /// and `-1` outside registration or on a host without the slot.
+    pub register_command_completions: Option<
+        extern "C" fn(
+            name: StbStringRef,
+            handler: CommandArgumentCompletionFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 }
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
@@ -2004,6 +2102,54 @@ pub fn register_tool_result(api: &PluginApi, handler: ToolResultFn, user_data: *
     }
     match api.register_tool_result {
         Some(register) => register(handler, callbacks::free_string, user_data),
+        None => -1,
+    }
+}
+
+/// Register an autocomplete provider (see [`AutocompleteProviderFn`]).
+///
+/// Returns the host's registration status, or `-1` when the host predates the
+/// slot (its `struct_size` does not reach it) or leaves it `None`. A plugin on
+/// such a host keeps the built-in file/slash completion only.
+pub fn register_autocomplete_provider(
+    api: &PluginApi,
+    handler: AutocompleteProviderFn,
+    user_data: *mut c_void,
+) -> i32 {
+    let end = core::mem::offset_of!(PluginApi, register_autocomplete_provider)
+        + core::mem::size_of::<usize>();
+    if (api.struct_size as usize) < end {
+        return -1;
+    }
+    match api.register_autocomplete_provider {
+        Some(register) => register(handler, callbacks::free_string, user_data),
+        None => -1,
+    }
+}
+
+/// Attach argument completions to a command this plugin registered (see
+/// [`CommandArgumentCompletionFn`]).
+///
+/// Returns `0` on success, `1` for an unknown command, and `-1` when the host
+/// predates the slot or leaves it `None`.
+pub fn register_command_completions(
+    api: &PluginApi,
+    name: &str,
+    handler: CommandArgumentCompletionFn,
+    user_data: *mut c_void,
+) -> i32 {
+    let end = core::mem::offset_of!(PluginApi, register_command_completions)
+        + core::mem::size_of::<usize>();
+    if (api.struct_size as usize) < end {
+        return -1;
+    }
+    match api.register_command_completions {
+        Some(register) => register(
+            StbStringRef::from_str(name),
+            handler,
+            callbacks::free_string,
+            user_data,
+        ),
         None => -1,
     }
 }
@@ -2399,6 +2545,8 @@ mod tests {
             register_tool_prompt: None,
             register_oauth_provider_cancellable: None,
             register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -2512,7 +2660,22 @@ mod tests {
             cancellable + size_of::<usize>(),
             "register_tool_result must be appended after register_oauth_provider_cancellable"
         );
-        assert_eq!(size_of::<PluginApi>(), tool_result + size_of::<usize>());
+        let autocomplete = core::mem::offset_of!(PluginApi, register_autocomplete_provider);
+        assert_eq!(
+            autocomplete,
+            tool_result + size_of::<usize>(),
+            "register_autocomplete_provider must be appended after register_tool_result"
+        );
+        let command_completions = core::mem::offset_of!(PluginApi, register_command_completions);
+        assert_eq!(
+            command_completions,
+            autocomplete + size_of::<usize>(),
+            "register_command_completions must be appended after register_autocomplete_provider"
+        );
+        assert_eq!(
+            size_of::<PluginApi>(),
+            command_completions + size_of::<usize>()
+        );
         assert_eq!(align_of::<PluginApi>(), align_of::<*const ()>());
     }
 
@@ -2551,6 +2714,7 @@ mod tests {
             RuntimeActionId::StopRound,
             RuntimeActionId::ToolProgram,
             RuntimeActionId::ReloadModels,
+            RuntimeActionId::GetEditorText,
         ];
 
         // Stable wire ids must not depend on which proposal was merged first.
@@ -2565,12 +2729,14 @@ mod tests {
         assert_eq!(u32::from(RuntimeActionId::StopRound), 29);
         assert_eq!(u32::from(RuntimeActionId::ToolProgram), 30);
         assert_eq!(u32::from(RuntimeActionId::ReloadModels), 31);
+        assert_eq!(u32::from(RuntimeActionId::GetEditorText), 32);
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ListCommands));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::Abort));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::RelayUiDialog));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::StopRound));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ReloadModels));
-        assert_eq!(RuntimeActionId::MAX, 31);
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::GetEditorText));
+        assert_eq!(RuntimeActionId::MAX, 32);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         let one_past_last = RuntimeActionId::MAX + 1;
@@ -2611,6 +2777,8 @@ mod tests {
             register_tool_prompt: None,
             register_oauth_provider_cancellable: None,
             register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
         }
     }
 

@@ -77,7 +77,7 @@ pub use actions::{
     ReloadModelsMailbox, ReloadModelsRequest, RuntimeActionHost, SideQuestionSink, UiDialogMailbox,
     UiDialogRequest,
 };
-pub use editor_text::{EditorTextEdit, EditorTextMailbox, EditorTextMode};
+pub use editor_text::{EditorDraft, EditorTextEdit, EditorTextMailbox, EditorTextMode};
 pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
 pub use loader::{
     load_dir, load_one, load_session, load_session_mixed, load_session_mixed_guarded,
@@ -93,7 +93,8 @@ pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
     assert_active, current_platform, platform_allows, BeforeAgentStartHandler, ExtensionRegistry,
-    ExtensionTool, ProviderManifest, RegisteredFlag, RegisteredHandler, RegisteredOAuthProvider,
+    ExtensionTool, ProviderManifest, RegisteredAutocompleteProvider, RegisteredCommand,
+    RegisteredCommandCompletions, RegisteredFlag, RegisteredHandler, RegisteredOAuthProvider,
     RegisteredProvider, RegisteredRenderer, RegisteredRendererKind, RegisteredShortcut,
     RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler, ToolPromptMetadata,
     DEFAULT_PRIORITY,
@@ -336,6 +337,8 @@ impl HostApi {
                 trampoline_register_oauth_provider_cancellable,
             ),
             register_tool_result: Some(trampoline_register_tool_result),
+            register_autocomplete_provider: Some(trampoline_register_autocomplete_provider),
+            register_command_completions: Some(trampoline_register_command_completions),
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
@@ -1017,6 +1020,59 @@ extern "C" fn trampoline_register_tool_result(
     } else {
         -1
     }
+}
+
+/// `register_autocomplete_provider` trampoline. Stores the handler with the
+/// plugin's own `plugin_free_string` (the `out` StbString it produces is
+/// plugin-owned) and its opaque `user_data`, exactly like a `tool_result`
+/// transform.
+extern "C" fn trampoline_register_autocomplete_provider(
+    handler: rpi_plugin_sdk::AutocompleteProviderFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    let ok = with_current_api(|api| {
+        api.with_registry(|reg| {
+            reg.register_autocomplete_provider(handler, plugin_free_string, user_data)
+        })
+        .is_some()
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// `register_command_completions` trampoline. Attaches the callback to an
+/// already-registered command: `0` on success, `1` when no such command exists
+/// (the plugin never registered it, or another plugin won the name first-wins),
+/// `-1` outside registration.
+extern "C" fn trampoline_register_command_completions(
+    name: StbStringRef,
+    handler: rpi_plugin_sdk::CommandArgumentCompletionFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    rpi_plugin_sdk::guard_or(-1, || {
+        // SAFETY: plugin-supplied ref is borrowed for this registration call.
+        let name = unsafe { name.as_str() };
+        match with_current_api(|api| {
+            api.with_registry(|reg| {
+                reg.set_command_completions(name, handler, plugin_free_string, user_data)
+            })
+        }) {
+            Some(Some(true)) => 0,
+            Some(Some(false)) => 1,
+            _ => -1,
+        }
+    })
 }
 
 /// `register_before_agent_start` trampoline. Same shape as

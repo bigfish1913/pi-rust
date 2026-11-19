@@ -45,6 +45,7 @@ use events::*;
 mod selectors;
 use selectors::*;
 mod autocomplete;
+mod plugin_autocomplete;
 use autocomplete::*;
 mod rendering;
 use rendering::*;
@@ -1315,6 +1316,12 @@ pub async fn interactive_tui(
     let autocomplete = AutocompleteManager::new();
     {
         let mut combined = CombinedAutocompleteProvider::new();
+        // Plugins get first refusal (pi's `addAutocompleteProvider` stacks on
+        // top of the built-in provider): their candidates are the specific ones
+        // (`#document`), and a plugin with no opinion falls through.
+        for provider in plugin_autocomplete::providers(reload_context.extension_session.clone()) {
+            combined.add_provider(provider);
+        }
         combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(
             all_slash_commands,
         )));

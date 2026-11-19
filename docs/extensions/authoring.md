@@ -146,6 +146,24 @@ rpi_plugin_sdk::export_plugin!(|api| {
 工具范围只能缩小，预算和取消由宿主管理。旧宿主不支持时必须明确报错，
 不能静默退回重新解析默认配置的子进程。详见 [子 agent 协议](subagents.md)。
 
+### 输入框草稿与补全
+
+Pi 的 `ui.getEditorText()`、`ui.addAutocompleteProvider()` 与
+`RegisteredCommand.getArgumentCompletions` 在 rpi 侧对应三条通道：
+
+- `GetEditorText`（32）：`{}` → `{"text":"...","cursor":N}`（`cursor` 为字节偏移）。
+  永不报错：无编辑器的宿主返回空草稿，按「没有草稿」退化而不是报错。
+  `EditorChange` 事件仍按设计不携带文本，不要用它攒本地副本。
+- `api.register_autocomplete_provider`：查询 `{"text","cursor","line","linePrefix"}`，
+  返回 `{"items":[{"text","label"?,"description"?,"insertSpace"?,"isDirectory"?}]}`。
+  返回 `1` 或空列表表示「没有意见」，宿主管继续问下一个插件并最终回落内置
+  file/slash provider；插件 provider 排在内置之前。
+- `api.register_command_completions`：先注册命令，再为该命令挂参数补全。参数
+  `{"argumentPrefix":"con"}`，返回 `0`/`1`（命令不属于本插件）/`-1`（不在注册期）。
+
+两个槽位都追加在 vtable 尾部、不改 ABI 版本；旧宿主为 `None` 时跳过注册，
+不能因此中止插件注册。补全在 TUI 线程上每帧询问，handler 必须线程安全且快速返回。
+
 ## 4. 工具生命周期：execute → poll → cancel → destroy
 
 工具导出四个 `extern "C"` 函数，宿主按固定协议驱动：

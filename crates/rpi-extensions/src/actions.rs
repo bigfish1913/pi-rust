@@ -1485,6 +1485,9 @@ async fn dispatch(
         // Editor-only action: served by the bridge (no harness call), exactly
         // like `SetStatus`/`UiDialog`. The TUI drains the queue each tick.
         RuntimeActionId::SetEditorText => editor_text.handle(args),
+        // Read side of the same mailbox: the TUI publishes the draft each
+        // tick, so this needs no harness call either.
+        RuntimeActionId::GetEditorText => editor_text.handle_get(args),
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
         RuntimeActionId::ToolProgram => Err("ToolProgram requires a live invocation bridge".into()),
@@ -1921,8 +1924,16 @@ mod tests {
             RuntimeActionId::try_from(31).is_ok(),
             "ReloadModels must remain a valid runtime action id"
         );
+        // Re-verified when `GetEditorText = 32` was appended: it reads the
+        // editor draft through the status/editor mailbox, so it never reaches
+        // `child_agent_roster` / `stop_child_agent`, whose un-owner-scoped
+        // control must stay unreachable from the plugin ABI.
         assert!(
-            RuntimeActionId::try_from(32).is_err(),
+            RuntimeActionId::try_from(32).is_ok(),
+            "GetEditorText must remain a valid runtime action id"
+        );
+        assert!(
+            RuntimeActionId::try_from(33).is_err(),
             "a new RuntimeActionId was added: re-verify that host-only child-agent control \
              (un-owner-scoped roster/stop) is still unreachable from the plugin ABI"
         );
