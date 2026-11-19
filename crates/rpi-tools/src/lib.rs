@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod active_session_guard;
 pub mod env;
 pub mod error;
 pub mod file_io;
@@ -36,6 +37,9 @@ pub use tools::{
     BashToolOptions, ExecutionToolContext, ProcessedImage, ReadImageProcessor, ReadToolOptions,
 };
 
+pub use active_session_guard::{
+    activate_session_guard, clear_session_guard, grant_writer, WriterCapability,
+};
 pub use env::{
     ExecutionEnv, FileContent, FileInfo, FileKind, FileSystem, Shell, ShellExecOptions,
     ShellOutput, WriterLease,
