@@ -241,6 +241,48 @@ macro_rules! take_step_result {
     }};
 }
 
+/// Copy and reclaim a plugin-owned tool result **without** writing `unsafe`.
+///
+/// [`take_step_result!`] is the raw form: it forwards to an `unsafe fn`, so
+/// every caller needs its own `unsafe` block and its own SAFETY argument. This
+/// macro is the same copy and reclaim with that contract asserted once, here —
+/// use it from a host that drives a plugin's `poll`, or from a test that plays
+/// the host, and keep [`take_step_result!`] only for a call site that must spell
+/// the ownership argument out itself.
+///
+/// ```ignore
+/// match rpi_plugin_sdk::take_step!(result) {
+///     Step::Done(json) => parse(&json),
+///     Step::Err(message) => Err(message),
+///     Step::Pending(progress) => still_running(progress),
+/// }
+/// ```
+#[macro_export]
+macro_rules! take_step {
+    ($result:expr) => {{
+        let result = $result;
+        // SAFETY: the caller received `result` from one plugin callback and
+        // transfers it exactly once; the tag selects the live union arm and the
+        // string is reclaimed through the producing SDK's deallocator.
+        unsafe { $crate::callbacks::take_step_result(result) }
+    }};
+}
+
+/// [`take_step!`] with an explicit producer deallocator, for a result that came
+/// from another plugin instance.
+#[macro_export]
+macro_rules! take_step_with {
+    ($result:expr, $free:expr) => {{
+        let result = $result;
+        // Bind the metavariable outside the `unsafe` block: clippy rejects
+        // expanding a caller expression inside one.
+        let free: $crate::FreeStringFn = $free;
+        // SAFETY: as in `take_step!`; `free` is that plugin's producer-side
+        // deallocator, callable from any thread.
+        unsafe { $crate::callbacks::take_step_result_with(result, free) }
+    }};
+}
+
 /// Call a runtime action and return `(status_code, response_body)`.
 ///
 /// Without this macro every plugin that talks to the host has to reproduce the

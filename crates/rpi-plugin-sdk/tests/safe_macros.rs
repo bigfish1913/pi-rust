@@ -109,6 +109,38 @@ fn outbound_macros_need_no_unsafe_in_plugin_code() {
 }
 
 #[test]
+fn taking_a_step_result_needs_no_unsafe_in_caller_code() {
+    host::reset();
+    // A plugin produced this in `poll`; the host has to copy and reclaim it.
+    let done = sdk::take_step!(sdk::StepResult::done(StbString::from_string(
+        r#"{"content":[]}"#.into(),
+    )));
+    match done {
+        sdk::callbacks::Step::Done(body) => assert_eq!(body, r#"{"content":[]}"#),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    let failed = sdk::take_step!(sdk::StepResult::err(StbString::from_string("boom".into(),)));
+    assert_eq!(failed, sdk::callbacks::Step::Err("boom".into()));
+    let pending = sdk::take_step!(sdk::StepResult::pending(StbString::from_string(
+        r#"{"progress":0.5}"#.into(),
+    )));
+    assert_eq!(
+        pending,
+        sdk::callbacks::Step::Pending(r#"{"progress":0.5}"#.into())
+    );
+
+    // A foreign plugin's result must be reclaimed with *its* deallocator.
+    let foreign = sdk::take_step_with!(
+        sdk::StepResult::done(StbString::from_string("x".into())),
+        host::counting_free_for_tests()
+    );
+    assert_eq!(foreign, sdk::callbacks::Step::Done("x".into()));
+    // The three local results were reclaimed through this SDK's own deallocator
+    // (`take_step!`), so only the foreign one shows up on the counted host free.
+    assert_eq!(host::frees(), 1);
+}
+
+#[test]
 fn a_command_handler_needs_no_unsafe_in_plugin_code() {
     sdk::string_handler! {
         fn probe_command(input, out, _user_data) {
