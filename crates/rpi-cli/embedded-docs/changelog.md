@@ -11,6 +11,17 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.26.1](https://github.com/bigfish1913/pi-rust/compare/v0.26.0...v0.26.1) - 2026-11-19
+
+### Added
+
+- *(sdk)* take_step! without a caller-side unsafe block ([#378](https://github.com/bigfish1913/pi-rust/pull/378))
+- *(sdk)* keep ABI strings out of plugin unsafe blocks ([#375](https://github.com/bigfish1913/pi-rust/pull/375))
+
+### Other
+
+- *(harness)* state that an expired lease fails closed ([#376](https://github.com/bigfish1913/pi-rust/pull/376))
+
 ## [0.26.0](https://github.com/bigfish1913/pi-rust/compare/v0.25.0...v0.26.0) - 2026-11-19
 
 ### Added
