@@ -298,7 +298,9 @@ fn validate(identity: &TaskIdentity) -> Result<(), TaskLeaseError> {
 ///
 /// - same identity + same lease id → renewal (extends expiry);
 /// - another identity holding a live lease → [`TaskLeaseError::Conflict`];
-/// - an expired lease → the old record becomes `Indeterminate`, the new one runs;
+/// - an expired lease → [`TaskLeaseError::Expired`]; nothing runs. The caller
+///   must run [`recover`] (which retires the record as `Indeterminate`) or open a
+///   new `execution_generation` before it can acquire again;
 /// - a terminal record → [`TaskLeaseError::AlreadyFinished`].
 pub fn acquire(
     session_path: &Path,
