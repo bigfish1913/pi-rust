@@ -249,7 +249,7 @@ macro_rules! take_step_result {
 /// the allocation back through the host's `free_string` (unsafe) — which forces
 /// a `#![deny(unsafe_code)]` plugin to open a hole for plumbing that has nothing
 /// to do with its own logic. The macro keeps that contract here, in the crate
-/// that owns it, exactly like [`string_handler!`] does for the inbound
+/// that owns it, exactly like [`string_handler!`](crate::string_handler) does for the inbound
 /// direction.
 ///
 /// The body is returned verbatim (empty when the host wrote nothing): callers
@@ -280,11 +280,17 @@ macro_rules! call_action {
     }};
 }
 
-/// Read an ABI string, owned ([`StbString`](crate::StbString)) or borrowed
+/// Read an ABI string, owned ([`StbString`]) or borrowed
 /// ([`StbStringRef`](crate::StbStringRef)), into a `String`.
 ///
-/// Public so the [`stb_text!`] macro can stay type-agnostic; plugins should call
-/// the macro, never this trait directly.
+/// `#[doc(hidden)]`: this exists only so [`stb_text!`](crate::stb_text) can be
+/// type-agnostic. It is not part of the documented plugin surface — a safe
+/// accessor would let safe code forge an ABI string, so the macros stay the
+/// only advertised entry point.
+///
+/// Public for macro expansion only; plugins should call the macro, never this
+/// trait directly.
+#[doc(hidden)]
 pub trait AbiText {
     /// Copy the string out of the ABI.
     ///
@@ -315,7 +321,7 @@ impl AbiText for crate::StbStringRef {
 /// does not own — an owned [`StbString`](crate::StbString) it is about to hand
 /// back to the host, a `StableToolSchema` field it just built, or a borrowed
 /// [`StbStringRef`](crate::StbStringRef) whose lifetime the host guarantees for
-/// the current call. Use [`stb_take!`] when the plugin *does* own the
+/// the current call. Use [`stb_take!`](crate::stb_take) when the plugin *does* own the
 /// allocation.
 #[macro_export]
 macro_rules! stb_text {
@@ -329,7 +335,7 @@ macro_rules! stb_text {
 
 /// Copy an owning ABI string and reclaim it with its producer's deallocator.
 ///
-/// The counterpart of [`stb_text!`] for strings the plugin received and must
+/// The counterpart of [`stb_text!`](crate::stb_text) for strings the plugin received and must
 /// free: one read, one free, in that order, so the allocation cannot leak. The
 /// deallocator is the one the host supplied with the value (for a tool `execute`
 /// that is the fourth argument), never this process's `free`.
@@ -533,6 +539,28 @@ mod tests {
         assert_eq!(rc, 1);
         assert_eq!(body, r#"{"error":"nope"}"#);
         assert_eq!(OWNER_FREES.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn call_action_tolerates_a_host_that_writes_nothing() {
+        extern "C" fn silent(
+            _id: u32,
+            _args: StbStringRef,
+            _out: *mut StbString,
+            _user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            -1 // no bridge / unsupported action: nothing written
+        }
+        OWNER_FREES.with(|count| count.set(0));
+        let host = FakeHost {
+            runtime_action: silent,
+            ..fake_host()
+        };
+        let (rc, body) = crate::call_action!(host, 9u32, "{}");
+        assert_eq!(rc, -1);
+        assert_eq!(body, "");
+        // Freeing the untouched empty slot is a no-op, not a double free.
+        assert_eq!(OWNER_FREES.with(std::cell::Cell::get), 0);
     }
 
     #[test]

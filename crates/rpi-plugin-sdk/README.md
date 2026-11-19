@@ -172,10 +172,14 @@ let params = rpi_plugin_sdk::stb_take!(params, free);        // read + reclaim
 ```
 
 Together with `string_handler!`, `execute_handler!` and `event_handler!` these
-cover every ABI shape a plugin touches, so a plugin crate can run
-`#![deny(unsafe_code)]` — `crates/rpi-plugin-sdk/tests/safe_macros.rs` exercises
-that under the lint. Hand-rolled trampolines remain possible; they are the only
-case that still needs an explicit `unsafe` block.
+cover the tool, command, event, renderer and runtime-action shapes, so that code
+compiles under `#![deny(unsafe_code)]` — `crates/rpi-plugin-sdk/tests/safe_macros.rs`
+exercises it under the lint. Three cases still need an explicit `unsafe` block:
+
+- a hand-rolled trampoline;
+- a `ProviderRequestFn` / `ProviderStreamRequestFn`, which reads the request and
+  writes `out` directly (see `examples/plugin-stub/src/lib.rs`);
+- a tool handle that heap-allocates per-call state (`Box::into_raw` / `from_raw`).
 
 Raw string readers `StbString::to_string_lossy` and `json::from_stable` require
 an explicit `unsafe` call: their public ABI pointer/length fields cannot prove

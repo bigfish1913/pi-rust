@@ -140,8 +140,8 @@ rpi_plugin_sdk::export_plugin!(|api| {
 
 ### 不写 unsafe 也能写插件
 
-ABI 的字符串与步骤返回都是裸指针，SDK 提供一组宏把契约收在自己这一侧，因此整个插件
-crate 可以开 `#![deny(unsafe_code)]`：
+ABI 的字符串与步骤返回都是裸指针，SDK 提供一组宏把契约收在自己这一侧。用它们写出的
+工具、命令、事件、渲染器和 runtime action 代码可以整体开 `#![deny(unsafe_code)]`：
 
 | 形状 | 宏 |
 | --- | --- |
@@ -152,9 +152,11 @@ crate 可以开 `#![deny(unsafe_code)]`：
 | 读 ABI 字符串（不释放） | `stb_text!(value)` |
 | 读并回收 ABI 字符串 | `stb_take!(value, free)` |
 
-它们不改 C ABI，只是把 `unsafe` 收敛到 SDK 内部；手写 trampoline 是唯一还需要自己写
-`unsafe` 的形状。`crates/rpi-plugin-sdk/tests/safe_macros.rs` 在 `#![deny(unsafe_code)]`
-下覆盖了这些路径。
+它们不改 C ABI，只是把 `unsafe` 收敛到 SDK 内部。仍然需要自己写 `unsafe` 的有三种：
+手写 trampoline；`ProviderRequestFn` / `ProviderStreamRequestFn`（读请求、写 `out`，见
+`examples/plugin-stub/src/lib.rs`）；以及需要在每次调用里堆分配状态的工具 handle
+（`Box::into_raw` / `from_raw`）。`crates/rpi-plugin-sdk/tests/safe_macros.rs` 在
+`#![deny(unsafe_code)]` 下覆盖了宏能覆盖的路径。
 
 ### 独立子任务
 
