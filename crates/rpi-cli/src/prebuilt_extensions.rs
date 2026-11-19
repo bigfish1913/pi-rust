@@ -650,7 +650,7 @@ pub async fn install(
         crate::install::RetiredGcOutcome::Deferred
     ) {
         eprintln!(
-            "warning: stale native extension artifacts were not cleaned up because a running rpi host holds the resource lease; they will be ignored at startup and retried on a later install"
+            "warning: stale native extension artifacts were not cleaned up because the resource lease could not be acquired (a running rpi host or lease setup failure); they will be ignored at startup and retried on a later install"
         );
     }
     println!("rpi will validate the plugin entrypoint/SDK API size and load this extension on the next start.");

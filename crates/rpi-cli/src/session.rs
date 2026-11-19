@@ -2896,9 +2896,10 @@ fn registry_aware_extension_inputs(
     dirs: &[PathBuf],
     explicit_files: &[PathBuf],
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let global_dir = crate::config::agent_dir()
-        .ok()
-        .map(|dir| dir.join("extensions"));
+    // `agent_dir` owns the registry file; `global_dir` is the directory the
+    // loader would otherwise scan. Keep both: the helpers take the agent dir.
+    let agent_dir = crate::config::agent_dir().ok();
+    let global_dir = agent_dir.as_ref().map(|dir| dir.join("extensions"));
     let mut filtered_dirs = Vec::with_capacity(dirs.len());
     let mut files = explicit_files.to_vec();
     let mut global_dir_handled = false;
@@ -2908,9 +2909,23 @@ fn registry_aware_extension_inputs(
             .is_some_and(|global| same_extension_dir(global, dir));
         if is_global {
             if !global_dir_handled {
-                files.extend(crate::install::active_global_native_package_artifacts());
-                files.extend(crate::install::unregistered_global_native_package_artifacts());
                 global_dir_handled = true;
+                // An unreadable registry cannot tell us which artifacts are
+                // retired, so fall back to the historical directory scan rather
+                // than silently loading no global extension at all.
+                let selection = agent_dir.as_ref().map(|agent| {
+                    (
+                        crate::install::active_global_native_package_artifacts_at(agent),
+                        crate::install::unregistered_global_native_package_artifacts_at(agent),
+                    )
+                });
+                match selection {
+                    Some((Ok(active), Ok(legacy))) => {
+                        files.extend(active);
+                        files.extend(legacy);
+                    }
+                    _ => filtered_dirs.push(dir.clone()),
+                }
             }
             continue;
         }
@@ -5840,6 +5855,39 @@ mod tests {
         let outcome = reload_extension_resources(&harness, &context).await;
         assert!(!outcome.had_errors, "{}", outcome.summary);
         assert_eq!(outcome.project_trusted, Some(true));
+    }
+
+    #[test]
+    fn registry_aware_global_selection_falls_back_when_the_registry_is_corrupt() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let extensions = agent.join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::write(agent.join("native-packages.json"), b"{ this is not json").unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        // An unreadable registry cannot tell us which artifacts are retired. Keep
+        // the historical directory scan instead of silently loading nothing.
+        let dirs = vec![extensions.clone()];
+        let (scan_dirs, files) = registry_aware_extension_inputs(&dirs, &[]);
+        assert!(
+            scan_dirs.contains(&extensions),
+            "a corrupt registry must not disable every global extension"
+        );
+        assert!(files.is_empty());
     }
 
     #[test]

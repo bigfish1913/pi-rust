@@ -2702,8 +2702,12 @@ mod tests {
         )
         .unwrap();
 
+        // `tempfile` hands back `/var/folders/...` on macOS, and the resource
+        // lease rejects a root reached through a symlink (`/var` -> `/private/var`),
+        // so canonicalize before asking for the lease.
+        let agent_dir = std::fs::canonicalize(agent.temp.path()).unwrap();
         assert_eq!(
-            gc_retired_native_artifacts(agent.temp.path()),
+            gc_retired_native_artifacts(&agent_dir),
             RetiredGcOutcome::Completed
         );
         assert!(extensions.join(active).exists());
@@ -2723,8 +2727,9 @@ mod tests {
         std::fs::write(extensions.join(stale), b"cdylib").unwrap();
         let _leases = crate::resource_management::host_leases(&cwd).unwrap();
 
+        let agent_dir = std::fs::canonicalize(agent.temp.path()).unwrap();
         assert_eq!(
-            gc_retired_native_artifacts(agent.temp.path()),
+            gc_retired_native_artifacts(&agent_dir),
             RetiredGcOutcome::Deferred
         );
         assert!(extensions.join(stale).exists());
