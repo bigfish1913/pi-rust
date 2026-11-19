@@ -11,13 +11,18 @@ impl Drop for RestoreSmokeConfig {
 }
 
 /// A real separately-built plugin crosses the SDK ABI and runtime action bridge.
-/// The worker is paused immediately, so this remains provider/network-free while
-/// checking the current durable goal notice and session semantics.
+///
+/// The goal is seeded with `append_custom_entry` instead of the `goal start`
+/// action: since rpi-goal 0.3.0 `start` arms an automatic continuation, which
+/// would need a live provider. Seeding keeps this fixture offline while still
+/// covering what it is for — branch-local goal state, the deferred notice outbox,
+/// turn accounting, and the terminal tool guards across the real ABI.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "set RPI_GOAL_SMOKE_DLL to the matching rpi-goal cdylib"]
 async fn native_goal_outbox_smoke() {
     use rpi_harness::agent_harness::AgentLane;
     use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
+    use rpi_plugin_sdk::EventTag;
     use serde_json::json;
     let dll = std::env::var_os("RPI_GOAL_SMOKE_DLL").expect("RPI_GOAL_SMOKE_DLL is required");
     let temporary = tempfile::tempdir().unwrap();
@@ -47,14 +52,21 @@ async fn native_goal_outbox_smoke() {
     let (harness, _events, context) = build(&resolved, &args, temporary.path(), false)
         .await
         .unwrap();
-    let tool = harness
-        .get_tools()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|tool| tool.tool.schema().name == "goal")
-        .expect("goal DLL must load")
-        .tool;
+
+    // The plugin registers the command tool plus the three explicit stopping
+    // reasons. `goal start` would arm automatic work, so the state is seeded.
+    let tools = harness.get_tools().await.unwrap();
+    let tool_named = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool.tool.schema().name == name)
+            .map(|tool| tool.tool.clone())
+            .unwrap_or_else(|| panic!("{name} DLL tool must load"))
+    };
+    let tool = tool_named("goal");
+    for name in ["goal_complete", "goal_blocked", "goal_wait"] {
+        tool_named(name);
+    }
     let execute = |params| {
         tool.execute(
             "smoke",
@@ -63,20 +75,93 @@ async fn native_goal_outbox_smoke() {
             Arc::new(|_| {}),
         )
     };
-    let started = execute(json!({"action":"start","title":"Branch A","maxTurns":2}))
+    let seed = |title: &str, max_turns: u32| {
+        let harness = harness.clone();
+        let title = title.to_string();
+        async move {
+            harness
+                .session()
+                .append_custom_entry(
+                    "goal-state",
+                    Some(json!({
+                        "version": 2,
+                        "active": {
+                            "id": format!("seed-{title}"),
+                            "title": title,
+                            "status": "active",
+                            "notes": "",
+                            "startedAt": 1,
+                            "updatedAt": 1,
+                            "turnsUsed": 0,
+                            "maxTurns": max_turns,
+                        },
+                        "archived": []
+                    })),
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    seed("Branch A", 2).await;
+    assert_eq!(
+        execute(json!({"action":"show"})).await.unwrap().details["goal"]["title"],
+        "Branch A"
+    );
+    let source = harness.view().get_leaf_id().await.unwrap().unwrap();
+    assert!(harness
+        .view()
+        .find_entries_on_branch(
+            &EntryQuery {
+                entry_type: Some("message"),
+                ..Default::default()
+            },
+            &BranchBounds::default()
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    // Neither branch navigation nor session switching dispatches a goal callback.
+    harness
+        .navigate_tree(None, false, None, None)
         .await
         .unwrap();
-    assert_eq!(started.details["goal"]["title"], "Branch A");
-    // The current goal worker uses triggerTurn=true. Pause immediately so this
-    // smoke test remains provider-free while exercising the durable notice path.
-    execute(json!({"action":"pause"})).await.unwrap();
-    harness.abort_and_reconcile().await.unwrap();
     assert_eq!(
-        execute(json!({"action":"show"})).await.unwrap().details["goal"]["status"],
-        "paused"
+        execute(json!({"action":"show"})).await.unwrap().details["active"],
+        false
     );
-    let original = harness.session().storage().metadata().id;
-    let initial_entries = harness
+    seed("Branch B", 2).await;
+    harness
+        .navigate_tree(Some(&source), false, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        execute(json!({"action":"show"})).await.unwrap().details["goal"]["title"],
+        "Branch A"
+    );
+
+    // A stale id never mutates the goal: the terminal tool rejects it.
+    assert!(tool_named("goal_complete")
+        .execute(
+            "smoke",
+            json!({"goal_id": "stale", "summary": "done"}),
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .is_err());
+
+    assert!(dispatch_session_event_async(&context, EventTag::TurnEnd)
+        .await
+        .is_none());
+    assert!(dispatch_session_event_async(&context, EventTag::TurnEnd)
+        .await
+        .is_none());
+    let shown = execute(json!({"action":"show"})).await.unwrap();
+    // A maxed turn budget is its own stopped state since 0.3.0.
+    assert_eq!(shown.details["goal"]["status"], "budget_limited");
+    assert_eq!(shown.details["goal"]["turnsUsed"], 2);
+    let entries = harness
         .view()
         .find_entries_on_branch(
             &EntryQuery {
@@ -88,26 +173,31 @@ async fn native_goal_outbox_smoke() {
         )
         .await
         .unwrap();
-    assert!(
-        initial_entries.len() >= 2,
-        "start and pause persist goal notices even if kickoff began: {initial_entries:?}"
+    assert_eq!(
+        entries.len(),
+        2,
+        "one goal notice and one budget-pause notice"
     );
-    let goal_notices = initial_entries
-        .iter()
-        .filter(|entry| {
-            matches!(
-                entry,
-                rpi_harness::session::types::Entry::Message(message)
-                    if matches!(&message.message, rpi_agent::AgentMessage::Custom(custom)
-                        if custom.data.get("customType") == Some(&json!("goal")))
+    assert!(dispatch_session_event_async(&context, EventTag::TurnEnd)
+        .await
+        .is_none());
+    assert_eq!(
+        harness
+            .view()
+            .find_entries_on_branch(
+                &EntryQuery {
+                    entry_type: Some("message"),
+                    ..Default::default()
+                },
+                &BranchBounds::default()
             )
-        })
-        .count();
-    assert!(
-        goal_notices >= 2,
-        "start and pause must each persist a goal notice"
+            .await
+            .unwrap()
+            .len(),
+        2
     );
 
+    let original = harness.session().storage().metadata().id;
     let host = context
         .action_bridge
         .lock()
@@ -130,7 +220,7 @@ async fn native_goal_outbox_smoke() {
             .await
             .had_errors
     );
-    let tool = harness
+    let reloaded = harness
         .get_tools()
         .await
         .unwrap()
@@ -139,15 +229,16 @@ async fn native_goal_outbox_smoke() {
         .unwrap()
         .tool;
     assert_eq!(
-        tool.execute(
-            "reload",
-            json!({"action":"show"}),
-            tokio_util::sync::CancellationToken::new(),
-            Arc::new(|_| {})
-        )
-        .await
-        .unwrap()
-        .details["goal"]["status"],
-        "paused"
+        reloaded
+            .execute(
+                "reload",
+                json!({"action":"show"}),
+                tokio_util::sync::CancellationToken::new(),
+                Arc::new(|_| {})
+            )
+            .await
+            .unwrap()
+            .details["goal"]["status"],
+        "budget_limited"
     );
 }
