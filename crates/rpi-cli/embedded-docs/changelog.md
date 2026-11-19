@@ -11,6 +11,28 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.26.0](https://github.com/bigfish1913/pi-rust/compare/v0.25.0...v0.26.0) - 2026-11-19
+
+### Added
+
+- *(tui)* extension argument suggestions in the autocomplete pipeline ([#338](https://github.com/bigfish1913/pi-rust/pull/338))
+- *(extensions)* pi editor-draft and completion parity ([#366](https://github.com/bigfish1913/pi-rust/pull/366))
+- *(extensions)* dispatch session-tree lifecycle events
+- *(host)* task leases, runtime approval gate, and message_agent tool ([#348](https://github.com/bigfish1913/pi-rust/pull/348))
+- *(host)* child-agent roster and host-initiated stop ([#355](https://github.com/bigfish1913/pi-rust/pull/355))
+- *(tui)* 启动标志改为可旋转的 3D 齿轮徽章 ([#346](https://github.com/bigfish1913/pi-rust/pull/346))
+- *(tui)* render LaTeX math in the transcript ([#362](https://github.com/bigfish1913/pi-rust/pull/362))
+
+### Fixed
+
+- *(test)* release the writer lease between legacy session reopens ([#359](https://github.com/bigfish1913/pi-rust/pull/359))
+- *(tui)* pin an explicit user-message foreground in the light theme ([#361](https://github.com/bigfish1913/pi-rust/pull/361))
+- *(tui)* keep word navigation byte-safe on multibyte lines ([#357](https://github.com/bigfish1913/pi-rust/pull/357))
+
+### Other
+
+- *(host)* reuse one transcript replay during restore ([#368](https://github.com/bigfish1913/pi-rust/pull/368))
+
 - *(extensions)* dispatch session-tree lifecycle events around interactive TUI and RPC
   navigation/compaction; document renderer payloads for plugin authors.
 
