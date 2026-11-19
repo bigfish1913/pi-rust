@@ -28,13 +28,15 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 - *(test)* release the writer lease between legacy session reopens ([#359](https://github.com/bigfish1913/pi-rust/pull/359))
 - *(tui)* pin an explicit user-message foreground in the light theme ([#361](https://github.com/bigfish1913/pi-rust/pull/361))
 - *(tui)* keep word navigation byte-safe on multibyte lines ([#357](https://github.com/bigfish1913/pi-rust/pull/357))
+- *(agent)* dispatch `ProviderHooks::after_response` before `MessageEnd` ([#367](https://github.com/bigfish1913/pi-rust/pull/367))
 
-### Other
+### Performance
 
-- *(host)* reuse one transcript replay during restore ([#368](https://github.com/bigfish1913/pi-rust/pull/368))
+- *(host)* reuse one transcript replay during session restore ([#368](https://github.com/bigfish1913/pi-rust/pull/368))
 
-- *(extensions)* dispatch session-tree lifecycle events around interactive TUI and RPC
-  navigation/compaction; document renderer payloads for plugin authors.
+### Documentation
+
+- *(extensions)* state where renderers run and how replies are chosen ([#360](https://github.com/bigfish1913/pi-rust/pull/360))
 
 ## [0.25.0](https://github.com/bigfish1913/pi-rust/compare/v0.24.2...v0.25.0) - 2026-11-17
 
