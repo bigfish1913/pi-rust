@@ -1196,3 +1196,89 @@ async fn prepared_restore_rejects_history_changes_before_commit() {
         .contains("changed during restore preparation"));
     assert!(!fs.exists("changed.jsonl.lock", None).await.unwrap());
 }
+
+/// A prepared restore must not repair the source while resource preflight is
+/// still deciding; the deferred torn-tail repair lands only in `commit()`.
+#[tokio::test]
+async fn prepared_restore_defers_torn_tail_repair_to_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    let complete = format!(
+        "{}{}",
+        encode_header(&header()),
+        encode_mutation(&message("e1", 1, None, "one")),
+    );
+    let torn = format!("{complete}{{\"seq\":2,\"tim");
+    fs.write_file("torn.jsonl", FileContent::Text(torn.clone()), None)
+        .await
+        .unwrap();
+
+    let prepared = JsonlSessionStorage::prepare_restore(
+        fs.clone(),
+        "torn.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs.read_text_file("torn.jsonl", None).await.unwrap(),
+        torn,
+        "preparation must not publish a repair"
+    );
+    assert!(!fs.exists("torn.jsonl.lock", None).await.unwrap());
+
+    let storage = prepared.commit().await.unwrap();
+    assert_eq!(
+        fs.read_text_file("torn.jsonl", None).await.unwrap(),
+        complete,
+        "commit publishes the valid prefix so later appends stay on their own line"
+    );
+    assert_eq!(storage.state.lock().await.sequence(), 1);
+    drop(storage);
+}
+
+/// The unterminated-tail repair is likewise deferred, and commit must leave the
+/// file newline-terminated with the same frames.
+#[tokio::test]
+async fn prepared_restore_defers_unterminated_tail_newline_to_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    let terminated = format!(
+        "{}{}",
+        encode_header(&header()),
+        encode_mutation(&message("e1", 1, None, "one")),
+    );
+    let unterminated = terminated.trim_end_matches('\n').to_string();
+    assert!(!unterminated.ends_with('\n'));
+    fs.write_file("open.jsonl", FileContent::Text(unterminated.clone()), None)
+        .await
+        .unwrap();
+
+    let prepared = JsonlSessionStorage::prepare_restore(
+        fs.clone(),
+        "open.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs.read_text_file("open.jsonl", None).await.unwrap(),
+        unterminated,
+        "preparation must not touch the source"
+    );
+
+    let storage = prepared.commit().await.unwrap();
+    assert_eq!(
+        fs.read_text_file("open.jsonl", None).await.unwrap(),
+        terminated,
+        "commit terminates the tail exactly once"
+    );
+    assert_eq!(storage.state.lock().await.sequence(), 1);
+    drop(storage);
+}
