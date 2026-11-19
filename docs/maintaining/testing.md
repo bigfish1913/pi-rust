@@ -397,6 +397,6 @@ Ubuntu `Offline resource regression`（`resources`）job 共用同一次构建�
 3. 编辑器与两种 RPC 编码各 5 个资源测量轮次；失败上传 `resource-smoke-diagnostics`。
 4. modern/legacy 各 3 次完整海量帧冷启动；成功/失败上传白名单 `historical-cold-start-diagnostics`。
 
-诊断均在 runner.temp，名称带 run/attempt，避免 Cargo cache 复用旧输出。`test` job 另显式运行官网校验器 `VerifierTests`，真实 Caddy 集成不包含在内。release/preview 的发布准备依赖 `test` 与 `resources` 等门禁；仓库 branch protection 的 required checks 仍需在 GitHub 设置中另行确认，工作流不能替代该设置。
+诊断均在 runner.temp，名称带 run/attempt，避免 Cargo cache 复用旧输出。`test` job 另显式运行官网校验器 `VerifierTests`，真实 Caddy 集成不包含在内。release/preview 的发布准备依赖 `test` 与 `resources` 等门禁；仓库 branch protection 的 required checks 仍需在 GitHub 设置中另行确认，工作流不能替代该设置。PR 描述还必须引用本仓库已存在的 issue，由独立工作流 `PR issue link`（`.github/workflows/pr-issue-link.yml` 的 `Require linked issue`）在打开、编辑描述、重新打开与转为 ready 时检查：先剥离 HTML 注释与代码块，再解析 `#123` 与 issue URL，并用 API 确认编号确实是 issue 而非 PR；仓库 owner、`OWNER`/`MEMBER` 关联作者以及 `release-plz-`、`automation/`、`dependabot/`、`renovate/` 分支豁免。该检查同样只有加入 branch protection 的 required checks 才会真正阻止合并。
 
 这些新增步骤不需要 secrets、不启用 live、不下载或安装独立业务扩展。本地验证不能冒充远端 CI 结果；普通 CI 的合成模型、fake PTY 与仓库 plugin-stub PASS，也不能推广为真实模型、真实终端或所有独立扩展 PASS。
