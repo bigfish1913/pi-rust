@@ -2850,15 +2850,7 @@ pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
 /// `--extensions-dir` flags (scanned after the defaults — `args.rs`).
 /// Diagnostics are a no-op sink for now; load skips/ABI mismatches surface via
 /// the `--verbose` summary.
-pub(crate) fn load_extensions(
-    args: &Args,
-    cwd: &Path,
-    project_trusted: bool,
-    action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
-) -> ExtensionSession {
-    if args.no_extensions {
-        return ExtensionSession::none();
-    }
+fn startup_extension_dirs(args: &Args, cwd: &Path, project_trusted: bool) -> Vec<PathBuf> {
     let mut dirs = if args.dev_local_only {
         Vec::new()
     } else if args.project_only {
@@ -2869,6 +2861,19 @@ pub(crate) fn load_extensions(
         global_extension_dirs()
     };
     dirs.extend(args.extensions_dir.iter().cloned());
+    dirs
+}
+
+pub(crate) fn load_extensions(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
+) -> ExtensionSession {
+    if args.no_extensions {
+        return ExtensionSession::none();
+    }
+    let dirs = startup_extension_dirs(args, cwd, project_trusted);
     let leases = match crate::resource_management::host_leases(cwd) {
         Ok(leases) => leases,
         Err(error) => {
@@ -2879,6 +2884,51 @@ pub(crate) fn load_extensions(
     load_extensions_from_dirs(args, &dirs, action_bridge, Some(leases))
 }
 
+/// Replace the default global extension directory with the registry-selected
+/// file list. The loader otherwise scans every cdylib in that directory,
+/// which re-loads retired versioned artifacts after an rpi-web update and
+/// makes two `ownsStdio` extensions race for stdio ownership.
+///
+/// Only the conventional `<agent_dir>/extensions` directory is rewritten.
+/// Project dirs and user-configured extension dirs stay directory-scanned;
+/// unmanaged legacy cdylibs in the global dir are preserved explicitly.
+fn registry_aware_extension_inputs(
+    dirs: &[PathBuf],
+    explicit_files: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let global_dir = crate::config::agent_dir()
+        .ok()
+        .map(|dir| dir.join("extensions"));
+    let mut filtered_dirs = Vec::with_capacity(dirs.len());
+    let mut files = explicit_files.to_vec();
+    let mut global_dir_handled = false;
+    for dir in dirs {
+        let is_global = global_dir
+            .as_ref()
+            .is_some_and(|global| same_extension_dir(global, dir));
+        if is_global {
+            if !global_dir_handled {
+                files.extend(crate::install::active_global_native_package_artifacts());
+                files.extend(crate::install::unregistered_global_native_package_artifacts());
+                global_dir_handled = true;
+            }
+            continue;
+        }
+        filtered_dirs.push(dir.clone());
+    }
+    (filtered_dirs, files)
+}
+
+fn same_extension_dir(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn load_extensions_from_dirs(
     args: &Args,
     dirs: &[PathBuf],
@@ -2886,6 +2936,7 @@ fn load_extensions_from_dirs(
     host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> ExtensionSession {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
+    let (dirs, files) = registry_aware_extension_inputs(dirs, &args.extension);
     // B5a: the action bridge is cloned into every loaded plugin's vtable
     // `user_data` so post-register `runtime_action` calls recover the harness
     // host from any thread. The call site already gates `load_extensions` behind
@@ -2893,8 +2944,8 @@ fn load_extensions_from_dirs(
     // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
     // and tests. Explicit `--extension`/`-e` files load after the dirs.
     rpi_extensions::load_session_mixed_guarded(
-        dirs,
-        &args.extension,
+        &dirs,
+        &files,
         diagnostics,
         action_bridge,
         host_guard,
@@ -5789,6 +5840,98 @@ mod tests {
         let outcome = reload_extension_resources(&harness, &context).await;
         assert!(!outcome.had_errors, "{}", outcome.summary);
         assert_eq!(outcome.project_trusted, Some(true));
+    }
+
+    #[test]
+    fn startup_and_reload_use_registry_aware_global_extension_selection() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let extensions = agent.join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let active =
+            extensions.join("librpi_web_extension-v0.1.64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.so");
+        let stale_same_version =
+            extensions.join("librpi_web_extension-v0.1.64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.so");
+        let stale_rpi_web =
+            extensions.join("librpi_web_extension-v0.1.63-cccccccccccccccccccccccccccccccc.so");
+        let legacy = extensions.join("legacy_custom.so");
+        for path in [&active, &stale_same_version, &stale_rpi_web, &legacy] {
+            std::fs::write(path, b"cdylib").unwrap();
+        }
+        let registry = serde_json::json!([
+            {
+                "name": "rpi-web",
+                "version": "0.1.64",
+                "source": null,
+                "artifacts": [active.file_name().unwrap().to_str().unwrap()]
+            }
+        ]);
+        std::fs::write(agent.join("native-packages.json"), registry.to_string()).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let args = Args {
+            trust_override: Some(false),
+            ..Args::default()
+        };
+        let startup_dirs = startup_extension_dirs(&args, &cwd, false);
+        assert!(startup_dirs.contains(&extensions));
+        let (startup_scan_dirs, startup_files) =
+            registry_aware_extension_inputs(&startup_dirs, &args.extension);
+        assert!(!startup_scan_dirs.contains(&extensions));
+        assert!(startup_files.contains(&active));
+        assert!(startup_files.contains(&legacy));
+        assert!(!startup_files.contains(&stale_same_version));
+        assert!(!startup_files.contains(&stale_rpi_web));
+
+        let prepared = prepare_reload_inputs_inner(&args, &cwd, false, || {}).unwrap();
+        let (reload_scan_dirs, reload_files) =
+            registry_aware_extension_inputs(&prepared.extension_dirs, &args.extension);
+        assert!(!reload_scan_dirs.contains(&extensions));
+        assert_eq!(reload_files, startup_files);
+    }
+
+    #[test]
+    fn registry_aware_global_selection_keeps_unmanaged_legacy_cdylib() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let extensions = agent.join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        let legacy = extensions.join("legacy_custom.so");
+        std::fs::write(&legacy, b"cdylib").unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let (dirs, files) = registry_aware_extension_inputs(&[extensions.clone()], &[]);
+        assert!(dirs.is_empty());
+        assert_eq!(files, vec![legacy]);
     }
 
     #[test]
