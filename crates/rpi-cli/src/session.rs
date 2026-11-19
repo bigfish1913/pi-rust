@@ -20,10 +20,12 @@
 //! - **No `ModelRuntime`/multi-provider registry.** The resolver supports the
 //!   built-in Anthropic/OpenAI-compatible providers and `models.json`, but
 //!   runtime catalog mutation remains outside this layer.
-//! - **Built-in tools**: `read`, `bash`, `edit`, `write`, and the read-only
-//!   `docs` lookup tool. The former rpi-only `grep`, `find`, `ls`, and
-//!   `powershell` tools remain library modules but are not registered by the
-//!   CLI.
+//! - **Built-in tools**: `read`, `grep`, `find`, `ls`, `bash`, `edit`,
+//!   `write`, and the read-only `docs` lookup tool (`powershell` additionally
+//!   on Windows). `grep`/`find`/`ls` were library-only until the mirach host
+//!   registered them (2026-11-19): without a dedicated search/list surface the
+//!   model routed all exploration through `bash`/`powershell`, which the tool
+//!   descriptions and the system prompt could not offset.
 //! - **Session restore (`-c`/`-r`/`--session`)** is *partially* supported: a
 //!   fresh session is always created. The harness's `create` rejects sessions
 //!   that already have records unless `allow_existing_session` is enabled.
@@ -50,8 +52,9 @@ use rpi_harness::types::{
 #[cfg(windows)]
 use rpi_tools::create_powershell_tool;
 use rpi_tools::{
-    create_bash_tool, create_edit_tool, create_read_tool, create_write_tool, ExecutionToolContext,
-    MutationQueueRegistry, OsExecutionEnv,
+    create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
+    create_read_tool, create_write_tool, ExecutionToolContext, MutationQueueRegistry,
+    OsExecutionEnv,
 };
 
 use crate::args::Args;
@@ -120,7 +123,8 @@ pub(crate) fn file_io_router(
 }
 
 /// The coding tools registered by the CLI by default.
-pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
+pub const BUILTIN_TOOL_NAMES: &[&str] =
+    &["read", "grep", "find", "ls", "bash", "edit", "write", "docs"];
 
 /// The default coding system prompt for the CLI's built-in tools.
 ///
@@ -2941,6 +2945,18 @@ fn build_tools_bound(
             .with_replay(ToolReplay::Safe),
         ),
         (
+            "grep",
+            HarnessTool::new(create_grep_tool(ctx, None)).with_replay(ToolReplay::Safe),
+        ),
+        (
+            "find",
+            HarnessTool::new(create_find_tool(ctx, None)).with_replay(ToolReplay::Safe),
+        ),
+        (
+            "ls",
+            HarnessTool::new(create_ls_tool(ctx, None)).with_replay(ToolReplay::Safe),
+        ),
+        (
             "bash",
             HarnessTool::new(create_bash_tool(ctx, Some(bash_options()))),
         ),
@@ -5318,9 +5334,12 @@ mod tests {
         assert!(p.contains("edit"));
         assert!(p.contains("write"));
         assert!(p.contains("docs"));
-        assert!(!p.contains("- grep"));
-        assert!(!p.contains("- find"));
-        assert!(!p.contains("- ls"));
+        // grep/find/ls are registered builtin tools (mirach 2026-11-19): the
+        // explore tools must be in the default prompt so the model has a
+        // dedicated search/list surface instead of routing through bash.
+        assert!(p.contains("- grep"));
+        assert!(p.contains("- find"));
+        assert!(p.contains("- ls"));
         assert!(!p.contains("- powershell"));
         assert!(p.contains("Bash/POSIX syntax, also on Windows"));
     }
@@ -5469,15 +5488,16 @@ mod tests {
             .map(|tool| tool.tool.schema().name.clone())
             .collect();
 
-        // `docs` is a default capability; the legacy rpi-only lookup tools stay
-        // unregistered. Asserted by membership (not exact equality) because
+        // `docs` is a default capability; grep/find/ls are registered too
+        // (mirach 2026-11-19: the model needs dedicated explore tools).
+        // Asserted by membership (not exact equality) because
         // `powershell` is Windows-only and `settings.json#defaultTools` may
         // narrow the set in a developer's environment.
         assert!(names.contains(&"docs".to_string()));
-        for legacy in ["grep", "find", "ls"] {
+        for required in ["read", "grep", "find", "ls", "bash", "edit", "write"] {
             assert!(
-                !names.contains(&legacy.to_string()),
-                "legacy tool {legacy} should not be registered by default"
+                names.contains(&required.to_string()),
+                "builtin tool {required} should be registered by default"
             );
         }
     }
