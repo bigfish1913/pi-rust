@@ -166,11 +166,20 @@ pub(super) fn command_argument_suggestions(
     }
     let before = input.get(..cursor)?;
     let after_slash = before.strip_prefix('/')?;
-    let name_end = after_slash
+    // The separator itself may be more than one byte (U+3000, U+00A0), so the
+    // argument span starts after the whole whitespace character — an `index + 1`
+    // shortcut would slice mid-character and panic.
+    let (name, arguments_start) = after_slash
         .find(char::is_whitespace)
-        .map(|index| index + 1)?;
-    let name = &after_slash[..name_end - 1];
-    let argument_prefix = &before[name_end + 1..];
+        .map(|index| {
+            let separator = after_slash[index..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
+            (&after_slash[..index], 1 + index + separator)
+        })?;
+    let argument_prefix = &before[arguments_start..];
     let command = commands
         .iter()
         .find(|registered| registered.name == name && registered.completions.is_some())?;
@@ -187,7 +196,7 @@ pub(super) fn command_argument_suggestions(
     }
     Some(AutocompleteSuggestions {
         items,
-        start: name_end + 1,
+        start: arguments_start,
         end: cursor,
         is_path: false,
     })
@@ -485,5 +494,15 @@ mod tests {
         assert!(command_argument_suggestions(&plain, "/office con", 11).is_none());
         // An unknown command never reaches a plugin.
         assert!(command_argument_suggestions(&commands, "/other con", 10).is_none());
+        // A multi-byte separator (ideographic space) must not slice mid-char.
+        let wide = "/office\u{3000}con";
+        let suggestions = command_argument_suggestions(&commands, wide, wide.len())
+            .expect("suggestions");
+        assert_eq!((suggestions.start, suggestions.end), (10, wide.len()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&last_query().expect("query")).unwrap()
+                ["argumentPrefix"],
+            serde_json::json!("con")
+        );
     }
 }
