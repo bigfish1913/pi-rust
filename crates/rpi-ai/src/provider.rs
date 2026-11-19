@@ -385,8 +385,9 @@ pub trait DeferredProvider: Send + Sync {
 /// A per-call provider hook. `before_request` may patch the live
 /// [`SimpleStreamOptions`] (e.g. inject/rotate headers, set metadata, override
 /// timeout) before the harness calls `stream_simple`; `after_response` observes
-/// the terminal assistant message after the stream resolves. Both are
-/// `Option`-returning: `None` = no change / no observation.
+/// the terminal assistant message after the stream resolves. `before_request`
+/// is `Option`-returning (`None` = leave options untouched); `after_response`
+/// is an observation-only callback.
 ///
 /// Implementations MUST be infallible at the API boundary — a hook error is
 /// swallowed (the run continues with the unpatched options), mirroring the
@@ -435,7 +436,7 @@ pub trait ProviderHooks: Send + Sync {
     /// Fired after the stream resolves with the terminal assistant message.
     /// `message` is the final `AssistantMessage` the provider produced (the same
     /// one the loop emits as `MessageEnd`). `None` lets the default no-op impl
-    /// apply. Runs on the blocking-bridge thread.
+    /// apply. Runs immediately before `MessageEnd` is emitted by the agent loop.
     fn after_response(&self, _model: &Model, _message: &AssistantMessage) {}
 }
 

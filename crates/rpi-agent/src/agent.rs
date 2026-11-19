@@ -552,6 +552,7 @@ impl Agent {
             })),
             before_tool_call: None,
             after_tool_call: None,
+            provider_hooks: None,
             tool_execution: self.inner.tool_execution,
             thinking_level: state.thinking_level,
             api_key: None,

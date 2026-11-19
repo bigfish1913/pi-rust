@@ -136,6 +136,11 @@ pub struct AgentLoopConfig {
     pub pending_message_count: Option<PendingMessageCount>,
     pub before_tool_call: Option<BeforeToolCall>,
     pub after_tool_call: Option<AfterToolCall>,
+    /// Called after each provider stream resolves with its terminal assistant
+    /// message. This is the host-side equivalent of pi's
+    /// `after_provider_response` observation and runs before `MessageEnd` is
+    /// emitted, so provider usage is visible to extensions for the same turn.
+    pub provider_hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
 
     /// Per-batch execution mode. Default `Parallel`.
     pub tool_execution: ToolExecutionMode,
@@ -184,6 +189,7 @@ impl std::fmt::Debug for AgentLoopConfig {
             )
             .field("before_tool_call", &self.before_tool_call.is_some())
             .field("after_tool_call", &self.after_tool_call.is_some())
+            .field("provider_hooks", &self.provider_hooks.is_some())
             .finish()
     }
 }

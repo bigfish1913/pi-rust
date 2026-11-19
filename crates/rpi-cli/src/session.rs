@@ -4965,6 +4965,7 @@ mod tests {
             pending_message_count: None,
             before_tool_call: None,
             after_tool_call: Some(after),
+            provider_hooks: None,
             tool_execution: rpi_agent::types::ToolExecutionMode::Sequential,
             thinking_level: rpi_ai::types::ThinkingLevel::default(),
             api_key: None,

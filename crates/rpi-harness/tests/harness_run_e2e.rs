@@ -706,8 +706,9 @@ async fn harness_forwards_after_tool_call_option_into_loop() {
 // faux-cache-hit path, but simplest is to assert the hook FIRED with the model
 // the loop is about to call (the per-call bridge ran). We pair the hook with a
 // counter and assert call_count == hook fires (one per stream_simple call).
-// (after_response observation is wired on the emitter side in B3+; here we
-// prove before_request runs per-call, which is the load-bearing B4 fix.)
+// `after_response` is delivered by the agent loop immediately before the
+// matching assistant `MessageEnd`; the same test also proves it fires once per
+// provider call.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -717,9 +718,11 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
     // One hook fire per stream_simple call. The script has 2 turns
     // (tool-call + final text), so we expect 2 provider calls == 2 hook fires.
     let fires: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let responses: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     struct CountingHooks {
         fires: Arc<std::sync::Mutex<Vec<String>>>,
+        responses: Arc<std::sync::Mutex<Vec<String>>>,
     }
     impl ProviderHooks for CountingHooks {
         fn before_request(
@@ -732,10 +735,22 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
             // Return a no-op patch (None would also work; exercise the apply path).
             None
         }
+
+        fn after_response(
+            &self,
+            _model: &rpi_ai::Model,
+            message: &rpi_ai::types::AssistantMessage,
+        ) {
+            self.responses
+                .lock()
+                .unwrap()
+                .push(message.stop_reason.as_str().to_string());
+        }
     }
 
     let hooks: Arc<dyn ProviderHooks> = Arc::new(CountingHooks {
         fires: Arc::clone(&fires),
+        responses: Arc::clone(&responses),
     });
 
     let script = FauxScript::new()
@@ -819,6 +834,12 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
         hook_fires.len(),
         2,
         "before_request must fire once per stream_simple call (per-call, not run-once)"
+    );
+    let response_fires = responses.lock().unwrap().clone();
+    assert_eq!(
+        response_fires.len(),
+        2,
+        "after_response must fire once for every resolved provider stream"
     );
 }
 
