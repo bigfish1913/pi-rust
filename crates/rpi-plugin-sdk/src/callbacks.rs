@@ -241,6 +241,119 @@ macro_rules! take_step_result {
     }};
 }
 
+/// Call a runtime action and return `(status_code, response_body)`.
+///
+/// Without this macro every plugin that talks to the host has to reproduce the
+/// ABI dance by hand — allocate an out [`StbString`](crate::StbString), call
+/// `runtime_action`, read it with `StbString::to_string_lossy` (unsafe) and hand
+/// the allocation back through the host's `free_string` (unsafe) — which forces
+/// a `#![deny(unsafe_code)]` plugin to open a hole for plumbing that has nothing
+/// to do with its own logic. The macro keeps that contract here, in the crate
+/// that owns it, exactly like [`string_handler!`](crate::string_handler) does for the inbound
+/// direction.
+///
+/// The body is returned verbatim (empty when the host wrote nothing): callers
+/// decode it themselves, so this works with or without the `json` feature. A
+/// nonzero status code is not an error — hosts use it for "this action does not
+/// apply here" as well as for failures — so the pair is returned as-is.
+///
+/// ```ignore
+/// let (rc, body) = rpi_plugin_sdk::call_action!(&api, RuntimeActionId::Abort, "{}");
+/// ```
+#[macro_export]
+macro_rules! call_action {
+    ($api:expr, $id:expr, $args:expr) => {{
+        let api = $api;
+        let mut out = $crate::StbString::empty();
+        let rc = (api.runtime_action)(
+            u32::from($id),
+            $crate::StbStringRef::from_str($args),
+            &mut out,
+            api.user_data,
+        );
+        // SAFETY: the host wrote `out` for this invocation and transferred it to
+        // the plugin; reading it and handing the allocation back through the
+        // host's own `free_string` exactly once is the response contract.
+        let text = unsafe { out.to_string_lossy() };
+        unsafe { (api.free_string)(out) };
+        (rc, text)
+    }};
+}
+
+/// Read an ABI string, owned ([`StbString`]) or borrowed
+/// ([`StbStringRef`](crate::StbStringRef)), into a `String`.
+///
+/// `#[doc(hidden)]`: this exists only so [`stb_text!`](crate::stb_text) can be
+/// type-agnostic. It is not part of the documented plugin surface — a safe
+/// accessor would let safe code forge an ABI string, so the macros stay the
+/// only advertised entry point.
+///
+/// Public for macro expansion only; plugins should call the macro, never this
+/// trait directly.
+#[doc(hidden)]
+pub trait AbiText {
+    /// Copy the string out of the ABI.
+    ///
+    /// # Safety
+    /// The value must be a live ABI string: plugin-owned memory from this SDK,
+    /// or host memory valid for the current call. The copy happens immediately,
+    /// so the result never borrows from it.
+    unsafe fn abi_text_read(&self) -> String;
+}
+
+impl AbiText for crate::StbString {
+    unsafe fn abi_text_read(&self) -> String {
+        // SAFETY: the caller upholds the trait contract.
+        unsafe { self.to_string_lossy() }
+    }
+}
+
+impl AbiText for crate::StbStringRef {
+    unsafe fn abi_text_read(&self) -> String {
+        // SAFETY: the caller upholds the trait contract.
+        unsafe { self.as_str() }.to_string()
+    }
+}
+
+/// Copy an ABI string (owned or borrowed) without reclaiming it.
+///
+/// The reading half of [`call_action!`], for the strings a plugin can see but
+/// does not own — an owned [`StbString`](crate::StbString) it is about to hand
+/// back to the host, a `StableToolSchema` field it just built, or a borrowed
+/// [`StbStringRef`](crate::StbStringRef) whose lifetime the host guarantees for
+/// the current call. Use [`stb_take!`](crate::stb_take) when the plugin *does* own the
+/// allocation.
+#[macro_export]
+macro_rules! stb_text {
+    ($string:expr) => {{
+        let string = $string;
+        // SAFETY: the caller passes a live ABI string — plugin-owned memory from
+        // this SDK, or host memory valid for the current call. Reading it copies.
+        unsafe { $crate::callbacks::AbiText::abi_text_read(&string) }
+    }};
+}
+
+/// Copy an owning ABI string and reclaim it with its producer's deallocator.
+///
+/// The counterpart of [`stb_text!`](crate::stb_text) for strings the plugin received and must
+/// free: one read, one free, in that order, so the allocation cannot leak. The
+/// deallocator is the one the host supplied with the value (for a tool `execute`
+/// that is the fourth argument), never this process's `free`.
+#[macro_export]
+macro_rules! stb_take {
+    ($string:expr, $free:expr) => {{
+        let string = $string;
+        // Bind the metavariable outside the `unsafe` block: clippy rejects
+        // expanding a caller expression inside one.
+        let free: Option<$crate::FreeStringFn> = $free;
+        // SAFETY: as in `stb_text!`; the value is owning, so it is reclaimed
+        // exactly once below with the producer's deallocator.
+        let text = unsafe { string.to_string_lossy() };
+        unsafe { string.free_with(free) };
+        text
+    }};
+}
+
 /// Define a command or prompt callback with a `&str` input and `&mut Output`.
 /// The four-argument form also supports runtime-action trampolines. A tuple
 /// input `(cwd, reason)` supports resource-discovery callbacks. All forms copy
@@ -358,6 +471,117 @@ mod tests {
         assert_eq!(params.to_string_lossy(), "{}");
         std::ptr::null_mut()
     } }
+
+    /// Just enough of a host for the outbound macros: the three fields
+    /// `call_action!` touches. The macro is duck-typed, so a full `PluginApi`
+    /// (26 fields) is unnecessary noise here.
+    #[derive(Clone, Copy)]
+    struct FakeHost {
+        runtime_action: crate::RuntimeActionFn,
+        free_string: crate::FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    }
+
+    thread_local! {
+        static LAST_ACTION: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+    }
+
+    extern "C" fn echo_action(
+        id: u32,
+        _args: StbStringRef,
+        out: *mut StbString,
+        _user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        LAST_ACTION.with(|last| last.set(id));
+        // SAFETY: the caller provides a live out slot for this invocation.
+        unsafe { *out = StbString::from_string(r#"{"aborted":false}"#.into()) };
+        0
+    }
+
+    fn fake_host() -> FakeHost {
+        FakeHost {
+            runtime_action: echo_action,
+            free_string: counted_free,
+            user_data: std::ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn call_action_returns_the_body_and_reclaims_it_once() {
+        OWNER_FREES.with(|count| count.set(0));
+        let host = fake_host();
+        let (rc, body) = crate::call_action!(host, 27u32, "{}");
+        assert_eq!(rc, 0);
+        assert_eq!(body, r#"{"aborted":false}"#);
+        assert_eq!(LAST_ACTION.with(std::cell::Cell::get), 27);
+        // Exactly one transfer back to the host: no leak, no double free.
+        assert_eq!(OWNER_FREES.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn call_action_reports_a_nonzero_status_without_failing() {
+        extern "C" fn refusing(
+            _id: u32,
+            _args: StbStringRef,
+            out: *mut StbString,
+            _user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            // SAFETY: as in `echo_action`; an error body is still a body.
+            unsafe { *out = StbString::from_string(r#"{"error":"nope"}"#.into()) };
+            1
+        }
+        OWNER_FREES.with(|count| count.set(0));
+        let host = FakeHost {
+            runtime_action: refusing,
+            ..fake_host()
+        };
+        let (rc, body) = crate::call_action!(host, 30u32, "{}");
+        assert_eq!(rc, 1);
+        assert_eq!(body, r#"{"error":"nope"}"#);
+        assert_eq!(OWNER_FREES.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn call_action_tolerates_a_host_that_writes_nothing() {
+        extern "C" fn silent(
+            _id: u32,
+            _args: StbStringRef,
+            _out: *mut StbString,
+            _user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            -1 // no bridge / unsupported action: nothing written
+        }
+        OWNER_FREES.with(|count| count.set(0));
+        let host = FakeHost {
+            runtime_action: silent,
+            ..fake_host()
+        };
+        let (rc, body) = crate::call_action!(host, 9u32, "{}");
+        assert_eq!(rc, -1);
+        assert_eq!(body, "");
+        // Freeing the untouched empty slot is a no-op, not a double free.
+        assert_eq!(OWNER_FREES.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn stb_text_copies_without_freeing() {
+        OWNER_FREES.with(|count| count.set(0));
+        let value = StbString::from_string("hello".into());
+        assert_eq!(crate::stb_text!(value), "hello");
+        assert_eq!(OWNER_FREES.with(std::cell::Cell::get), 0);
+        // The caller still owns it; reclaim so the test does not leak.
+        // SAFETY: the test owns this allocation.
+        unsafe { value.free_with(Some(counted_free)) };
+        assert_eq!(OWNER_FREES.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn stb_take_reads_and_reclaims_in_one_step() {
+        OWNER_FREES.with(|count| count.set(0));
+        let value = StbString::from_string("bye".into());
+        assert_eq!(crate::stb_take!(value, Some(counted_free)), "bye");
+        assert_eq!(OWNER_FREES.with(std::cell::Cell::get), 1);
+    }
 
     #[test]
     fn execute_trampoline_reclaims_parameters_on_refusal_and_invalid_id() {
