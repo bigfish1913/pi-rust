@@ -153,6 +153,30 @@ underlying function; the macro cannot prove an arbitrary result's ownership.
 receiving a result from another plugin. These are ABI boundaries: the host must still honor
 buffer validity and producer allocation ownership.
 
+`call_action!` is the outbound counterpart: it calls a runtime action and returns
+`(status_code, body)`, doing the allocate/call/read/free dance inside the SDK:
+
+```rust
+let (rc, body) = rpi_plugin_sdk::call_action!(&api, RuntimeActionId::Abort, "{}");
+// rc 0 = the host answered; parse `body` yourself.
+```
+
+`stb_text!` copies an ABI string (`StbString` or `StbStringRef`) without freeing
+it — for an owned string the plugin is about to hand back, a `StableToolSchema`
+field, or a borrowed input valid for the current call. `stb_take!` reads *and*
+reclaims an owned string with its producer's deallocator in one step:
+
+```rust
+let name = rpi_plugin_sdk::stb_text!(schema.name);           // read only
+let params = rpi_plugin_sdk::stb_take!(params, free);        // read + reclaim
+```
+
+Together with `string_handler!`, `execute_handler!` and `event_handler!` these
+cover every ABI shape a plugin touches, so a plugin crate can run
+`#![deny(unsafe_code)]` — `crates/rpi-plugin-sdk/tests/safe_macros.rs` exercises
+that under the lint. Hand-rolled trampolines remain possible; they are the only
+case that still needs an explicit `unsafe` block.
+
 Raw string readers `StbString::to_string_lossy` and `json::from_stable` require
 an explicit `unsafe` call: their public ABI pointer/length fields cannot prove
 that a buffer is still valid. Keep the allocation live and unchanged during

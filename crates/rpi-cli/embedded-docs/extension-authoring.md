@@ -140,6 +140,24 @@ rpi_plugin_sdk::export_plugin!(|api| {
 返回结构化错误，不会进入分发。runtime action 使用 SDK 的 `RuntimeActionId`
 定义（含 `GetCliFlag`、`UiDialog`），不要自行假定数字范围。
 
+### 不写 unsafe 也能写插件
+
+ABI 里的字符串与步骤返回都是裸指针，SDK 因此提供了一组宏把这些契约收在自己这一侧。
+用它们可以把整个插件 crate 开成 `#![deny(unsafe_code)]`：
+
+| 形状 | 宏 |
+| --- | --- |
+| 事件回调 | `event_handler!`（`EventView`，访问器返回自有字符串） |
+| 命令 / 提示 / 资源发现回调 | `string_handler!`（`&str` 输入 + `&mut Output`） |
+| 工具 `execute` | `execute_handler!`（借用 call id，`OwnedString` 参数自动回收） |
+| 调用 runtime action | `call_action!(api, id, args)` → `(rc, body)` |
+| 读 ABI 字符串（不释放） | `stb_text!(value)`（`StbString` / `StbStringRef` 都可） |
+| 读并回收 ABI 字符串 | `stb_take!(value, free)` |
+
+它们不改 C ABI，只是把 `unsafe` 收敛到 SDK 内部。手写 trampoline 仍然可以，但那是唯一
+还需要自己写 `unsafe` 的形状。`crates/rpi-plugin-sdk/tests/safe_macros.rs` 在
+`#![deny(unsafe_code)]` 下覆盖了这几条路径。
+
 ### 独立子任务
 
 `GetExecutionContext`（23）返回当前模型身份、thinking、活动工具、cwd 和会话 ID，
