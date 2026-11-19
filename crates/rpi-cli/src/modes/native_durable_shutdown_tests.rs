@@ -159,6 +159,7 @@ impl Fixture {
                 vec![],
                 rpi_extensions::UiDialogMailbox::new(),
                 None,
+                None,
                 crate::args::RpcMessageUpdates::default(),
                 enabled,
                 input,

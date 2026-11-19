@@ -414,28 +414,38 @@ pub(super) async fn run_skill_streaming(
 /// `/compact`: drive a compaction on the lane (mirrors TS `app.compact`).
 /// Reports the outcome as a transcript note; the harness progress watcher
 /// displays the compaction indicator while the summary is generated.
+///
+/// Returns whether a compaction entry was actually written, so the caller can
+/// report `SessionCompact` only when the branch changed (a declined or aborted
+/// compaction leaves it untouched).
 pub(super) async fn run_compact(
     lane: &Arc<dyn AgentLane>,
     tui: &Arc<TuiAltScreen>,
     state: &Arc<TuiState>,
-) {
+) -> bool {
     state.set_status(RunStatus::Working);
     tui.request_render(false);
-    match lane.compact(None).await {
-        Ok(_) => {
+    let compacted = match lane.compact(None).await {
+        Ok(result) => {
             add_note_message(&state.notice_container(), "Conversation compacted.");
             // The last assistant usage describes the pre-compaction context;
             // reset the badge to `?` until the next response reports the new
             // (much smaller) prompt size — mirrors pi's `percent: null`.
             state.footer.set_context_tokens(None);
+            matches!(
+                result.outcome,
+                rpi_harness::agent_harness::CompactionOutcome::Completed { .. }
+            )
         }
         Err(e) => {
             add_error_message(&state.notice_container(), &format!("Compact failed: {e}"));
+            false
         }
-    }
+    };
     state.set_status(RunStatus::Idle);
     history::settle(state, tui);
     tui.request_render(false);
+    compacted
 }
 
 /// Copy the fullscreen mouse selection, if present. `Some(false)` still

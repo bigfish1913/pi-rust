@@ -1817,36 +1817,47 @@ mod tests {
         let _guard = HANDLER_TEST_LOCK.lock().unwrap();
         HANDLER_HITS.store(0, Ordering::SeqCst);
         let mut reg = crate::registry::ExtensionRegistry::new();
-        reg.register_event_handler(
-            "test-plugin".to_string(),
+        let lifecycle_tags = [
             EventTag::SessionStart,
-            counting_handler,
-            std::ptr::null_mut(),
-        );
-        reg.register_event_handler(
-            "test-plugin".to_string(),
+            EventTag::SessionBeforeSwitch,
+            EventTag::SessionBeforeFork,
+            EventTag::SessionBeforeCompact,
+            EventTag::SessionCompact,
+            EventTag::SessionBeforeTree,
+            EventTag::SessionTree,
             EventTag::BeforeTuiStart,
-            counting_handler,
-            std::ptr::null_mut(),
-        );
+        ];
+        for tag in lifecycle_tags {
+            reg.register_event_handler(
+                "test-plugin".to_string(),
+                tag,
+                counting_handler,
+                std::ptr::null_mut(),
+            );
+        }
         let snap = Arc::new(reg.snapshot());
 
         // No subscriber for SessionShutdown → no handler invoked.
         assert!(!dispatch_empty_event(&snap, EventTag::SessionShutdown));
         assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 0);
 
-        // SessionStart + BeforeTuiStart both have one subscriber each.
-        assert!(dispatch_empty_event(&snap, EventTag::SessionStart));
-        assert!(dispatch_empty_event(&snap, EventTag::BeforeTuiStart));
-        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 2);
+        // Every payload-free session lifecycle tag is dispatched to its subscriber.
+        for tag in lifecycle_tags {
+            assert!(dispatch_empty_event(&snap, tag));
+        }
+        assert_eq!(
+            HANDLER_HITS.load(Ordering::SeqCst),
+            lifecycle_tags.len(),
+            "all subscribed lifecycle tags fire exactly once"
+        );
 
         // Stale registry (session swapped): dispatch is a silent no-op inside
         // `dispatch_to_handlers` — no handler is invoked — though the fn still
         // reports subscribers existed (matches `dispatch_data_event` semantics).
         reg.invalidate();
         assert!(dispatch_empty_event(&snap, EventTag::SessionStart));
-        assert!(dispatch_empty_event(&snap, EventTag::BeforeTuiStart));
-        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 2);
+        assert!(dispatch_empty_event(&snap, EventTag::SessionTree));
+        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), lifecycle_tags.len());
     }
 
     // --- dispatch_lifecycle_event: veto + timeout (P1) ---

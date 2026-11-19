@@ -11,6 +11,9 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+- *(extensions)* dispatch session-tree lifecycle events around interactive TUI and RPC
+  navigation/compaction; document renderer payloads for plugin authors.
+
 ## [0.25.0](https://github.com/bigfish1913/pi-rust/compare/v0.24.2...v0.25.0) - 2026-11-17
 
 ### Added
