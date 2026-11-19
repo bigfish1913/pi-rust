@@ -116,10 +116,14 @@ impl ReadTool {
         Tool {
             name: "read".to_string(),
             description: format!(
-                "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). \
-                 Images are sent as attachments. For text files, output is truncated to {DEFAULT_MAX_LINES} \
-                 lines or {kb}KB (whichever is hit first). Use offset/limit for large files. When you need \
-                 the full file, continue with offset until complete.",
+                "Read the contents of a file. Prefer this over shell commands (`cat`, `head`, `tail`, \
+                 `Get-Content`). Supports text files and images (jpg, png, gif, webp, bmp); images \
+                 are sent as attachments and presented visually. For text files, output is truncated \
+                 to {DEFAULT_MAX_LINES} lines or {kb}KB (whichever is hit first). Use offset/limit \
+                 for large files: when you already know which part of the file you need, only read \
+                 that part; when you need the full file, continue with offset until complete. \
+                 Do NOT re-read a file you just edited to verify — `edit`/`write` would have errored \
+                 if the change failed.",
                 kb = DEFAULT_MAX_BYTES / 1024
             ),
             parameters: rpi_ai::types::Schema::new(serde_json::to_value(params).unwrap_or_default()),

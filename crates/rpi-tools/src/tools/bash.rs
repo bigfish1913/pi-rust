@@ -133,7 +133,9 @@ impl BashTool {
         Tool {
             name: "bash".to_string(),
             description: format!(
-                "Execute a Bash command in the current working directory using Bash/POSIX syntax, even on Windows. PowerShell cmdlets (Get-ChildItem, Select-Object, Select-String) are not valid here; use ls, find, rg, and POSIX pipelines instead. Returns stdout and \
+                "Execute a Bash command in the current working directory using Bash/POSIX syntax, even on Windows. PowerShell cmdlets (Get-ChildItem, Select-Object, Select-String) are not valid here; use the dedicated tools instead. \
+                 IMPORTANT: Avoid using this tool to run `cat`, `head`, `tail`, `grep`, `rg`, `find`, `ls`, `sed`, `awk`, or `echo` commands for reading files, searching content, listing directories, or writing files, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the `read`, `grep`, `find`, `ls`, `edit`, or `write` tool as this will provide a much better experience for the user. \
+                 Returns stdout and \
                  stderr. Output is truncated to last {DEFAULT_MAX_LINES} lines or {kb}KB \
                  (whichever is hit first). If truncated, full output is saved to a temp file. \
                  Defaults to a {default_timeout}-second timeout; provide timeout in seconds to override it. \

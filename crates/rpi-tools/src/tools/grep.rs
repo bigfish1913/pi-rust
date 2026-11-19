@@ -97,7 +97,8 @@ impl GrepTool {
         Tool {
             name: "grep".to_string(),
             description: format!(
-                "Search file contents for a pattern. Returns matching lines with file paths and \
+                "Search file contents for a pattern. Prefer this over `grep`/`rg`/`Select-String` in \
+                 shell commands. Returns matching lines with file paths and \
                  line numbers. Skips `.git/` directories. Output is truncated to {DEFAULT_LIMIT} \
                  matches or {kb}KB (whichever is hit first). Long lines are truncated to \
                  {GREP_MAX_LINE_LENGTH} chars.",

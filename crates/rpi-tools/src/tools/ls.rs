@@ -73,7 +73,8 @@ impl LsTool {
         Tool {
             name: "ls".to_string(),
             description: format!(
-                "List directory contents. Returns entries sorted alphabetically, with a '/' suffix \
+                "List directory contents. Prefer this over `ls`/`dir`/`Get-ChildItem` in shell \
+                 commands. Returns entries sorted alphabetically, with a '/' suffix \
                  for directories. Includes dotfiles. Output is truncated to {DEFAULT_LIMIT} entries \
                  or {kb}KB (whichever is hit first).",
                 kb = DEFAULT_MAX_BYTES / 1024

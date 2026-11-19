@@ -40,7 +40,7 @@ impl PowerShellTool {
     fn schema() -> Tool {
         Tool {
             name: "powershell".into(),
-            description: "Execute a PowerShell command on Windows. Returns stdout and stderr. Prefer bash for file/text work; use this only for PowerShell object operations (registry, COM/WMI, scheduled tasks, .NET). Always pass `description`: a concise 5-10 word summary of the command's purpose; hosts show it in the collapsed tool row."
+            description: "Execute a PowerShell command on Windows. Returns stdout and stderr. IMPORTANT: Avoid using this tool to read files, search content, or list directories — use the dedicated `read`, `grep`, `find`, and `ls` tools instead; they give a much better experience. Prefer `bash` for general command-line work; use this only for PowerShell object operations (registry, COM/WMI, scheduled tasks, .NET). Always pass `description`: a concise 5-10 word summary of the command's purpose; hosts show it in the collapsed tool row."
                 .into(),
             parameters: rpi_ai::types::Schema::new(
                 serde_json::to_value(schemars::schema_for!(PowerShellInput)).unwrap_or_default(),

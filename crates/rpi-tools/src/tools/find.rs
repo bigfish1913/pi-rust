@@ -79,7 +79,8 @@ impl FindTool {
         Tool {
             name: "find".to_string(),
             description: format!(
-                "Search for files by glob pattern. Returns matching file paths relative to the \
+                "Search for files by glob pattern. Prefer this over `find`/`dir /s`/`Get-ChildItem \
+                 -Recurse` in shell commands. Returns matching file paths relative to the \
                  search directory. Skips `.git/` directories. Output is truncated to {DEFAULT_LIMIT} \
                  results or {kb}KB (whichever is hit first).",
                 kb = DEFAULT_MAX_BYTES / 1024
