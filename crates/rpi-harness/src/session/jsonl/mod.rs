@@ -23,7 +23,8 @@ pub use codec::{
 pub use errors::{file_result, invalid_file, JsonlDecodeError, JsonlDecodeErrorKind};
 pub use repo::{jsonl_session_directory_name, JsonlSessionRepo};
 pub use storage::{
-    compact_retired_frames, JsonlSessionFacts, JsonlSessionStorage, RetiredFrameGcReport,
+    compact_retired_frames, JsonlSessionFacts, JsonlSessionStorage, PreparedJsonlRestore,
+    RetiredFrameGcReport,
 };
 pub use types::{
     HeaderKind, JsonlSessionCreateOptions, JsonlSessionListOptions, JsonlSessionMetadata,

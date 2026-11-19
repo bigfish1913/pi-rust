@@ -65,7 +65,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use rpi_tools::env::{FileContent, FileSystem, WriterLease};
+use rpi_tools::env::{FileContent, FileSystem, ReadFile, WriterLease};
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
 use crate::session::jsonl::codec::{
@@ -94,6 +94,47 @@ pub struct JsonlSessionFacts {
     pub values: crate::session::SessionValues,
 }
 
+/// A fully replayed restore which has not yet acquired the writer lease.
+/// Resource preflight can inspect its facts and reject safely; commit later
+/// verifies the source, acquires the lease, and applies deferred repair.
+pub struct PreparedJsonlRestore {
+    storage: JsonlSessionStorage,
+    facts: JsonlSessionFacts,
+}
+
+impl PreparedJsonlRestore {
+    pub async fn facts(&self) -> SessionResult<JsonlSessionFacts> {
+        Ok(self.facts.clone())
+    }
+
+    pub fn metadata(&self) -> JsonlSessionMetadata {
+        self.facts.metadata.clone()
+    }
+
+    pub async fn commit(self) -> SessionResult<JsonlSessionStorage> {
+        let mut storage = self.storage;
+        // Reject a stale prepared replay before creating the writer lease. A
+        // second check closes the race between verification and acquisition.
+        storage.verify_loaded_history().await?;
+        storage.acquire_writer_lease().await?;
+        storage.verify_loaded_history().await?;
+        storage.commit_pending_repair().await?;
+        Ok(storage)
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum PendingRepair {
+    Streaming {
+        reader: Arc<dyn ReadFile>,
+        spans: Vec<(u64, u64)>,
+    },
+    Eager {
+        bytes: Vec<u8>,
+    },
+    AppendNewline,
+}
+
 /// Recovery policy is independent of cold payload residency. Both replay paths
 /// must enforce it before returning; detached snapshots materialize afterwards.
 #[derive(Clone, Copy)]
@@ -102,6 +143,8 @@ enum ReadPolicy {
     ReadOnly,
     /// Private, capability-free facts replay only; it never exports storage.
     FactsOnly,
+    /// Full restore replay without lease acquisition or repair.
+    PreparedRestore,
     ResourceTransitionStrict,
     SavedReadCold(std::time::Instant),
 }
@@ -111,6 +154,10 @@ impl ReadPolicy {
 
     fn repairs(self) -> bool {
         matches!(self, Self::Restore)
+    }
+
+    fn defers_repairs(self) -> bool {
+        matches!(self, Self::PreparedRestore)
     }
 
     /// Facts-only replay validates every row but must not retain frame
@@ -177,6 +224,8 @@ pub struct JsonlSessionStorage {
     progress: super::progress::JsonlProgressStore,
     /// Exact loaded legacy history, including its header, before writable opt-in.
     legacy_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
+    loaded_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
+    pending_repair: Arc<StdMutex<Option<PendingRepair>>>,
 }
 
 impl Clone for JsonlSessionStorage {
@@ -196,6 +245,8 @@ impl Clone for JsonlSessionStorage {
             generation: self.generation.clone(),
             progress: self.progress.clone(),
             legacy_history_digest: self.legacy_history_digest.clone(),
+            loaded_history_digest: self.loaded_history_digest.clone(),
+            pending_repair: self.pending_repair.clone(),
         }
     }
 }
@@ -272,6 +323,8 @@ impl JsonlSessionStorage {
             uncertain: Arc::new(AtomicBool::new(false)),
             generation: Arc::new(AtomicU64::new(generation)),
             legacy_history_digest: Arc::new(StdMutex::new(None)),
+            loaded_history_digest: Arc::new(StdMutex::new(None)),
+            pending_repair: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -461,6 +514,18 @@ impl JsonlSessionStorage {
             .await
     }
 
+    /// Replay a restore without claiming ownership or repairing the source.
+    pub async fn prepare_restore(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<PreparedJsonlRestore> {
+        let storage = Self::load_impl(fs, path, clock, ids, ReadPolicy::PreparedRestore).await?;
+        let facts = storage.facts().await?;
+        Ok(PreparedJsonlRestore { storage, facts })
+    }
+
     /// Strict nonrepairing transition open. Caller must own the canonical writer
     /// lock before using the returned handle for writes. Preflight may inspect
     /// it without ownership, but must discard the handle afterwards.
@@ -530,6 +595,56 @@ impl JsonlSessionStorage {
         })
     }
 
+    async fn verify_loaded_history(&self) -> SessionResult<()> {
+        let expected = self
+            .loaded_history_digest
+            .lock()
+            .map_err(|_| SessionError::storage("session history digest lock poisoned"))?
+            .ok_or_else(|| SessionError::storage("prepared restore has no source fingerprint"))?;
+        let actual = if let Some(reader) = file_result(
+            self.fs.open_read_file(&self.metadata.path).await,
+            "open prepared session history verifier",
+        )? {
+            if let Some(length) = file_result(
+                reader.byte_len().await,
+                "stat prepared session history verifier",
+            )? {
+                streaming::hash_reader(&reader, length).await?
+            } else {
+                <[u8; 32]>::from(Sha256::digest(&file_result(
+                    reader.read_all().await,
+                    "read prepared session history verifier",
+                )?))
+            }
+        } else {
+            <[u8; 32]>::from(Sha256::digest(
+                file_result(
+                    self.fs.read_text_file(&self.metadata.path, None).await,
+                    "read prepared session history verifier",
+                )?
+                .as_bytes(),
+            ))
+        };
+        if actual != expected {
+            return Err(SessionError::invalid_entry(
+                "session history changed during restore preparation; reopen session",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn commit_pending_repair(&mut self) -> SessionResult<()> {
+        let pending = self
+            .pending_repair
+            .lock()
+            .map_err(|_| SessionError::storage("session repair lock poisoned"))?
+            .take();
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        self.commit_pending_repair_impl(pending).await
+    }
+
     async fn load_impl(
         fs: Arc<dyn FileSystem>,
         path: &str,
@@ -539,6 +654,7 @@ impl JsonlSessionStorage {
     ) -> SessionResult<Self> {
         policy.check(0)?;
         let repair = policy.repairs();
+        let defer_repair = policy.defers_repairs();
         let strict = policy.strict();
         let read_diagnostics = crate::session::diagnostics::RecoveryPhase::start("history_read");
         let reader = file_result(fs.open_read_file(path).await, "open session history reader")?;
@@ -639,9 +755,10 @@ impl JsonlSessionStorage {
             }
         }
         storage.progress.required = header.progress_format.is_some();
+        let source_digest = <[u8; 32]>::from(Sha256::digest(content.as_bytes()));
+        *storage.loaded_history_digest.lock().unwrap() = Some(source_digest);
         if !storage.progress.required {
-            *storage.legacy_history_digest.lock().unwrap() =
-                Some(Sha256::digest(content.as_bytes()).into());
+            *storage.legacy_history_digest.lock().unwrap() = Some(source_digest);
         }
         if let Some(checkpoint) =
             history_checkpoint(&header).map_err(|error| invalid_file(path, 1, &error))?
@@ -774,13 +891,22 @@ impl JsonlSessionStorage {
                     let is_last = idx == physical_lines.len() - 1;
                     let is_torn_tail = is_last && err.kind == JsonlDecodeErrorKind::Syntax;
                     if is_torn_tail {
-                        if !repair {
+                        if !repair && !defer_repair {
                             return Ok(storage);
                         }
                         // Drop the unacknowledged partial append by atomically
-                        // publishing the valid prefix.
-                        storage.ensure_writer_lease().await?;
+                        // publishing the valid prefix. Prepared restores defer
+                        // this publication until after resource preflight.
                         let valid_prefix = format!("{}\n", physical_lines[..idx].join("\n"));
+                        if defer_repair {
+                            *storage.pending_repair.lock().unwrap() = Some(PendingRepair::Eager {
+                                bytes: valid_prefix.into_bytes(),
+                            });
+                            let applied = kept_lines.len();
+                            replay_diagnostics.finish(physical_lines.len() - 1, applied);
+                            return Ok(storage);
+                        }
+                        storage.ensure_writer_lease().await?;
                         if !storage.progress.required {
                             *storage.legacy_history_digest.lock().unwrap() =
                                 Some(Sha256::digest(valid_prefix.as_bytes()).into());
@@ -812,8 +938,7 @@ impl JsonlSessionStorage {
         // without the dropped duplicates so the log no longer carries them.
         // Seq values are untouched (no renumbering), so subsequent appends
         // stay consistent with the file.
-        if dropped_duplicates && repair {
-            storage.ensure_writer_lease().await?;
+        if dropped_duplicates && (repair || defer_repair) {
             let mut repaired = String::with_capacity(content.len());
             repaired.push_str(physical_lines[0]);
             repaired.push('\n');
@@ -821,46 +946,60 @@ impl JsonlSessionStorage {
                 repaired.push_str(line);
                 repaired.push('\n');
             }
-            if !storage.progress.required {
-                *storage.legacy_history_digest.lock().unwrap() =
-                    Some(Sha256::digest(repaired.as_bytes()).into());
-            }
-            let fs = storage.fs.clone();
-            let path_owned = path.to_string();
-            publish_file_atomically(&fs, &path_owned, |fs, temp_path| {
-                let repaired = repaired.clone();
-                let path_owned = path_owned.clone();
-                Box::pin(async move {
-                    file_result(
-                        fs.write_file(temp_path, FileContent::Text(repaired), None)
-                            .await,
-                        &format!("Failed to stage session repair {path_owned}"),
-                    )?;
-                    Ok(())
+            if defer_repair {
+                *storage.pending_repair.lock().unwrap() = Some(PendingRepair::Eager {
+                    bytes: repaired.into_bytes(),
+                });
+            } else {
+                storage.ensure_writer_lease().await?;
+                if !storage.progress.required {
+                    *storage.legacy_history_digest.lock().unwrap() =
+                        Some(Sha256::digest(repaired.as_bytes()).into());
+                }
+                let fs = storage.fs.clone();
+                let path_owned = path.to_string();
+                publish_file_atomically(&fs, &path_owned, |fs, temp_path| {
+                    let repaired = repaired.clone();
+                    let path_owned = path_owned.clone();
+                    Box::pin(async move {
+                        file_result(
+                            fs.write_file(temp_path, FileContent::Text(repaired), None)
+                                .await,
+                            &format!("Failed to stage session repair {path_owned}"),
+                        )?;
+                        Ok(())
+                    })
                 })
-            })
-            .await?;
+                .await?;
+            }
             replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
             return Ok(storage);
         }
         // Repair an unterminated tail (no trailing "\n") so future appends are
         // on their own line.
-        if repair && !content.ends_with('\n') {
-            storage.ensure_writer_lease().await?;
-            file_result(
-                storage
-                    .fs
-                    .append_file(path, FileContent::Text("\n".into()), None)
-                    .await,
-                &format!("Failed to repair unterminated session tail {path}"),
-            )?;
-            file_result(
-                storage.fs.sync_file(path, true, None).await,
-                &format!("Failed to sync repaired session tail {path}"),
-            )?;
-            if !storage.progress.required {
-                *storage.legacy_history_digest.lock().unwrap() =
-                    Some(Sha256::digest(format!("{content}\n").as_bytes()).into());
+        if (repair || defer_repair) && !content.ends_with('\n') {
+            if defer_repair {
+                let mut repaired = content.as_bytes().to_vec();
+                repaired.push(b'\n');
+                *storage.pending_repair.lock().unwrap() =
+                    Some(PendingRepair::Eager { bytes: repaired });
+            } else {
+                storage.ensure_writer_lease().await?;
+                file_result(
+                    storage
+                        .fs
+                        .append_file(path, FileContent::Text("\n".into()), None)
+                        .await,
+                    &format!("Failed to repair unterminated session tail {path}"),
+                )?;
+                file_result(
+                    storage.fs.sync_file(path, true, None).await,
+                    &format!("Failed to sync repaired session tail {path}"),
+                )?;
+                if !storage.progress.required {
+                    *storage.legacy_history_digest.lock().unwrap() =
+                        Some(Sha256::digest(format!("{content}\n").as_bytes()).into());
+                }
             }
         }
         policy.check(physical_lines.len() - 1)?;
