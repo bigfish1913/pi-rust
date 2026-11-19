@@ -1116,6 +1116,13 @@ pub type BeforeAgentStartFn =
 pub type ToolResultFn =
     extern "C" fn(event_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
+/// Argument suggester for the TUI autocomplete pipeline (see
+/// [`PluginApi::register_argument_suggester`]). Same JSON-in/JSON-out shape as
+/// [`ToolResultFn`]: the request is borrowed and must not be freed; `out` is
+/// plugin-owned and reclaimed via the registered `plugin_free_string`.
+pub type ArgumentSuggesterFn =
+    extern "C" fn(request_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
 // ---------------------------------------------------------------------------
 // Runtime actions — uniform JSON-RPC dispatch by RuntimeActionId
 // ---------------------------------------------------------------------------
@@ -2051,6 +2058,60 @@ pub struct PluginApi {
             user_data: *mut c_void,
         ) -> i32,
     >,
+    /// Register an argument suggester for the TUI autocomplete pipeline,
+    /// appended after `register_tool_result`. Appended last on purpose so
+    /// older hosts (shorter `struct_size`) simply never reach it; plugins
+    /// must treat `None` as "no argument suggestions on this host".
+    ///
+    /// `command` is the slash-command token the suggestions annotate (with or
+    /// without the leading `/`; the host normalizes). Re-registering the same
+    /// command replaces the previous suggester. The host calls the handler
+    /// only when the editor draft starts with that command token.
+    ///
+    /// The handler receives a borrowed JSON request
+    /// `{"command":"/msg","args":""}` and writes an owning response
+    /// `{"items":[{"value":"…","label":"…","description":"…"}]}` into `out`.
+    /// `value` is what the completion inserts; `label` is what renders;
+    /// `description` is the optional right-hand hint. An empty or missing
+    /// `items` array means "no suggestions".
+    ///
+    /// **Full-candidate-list contract:** the host calls the suggester with an
+    /// EMPTY `args` and caches the returned list **per command**; narrowing
+    /// against the typed prefix happens in the host, locally per keystroke.
+    /// Return every valid candidate — do NOT filter on `args` (a filtered
+    /// list would shrink the host's cached frame and lose candidates when the
+    /// user deletes a character). Plugins that need query-dependent results
+    /// must instead return the full list and let the host narrow.
+    ///
+    /// Contract notes for plugins:
+    /// - the host calls the handler from a background worker with a **500 ms
+    ///   bounded wait**; a late response is reclaimed and dropped — it can
+    ///   never block typing. At most one call per command is in flight; keep
+    ///   the implementation cheap and cache-heavy (it runs at most once per
+    ///   refresh window per command, not per keystroke).
+    /// - response caps: at most 64 items, each string field at most 256
+    ///   characters including any truncation ellipsis (host-side; longer
+    ///   entries are truncated, oversized responses are dropped before the
+    ///   host copies them).
+    /// - narrowing/matching (host-side, per keystroke): rows whose `value`
+    ///   starts with the typed prefix rank first, then rows whose `label`
+    ///   contains it, then rows whose `value` contains it; an exact value
+    ///   match is excluded (it is the just-completed selection). Keep
+    ///   `value` a clean instance token so prefix matching stays predictable.
+    /// - the strings cross the ABI like every other callback: request is
+    ///   borrowed (do not free), response is plugin-owned and reclaimed via
+    ///   the registered `plugin_free_string`.
+    ///
+    /// Returns 0 on registration success, nonzero when the host rejects the
+    /// registration.
+    pub register_argument_suggester: Option<
+        extern "C" fn(
+            command: StbStringRef,
+            handler: ArgumentSuggesterFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 }
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
@@ -2547,6 +2608,7 @@ mod tests {
             register_tool_result: None,
             register_autocomplete_provider: None,
             register_command_completions: None,
+            register_argument_suggester: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -2672,9 +2734,15 @@ mod tests {
             autocomplete + size_of::<usize>(),
             "register_command_completions must be appended after register_autocomplete_provider"
         );
+        let argument_suggester = core::mem::offset_of!(PluginApi, register_argument_suggester);
+        assert_eq!(
+            argument_suggester,
+            command_completions + size_of::<usize>(),
+            "register_argument_suggester must be appended after register_command_completions"
+        );
         assert_eq!(
             size_of::<PluginApi>(),
-            command_completions + size_of::<usize>()
+            argument_suggester + size_of::<usize>()
         );
         assert_eq!(align_of::<PluginApi>(), align_of::<*const ()>());
     }
@@ -2779,6 +2847,7 @@ mod tests {
             register_tool_result: None,
             register_autocomplete_provider: None,
             register_command_completions: None,
+            register_argument_suggester: None,
         }
     }
 

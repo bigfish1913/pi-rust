@@ -443,6 +443,12 @@ pub struct ExtensionSession {
     /// host's harness cell immediately after create. Cloning is cheap (an `Arc`
     /// clone); the keepalive also holds a clone for the lifetime guarantee.
     action_bridge: Option<Arc<ActionBridge>>,
+    /// Session-level argument-suggestion service: one worker thread, per-
+    /// command cache and generation tags. Built once per session, so a
+    /// `/reload` that builds a fresh session also gets a fresh (empty) cache —
+    /// stale frames from the previous session are structurally unreachable
+    /// (review #5). See [`suggest_service::SuggestService`].
+    suggest_service: Arc<crate::suggest_service::SuggestService>,
 }
 
 impl ExtensionSession {
@@ -456,6 +462,7 @@ impl ExtensionSession {
         action_bridge: Option<Arc<ActionBridge>>,
     ) -> Self {
         Self {
+            suggest_service: Arc::new(crate::suggest_service::SuggestService::new()),
             keepalive,
             snapshot: Some(snapshot),
             loaded_paths,
@@ -465,12 +472,21 @@ impl ExtensionSession {
 
     /// An empty session (no plugins loaded — `--no-extensions` or no dirs found).
     pub fn none() -> Self {
+        let keepalive = Arc::new(PluginKeepalive::new(Vec::new(), None));
         Self {
-            keepalive: Arc::new(PluginKeepalive::new(Vec::new(), None)),
+            suggest_service: Arc::new(crate::suggest_service::SuggestService::new()),
+            keepalive,
             snapshot: None,
             loaded_paths: Vec::new(),
             action_bridge: None,
         }
+    }
+
+    /// The session's argument-suggestion service. One per session: the TUI's
+    /// autocomplete provider resolves it per call (cheap `Arc` access) and a
+    /// `/reload` swaps in a fresh service with an empty cache.
+    pub fn suggest_service(&self) -> Arc<crate::suggest_service::SuggestService> {
+        Arc::clone(&self.suggest_service)
     }
 
     /// Cancel plugin background work. Call outside host/session locks.
@@ -623,8 +639,10 @@ pub fn load_session_mixed_guarded(
     let mut keepalive = PluginKeepalive::new(Vec::new(), action_bridge.clone());
     keepalive.plugins = loaded;
     let snapshot = Arc::new(session_registry.snapshot());
+    let keepalive = Arc::new(keepalive);
     ExtensionSession {
-        keepalive: Arc::new(keepalive),
+        suggest_service: Arc::new(crate::suggest_service::SuggestService::new()),
+        keepalive,
         snapshot: Some(snapshot),
         loaded_paths,
         action_bridge,

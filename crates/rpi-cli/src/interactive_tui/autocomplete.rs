@@ -380,9 +380,9 @@ pub(super) fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>)
         if !completes_whole {
             return false;
         }
-        return apply_suggestion(state, editor, token_start, token_end, top);
+        return apply_suggestion(state, editor, token_start, token_end, top, false);
     }
-    apply_suggestion(state, editor, start, end, top)
+    apply_suggestion(state, editor, start, end, top, true)
 }
 
 /// Replace `text[start..end]` with `item`, keep the text after the span,
@@ -393,14 +393,27 @@ fn apply_suggestion(
     start: usize,
     end: usize,
     item: &AutocompleteItem,
+    allow_leading_space: bool,
 ) -> bool {
     let text = editor.get_text();
     // `start`/`end` are byte offsets on char boundaries, so the `text[..start]`
     // / `text[end..]` slices are sound for multibyte input.
     let start = start.min(text.len());
     let end = end.min(text.len());
-    let mut replaced = String::with_capacity(text.len() + item.text.len());
+    let mut replaced = String::with_capacity(text.len() + item.text.len() + 1);
     replaced.push_str(&text[..start]);
+    // Argument suggestions replace an empty span right after the command
+    // token (`/msg|` + Tab): the item itself carries `insert_space` for the
+    // trailing space, but the boundary between the command token and the
+    // inserted value also needs one, or `/msg` and `jixiuf@...` fuse.
+    if allow_leading_space
+        && start > 0
+        && item.insert_space
+        && !item.is_directory
+        && !text[..start].ends_with(char::is_whitespace)
+    {
+        replaced.push(' ');
+    }
     replaced.push_str(&item.text);
     // Keep the text AFTER the replaced span (mid-line completion: replacing
     // `[start, end)` must not drop the rest of the line).
@@ -417,10 +430,15 @@ fn apply_suggestion(
         item.text.len()
     };
     // New caret position: after the inserted text (byte offset; the editor
-    // snaps `set_cursor` to a char boundary as a safety net).
-    let new_cursor = replaced
-        .len()
-        .min(start + inserted_cursor_len + usize::from(add_space));
+    // snaps `set_cursor` to a char boundary as a safety net). Include the
+    // optional separator before the item as well as the trailing separator.
+    let leading_space = allow_leading_space
+        && start > 0
+        && item.insert_space
+        && !item.is_directory
+        && !text[..start].ends_with(char::is_whitespace);
+    let new_cursor =
+        start + usize::from(leading_space) + inserted_cursor_len + usize::from(add_space);
     editor.set_text(&replaced);
     set_editor_cursor_offset(editor, &replaced, new_cursor);
     close_autocomplete_popup(state);
@@ -530,17 +548,17 @@ pub(super) struct EnterCompletion {
     /// What the Enter key does.
     pub(super) action: EnterCompletionAction,
     /// The candidate to insert and the byte span it replaces.
-    pub(super) candidate: Option<(AutocompleteItem, usize, usize)>,
+    pub(super) candidate: Option<(AutocompleteItem, usize, usize, bool)>,
 }
 
 impl EnterCompletion {
     /// Write the resolved replacement into the editor. Returns `true` when a
     /// candidate was applied; a `Submit` decision carries none.
     pub(super) fn apply(&self, state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
-        let Some((item, start, end)) = self.candidate.as_ref() else {
+        let Some((item, start, end, allow_leading_space)) = self.candidate.as_ref() else {
             return false;
         };
-        apply_suggestion(state, editor, *start, *end, item)
+        apply_suggestion(state, editor, *start, *end, item, *allow_leading_space)
     }
 
     /// Whether the key loop consumes this Enter instead of forwarding it to
@@ -584,12 +602,16 @@ pub(super) fn resolve_enter_completion(
         return None;
     }
     let start = popup.start.min(text.len());
-    // Same explicit-context rule as `navigate_autocomplete`: only the `/`
-    // token at input start or an `@`-file token counts as a popup the Enter
-    // key belongs to.
-    let explicit = text[start..].starts_with('/')
-        || text[..start].ends_with('@')
-        || text[..start].ends_with("@\"");
+    let command_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let is_argument_popup = !popup.is_path
+        && popup.start == command_end
+        && cursor > command_end
+        && text[..command_end].starts_with('/');
+    let explicit = if popup.is_path {
+        text[..start].ends_with('@') || text[..start].ends_with("@\"")
+    } else {
+        (popup.start == 0 && text.starts_with('/')) || is_argument_popup
+    };
     if !explicit {
         return None;
     }
@@ -598,9 +620,26 @@ pub(super) fn resolve_enter_completion(
     // `end` = caret), so with the caret in the ARGUMENTS (`/help me`) the
     // replacement would run to the end of the line and swallow them: Enter on
     // `/help me` must submit `/help me`, not `/help`.
+    //
+    // Extension ARGUMENT suggestions are the exception: their `start` equals
+    // the command token's end (the provider replaces only the argument span),
+    // and Enter there means "accept the highlighted target" — the guard below
+    // must not reject that popup.
     let command_end = text.find(char::is_whitespace).unwrap_or(text.len());
-    if !popup.is_path && cursor > command_end {
+    let is_argument_popup =
+        !popup.is_path && popup.start == command_end && text[..command_end].starts_with('/');
+    if !popup.is_path && !is_argument_popup && cursor > command_end {
         return None;
+    }
+    // An argument popup at the exact command boundary exists for Tab, but
+    // Enter at `/msg|` must still submit the command rather than silently
+    // choosing the first target. Argument completion becomes Enter-active
+    // only once the caret has entered the argument region.
+    if !popup.is_path && popup.start > 0 && cursor <= command_end {
+        return Some(EnterCompletion {
+            action: EnterCompletionAction::Submit,
+            candidate: None,
+        });
     }
     // Explicit selection: the user navigated THIS popup with ↑/↓. The stamp
     // (set by navigation, retired when the popup changes) is what carries the
@@ -659,13 +698,22 @@ pub(super) fn resolve_enter_completion(
             candidate: None,
         });
     }
+    // An extension-argument popup replaces only the argument span (its
+    // `start` sits after the command token, which the draft keeps). Applying
+    // the target must NOT submit: the user still needs to type the message
+    // body, so the Enter is consumed like a path completion.
     Some(EnterCompletion {
-        action: if popup.is_path {
+        action: if popup.is_path || is_argument_popup {
             EnterCompletionAction::ApplyOnly
         } else {
             EnterCompletionAction::ApplyAndSubmit
         },
-        candidate: Some((top.clone(), replacement_start, replacement_end)),
+        candidate: Some((
+            top.clone(),
+            replacement_start,
+            replacement_end,
+            !popup.is_path,
+        )),
     })
 }
 
@@ -718,11 +766,16 @@ pub(super) fn navigate_autocomplete(
         return false;
     }
     let start = sugg.start.min(text.len());
-    // `/` commands keep the slash at `start`; the path provider keeps `@`
-    // (and an optional opening quote) before `start`.
-    let explicit = text[start..].starts_with('/')
-        || text[..start].ends_with('@')
-        || text[..start].ends_with("@\"");
+    let command_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let is_argument_popup = !sugg.is_path
+        && sugg.start == command_end
+        && cursor > command_end
+        && text[..command_end].starts_with('/');
+    let explicit = if sugg.is_path {
+        text[..start].ends_with('@') || text[..start].ends_with("@\"")
+    } else {
+        (sugg.start == 0 && text.starts_with('/')) || is_argument_popup
+    };
     if !explicit {
         return false;
     }

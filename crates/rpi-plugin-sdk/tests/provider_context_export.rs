@@ -90,6 +90,7 @@ fn api() -> sdk::PluginApi {
         register_tool_result: None,
         register_autocomplete_provider: None,
         register_command_completions: None,
+        register_argument_suggester: None,
     }
 }
 
