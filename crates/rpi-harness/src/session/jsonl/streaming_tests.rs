@@ -1179,13 +1179,11 @@ async fn prepared_restore_rejects_history_changes_before_commit() {
     )
     .await
     .unwrap();
-    fs.append_file(
-        "changed.jsonl",
-        FileContent::Text(encode_mutation(&message("e2", 2, Some("e1"), "two"))),
-        None,
-    )
-    .await
-    .unwrap();
+    let appended = encode_mutation(&message("e2", 2, Some("e1"), "two"));
+    fs.append_file("changed.jsonl", FileContent::Text(appended.clone()), None)
+        .await
+        .unwrap();
+    let source_after_append = fs.read_text_file("changed.jsonl", None).await.unwrap();
 
     let error = match prepared.commit().await {
         Ok(_) => panic!("prepared restore accepted a changed transcript"),
@@ -1194,5 +1192,240 @@ async fn prepared_restore_rejects_history_changes_before_commit() {
     assert!(error
         .to_string()
         .contains("changed during restore preparation"));
-    assert!(!fs.exists("changed.jsonl.lock", None).await.unwrap());
+    // The rejected commit must not keep ownership: a later open has to succeed,
+    // and the source generation it observed must be left exactly as it was.
+    let lease = fs
+        .try_acquire_writer_lease("changed.jsonl")
+        .await
+        .expect("failed prepared commit released its lease");
+    assert!(lease.is_some(), "OS backend must report lease capability");
+    assert_eq!(
+        source_after_append,
+        fs.read_text_file("changed.jsonl", None).await.unwrap()
+    );
+}
+
+/// Injects one foreign append exactly while the writer lease is being acquired,
+/// i.e. inside the window between prepared replay and commit.
+struct LeaseRacingFs {
+    inner: Arc<dyn FileSystem>,
+    path: &'static str,
+    stolen: std::sync::Mutex<Option<Vec<u8>>>,
+}
+#[async_trait]
+impl FileSystem for LeaseRacingFs {
+    fn cwd(&self) -> &std::path::Path {
+        self.inner.cwd()
+    }
+    async fn absolute_path(
+        &self,
+        path: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<std::path::PathBuf, rpi_tools::FileError> {
+        self.inner.absolute_path(path, cancel).await
+    }
+    async fn join_path(
+        &self,
+        parts: &[&str],
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<std::path::PathBuf, rpi_tools::FileError> {
+        self.inner.join_path(parts, cancel).await
+    }
+    async fn read_text_file(
+        &self,
+        path: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<String, rpi_tools::FileError> {
+        self.inner.read_text_file(path, cancel).await
+    }
+    async fn read_text_lines(
+        &self,
+        path: &str,
+        max_lines: Option<usize>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Vec<String>, rpi_tools::FileError> {
+        self.inner.read_text_lines(path, max_lines, cancel).await
+    }
+    async fn read_binary_file(
+        &self,
+        path: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Vec<u8>, rpi_tools::FileError> {
+        self.inner.read_binary_file(path, cancel).await
+    }
+    async fn write_file(
+        &self,
+        path: &str,
+        content: FileContent,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(), rpi_tools::FileError> {
+        self.inner.write_file(path, content, cancel).await
+    }
+    async fn append_file(
+        &self,
+        path: &str,
+        content: FileContent,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(), rpi_tools::FileError> {
+        self.inner.append_file(path, content, cancel).await
+    }
+    async fn open_read_file(
+        &self,
+        path: &str,
+    ) -> Result<Option<Arc<dyn ReadFile>>, rpi_tools::FileError> {
+        self.inner.open_read_file(path).await
+    }
+    async fn file_info(
+        &self,
+        path: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<rpi_tools::env::FileInfo, rpi_tools::FileError> {
+        self.inner.file_info(path, cancel).await
+    }
+    async fn list_dir(
+        &self,
+        path: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Vec<rpi_tools::env::FileInfo>, rpi_tools::FileError> {
+        self.inner.list_dir(path, cancel).await
+    }
+    async fn canonical_path(
+        &self,
+        path: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<std::path::PathBuf, rpi_tools::FileError> {
+        self.inner.canonical_path(path, cancel).await
+    }
+    async fn exists(
+        &self,
+        path: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<bool, rpi_tools::FileError> {
+        self.inner.exists(path, cancel).await
+    }
+    async fn create_dir(
+        &self,
+        path: &str,
+        recursive: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(), rpi_tools::FileError> {
+        self.inner.create_dir(path, recursive, cancel).await
+    }
+    async fn remove(
+        &self,
+        path: &str,
+        recursive: bool,
+        force: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(), rpi_tools::FileError> {
+        self.inner.remove(path, recursive, force, cancel).await
+    }
+    async fn rename_file(
+        &self,
+        source: &str,
+        dest: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(), rpi_tools::FileError> {
+        self.inner.rename_file(source, dest, cancel).await
+    }
+    async fn create_temp_dir(
+        &self,
+        prefix: Option<&str>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<std::path::PathBuf, rpi_tools::FileError> {
+        self.inner.create_temp_dir(prefix, cancel).await
+    }
+    async fn create_temp_file(
+        &self,
+        prefix: &str,
+        suffix: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<std::path::PathBuf, rpi_tools::FileError> {
+        self.inner.create_temp_file(prefix, suffix, cancel).await
+    }
+    async fn sync_directory(
+        &self,
+        path: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(), rpi_tools::FileError> {
+        self.inner.sync_directory(path, cancel).await
+    }
+    async fn cleanup(&self) {
+        self.inner.cleanup().await
+    }
+    async fn try_acquire_writer_lease(
+        &self,
+        path: &str,
+    ) -> Result<Option<Box<dyn rpi_tools::env::WriterLease>>, rpi_tools::FileError> {
+        let lease = self.inner.try_acquire_writer_lease(path).await?;
+        // A compliant writer cannot do this while the lease is held; the append
+        // lands first and then this commit acquires ownership, which is exactly
+        // the race the fingerprint check has to catch.
+        let stolen = if path == self.path {
+            let taken = self
+                .stolen
+                .lock()
+                .map_err(|_| {
+                    rpi_tools::FileError::new(
+                        rpi_tools::FileErrorCode::Unknown,
+                        "steal lock poisoned",
+                    )
+                })?
+                .take();
+            taken
+        } else {
+            None
+        };
+        if let Some(bytes) = stolen {
+            self.inner
+                .append_file(path, FileContent::Bytes(bytes), None)
+                .await?;
+        }
+        Ok(lease)
+    }
+}
+
+#[tokio::test]
+async fn prepared_restore_verifies_the_source_after_taking_ownership() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    // Unterminated tail so commit has a deferred repair whose publication would
+    // replace the whole file from the replayed spans.
+    let history = format!(
+        "{}{}",
+        encode_header(&header()),
+        encode_mutation(&message("e1", 1, None, "one")),
+    );
+    let stolen = encode_mutation(&message("e2", 2, Some("e1"), "two"));
+    let fs: Arc<dyn FileSystem> = Arc::new(LeaseRacingFs {
+        inner: env.clone(),
+        path: "racing.jsonl",
+        stolen: std::sync::Mutex::new(Some(stolen.clone().into_bytes())),
+    });
+    fs.write_file("racing.jsonl", FileContent::Text(history), None)
+        .await
+        .unwrap();
+
+    let prepared = JsonlSessionStorage::prepare_restore(
+        fs.clone(),
+        "racing.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
+    .await
+    .unwrap();
+    let error = match prepared.commit().await {
+        Ok(_) => panic!("commit published a repair over a concurrently changed source"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("changed during restore preparation"));
+    let published = fs.read_text_file("racing.jsonl", None).await.unwrap();
+    assert!(
+        published.ends_with(&stolen),
+        "foreign append must survive the rejected commit: {published:?}"
+    );
 }

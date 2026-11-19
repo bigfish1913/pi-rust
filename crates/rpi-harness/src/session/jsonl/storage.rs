@@ -113,12 +113,14 @@ impl PreparedJsonlRestore {
 
     pub async fn commit(self) -> SessionResult<JsonlSessionStorage> {
         let mut storage = self.storage;
-        // Reject a stale prepared replay before creating the writer lease. Once
-        // the lease is held, its fence prevents other compliant writers from
-        // changing the source while deferred repair is committed; rehashing
-        // the entire transcript here would only duplicate the replay cost.
-        storage.verify_loaded_history().await?;
+        // Ownership first, then the single fingerprint check: while the lease is
+        // held no compliant writer can change the source, so this digest proves
+        // the replay still matches the generation the deferred repair publishes.
+        // Verifying before the lease would leave a window where a concurrent
+        // append lands between the check and acquisition and is then silently
+        // replaced by the repair.
         storage.ensure_writer_lease().await?;
+        storage.verify_loaded_history().await?;
         storage.commit_pending_repair().await?;
         Ok(storage)
     }
