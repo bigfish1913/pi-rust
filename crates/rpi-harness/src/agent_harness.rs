@@ -3827,10 +3827,10 @@ impl AgentHarness {
     /// `before_provider_request`/`before_provider_headers` `on()` handlers can
     /// patch the LIVE per-call options (not a run-once config-build — that
     /// would not be equivalent to pi's `beforeRequest`, which fires before
-    /// every provider call). `after_response` observation is wired on the
-    /// emitter side (B3+) where the terminal `MessageEnd` is visible without
-    /// stealing the stream from the loop; the per-call patch is the
-    /// load-bearing B4 deliverable here.
+    /// every provider call). `after_response` is invoked by the agent loop
+    /// after the stream resolves and before it emits `MessageEnd`, where the
+    /// terminal assistant message is available without consuming the stream
+    /// in this bridge.
     fn build_stream_fn(
         models: Vec<Arc<dyn AiProvider>>,
         provider_hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
@@ -5138,6 +5138,7 @@ impl AgentHarness {
             }),
             before_tool_call: snap.before_tool_call.clone(),
             after_tool_call: snap.after_tool_call.clone(),
+            provider_hooks: snap.provider_hooks.clone(),
             tool_execution: snap.tool_execution.to_agent_mode(),
             thinking_level: snap.thinking_level,
             api_key: None,
