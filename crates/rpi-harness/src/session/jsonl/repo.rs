@@ -319,6 +319,28 @@ impl JsonlSessionRepo {
         Ok(facts)
     }
 
+    /// Prepare a complete restore replay without claiming the session writer.
+    /// The caller may inspect facts and commit the same replay after admission.
+    pub async fn prepare_restore_by_jsonl_metadata(
+        &self,
+        metadata: &JsonlSessionMetadata,
+    ) -> SessionResult<super::PreparedJsonlRestore> {
+        let prepared = JsonlSessionStorage::prepare_restore(
+            self.fs.clone(),
+            &metadata.path,
+            self.clock.clone(),
+            self.ids.clone(),
+        )
+        .await?;
+        if prepared.metadata().id != metadata.id {
+            return Err(SessionError::invalid_entry(format!(
+                "Session id does not match header: {}",
+                metadata.id
+            )));
+        }
+        Ok(prepared)
+    }
+
     /// Delete a session by its rich JSONL metadata (direct-path remove).
     /// Mirrors TS `delete(metadata: JsonlSessionMetadata)`.
     pub async fn delete_by_jsonl_metadata(

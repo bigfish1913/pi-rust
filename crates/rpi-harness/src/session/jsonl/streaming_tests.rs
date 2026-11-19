@@ -1114,3 +1114,85 @@ async fn raw_value_clear_rows_keep_canonical_tail_and_policy_semantics() {
         );
     }
 }
+
+#[tokio::test]
+async fn prepared_restore_reuses_replay_without_touching_source_before_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    let history = format!(
+        "{}{}{}",
+        encode_header(&header()),
+        encode_mutation(&message("e1", 1, None, "one")),
+        encode_mutation(&message("e2", 2, Some("e1"), "two")),
+    );
+    fs.write_file("prepared.jsonl", FileContent::Text(history.clone()), None)
+        .await
+        .unwrap();
+
+    let prepared = JsonlSessionStorage::prepare_restore(
+        fs.clone(),
+        "prepared.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
+    .await
+    .unwrap();
+    let facts = prepared.facts().await.unwrap();
+    assert_eq!(facts.metadata.id, "stream-test");
+    assert_eq!(facts.values.get("missing"), None);
+    assert!(!fs.exists("prepared.jsonl.lock", None).await.unwrap());
+    assert_eq!(
+        fs.read_text_file("prepared.jsonl", None).await.unwrap(),
+        history
+    );
+
+    let storage = prepared.commit().await.unwrap();
+    assert!(fs.exists("prepared.jsonl.lock", None).await.unwrap());
+    assert_eq!(storage.state.lock().await.sequence(), 2);
+    drop(storage);
+}
+
+#[tokio::test]
+async fn prepared_restore_rejects_history_changes_before_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    fs.write_file(
+        "changed.jsonl",
+        FileContent::Text(format!(
+            "{}{}",
+            encode_header(&header()),
+            encode_mutation(&message("e1", 1, None, "one")),
+        )),
+        None,
+    )
+    .await
+    .unwrap();
+    let prepared = JsonlSessionStorage::prepare_restore(
+        fs.clone(),
+        "changed.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
+    .await
+    .unwrap();
+    fs.append_file(
+        "changed.jsonl",
+        FileContent::Text(encode_mutation(&message("e2", 2, Some("e1"), "two"))),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let error = match prepared.commit().await {
+        Ok(_) => panic!("prepared restore accepted a changed transcript"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("changed during restore preparation"));
+    assert!(!fs.exists("changed.jsonl.lock", None).await.unwrap());
+}

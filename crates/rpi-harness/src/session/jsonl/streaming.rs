@@ -92,7 +92,10 @@ async fn copy_range(
     }
     Ok(())
 }
-async fn hash_reader(reader: &Arc<dyn ReadFile>, length: u64) -> SessionResult<[u8; 32]> {
+pub(super) async fn hash_reader(
+    reader: &Arc<dyn ReadFile>,
+    length: u64,
+) -> SessionResult<[u8; 32]> {
     let mut hash = Sha256::new();
     let mut offset = 0;
     while offset < length {
@@ -122,6 +125,7 @@ impl JsonlSessionStorage {
     ) -> SessionResult<Self> {
         policy.check(0)?;
         let allow_repair = policy.repairs();
+        let defer_repair = policy.defers_repairs();
         let strict = policy.strict();
         let mut scan = Scanner::new(reader.clone(), length);
         scan.policy = policy;
@@ -279,55 +283,151 @@ impl JsonlSessionStorage {
                 Err(error) => return Err(invalid_file(path, line_no, &error)),
             }
         }
-        if repair && allow_repair {
-            storage.ensure_writer_lease().await?;
-            let digest = Arc::new(std::sync::Mutex::new(None));
-            let output = digest.clone();
-            publish_file_atomically(&fs, path, move |fs, temp| {
-                Box::pin(async move {
-                    file_result(
-                        fs.write_file(temp, FileContent::Bytes(Vec::new()), None)
-                            .await,
-                        "stage session repair",
-                    )?;
-                    let mut hash = Sha256::new();
-                    for (offset, count) in spans {
-                        copy_range(fs, temp, &reader, offset, count, &mut hash).await?;
+        let source_digest = <[u8; 32]>::from(scan.hash.clone().finalize());
+        *storage.loaded_history_digest.lock().unwrap() = Some(source_digest);
+        if !storage.progress.required {
+            *storage.legacy_history_digest.lock().unwrap() = Some(source_digest);
+        }
+        if repair && (allow_repair || defer_repair) {
+            if allow_repair {
+                storage.ensure_writer_lease().await?;
+                let digest = Arc::new(std::sync::Mutex::new(None));
+                let output = digest.clone();
+                publish_file_atomically(&fs, path, move |fs, temp| {
+                    Box::pin(async move {
                         file_result(
-                            fs.append_file(temp, FileContent::Bytes(vec![b'\n']), None)
+                            fs.write_file(temp, FileContent::Bytes(Vec::new()), None)
                                 .await,
-                            "stage repaired newline",
+                            "stage session repair",
                         )?;
-                        hash.update(b"\n");
-                    }
-                    *output.lock().unwrap() = Some(<[u8; 32]>::from(hash.finalize()));
-                    Ok(())
+                        let mut hash = Sha256::new();
+                        for (offset, count) in spans {
+                            copy_range(fs, temp, &reader, offset, count, &mut hash).await?;
+                            file_result(
+                                fs.append_file(temp, FileContent::Bytes(vec![b'\n']), None)
+                                    .await,
+                                "stage repaired newline",
+                            )?;
+                            hash.update(b"\n");
+                        }
+                        *output.lock().unwrap() = Some(<[u8; 32]>::from(hash.finalize()));
+                        Ok(())
+                    })
                 })
-            })
-            .await?;
-            if !storage.progress.required {
-                *storage.legacy_history_digest.lock().unwrap() = *digest.lock().unwrap();
+                .await?;
+                if !storage.progress.required {
+                    *storage.legacy_history_digest.lock().unwrap() = *digest.lock().unwrap();
+                }
+            } else {
+                *storage.pending_repair.lock().unwrap() =
+                    Some(PendingRepair::Streaming { reader, spans });
             }
         } else {
-            if !terminated && allow_repair {
-                storage.ensure_writer_lease().await?;
-                file_result(
-                    fs.append_file(path, FileContent::Text("\n".into()), None)
-                        .await,
-                    "repair unterminated session tail",
-                )?;
-                file_result(
-                    fs.sync_file(path, true, None).await,
-                    "sync repaired unterminated session tail",
-                )?;
-                scan.hash.update(b"\n");
+            if !terminated && (allow_repair || defer_repair) {
+                if allow_repair {
+                    storage.ensure_writer_lease().await?;
+                    file_result(
+                        fs.append_file(path, FileContent::Text("\n".into()), None)
+                            .await,
+                        "repair unterminated session tail",
+                    )?;
+                    file_result(
+                        fs.sync_file(path, true, None).await,
+                        "sync repaired unterminated session tail",
+                    )?;
+                    scan.hash.update(b"\n");
+                } else {
+                    *storage.pending_repair.lock().unwrap() = Some(PendingRepair::AppendNewline);
+                }
             }
-            if !storage.progress.required {
+            if !storage.progress.required && allow_repair {
                 *storage.legacy_history_digest.lock().unwrap() = Some(scan.hash.finalize().into());
             }
         }
         policy.check((line_no - 1) as usize)?;
         Ok(storage)
+    }
+
+    pub(super) async fn commit_pending_repair_impl(
+        &mut self,
+        pending: PendingRepair,
+    ) -> SessionResult<()> {
+        match pending {
+            PendingRepair::Streaming { reader, spans } => {
+                let path = self.metadata.path.clone();
+                let digest = Arc::new(std::sync::Mutex::new(None));
+                let output = digest.clone();
+                publish_file_atomically(&self.fs, &path, move |fs, temp| {
+                    Box::pin(async move {
+                        file_result(
+                            fs.write_file(temp, FileContent::Bytes(Vec::new()), None)
+                                .await,
+                            "stage prepared session repair",
+                        )?;
+                        let mut hash = Sha256::new();
+                        for (offset, count) in spans {
+                            copy_range(fs, temp, &reader, offset, count, &mut hash).await?;
+                            file_result(
+                                fs.append_file(temp, FileContent::Bytes(vec![b'\n']), None)
+                                    .await,
+                                "stage prepared session repair line",
+                            )?;
+                            hash.update(b"\n");
+                        }
+                        *output.lock().unwrap() = Some(<[u8; 32]>::from(hash.finalize()));
+                        Ok(())
+                    })
+                })
+                .await?;
+                if !self.progress.required {
+                    *self.legacy_history_digest.lock().unwrap() = *digest.lock().unwrap();
+                }
+            }
+            PendingRepair::Eager { bytes } => {
+                let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
+                let path = self.metadata.path.clone();
+                publish_file_atomically(&self.fs, &path, move |fs, temp| {
+                    Box::pin(async move {
+                        file_result(
+                            fs.write_file(temp, FileContent::Bytes(bytes), None).await,
+                            "stage prepared eager session repair",
+                        )?;
+                        Ok(())
+                    })
+                })
+                .await?;
+                if !self.progress.required {
+                    *self.legacy_history_digest.lock().unwrap() = Some(digest);
+                }
+            }
+            PendingRepair::AppendNewline => {
+                file_result(
+                    self.fs
+                        .append_file(&self.metadata.path, FileContent::Text("\n".into()), None)
+                        .await,
+                    "repair prepared unterminated session tail",
+                )?;
+                file_result(
+                    self.fs.sync_file(&self.metadata.path, true, None).await,
+                    "sync prepared unterminated session tail",
+                )?;
+                if !self.progress.required {
+                    let reader = file_result(
+                        self.fs.open_read_file(&self.metadata.path).await,
+                        "read repaired session history",
+                    )?
+                    .ok_or_else(|| SessionError::storage("missing repaired session history"))?;
+                    let length =
+                        file_result(reader.byte_len().await, "stat repaired session history")?
+                            .ok_or_else(|| {
+                                SessionError::storage("repaired session history has no length")
+                            })?;
+                    *self.legacy_history_digest.lock().unwrap() =
+                        Some(hash_reader(&reader, length).await?);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns false only for compatibility filesystems without stable ranged
