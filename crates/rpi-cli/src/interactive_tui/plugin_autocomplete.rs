@@ -169,16 +169,14 @@ pub(super) fn command_argument_suggestions(
     // The separator itself may be more than one byte (U+3000, U+00A0), so the
     // argument span starts after the whole whitespace character — an `index + 1`
     // shortcut would slice mid-character and panic.
-    let (name, arguments_start) = after_slash
-        .find(char::is_whitespace)
-        .map(|index| {
-            let separator = after_slash[index..]
-                .chars()
-                .next()
-                .map(char::len_utf8)
-                .unwrap_or(1);
-            (&after_slash[..index], 1 + index + separator)
-        })?;
+    let (name, arguments_start) = after_slash.find(char::is_whitespace).map(|index| {
+        let separator = after_slash[index..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+        (&after_slash[..index], 1 + index + separator)
+    })?;
     let argument_prefix = &before[arguments_start..];
     let command = commands
         .iter()
@@ -496,8 +494,8 @@ mod tests {
         assert!(command_argument_suggestions(&commands, "/other con", 10).is_none());
         // A multi-byte separator (ideographic space) must not slice mid-char.
         let wide = "/office\u{3000}con";
-        let suggestions = command_argument_suggestions(&commands, wide, wide.len())
-            .expect("suggestions");
+        let suggestions =
+            command_argument_suggestions(&commands, wide, wide.len()).expect("suggestions");
         assert_eq!((suggestions.start, suggestions.end), (10, wide.len()));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&last_query().expect("query")).unwrap()
