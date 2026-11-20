@@ -109,6 +109,7 @@ impl MessageIdSeq {
 pub struct TranscriptView {
     show_images: bool,
     chat: Arc<Container>,
+    /// Persistent current-task panels; plans remain in transcript order.
     panels: Arc<Container>,
     current_assistant: Arc<Mutex<Option<Arc<AssistantMessageComponent>>>>,
     tool_components: Arc<Mutex<HashMap<String, Arc<ToolExecutionComponent>>>>,
@@ -659,7 +660,7 @@ impl TranscriptView {
     fn tool_end(&self, id: &str, name: &str, result: &Value, is_error: bool, width: usize) {
         if matches!(name, "plan_mode_start" | "plan_mode_complete")
             && !is_error
-            && update_plan_panel(&self.panels, result)
+            && update_plan_panel(&self.chat, result)
         {
             return;
         }

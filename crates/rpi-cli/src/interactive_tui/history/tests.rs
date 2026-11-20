@@ -3,6 +3,8 @@ use super::*;
 use rpi_harness::session::types::{ProvisionedEntry, ProvisionedKind, SessionMetadata};
 use rpi_harness::session::{CounterIdGenerator, FakeClock, InMemorySessionStorage};
 
+#[path = "tests/plan_order.rs"]
+mod plan_order;
 #[path = "tests/startup_header.rs"]
 mod startup_header;
 #[path = "tests/update_notices.rs"]
@@ -179,10 +181,8 @@ async fn latest_append_settlement_is_bounded_and_old_pages_do_not_revert_panels(
     let (storage, state, tui) = fixture(75).await;
     request(state.clone(), tui.clone(), Direction::Latest);
     finish_request(&state).await;
-    crate::transcript_view::update_plan_panel(
-        &state.history_page.panels,
-        &serde_json::json!({"details":{"kind":"plan","active":true,"plan":"current-plan"}}),
-    );
+    // Only current tasks survive outside the bounded transcript. Plan
+    // chronology and retirement are covered by plan_order's real entry replay.
     crate::transcript_view::update_todo_list(
         &state.history_page.panels,
         &serde_json::json!({"details":{"todos":[{"text":"current-task","done":false}]}}),
@@ -219,7 +219,7 @@ async fn latest_append_settlement_is_bounded_and_old_pages_do_not_revert_panels(
     settle(&state, &tui);
     assert_eq!(old, text(&state));
     assert!(state.history_page.active.get_children().is_empty());
-    assert_eq!(state.history_page.panels.child_count(), 2);
+    assert_eq!(state.history_page.panels.child_count(), 1);
 }
 
 #[tokio::test]
@@ -424,9 +424,11 @@ async fn bounded_panel_restore_uses_sequence_order_across_legacy_todo_kinds() {
     let panel_text = strip_ansi(&state.history_page.panels.render(100).join("\n"));
     assert!(panel_text.contains("newest-task"));
     assert!(!panel_text.contains("obsolete-task"));
-    assert_eq!(state.history_page.panels.child_count(), 2);
+    assert!(!panel_text.contains("Plan ·"));
+    assert_eq!(state.history_page.panels.child_count(), 1);
     request(state.clone(), tui.clone(), Direction::Latest);
     finish_request(&state).await;
+    assert_eq!(text(&state).matches("Plan · Planning").count(), 1);
     request(state.clone(), tui.clone(), Direction::Older);
     finish_request(&state).await;
     assert_eq!(

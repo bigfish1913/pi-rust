@@ -94,7 +94,10 @@ pub(super) fn handle_extension_ui_result(
     }
     match value.get("kind").and_then(|v| v.as_str()) {
         Some("message") | None => {
-            if crate::transcript_view::update_plan_panel(&ctx.chat, &value) {
+            // Command results join the currently visible transcript slot.
+            // Appending a plan to the assembled root would put it after the
+            // live container, so subsequent replies would appear above it.
+            if crate::transcript_view::update_plan_panel(&ctx.state.notice_container(), &value) {
                 ctx.tui.request_render(false);
                 return;
             }
