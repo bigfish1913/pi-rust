@@ -153,7 +153,7 @@ def main(argv=None, fetch=default_fetch, stream=None):
         if issue is not None:
             print(
                 f"Linked issue #{number} exists: {issue.get('title', '(no title)')}",
-                file=stream,
+                file=out,
             )
             return 0
         rejected.append(number)
