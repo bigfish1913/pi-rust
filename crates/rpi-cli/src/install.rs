@@ -1241,23 +1241,32 @@ fn is_versioned_artifact_for_package(name: &str, normalized_package: &str) -> bo
         && normalize_name(prefix.trim_start_matches("lib")) == normalized_package
 }
 
+/// Outcome of a best-effort retired-native-artifact cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetiredGcOutcome {
+    /// Cleanup ran; surviving stale artifacts are not loadable via the registry-aware discovery.
+    Completed,
+    /// A live host or mutation held the lease, so on-disk cleanup was skipped.
+    Deferred,
+}
+
 /// Best-effort cleanup for retired native artifacts. The exclusive resource
 /// lease is the proof that no host is currently holding the old libraries; a
 /// live host therefore only causes cleanup to be deferred until a later
 /// install or explicit maintenance command.
-fn gc_retired_native_artifacts(agent_dir: &Path) {
+pub(crate) fn gc_retired_native_artifacts(agent_dir: &Path) -> RetiredGcOutcome {
     let metadata_path = agent_dir.join(NATIVE_PACKAGES_FILE);
     let lease = match crate::resource_management::mutation_lease(agent_dir) {
         Ok(lease) => lease,
-        Err(_) => return,
+        Err(_) => return RetiredGcOutcome::Deferred,
     };
     let _lock = match NativePackageMutationLock::acquire_with_lease(&metadata_path, lease) {
         Ok(lock) => lock,
-        Err(_) => return,
+        Err(_) => return RetiredGcOutcome::Deferred,
     };
     let records = match read_native_package_registry_at(&metadata_path) {
         Ok(registry) => registry.into_records(),
-        Err(_) => return,
+        Err(_) => return RetiredGcOutcome::Deferred,
     };
     let active = records
         .iter()
@@ -1266,7 +1275,7 @@ fn gc_retired_native_artifacts(agent_dir: &Path) {
         .collect::<HashSet<_>>();
     let destination = agent_dir.join("extensions");
     let Ok(entries) = std::fs::read_dir(&destination) else {
-        return;
+        return RetiredGcOutcome::Completed;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1294,6 +1303,7 @@ fn gc_retired_native_artifacts(agent_dir: &Path) {
             let _ = std::fs::remove_file(path);
         }
     }
+    RetiredGcOutcome::Completed
 }
 
 pub(crate) fn versioned_artifact_name(
@@ -2666,6 +2676,63 @@ mod tests {
         assert!(!destination.join("new.dll").exists());
         assert_no_native_transaction_files(temp.path());
         assert_no_native_transaction_files(&destination);
+    }
+
+    #[test]
+    fn registry_aware_gc_removes_stale_versioned_cdylibs_but_keeps_active_and_legacy() {
+        let agent = TempAgent::new();
+        let extensions = agent.temp.path().join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        let active = "librpi_web_extension-v0.1.64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.so";
+        let stale = "librpi_web_extension-v0.1.64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.so";
+        let stale_old = "librpi_web_extension-v0.1.63-cccccccccccccccccccccccccccccccc.so";
+        let legacy = "legacy_custom.so";
+        for name in [active, stale, stale_old, legacy] {
+            std::fs::write(extensions.join(name), b"cdylib").unwrap();
+        }
+        write_native_packages_at(
+            &agent.metadata_path(),
+            &[InstalledNativePackage {
+                name: "rpi-web".into(),
+                version: "0.1.64".into(),
+                source: None,
+                prebuilt: None,
+                artifacts: vec![active.into()],
+            }],
+        )
+        .unwrap();
+
+        // `tempfile` hands back `/var/folders/...` on macOS, and the resource
+        // lease rejects a root reached through a symlink (`/var` -> `/private/var`),
+        // so canonicalize before asking for the lease.
+        let agent_dir = std::fs::canonicalize(agent.temp.path()).unwrap();
+        assert_eq!(
+            gc_retired_native_artifacts(&agent_dir),
+            RetiredGcOutcome::Completed
+        );
+        assert!(extensions.join(active).exists());
+        assert!(extensions.join(legacy).exists());
+        assert!(!extensions.join(stale).exists());
+        assert!(!extensions.join(stale_old).exists());
+    }
+
+    #[test]
+    fn registry_aware_gc_is_deferred_while_a_host_holds_the_lease() {
+        let agent = TempAgent::new();
+        let extensions = agent.temp.path().join("extensions");
+        let cwd = agent.temp.path().join("project");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let stale = "librpi_web_extension-v0.1.64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.so";
+        std::fs::write(extensions.join(stale), b"cdylib").unwrap();
+        let _leases = crate::resource_management::host_leases(&cwd).unwrap();
+
+        let agent_dir = std::fs::canonicalize(agent.temp.path()).unwrap();
+        assert_eq!(
+            gc_retired_native_artifacts(&agent_dir),
+            RetiredGcOutcome::Deferred
+        );
+        assert!(extensions.join(stale).exists());
     }
 
     fn assert_no_native_transaction_files(directory: &Path) {

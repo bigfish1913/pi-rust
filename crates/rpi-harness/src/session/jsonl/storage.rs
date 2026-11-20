@@ -94,6 +94,19 @@ pub struct JsonlSessionFacts {
     pub values: crate::session::SessionValues,
 }
 
+/// Cheap physical identity of one replayed transcript generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReplaySourceIdentity {
+    pub size: u64,
+    pub mtime_ms: i64,
+}
+
+impl ReplaySourceIdentity {
+    pub(super) fn matches(self, info: &rpi_tools::env::FileInfo) -> bool {
+        self.size == info.size && self.mtime_ms == info.mtime_ms
+    }
+}
+
 /// A fully replayed restore which has not yet acquired the writer lease.
 /// Resource preflight can inspect its facts and reject safely; commit later
 /// verifies the source, acquires the lease, and applies deferred repair.
@@ -235,6 +248,10 @@ pub struct JsonlSessionStorage {
     /// Exact loaded legacy history, including its header, before writable opt-in.
     legacy_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
     loaded_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
+    /// Physical identity of the replayed generation. A matching stat lets a
+    /// prepared commit skip the full-history digest without weakening change
+    /// detection: any size/mtime difference falls back to the digest.
+    loaded_history_identity: Arc<StdMutex<Option<ReplaySourceIdentity>>>,
     pending_repair: Arc<StdMutex<Option<PendingRepair>>>,
 }
 
@@ -256,6 +273,7 @@ impl Clone for JsonlSessionStorage {
             progress: self.progress.clone(),
             legacy_history_digest: self.legacy_history_digest.clone(),
             loaded_history_digest: self.loaded_history_digest.clone(),
+            loaded_history_identity: self.loaded_history_identity.clone(),
             pending_repair: self.pending_repair.clone(),
         }
     }
@@ -334,6 +352,7 @@ impl JsonlSessionStorage {
             generation: Arc::new(AtomicU64::new(generation)),
             legacy_history_digest: Arc::new(StdMutex::new(None)),
             loaded_history_digest: Arc::new(StdMutex::new(None)),
+            loaded_history_identity: Arc::new(StdMutex::new(None)),
             pending_repair: Arc::new(StdMutex::new(None)),
         }
     }
@@ -605,7 +624,49 @@ impl JsonlSessionStorage {
         })
     }
 
+    /// Record the physical generation the replay describes. `size` must be the
+    /// number of bytes the replay actually consumed (and the stat must be the
+    /// one taken when that read started), otherwise a concurrent append would
+    /// make the identity describe a newer generation than the replayed bytes and
+    /// the stat fast path would accept a stale replay.
+    ///
+    /// Only the deferred prepared path records it; every other policy either
+    /// repairs immediately or never commits repair. An unknown mtime (0, from a
+    /// filesystem that cannot report one) is never recorded: a stat that always
+    /// compares equal must not be able to disable the digest.
+    fn record_replay_identity(&mut self, info: &rpi_tools::env::FileInfo, replayed_bytes: u64) {
+        if info.size != replayed_bytes || info.mtime_ms == 0 {
+            return;
+        }
+        if let Ok(mut slot) = self.loaded_history_identity.lock() {
+            *slot = Some(ReplaySourceIdentity {
+                size: info.size,
+                mtime_ms: info.mtime_ms,
+            });
+        }
+    }
+
     async fn verify_loaded_history(&self) -> SessionResult<()> {
+        let identity = *self
+            .loaded_history_identity
+            .lock()
+            .map_err(|_| SessionError::storage("session history identity lock poisoned"))?;
+        if let Some(identity) = identity {
+            let info = file_result(
+                self.fs.file_info(&self.metadata.path, None).await,
+                "stat prepared session history verifier",
+            )?;
+            // Appends, truncations and atomic replacements all change one of
+            // these, so an unchanged stat is evidence that the replay still
+            // describes the published generation and the full digest read can be
+            // skipped. It is not proof: a filesystem with one-second mtime
+            // granularity cannot see a same-size in-place rewrite inside that
+            // second, which is why the identity is only recorded when the mtime
+            // is real (`record_replay_identity` rejects 0).
+            if identity.matches(&info) && identity.mtime_ms != 0 {
+                return Ok(());
+            }
+        }
         let expected = self
             .loaded_history_digest
             .lock()
@@ -667,6 +728,16 @@ impl JsonlSessionStorage {
         let defer_repair = policy.defers_repairs();
         let strict = policy.strict();
         let read_diagnostics = crate::session::diagnostics::RecoveryPhase::start("history_read");
+        // Stat before the read: the identity must describe the generation the
+        // replay consumes, so a later stat (after an append) cannot be used.
+        let info_before_read = if defer_repair {
+            Some(file_result(
+                fs.file_info(path, None).await,
+                "stat session history",
+            )?)
+        } else {
+            None
+        };
         let reader = file_result(fs.open_read_file(path).await, "open session history reader")?;
         policy.check(0)?;
         if let Some(source) = &reader {
@@ -982,6 +1053,9 @@ impl JsonlSessionStorage {
                 })
                 .await?;
             }
+            if let Some(info) = &info_before_read {
+                storage.record_replay_identity(info, content.len() as u64);
+            }
             replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
             return Ok(storage);
         }
@@ -1014,6 +1088,9 @@ impl JsonlSessionStorage {
         }
         policy.check(physical_lines.len() - 1)?;
         replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
+        if let Some(info) = &info_before_read {
+            storage.record_replay_identity(info, content.len() as u64);
+        }
         Ok(storage)
     }
 
