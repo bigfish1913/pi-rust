@@ -11,6 +11,20 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.27.0](https://github.com/bigfish1913/pi-rust/compare/v0.26.1...v0.27.0) - 2026-11-20
+
+### Added
+
+- *(tui)* show user message preview in /tree selector ([#390](https://github.com/bigfish1913/pi-rust/pull/390))
+- *(tui)* compact 24x12 gear+rpi startup lockup ([#386](https://github.com/bigfish1913/pi-rust/pull/386))
+
+### Other
+
+- accelerate historical session restore and recovery ([#389](https://github.com/bigfish1913/pi-rust/pull/389))
+- *(harness)* skip the prepared restore digest when the source stat is unchanged ([#383](https://github.com/bigfish1913/pi-rust/pull/383))
+- *(harness)* hash prepared restore only after taking ownership ([#379](https://github.com/bigfish1913/pi-rust/pull/379))
+- *(tui)* place screenshots instead of resending them every frame ([#384](https://github.com/bigfish1913/pi-rust/pull/384))
+
 ### Changed
 
 - *(tui)* 启动标志换成 24×12 的半块线稿（齿轮环 + 内圆 + `r p i`），并用主题默认
