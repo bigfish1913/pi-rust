@@ -2105,7 +2105,6 @@ impl TuiState {
     ///
     /// [`TranscriptView`]: crate::transcript_view::TranscriptView
     pub(super) fn transcript_view(&self) -> crate::transcript_view::TranscriptView {
-        let managed = self.history_page.is_bound();
         crate::transcript_view::TranscriptView::with_maps(
             self.transcript_container(),
             self.current_assistant.clone(),
@@ -2116,11 +2115,6 @@ impl TuiState {
             self.markdown_transformer.clone(),
             self.message_seq.clone(),
         )
-        .with_panels(if managed {
-            self.history_page.panels.clone()
-        } else {
-            self.chat_container.clone()
-        })
         .with_show_images(self.images_visible())
     }
 

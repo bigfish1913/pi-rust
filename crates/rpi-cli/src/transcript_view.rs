@@ -109,8 +109,6 @@ impl MessageIdSeq {
 pub struct TranscriptView {
     show_images: bool,
     chat: Arc<Container>,
-    /// Persistent current-task panels; plans remain in transcript order.
-    panels: Arc<Container>,
     current_assistant: Arc<Mutex<Option<Arc<AssistantMessageComponent>>>>,
     tool_components: Arc<Mutex<HashMap<String, Arc<ToolExecutionComponent>>>>,
     /// Bash executions keyed by `tool_call_id` — kept separate from the generic
@@ -165,7 +163,6 @@ impl TranscriptView {
     ) -> Self {
         Self {
             show_images: true,
-            panels: chat.clone(),
             chat,
             current_assistant,
             tool_components,
@@ -175,11 +172,6 @@ impl TranscriptView {
             markdown_transformer,
             message_seq,
         }
-    }
-
-    pub(crate) fn with_panels(mut self, panels: Arc<Container>) -> Self {
-        self.panels = panels;
-        self
     }
 
     /// Configure image visibility for newly created assistant components.
@@ -664,7 +656,7 @@ impl TranscriptView {
         {
             return;
         }
-        if name == "todo" && !is_error && update_todo_list(&self.panels, result) {
+        if name == "todo" && !is_error && update_todo_list(&self.chat, result) {
             return;
         }
         if name.trim().is_empty() {

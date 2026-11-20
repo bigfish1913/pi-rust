@@ -78,10 +78,7 @@ async fn managed_live_plan_ready_does_not_trail_later_messages() {
     let expanded = rpi_tui::render::with_main_screen_frame(|| text(&state));
     assert_order(&expanded, "Implementation checklist", "repository findings");
     assert_order(&expanded, "repository findings", "implementation progress");
-    assert!(
-        state.history_page.panels.get_children().is_empty(),
-        "plans are not task-footer panels"
-    );
+    assert!(strip_ansi(&state.history_page.active.render(100).join("\n")).contains("Plan · Ready"));
 }
 
 #[tokio::test]

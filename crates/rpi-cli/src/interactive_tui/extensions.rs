@@ -110,7 +110,7 @@ pub(super) fn handle_extension_ui_result(
             if !text.is_empty() {
                 if value.get("markdown").and_then(|v| v.as_bool()) == Some(true) {
                     if let Some(component) = extension_text_component(&value) {
-                        ctx.chat.add_child(component);
+                        ctx.state.notice_container().add_child(component);
                     }
                 } else {
                     add_note_message(&ctx.state.notice_container(), &text);

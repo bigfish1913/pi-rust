@@ -529,7 +529,6 @@ pub(super) async fn render_session_history(
         show_images,
         hide_thinking,
     );
-    restore_history_panels(&tree, chat).await;
     if let Some(footer) = footer {
         if let Ok(name) = tree.get_name().await {
             footer.set_session_name(name.as_deref());
@@ -589,9 +588,9 @@ pub(super) fn render_history_entries(
                     }
                 }
                 AgentMessage::ToolResult(result) => {
-                    // Todo has a separate current-state panel. Successful
-                    // plan tools are restored from their plan-mode entries at
-                    // the original transcript position, not from a footer.
+                    // Successful plan/todo tools are restored from their
+                    // custom entries at the original transcript position.
+                    // Errors still use ordinary completed tool panels.
                     if matches!(
                         result.tool_name.as_str(),
                         "plan_mode_start" | "plan_mode_complete" | "todo"
@@ -662,6 +661,11 @@ pub(super) fn render_history_entries(
                     continue;
                 }
                 if matches!(custom.custom_type.as_str(), "todo" | "todo-state") {
+                    let details = custom.data.unwrap_or(serde_json::Value::Null);
+                    crate::transcript_view::update_todo_list(
+                        chat,
+                        &serde_json::json!({"details": details}),
+                    );
                     continue;
                 }
                 let rendered = extension_session.as_ref().and_then(|session| {
@@ -695,43 +699,6 @@ pub(super) fn render_history_entries(
                 );
             }
         }
-    }
-}
-
-/// Current task panels are restored with storage-side filters and limits.
-/// Plans are replayed inline by `render_history_entries`, never pinned below
-/// newer messages or carried onto unrelated history pages.
-pub(super) async fn restore_history_panels(
-    tree: &Arc<dyn rpi_harness::session::types::SessionTree>,
-    chat: &Arc<Container>,
-) {
-    // Read at most one entry per supported persisted kind, then replay in
-    // sequence order: legacy todo-state must not overwrite a newer todo entry.
-    let mut latest = Vec::new();
-    for kind in ["todo", "todo-state"] {
-        let Ok(entries) = tree
-            .find_entries_on_branch(
-                &EntryQuery {
-                    custom_type: Some(kind.into()),
-                    order: Some(EntryOrder::NewestFirst),
-                    limit: Some(1),
-                    ..Default::default()
-                },
-                &BranchBounds::default(),
-            )
-            .await
-        else {
-            continue;
-        };
-        latest.extend(entries);
-    }
-    latest.sort_by_key(Entry::seq);
-    for entry in latest {
-        let Entry::Custom(custom) = entry else {
-            continue;
-        };
-        let details = custom.data.unwrap_or(serde_json::Value::Null);
-        crate::transcript_view::update_todo_list(chat, &serde_json::json!({"details":details}));
     }
 }
 
