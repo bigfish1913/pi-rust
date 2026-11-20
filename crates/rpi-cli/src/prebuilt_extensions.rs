@@ -627,6 +627,7 @@ pub async fn install(
     )
     .await?;
     let agent_dir = crate::config::agent_dir().map_err(|e| e.to_string())?;
+    let agent_dir_for_gc = agent_dir.clone();
     let target = target.to_string();
     let installed = tokio::task::spawn_blocking(move || {
         install_archive_at(
@@ -643,6 +644,14 @@ pub async fn install(
     .map_err(|e| format!("prebuilt installation failed: {e}"))??;
     for path in installed {
         println!("installed {}", path.display());
+    }
+    if matches!(
+        crate::install::gc_retired_native_artifacts(&agent_dir_for_gc),
+        crate::install::RetiredGcOutcome::Deferred
+    ) {
+        eprintln!(
+            "warning: stale native extension artifacts were not cleaned up because the resource lease could not be acquired (a running rpi host or lease setup failure); they will be ignored at startup and retried on a later install"
+        );
     }
     println!("rpi will validate the plugin entrypoint/SDK API size and load this extension on the next start.");
     Ok(())
