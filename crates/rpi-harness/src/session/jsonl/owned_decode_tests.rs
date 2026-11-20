@@ -245,3 +245,54 @@ fn benchmark_owned_codec_against_frozen_decoder_on_real_transcript() {
         }
     }
 }
+
+#[test]
+#[ignore = "release-mode stage probe; set RPI_CODEC_BENCH_TRANSCRIPT"]
+fn benchmark_mutation_decode_stages_on_real_transcript() {
+    let path = std::env::var("RPI_CODEC_BENCH_TRANSCRIPT").expect("RPI_CODEC_BENCH_TRANSCRIPT");
+    let transcript = std::fs::read_to_string(path).unwrap();
+    // Use streaming's frame recognizer only as a selection filter, not a full
+    // replay (duplicate/backward sequence handling is not modeled here).
+    // This read-only probe excludes recognized cold frames and measures only
+    // canonical codec rows, without storage open, leases or transcript writes.
+    let lines: Vec<_> = transcript
+        .lines()
+        .skip(1)
+        .filter(|line| super::super::cold_decode::parse_cold_frame(line).is_none())
+        .collect();
+    assert!(!lines.is_empty());
+    for line in &lines {
+        parse_mutation(line).unwrap();
+    }
+    for round in 0..5 {
+        let mut parse_ns = 0u128;
+        let mut typed_ns = 0u128;
+        let mut drop_ns = 0u128;
+        for line in &lines {
+            let started = std::time::Instant::now();
+            let value = parse_object(line).unwrap();
+            parse_ns += started.elapsed().as_nanos();
+            let started = std::time::Instant::now();
+            let seq = require_sequence(&value).unwrap();
+            let mutation = match value.get("kind").and_then(|v| v.as_str()) {
+                Some("entry") => parse_entry_mutation(value, seq),
+                Some("record") => parse_record_mutation(value, seq),
+                Some("lane") => parse_lane_mutation(&value, seq),
+                Some("fact") => parse_fact_mutation(&value, seq),
+                _ => panic!("unknown mutation kind in accepted fixture"),
+            }
+            .unwrap();
+            typed_ns += started.elapsed().as_nanos();
+            let started = std::time::Instant::now();
+            drop(std::hint::black_box(mutation));
+            drop_ns += started.elapsed().as_nanos();
+        }
+        eprintln!(
+            "round={round} rows={} parse_value_ms={:.3} typed_decode_ms={:.3} drop_ms={:.3}",
+            lines.len(),
+            parse_ns as f64 / 1e6,
+            typed_ns as f64 / 1e6,
+            drop_ns as f64 / 1e6
+        );
+    }
+}

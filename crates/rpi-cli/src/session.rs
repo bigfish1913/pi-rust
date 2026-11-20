@@ -431,9 +431,11 @@ fn preflight_extension_startup_with_restore(
     ),
     BuildError,
 > {
+    let resource_selection_load = StartupSpan::start(Phase::ResourceSelectionLoad);
     let mut resources = crate::resource_selection::ResolvedSelection::load(args, cwd, trusted)
         .map_err(BuildError::HarnessCreate)?;
     let selection = select_session(args, cwd);
+    resource_selection_load.finish();
     let pinned = std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -443,13 +445,16 @@ fn preflight_extension_startup_with_restore(
                     .map_err(|e| BuildError::SessionOpen(e.to_string()))?
                     .block_on(async {
                         if let Some(selected) = &mut resources {
+                            let skill_validate = StartupSpan::start(Phase::SkillValidate);
                             let env: Arc<dyn rpi_tools::ExecutionEnv> =
                                 Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
                             selected
                                 .validate_skills(&env)
                                 .await
                                 .map_err(BuildError::HarnessCreate)?;
+                            skill_validate.finish();
                         }
+                        let restore_target = StartupSpan::start(Phase::RestoreTarget);
                         let cwd_str = cwd.to_string_lossy();
                         let target = match &selection {
                             SessionSelection::Fork { source, dir } => {
@@ -460,6 +465,7 @@ fn preflight_extension_startup_with_restore(
                             }
                             _ => resolve_restore_target(&selection, &cwd_str).await?,
                         };
+                        restore_target.finish();
                         let Some(meta) = target else {
                             if resources.as_ref().is_some_and(|r| r.transition.is_some()) {
                                 return Err(BuildError::SessionOpen("resource transition requires an existing native session".into()));
@@ -499,14 +505,18 @@ fn preflight_extension_startup_with_restore(
                                 None,
                             )
                         } else if prepare_restore {
+                            let prepared_replay = StartupSpan::start(Phase::PreparedReplay);
                             let prepared = repo
                                 .prepare_restore_by_jsonl_metadata(&meta)
                                 .await
                                 .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                            prepared_replay.finish();
+                            let prepared_facts = StartupSpan::start(Phase::PreparedFacts);
                             let facts = prepared
                                 .facts()
                                 .await
                                 .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                            prepared_facts.finish();
                             (facts, Some(prepared))
                         } else {
                             (
@@ -516,11 +526,13 @@ fn preflight_extension_startup_with_restore(
                                 None,
                             )
                         };
+                        let binding_validate = StartupSpan::start(Phase::BindingValidate);
                         crate::resource_selection::validate_session_binding(
                             &facts.values,
                             resources.as_ref(),
                         )
                         .map_err(BuildError::SessionOpen)?;
+                        binding_validate.finish();
                         Ok((
                             match selection {
                                 SessionSelection::Fork { .. } => SessionSelection::Fork {
@@ -547,8 +559,10 @@ pub fn prepare_extensions(
     crate::native_durable::experimental_epoch::policy(args).map_err(BuildError::HarnessCreate)?;
     let resource_leases =
         crate::resource_management::host_leases(cwd).map_err(BuildError::HarnessCreate)?;
+    let preflight_prepare = StartupSpan::start(Phase::PreflightPrepare);
     let (resource_selection, (session_selection, prepared_restore)) =
         preflight_extension_startup_with_restore(args, cwd, project_trusted, true)?;
+    preflight_prepare.finish();
     // Transition hosts own the writer before any DLL registration. The strict
     // loader cannot repair history/progress or migrate metadata on rejection.
     let transition_session = if resource_selection
@@ -658,6 +672,7 @@ pub fn prepare_extensions(
         editor_text_mailbox.clone(),
     );
 
+    let extension_register = StartupSpan::start(Phase::ExtensionRegister);
     let extension_session = if let Some(selected) = &resource_selection {
         let session = rpi_extensions::load_session_mixed_guarded(
             &[],
@@ -689,6 +704,7 @@ pub fn prepare_extensions(
         report_deferred_renderers(&extension_session);
     }
     validate_durable_extensions(&extension_session).map_err(BuildError::HarnessCreate)?;
+    extension_register.finish();
     // Publish the extension registry so `ListCommands` can enumerate slash
     // commands. Done here rather than at host construction because the registry
     // only exists after extensions load; `/reload` republishes the new snapshot

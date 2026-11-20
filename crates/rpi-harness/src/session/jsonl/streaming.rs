@@ -185,7 +185,17 @@ impl JsonlSessionStorage {
         let mut repair = false;
         let mut terminated = header_newline;
         let mut line_no = 1;
-        while let Some((offset, raw, last, newline)) = scan.next().await? {
+        use crate::session::diagnostics::RecoveryAccumulator;
+        let mut scan_time = RecoveryAccumulator::new("replay_scan");
+        let mut probe_time = RecoveryAccumulator::new("replay_classify");
+        let mut decode_time = RecoveryAccumulator::new("replay_decode");
+        let mut apply_time = RecoveryAccumulator::new("replay_index_apply");
+        while let Some((offset, raw, last, newline)) = {
+            let started = scan_time.start();
+            let row = scan.next().await?;
+            scan_time.record(started);
+            row
+        } {
             line_no += 1;
             policy.check((line_no - 1) as usize)?;
             terminated = newline;
@@ -194,13 +204,17 @@ impl JsonlSessionStorage {
                     "resource transition requires complete unrecovered history",
                 ));
             }
+            let classify_started = probe_time.start();
             let line = std::str::from_utf8(&raw)
                 .map_err(|_| SessionError::invalid_entry("invalid session UTF-8"))?;
             // Historical assistant frames do not need their discarded payloads
             // during cold startup. Recognize their indexed metadata directly;
             // duplicate/backward sequences still fall through to the canonical
             // codec so recovery keeps its exact-equivalence checks.
-            if let Some(metadata) = super::super::cold_decode::parse_cold_frame(line) {
+            let frame_metadata = super::super::cold_decode::parse_cold_frame(line);
+            probe_time.record(classify_started);
+            if let Some(metadata) = frame_metadata {
+                let apply_started = apply_time.start();
                 let mut state = storage.state.lock().await;
                 if metadata.seq > state.sequence() {
                     if metadata.seq > state.next_sequence() {
@@ -216,11 +230,17 @@ impl JsonlSessionStorage {
                     }
                     seen.insert(seq, (offset, raw.len()));
                     spans.push((offset, raw.len() as u64));
+                    apply_time.record(apply_started);
                     continue;
                 }
+                apply_time.record(apply_started);
             }
-            match parse_mutation(line) {
+            let decode_started = decode_time.start();
+            let mutation = parse_mutation(line);
+            decode_time.record(decode_started);
+            match mutation {
                 Ok(mutation) => {
+                    let apply_started = apply_time.start();
                     let mut state = storage.state.lock().await;
                     if mutation.seq() <= state.sequence() {
                         let duplicate = if let Some(&(previous, count)) = seen.get(&mutation.seq())
@@ -243,6 +263,7 @@ impl JsonlSessionStorage {
                                 ));
                             }
                             repair = true;
+                            apply_time.record(apply_started);
                             continue;
                         }
                         return Err(invalid_file(
@@ -267,6 +288,7 @@ impl JsonlSessionStorage {
                         })?;
                     seen.insert(seq, (offset, raw.len()));
                     spans.push((offset, raw.len() as u64));
+                    apply_time.record(apply_started);
                 }
                 Err(error)
                     if !strict
@@ -345,6 +367,14 @@ impl JsonlSessionStorage {
             }
         }
         policy.check((line_no - 1) as usize)?;
+        // These are disjoint accumulated timings, not per-row stderr events.
+        // Scan includes bounded I/O, whole-source hashing and row copying;
+        // index apply includes reducer updates and cold-location digests.
+        let rows = (line_no - 1) as usize;
+        scan_time.finish(rows);
+        probe_time.finish(rows);
+        decode_time.finish(rows);
+        apply_time.finish(rows);
         Ok(storage)
     }
 
