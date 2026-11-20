@@ -11,6 +11,18 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Changed
+
+- *(tui)* 启动标志换成 24×12 的半块线稿（齿轮环 + 内圆 + `r p i`），并用主题默认
+  前景色（dark 下白、light 下黑）。之前那枚 44×22 的 3D 徽章画的是「实心圆盘 +
+  镂空 rpi」，和 `docs/images/rpi-logo.jpg` 的线稿不是同一张图，缩到终端分辨率
+  远看就是一团斑块；`brand/shape.rs`、`brand/spin.rs`（3D 步进求交、7 秒自转）
+  随之删除，渲染 tick 不再为装饰性动画请求重绘。
+- *(tui)* 欢迎页 header 压到 17 行，80×24 的终端首屏可以完整显示。80×24 下转录
+  视口只有 17 行，旧 header 是 28 行，会滚掉整个标志。除了标志从 22 行降到 12 行，
+  还去掉了 logo 后的空行与和 footer 重复的 `Type your message and press Enter to
+  send.` 一行。
+
 ## [0.26.1](https://github.com/bigfish1913/pi-rust/compare/v0.26.0...v0.26.1) - 2026-11-19
 
 ### Added
