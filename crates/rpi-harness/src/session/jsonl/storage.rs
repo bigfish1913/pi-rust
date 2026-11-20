@@ -94,6 +94,19 @@ pub struct JsonlSessionFacts {
     pub values: crate::session::SessionValues,
 }
 
+/// Cheap physical identity of one replayed transcript generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReplaySourceIdentity {
+    pub size: u64,
+    pub mtime_ms: i64,
+}
+
+impl ReplaySourceIdentity {
+    pub(super) fn matches(self, info: &rpi_tools::env::FileInfo) -> bool {
+        self.size == info.size && self.mtime_ms == info.mtime_ms
+    }
+}
+
 /// A fully replayed restore which has not yet acquired the writer lease.
 /// Resource preflight can inspect its facts and reject safely; commit later
 /// verifies the source, acquires the lease, and applies deferred repair.
@@ -235,6 +248,10 @@ pub struct JsonlSessionStorage {
     /// Exact loaded legacy history, including its header, before writable opt-in.
     legacy_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
     loaded_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
+    /// Physical identity of the replayed generation. A matching stat lets a
+    /// prepared commit skip the full-history digest without weakening change
+    /// detection: any size/mtime difference falls back to the digest.
+    loaded_history_identity: Arc<StdMutex<Option<ReplaySourceIdentity>>>,
     pending_repair: Arc<StdMutex<Option<PendingRepair>>>,
 }
 
@@ -256,6 +273,7 @@ impl Clone for JsonlSessionStorage {
             progress: self.progress.clone(),
             legacy_history_digest: self.legacy_history_digest.clone(),
             loaded_history_digest: self.loaded_history_digest.clone(),
+            loaded_history_identity: self.loaded_history_identity.clone(),
             pending_repair: self.pending_repair.clone(),
         }
     }
@@ -334,6 +352,7 @@ impl JsonlSessionStorage {
             generation: Arc::new(AtomicU64::new(generation)),
             legacy_history_digest: Arc::new(StdMutex::new(None)),
             loaded_history_digest: Arc::new(StdMutex::new(None)),
+            loaded_history_identity: Arc::new(StdMutex::new(None)),
             pending_repair: Arc::new(StdMutex::new(None)),
         }
     }
@@ -605,7 +624,43 @@ impl JsonlSessionStorage {
         })
     }
 
+    /// Record the physical generation the replay currently describes. Only the
+    /// deferred prepared path needs it; every other policy either repairs
+    /// immediately or never commits repair.
+    async fn capture_replay_identity(
+        &self,
+        fs: &Arc<dyn FileSystem>,
+        path: &str,
+    ) -> SessionResult<()> {
+        let info = file_result(fs.file_info(path, None).await, "stat replayed history")?;
+        *self
+            .loaded_history_identity
+            .lock()
+            .map_err(|_| SessionError::storage("session history identity lock poisoned"))? =
+            Some(ReplaySourceIdentity {
+                size: info.size,
+                mtime_ms: info.mtime_ms,
+            });
+        Ok(())
+    }
+
     async fn verify_loaded_history(&self) -> SessionResult<()> {
+        let identity = *self
+            .loaded_history_identity
+            .lock()
+            .map_err(|_| SessionError::storage("session history identity lock poisoned"))?;
+        if let Some(identity) = identity {
+            let info = file_result(
+                self.fs.file_info(&self.metadata.path, None).await,
+                "stat prepared session history verifier",
+            )?;
+            // Appends, truncations and atomic replacements all change one of
+            // these, so an unchanged stat proves the replay still describes the
+            // published generation and the full digest read can be skipped.
+            if identity.matches(&info) {
+                return Ok(());
+            }
+        }
         let expected = self
             .loaded_history_digest
             .lock()
@@ -982,6 +1037,9 @@ impl JsonlSessionStorage {
                 })
                 .await?;
             }
+            if defer_repair {
+                storage.capture_replay_identity(&fs, path).await?;
+            }
             replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
             return Ok(storage);
         }
@@ -1014,6 +1072,9 @@ impl JsonlSessionStorage {
         }
         policy.check(physical_lines.len() - 1)?;
         replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
+        if defer_repair {
+            storage.capture_replay_identity(&fs, path).await?;
+        }
         Ok(storage)
     }
 

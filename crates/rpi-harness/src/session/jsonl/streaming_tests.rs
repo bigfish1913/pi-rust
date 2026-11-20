@@ -1212,6 +1212,35 @@ struct LeaseRacingFs {
     inner: Arc<dyn FileSystem>,
     path: &'static str,
     stolen: std::sync::Mutex<Option<Vec<u8>>>,
+    /// Ranged history reads performed through this wrapper, so a test can prove
+    /// the prepared commit did not hash the transcript.
+    ranges: Arc<AtomicUsize>,
+    /// Added to the reported mtime, to simulate a stat-only difference. Set it
+    /// after the replay, so the recorded identity keeps the original stamp.
+    mtime_skew_ms: std::sync::atomic::AtomicI64,
+}
+
+struct CountingReader {
+    inner: Arc<dyn ReadFile>,
+    ranges: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl ReadFile for CountingReader {
+    async fn read_all(&self) -> Result<Vec<u8>, rpi_tools::FileError> {
+        self.ranges.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_all().await
+    }
+    async fn byte_len(&self) -> Result<Option<u64>, rpi_tools::FileError> {
+        self.inner.byte_len().await
+    }
+    async fn read_range(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, rpi_tools::FileError> {
+        self.ranges.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_range(offset, length).await
+    }
 }
 #[async_trait]
 impl FileSystem for LeaseRacingFs {
@@ -1274,14 +1303,23 @@ impl FileSystem for LeaseRacingFs {
         &self,
         path: &str,
     ) -> Result<Option<Arc<dyn ReadFile>>, rpi_tools::FileError> {
-        self.inner.open_read_file(path).await
+        Ok(self.inner.open_read_file(path).await?.map(|reader| {
+            Arc::new(CountingReader {
+                inner: reader,
+                ranges: self.ranges.clone(),
+            }) as Arc<dyn ReadFile>
+        }))
     }
     async fn file_info(
         &self,
         path: &str,
         cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<rpi_tools::env::FileInfo, rpi_tools::FileError> {
-        self.inner.file_info(path, cancel).await
+        let mut info = self.inner.file_info(path, cancel).await?;
+        if path == self.path {
+            info.mtime_ms += self.mtime_skew_ms.load(Ordering::Relaxed);
+        }
+        Ok(info)
     }
     async fn list_dir(
         &self,
@@ -1404,6 +1442,8 @@ async fn prepared_restore_verifies_the_source_after_taking_ownership() {
         inner: env.clone(),
         path: "racing.jsonl",
         stolen: std::sync::Mutex::new(Some(stolen.clone().into_bytes())),
+        ranges: Arc::new(AtomicUsize::new(0)),
+        mtime_skew_ms: std::sync::atomic::AtomicI64::new(0),
     });
     fs.write_file("racing.jsonl", FileContent::Text(history), None)
         .await
@@ -1429,4 +1469,86 @@ async fn prepared_restore_verifies_the_source_after_taking_ownership() {
         published.ends_with(&stolen),
         "foreign append must survive the rejected commit: {published:?}"
     );
+}
+
+fn replay_wrapper(temp: &tempfile::TempDir, path: &'static str) -> Arc<LeaseRacingFs> {
+    Arc::new(LeaseRacingFs {
+        inner: Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+            temp.path().to_path_buf(),
+        )),
+        path,
+        stolen: std::sync::Mutex::new(None),
+        ranges: Arc::new(AtomicUsize::new(0)),
+        mtime_skew_ms: std::sync::atomic::AtomicI64::new(0),
+    })
+}
+
+#[tokio::test]
+async fn prepared_commit_skips_the_digest_when_the_source_stat_is_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs = replay_wrapper(&temp, "stable.jsonl");
+    fs.write_file(
+        "stable.jsonl",
+        FileContent::Text(format!(
+            "{}{}",
+            encode_header(&header()),
+            encode_mutation(&message("e1", 1, None, "one")),
+        )),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let prepared = JsonlSessionStorage::prepare_restore(
+        fs.clone(),
+        "stable.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
+    .await
+    .unwrap();
+    let before = fs.ranges.load(Ordering::Relaxed);
+    let storage = prepared.commit().await.unwrap();
+    assert_eq!(
+        fs.ranges.load(Ordering::Relaxed),
+        before,
+        "an unchanged source must not be rehashed during commit"
+    );
+    assert_eq!(storage.state.lock().await.sequence(), 1);
+}
+
+#[tokio::test]
+async fn prepared_commit_falls_back_to_the_digest_when_only_the_stat_differs() {
+    let temp = tempfile::tempdir().unwrap();
+    // Same bytes, different mtime: the stat fast path cannot prove equality, so
+    // the commit must re-read and accept only because the digest still matches.
+    let fs = replay_wrapper(&temp, "touched.jsonl");
+    fs.write_file(
+        "touched.jsonl",
+        FileContent::Text(format!(
+            "{}{}",
+            encode_header(&header()),
+            encode_mutation(&message("e1", 1, None, "one")),
+        )),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let prepared = JsonlSessionStorage::prepare_restore(
+        fs.clone(),
+        "touched.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
+    .await
+    .unwrap();
+    fs.mtime_skew_ms.store(5_000, Ordering::Relaxed);
+    let before = fs.ranges.load(Ordering::Relaxed);
+    let storage = prepared.commit().await.unwrap();
+    assert!(
+        fs.ranges.load(Ordering::Relaxed) > before,
+        "a different stat must re-read the history"
+    );
+    assert_eq!(storage.state.lock().await.sequence(), 1);
 }

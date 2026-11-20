@@ -345,6 +345,11 @@ impl JsonlSessionStorage {
             }
         }
         policy.check((line_no - 1) as usize)?;
+        // Capture the published generation once, after any streaming repair, so
+        // the prepared commit can prove the replay is current with one stat.
+        if defer_repair {
+            storage.capture_replay_identity(&fs, path).await?;
+        }
         Ok(storage)
     }
 
