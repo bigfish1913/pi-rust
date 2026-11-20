@@ -513,6 +513,73 @@ pub(super) fn custom_entry_display_text(
     Some(format!("{label}: {text}"))
 }
 
+/// Max characters (not bytes) kept in a user-message preview. Char-boundary
+/// safe on multi-byte text — `&text[..n]` would panic there.
+const TREE_PREVIEW_MAX_CHARS: usize = 60;
+
+/// One-line preview of a user message's text content, or `None` when there is
+/// nothing meaningful to show. Only user messages get previews: assistant,
+/// toolResult, and custom entries keep the plain `type #seq` row (tool output
+/// is long and noisy), per the #387 review. Newlines and whitespace runs are
+/// collapsed to single spaces so a multi-line message cannot break the row.
+/// A message with no text but with image blocks yields an `[image]` placeholder
+/// instead of a blank line.
+fn user_message_preview(entry: &Entry) -> Option<String> {
+    let AgentMessage::User(user) = entry.as_message()? else {
+        return None;
+    };
+    let collapsed = user_message_text(user)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.chars().count() > TREE_PREVIEW_MAX_CHARS {
+        let truncated: String = collapsed.chars().take(TREE_PREVIEW_MAX_CHARS).collect();
+        return Some(format!("{truncated}…"));
+    }
+    if collapsed.is_empty() {
+        let has_image = match &user.content {
+            rpi_ai::types::UserContent::Blocks(blocks) => blocks
+                .iter()
+                .any(|block| matches!(block, Content::Image(_))),
+            rpi_ai::types::UserContent::Text(_) => false,
+        };
+        if has_image {
+            return Some("[image]".to_string());
+        }
+        return None;
+    }
+    Some(collapsed)
+}
+
+/// Build the `/tree` row for one entry. Keeps the existing `type #seq` label
+/// (`(current)` marker on the leaf), the short id, and the type/seq/id search
+/// text; a user-message preview rides along in the description and the search
+/// text so the filter box can match "what I said" (issue #387).
+fn tree_entry_item(entry: &Entry, is_current: bool) -> SelectItem {
+    let label = if is_current {
+        format!("{} #{} (current)", entry.entry_type(), entry.seq())
+    } else {
+        format!("{} #{}", entry.entry_type(), entry.seq())
+    };
+    let short_id = &entry.id()[..entry.id().len().min(12)];
+    let preview = user_message_preview(entry);
+    let description = match &preview {
+        Some(text) => format!("{short_id} — {text}"),
+        None => short_id.to_string(),
+    };
+    // Search on the entry type, sequence, and id so `/tree` stays usable in
+    // long sessions, plus the user-message preview so a remembered phrase is
+    // enough to find the right fork point.
+    let mut search_text = format!("{} {} {}", entry.entry_type(), entry.seq(), entry.id());
+    if let Some(text) = &preview {
+        search_text.push(' ');
+        search_text.push_str(text);
+    }
+    SelectItem::new(entry.id(), &label)
+        .with_description(&description)
+        .with_search_text(&search_text)
+}
+
 /// Open a selector for the current session's persisted entry tree. Selecting a
 /// message moves the main lane leaf to that entry, then the caller reloads the
 /// visible branch from durable storage.
@@ -546,20 +613,7 @@ pub(super) async fn open_tree_selector(
     let current = harness.session().get_leaf_id().await.ok().flatten();
     let items: Vec<SelectItem> = entries
         .iter()
-        .map(|entry| {
-            let label = if current.as_deref() == Some(entry.id()) {
-                format!("{} #{} (current)", entry.entry_type(), entry.seq())
-            } else {
-                format!("{} #{}", entry.entry_type(), entry.seq())
-            };
-            let short_id = &entry.id()[..entry.id().len().min(12)];
-            // Search on the entry type, sequence, and id so `/tree` stays
-            // usable in long sessions.
-            let search_text = format!("{} {} {}", entry.entry_type(), entry.seq(), entry.id());
-            SelectItem::new(entry.id(), &label)
-                .with_description(short_id)
-                .with_search_text(&search_text)
-        })
+        .map(|entry| tree_entry_item(entry, current.as_deref() == Some(entry.id())))
         .collect();
     if items.is_empty() {
         add_note_message(
@@ -1202,4 +1256,209 @@ pub(super) fn open_images_selector(
         list,
         SelectorKind::Images,
     );
+}
+
+#[cfg(test)]
+mod tree_preview_tests {
+    use super::*;
+    use rpi_harness::session::types::{EntryBase, MessageEntry};
+
+    fn message_entry(seq: u64, id: &str, message: AgentMessage) -> Entry {
+        Entry::Message(MessageEntry {
+            base: EntryBase {
+                entry_type: "message".to_string(),
+                id: id.to_string(),
+                seq,
+                parent_id: None,
+                timestamp: 0,
+            },
+            message,
+            terminate: None,
+        })
+    }
+
+    fn user_entry(seq: u64, id: &str, content: rpi_ai::types::UserContent) -> Entry {
+        message_entry(
+            seq,
+            id,
+            AgentMessage::User(rpi_ai::types::UserMessage::new(content, 0)),
+        )
+    }
+
+    fn text_blocks(texts: &[&str]) -> Vec<Content> {
+        texts
+            .iter()
+            .map(|text| {
+                Content::Text(rpi_ai::types::TextContent {
+                    kind: rpi_ai::types::TextContentType,
+                    text: (*text).to_string(),
+                    text_signature: None,
+                })
+            })
+            .collect()
+    }
+
+    fn image_block() -> Content {
+        Content::Image(rpi_ai::types::ImageContent {
+            kind: rpi_ai::types::ImageContentType,
+            data: std::sync::Arc::from("aGk="),
+            mime_type: "image/png".to_string(),
+        })
+    }
+
+    #[test]
+    fn user_message_preview_joins_and_collapses_whitespace() {
+        let entry = user_entry(
+            1,
+            "e1",
+            rpi_ai::types::UserContent::Blocks(text_blocks(&[
+                "帮我看看\n这个 panic",
+                "  第二段  \t文本",
+            ])),
+        );
+        let preview = user_message_preview(&entry).expect("text blocks yield a preview");
+        assert_eq!(preview, "帮我看看 这个 panic 第二段 文本");
+
+        let item = tree_entry_item(&entry, false);
+        assert_eq!(item.label, "message #1");
+        assert_eq!(
+            item.description.as_deref(),
+            Some("e1 — 帮我看看 这个 panic 第二段 文本")
+        );
+        let search = item.search_text.expect("search text is always set");
+        assert!(search.starts_with("message 1 e1 "));
+        assert!(
+            search.contains("帮我看看 这个 panic"),
+            "search text must include the preview: {search}"
+        );
+    }
+
+    #[test]
+    fn user_message_preview_truncates_on_char_boundaries() {
+        let long = "好".repeat(TREE_PREVIEW_MAX_CHARS + 20);
+        let entry = user_entry(2, "e2", rpi_ai::types::UserContent::Text(long));
+        let preview = user_message_preview(&entry).expect("long text yields a preview");
+        let chars: Vec<char> = preview.chars().collect();
+        assert_eq!(chars.len(), TREE_PREVIEW_MAX_CHARS + 1);
+        assert_eq!(chars.last().copied(), Some('…'));
+        // All 60 kept characters are intact CJK chars, no split multi-byte panics.
+        assert!(chars[..TREE_PREVIEW_MAX_CHARS].iter().all(|&c| c == '好'));
+    }
+
+    #[test]
+    fn image_only_user_message_gets_placeholder() {
+        let entry = user_entry(
+            3,
+            "e3",
+            rpi_ai::types::UserContent::Blocks(vec![image_block()]),
+        );
+        let item = tree_entry_item(&entry, false);
+        assert_eq!(user_message_preview(&entry).as_deref(), Some("[image]"));
+        assert_eq!(item.description.as_deref(), Some("e3 — [image]"));
+    }
+
+    #[test]
+    fn mixed_text_and_image_blocks_preview_text_only() {
+        let entry = user_entry(
+            4,
+            "e4",
+            rpi_ai::types::UserContent::Blocks(vec![
+                image_block(),
+                text_blocks(&["截图里的报错"])[0].clone(),
+            ]),
+        );
+        assert_eq!(
+            user_message_preview(&entry).as_deref(),
+            Some("截图里的报错"),
+            "image blocks next to text must not blank the preview"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_user_message_has_no_preview() {
+        let entry = user_entry(
+            5,
+            "e5",
+            rpi_ai::types::UserContent::Text("  \n\t ".to_string()),
+        );
+        assert_eq!(user_message_preview(&entry), None);
+        let item = tree_entry_item(&entry, false);
+        assert_eq!(item.description.as_deref(), Some("e5"));
+    }
+
+    #[test]
+    fn non_user_entries_keep_plain_rows() {
+        let assistant = {
+            let mut a = rpi_ai::types::AssistantMessage::empty(
+                rpi_ai::Api::AnthropicMessages,
+                "anthropic",
+                "m",
+                0,
+            );
+            a.content = text_blocks(&["very long assistant reply that must not appear"]);
+            a
+        };
+        let tool_result = rpi_agent::message::AgentMessage::ToolResult(Box::new(
+            rpi_ai::types::ToolResultMessage {
+                role: rpi_ai::types::ToolResultRole,
+                tool_call_id: "tc1".to_string(),
+                tool_name: "bash".to_string(),
+                content: text_blocks(&["tool output noise"]),
+                details: None,
+                usage: None,
+                added_tool_names: Vec::new(),
+                is_error: false,
+                timestamp: 0,
+            },
+        ));
+        let entries = vec![
+            message_entry(
+                6,
+                "e6",
+                rpi_agent::message::AgentMessage::Assistant(Box::new(assistant)),
+            ),
+            message_entry(7, "e7", tool_result),
+            Entry::ModelChange(rpi_harness::session::types::ModelChangeEntry {
+                base: EntryBase {
+                    entry_type: "model_change".to_string(),
+                    id: "e8".to_string(),
+                    seq: 8,
+                    parent_id: None,
+                    timestamp: 0,
+                },
+                provider: "anthropic".to_string(),
+                model_id: "m".to_string(),
+            }),
+        ];
+        for entry in &entries {
+            assert_eq!(user_message_preview(entry), None, "{entry:?}");
+            let item = tree_entry_item(entry, false);
+            assert!(
+                !item.description.as_deref().unwrap().contains("—"),
+                "{item:?}"
+            );
+            let search = item.search_text.unwrap();
+            assert!(!search.contains("noise"));
+            assert!(!search.contains("reply"));
+        }
+    }
+
+    #[test]
+    fn current_entry_keeps_marker_and_short_id() {
+        let entry = user_entry(
+            9,
+            "abcdefghijklmn",
+            rpi_ai::types::UserContent::Text("hi".into()),
+        );
+        let current = tree_entry_item(&entry, true);
+        assert_eq!(current.label, "message #9 (current)");
+        assert!(current
+            .description
+            .as_deref()
+            .unwrap()
+            .starts_with("abcdefghijkl — hi"));
+
+        let not_current = tree_entry_item(&entry, false);
+        assert_eq!(not_current.label, "message #9");
+    }
 }
