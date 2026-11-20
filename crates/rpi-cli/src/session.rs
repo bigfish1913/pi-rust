@@ -788,6 +788,7 @@ pub async fn build_prepared(
         extension_session,
         prepared_restore,
     } = prepared;
+    let build_tools = StartupSpan::start(Phase::BuildTools);
     let catalog = crate::provider::authenticated_catalog(resolved);
     action_host.set_catalog(catalog.clone());
 
@@ -833,6 +834,8 @@ pub async fn build_prepared(
     // can change while extensions load, and an adopted session cwd would point
     // at another project's tree. Both the cwd peek and this build must read the
     // same root, so the caller pins it into `args` before either runs.
+    build_tools.finish();
+    let writer_restore = StartupSpan::start(Phase::WriterRestore);
     let session = match transition_session {
         Some(session) => session,
         None => {
@@ -845,9 +848,12 @@ pub async fn build_prepared(
             .await?
         }
     };
+    writer_restore.finish();
+    let session_bind = StartupSpan::start(Phase::SessionBind);
     crate::resource_selection::bind_session(&session, resource_selection.as_ref())
         .await
         .map_err(BuildError::SessionOpen)?;
+    session_bind.finish();
     // Plugin tools now know which session they serve: `todo` and friends key
     // their per-session state off it. A session without an id (ephemeral) leaves
     // the field unset and a plugin is expected to fall back to project scope.
@@ -882,6 +888,7 @@ pub async fn build_prepared(
     // direction as skills/prompts precedence.
     // Whether this model sees its own prior reasoning again decides how the
     // working-state rule is worded (see `default_system_prompt`).
+    let prompt_resources = StartupSpan::start(Phase::PromptResources);
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
     let prompt_tools = active.clone();
     let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
@@ -1162,6 +1169,7 @@ pub async fn build_prepared(
         eprintln!("=== end --debug-system-prompt ===");
     }
 
+    prompt_resources.finish();
     // ---- Options ----
     // Install a BroadcastEmitter so the caller (the interactive TUI) can drain
     // AgentEvents live as a run unfolds. The corresponding broadcast::Receiver
@@ -1373,13 +1381,16 @@ pub async fn build_prepared(
             .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
     };
 
+    let harness_create = StartupSpan::start(Phase::HarnessCreate);
     let harness = match experimental_policy {
         Some(policy) => AgentHarness::create_experimental(options, policy).await,
         None => AgentHarness::create(options).await,
     }
     .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
+    harness_create.finish();
 
     if args.native_durable {
+        let durable_validate = StartupSpan::start(Phase::DurableValidate);
         // Validate legacy/corrupt branch state before sealing resources or ready.
         rpi_harness::durable::DurableService::bind(
             &harness,
@@ -1389,6 +1400,7 @@ pub async fn build_prepared(
         .snapshot()
         .await
         .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
+        durable_validate.finish();
     }
     // Populate the weak tool binding before resource selection is published.
     // Unconditional: host-integrated tools (approval gate session id,
@@ -1406,6 +1418,7 @@ pub async fn build_prepared(
             let _ = &harness_leases;
         });
     install_extension_settlement_bridge(harness.events(), extension_session_cell.clone());
+    let resource_seal = StartupSpan::start(Phase::ResourceSeal);
     if let Some(selected) = &resource_selection {
         harness
             .seal_resources(active)
@@ -1473,6 +1486,7 @@ pub async fn build_prepared(
             .await
             .map_err(BuildError::SessionOpen)?;
     }
+    resource_seal.finish();
     // Publish only after exact resources have been sealed and validated.
     crate::extensions_actions::HarnessActionHost::set_harness(
         &harness_cell,
@@ -1488,6 +1502,7 @@ pub async fn build_prepared(
     // read-only: nothing is mutated here, so a failed sweep cannot corrupt the
     // log. A clean session (the common case) reports no findings.
     {
+        let recovery_sweep = StartupSpan::start(Phase::RecoverySweep);
         let runtime = rpi_harness::runtime::SessionRuntime::new(harness.session().clone());
         match rpi_harness::runtime::recover_all_lanes(&runtime).await {
             Ok(reports) => {
@@ -1521,6 +1536,7 @@ pub async fn build_prepared(
                 }
             }
         }
+        recovery_sweep.finish();
     }
 
     // ---- B5d: assemble the ReloadContext the TUI holds ----
@@ -3191,10 +3207,13 @@ async fn restore_session(
         let storage = prepared
             .commit()
             .await
-            .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?
+            .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?;
+        let progress_upgrade = StartupSpan::start(Phase::ProgressUpgrade);
+        let storage = storage
             .enable_progress_under_exclusive_lock()
             .await
             .map_err(|e| BuildError::SessionOpen(format!("upgrade {}: {e}", meta.path)))?;
+        progress_upgrade.finish();
         return Ok(Session::new(Arc::new(storage), None));
     }
     let sessions_root = selection_dir(selection);

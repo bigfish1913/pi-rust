@@ -612,6 +612,11 @@ impl Session {
         self.storage_arc().get_entry(id).await
     }
 
+    /// Read one reserved result while retaining only its tool-call identity.
+    pub async fn tool_result_identity(&self, id: &str) -> SessionResult<Option<(String, String)>> {
+        self.storage_arc().tool_result_identity(id).await
+    }
+
     /// Estimate the main lane's default context, if supported by storage.
     pub async fn context_usage(
         &self,

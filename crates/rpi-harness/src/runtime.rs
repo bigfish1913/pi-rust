@@ -31,12 +31,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
 use rpi_agent::message::AgentMessage;
 
 use crate::error::{SessionError, SessionResult};
 use crate::events::{HarnessEvent, HarnessEventBus};
 use crate::session::session::Session;
-use crate::session::types::{Entry, EntryOrder, LaneRecord, OperationIntent, RecordQuery};
+use crate::session::types::{EntryOrder, LaneRecord, OperationIntent, RecordQuery};
 
 /// How many open operations constitute corruption (mirrors the TS
 /// `find_open_operations(limit: 2)` rule).
@@ -298,17 +299,14 @@ impl SessionRuntime {
                     });
                 }
                 LaneRecord::ToolStarted(t) => {
-                    // The tool's result landed: the invocation is settled.
-                    let landed = match self.session.get_entry(&t.result_entry_id).await? {
-                        Some(Entry::Message(message)) => match message.message {
-                            AgentMessage::ToolResult(result) => {
-                                result.tool_call_id == t.tool_call_id
-                                    && result.tool_name == t.tool_name
-                            }
-                            _ => false,
-                        },
-                        _ => false,
-                    };
+                    // Read and verify the reserved row, retaining only call identity.
+                    let landed = self
+                        .session
+                        .tool_result_identity(&t.result_entry_id)
+                        .await?
+                        .is_some_and(|(call_id, name)| {
+                            call_id == t.tool_call_id && name == t.tool_name
+                        });
                     if landed {
                         continue;
                     }

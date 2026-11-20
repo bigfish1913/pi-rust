@@ -37,6 +37,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 fs2 = { workspace = true }
 sha2 = "0.10.9"
+# Already used by reqwest/rustls; use its runtime-dispatched SHA-256 backend.
+ring = "0.17.14"
 
 [dev-dependencies]
 tempfile = { workspace = true }

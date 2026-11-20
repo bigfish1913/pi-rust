@@ -2,6 +2,7 @@
 
 //! JSONL-private payload references. Query plans own only selected sources; no
 //! warm cache and no published plan holds or clones the resident history index.
+use super::digest::Sha256;
 use super::{codec::parse_mutation, errors::file_result};
 use crate::{
     error::{SessionError, SessionResult},
@@ -11,7 +12,7 @@ use crate::{
     },
 };
 use rpi_tools::env::{AppendReceipt, ReadFile};
-use sha2::{Digest, Sha256};
+use serde::{de::IgnoredAny, Deserialize};
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
@@ -49,6 +50,64 @@ async fn read_range_bounded(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+/// Projection of an already-validated entry. This is NOT a replacement codec:
+/// it may ignore schema/range constraints in discarded fields. It is used only
+/// after Location's length and SHA-256 check proves these are exactly the bytes
+/// accepted by the authoritative replay (or emitted by the typed live writer).
+/// Unknown/duplicate discriminator shapes fall back to the ordinary decoder.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ToolResultProbe {
+    kind: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+    id: String,
+    seq: u64,
+    message: ToolResultMessageProbe,
+    timestamp: IgnoredAny,
+    #[serde(default)]
+    parent_id: IgnoredAny,
+    #[serde(default)]
+    lane: IgnoredAny,
+    #[serde(default)]
+    terminate: IgnoredAny,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ToolResultMessageProbe {
+    kind: String,
+    role: String,
+    tool_call_id: String,
+    tool_name: String,
+    content: IgnoredAny,
+    is_error: IgnoredAny,
+    timestamp: IgnoredAny,
+    #[serde(default)]
+    details: IgnoredAny,
+    #[serde(default)]
+    usage: IgnoredAny,
+    #[serde(default)]
+    added_tool_names: IgnoredAny,
+}
+
+fn parse_tool_result_probe(line: &str) -> Option<ToolResultProbe> {
+    let mut deserializer = serde_json::Deserializer::from_str(line);
+    let probe = ToolResultProbe::deserialize(&mut deserializer).ok()?;
+    deserializer.end().ok()?;
+    Some(probe)
+}
+
+fn tool_result_identity(entry: &Entry) -> Option<(String, String)> {
+    let Entry::Message(message) = entry else {
+        return None;
+    };
+    let rpi_agent::message::AgentMessage::ToolResult(result) = &message.message else {
+        return None;
+    };
+    Some((result.tool_call_id.clone(), result.tool_name.clone()))
 }
 
 #[derive(Clone)]
@@ -92,27 +151,58 @@ impl Location {
             retired: false,
             offset,
             length: raw.len(),
-            digest: Sha256::digest(raw).into(),
+            digest: Sha256::digest(raw),
             id,
             lane: Arc::from(lane),
             run: Arc::from(run),
         }
     }
-    async fn read(&self) -> SessionResult<SessionMutation> {
-        let raw = read_range_bounded(&self.reader, self.offset, self.length).await?;
-        self.decode(&raw)
+    async fn read_raw(&self) -> SessionResult<Vec<u8>> {
+        read_range_bounded(&self.reader, self.offset, self.length).await
     }
-    fn decode(&self, raw: &[u8]) -> SessionResult<SessionMutation> {
+    fn validate_raw<'a>(&self, raw: &'a [u8]) -> SessionResult<&'a str> {
         if raw.len() != self.length {
             return Err(SessionError::storage("short cold history read"));
         }
-        if <[u8; 32]>::from(Sha256::digest(raw)) != self.digest {
+        if Sha256::digest(raw) != self.digest {
             return Err(SessionError::invalid_entry(
                 "cold history source changed; reopen session",
             ));
         }
-        let line = std::str::from_utf8(raw)
-            .map_err(|_| SessionError::invalid_entry("invalid cold history UTF-8"))?;
+        std::str::from_utf8(raw)
+            .map_err(|_| SessionError::invalid_entry("invalid cold history UTF-8"))
+    }
+    async fn read(&self) -> SessionResult<SessionMutation> {
+        let raw = self.read_raw().await?;
+        self.decode(&raw)
+    }
+    async fn read_tool_result_identity(&self) -> SessionResult<Option<(String, String)>> {
+        let raw = self.read_raw().await?;
+        let line = self.validate_raw(&raw)?;
+
+        // Never probe before verifying the digest: discarding fields is safe
+        // only because these exact bytes were already fully validated. Keep
+        // the full decoder's identity checks, with conservative fallback for
+        // non-tool messages and unusual/duplicate field representations.
+        if let Some(probe) = parse_tool_result_probe(line) {
+            if probe.kind == "entry"
+                && probe.entry_type == "message"
+                && probe.id == self.id
+                && probe.seq == self.seq
+                && probe.message.kind == "tool_result"
+                && probe.message.role == "toolResult"
+            {
+                return Ok(Some((probe.message.tool_call_id, probe.message.tool_name)));
+            }
+        }
+
+        let SessionMutation::Entry { entry, .. } = self.decode(&raw)? else {
+            return Err(SessionError::invalid_entry("cold entry identity mismatch"));
+        };
+        Ok(tool_result_identity(&entry))
+    }
+    fn decode(&self, raw: &[u8]) -> SessionResult<SessionMutation> {
+        let line = self.validate_raw(raw)?;
         let mutation = parse_mutation(line)
             .map_err(|e| SessionError::invalid_entry(format!("invalid cold history: {e}")))?;
         let identity = match &mutation {
@@ -238,6 +328,17 @@ impl JsonlPayload {
                 parent,
                 live_nulls,
             } => restore_entry(source.read().await?, parent, live_nulls),
+        }
+    }
+
+    /// Read and validate one reserved entry, but retain only tool identity.
+    /// Cold recovery must still read every selected payload so source changes and
+    /// malformed rows remain observable; this avoids constructing the large
+    /// message content/details trees on the common tool-result path.
+    pub async fn tool_result_identity(&self) -> SessionResult<Option<(String, String)>> {
+        match self {
+            Self::Resident(entry) => Ok(tool_result_identity(entry)),
+            Self::Cold { source, .. } => source.read_tool_result_identity().await,
         }
     }
 }
@@ -475,7 +576,7 @@ impl ResidentState {
             retired: false,
             offset,
             length: raw.len(),
-            digest: Sha256::digest(raw).into(),
+            digest: Sha256::digest(raw),
             id: metadata.id.into_owned(),
             lane,
             run,
@@ -1323,6 +1424,9 @@ mod context_usage_tests;
 #[cfg(test)]
 #[path = "cold_frames_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "tool_identity_tests.rs"]
+mod tool_identity_tests;
 
 impl ResidentState {
     /// Retained historical frame read locations; zero for facts-only replay.

@@ -61,8 +61,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use super::digest::Sha256;
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use rpi_tools::env::{FileContent, FileSystem, ReadFile, WriterLease};
@@ -119,9 +119,16 @@ impl PreparedJsonlRestore {
         // Verifying before the lease would leave a window where a concurrent
         // append lands between the check and acquisition and is then silently
         // replaced by the repair.
+        // Timing-only phases; input/output are zero (not payload counts).
+        let lease = crate::session::diagnostics::RecoveryPhase::start("prepared_writer_lease");
         storage.ensure_writer_lease().await?;
+        lease.finish(0, 0);
+        let verify = crate::session::diagnostics::RecoveryPhase::start("prepared_source_verify");
         storage.verify_loaded_history().await?;
+        verify.finish(0, 0);
+        let repair = crate::session::diagnostics::RecoveryPhase::start("prepared_repair");
         storage.commit_pending_repair().await?;
+        repair.finish(0, 0);
         Ok(storage)
     }
 }
@@ -614,19 +621,19 @@ impl JsonlSessionStorage {
             )? {
                 streaming::hash_reader(&reader, length).await?
             } else {
-                <[u8; 32]>::from(Sha256::digest(&file_result(
+                Sha256::digest(file_result(
                     reader.read_all().await,
                     "read prepared session history verifier",
-                )?))
+                )?)
             }
         } else {
-            <[u8; 32]>::from(Sha256::digest(
+            Sha256::digest(
                 file_result(
                     self.fs.read_text_file(&self.metadata.path, None).await,
                     "read prepared session history verifier",
                 )?
                 .as_bytes(),
-            ))
+            )
         };
         if actual != expected {
             return Err(SessionError::invalid_entry(
@@ -758,7 +765,7 @@ impl JsonlSessionStorage {
             }
         }
         storage.progress.required = header.progress_format.is_some();
-        let source_digest = <[u8; 32]>::from(Sha256::digest(content.as_bytes()));
+        let source_digest = Sha256::digest(content.as_bytes());
         *storage.loaded_history_digest.lock().unwrap() = Some(source_digest);
         if !storage.progress.required {
             *storage.legacy_history_digest.lock().unwrap() = Some(source_digest);
@@ -912,7 +919,7 @@ impl JsonlSessionStorage {
                         storage.ensure_writer_lease().await?;
                         if !storage.progress.required {
                             *storage.legacy_history_digest.lock().unwrap() =
-                                Some(Sha256::digest(valid_prefix.as_bytes()).into());
+                                Some(Sha256::digest(valid_prefix.as_bytes()));
                         }
                         let fs = storage.fs.clone();
                         let path_owned = path.to_string();
@@ -957,7 +964,7 @@ impl JsonlSessionStorage {
                 storage.ensure_writer_lease().await?;
                 if !storage.progress.required {
                     *storage.legacy_history_digest.lock().unwrap() =
-                        Some(Sha256::digest(repaired.as_bytes()).into());
+                        Some(Sha256::digest(repaired.as_bytes()));
                 }
                 let fs = storage.fs.clone();
                 let path_owned = path.to_string();
@@ -1001,7 +1008,7 @@ impl JsonlSessionStorage {
                 )?;
                 if !storage.progress.required {
                     *storage.legacy_history_digest.lock().unwrap() =
-                        Some(Sha256::digest(format!("{content}\n").as_bytes()).into());
+                        Some(Sha256::digest(format!("{content}\n").as_bytes()));
                 }
             }
         }
@@ -1053,7 +1060,7 @@ impl JsonlSessionStorage {
                 storage.fs.read_text_file(&path, None).await,
                 "read history for progress upgrade",
             )?;
-            if <[u8; 32]>::from(Sha256::digest(content.as_bytes())) != expected {
+            if Sha256::digest(content.as_bytes()) != expected {
                 return Err(SessionError::invalid_entry(
                     "session history changed before progress upgrade; reopen session",
                 ));
@@ -1100,7 +1107,7 @@ impl JsonlSessionStorage {
                         fs.read_text_file(&history_path, None).await,
                         "recheck history for progress upgrade",
                     )?;
-                    if <[u8; 32]>::from(Sha256::digest(current.as_bytes())) != expected {
+                    if Sha256::digest(current.as_bytes()) != expected {
                         return Err(SessionError::invalid_entry(
                             "session history changed during progress upgrade; reopen session",
                         ));
@@ -1549,8 +1556,7 @@ impl JsonlSessionStorage {
         );
         header.metadata = Some(metadata);
         let output = encode_header(&header);
-        let legacy_digest =
-            (!self.progress.required).then(|| Sha256::digest(output.as_bytes()).into());
+        let legacy_digest = (!self.progress.required).then(|| Sha256::digest(output.as_bytes()));
         let fs = self.fs.clone();
         let path = self.metadata.path.clone();
         let staged = output.clone();
@@ -2223,6 +2229,14 @@ impl SessionStorage for JsonlSessionStorage {
                 .rev()
                 .map(|&index| state.entry_meta(index).expect("validated branch index")),
         ))
+    }
+
+    async fn tool_result_identity(&self, id: &str) -> SessionResult<Option<(String, String)>> {
+        let selected = self.state.lock().await.entry_ref(id);
+        match selected {
+            Some(payload) => payload.tool_result_identity().await,
+            None => Ok(None),
+        }
     }
 
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {

@@ -436,115 +436,150 @@ impl Serialize for Entry {
 impl<'de> Deserialize<'de> for Entry {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = serde_json::Value::deserialize(d)?;
-        let obj = raw
-            .as_object()
-            .ok_or_else(|| serde::de::Error::custom("entry is not a JSON object"))?;
-        let ty = obj
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| serde::de::Error::custom("entry missing \"type\""))?;
-        let base = deserialize_base(obj).map_err(serde::de::Error::custom)?;
-        let entry = match ty {
+        let serde_json::Value::Object(obj) = raw else {
+            return Err(serde::de::Error::custom("entry is not a JSON object"));
+        };
+        Self::decode_flat_object(obj)
+    }
+}
+
+impl Entry {
+    /// Consume the codec's already-parsed object without rebuilding its Value
+    /// tree. Keep serde_json's private RawValue normalization on the uncommon
+    /// path: an otherwise unknown key can change Value deserialization semantics.
+    pub(crate) fn from_json_object(
+        obj: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, serde_json::Error> {
+        if object_contains_raw_value_key(&obj) {
+            serde_json::from_value(serde_json::Value::Object(obj))
+        } else {
+            Self::decode_flat_object(obj)
+        }
+    }
+
+    fn decode_flat_object<E: serde::de::Error>(
+        mut obj: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, E> {
+        let ty = String::from(
+            obj.get("type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| E::custom("entry missing \"type\""))?,
+        );
+        let base = deserialize_base(&obj).map_err(E::custom)?;
+        let entry = match ty.as_str() {
             "message" => Entry::Message(MessageEntry {
                 base,
-                message: serde_json::from_value(obj.get("message").cloned().ok_or_else(|| {
-                    serde::de::Error::custom("message entry missing \"message\"")
-                })?)
-                .map_err(serde::de::Error::custom)?,
+                message: serde_json::from_value(
+                    obj.remove("message")
+                        .ok_or_else(|| E::custom("message entry missing \"message\""))?,
+                )
+                .map_err(E::custom)?,
                 terminate: obj.get("terminate").and_then(|v| v.as_bool()),
             }),
-            "model_change" => {
-                Entry::ModelChange(ModelChangeEntry {
-                    base,
-                    provider: serde_json::from_value(obj.get("provider").cloned().ok_or_else(
-                        || serde::de::Error::custom("model_change missing \"provider\""),
-                    )?)
-                    .map_err(serde::de::Error::custom)?,
-                    model_id: serde_json::from_value(obj.get("modelId").cloned().ok_or_else(
-                        || serde::de::Error::custom("model_change missing \"modelId\""),
-                    )?)
-                    .map_err(serde::de::Error::custom)?,
-                })
-            }
+            "model_change" => Entry::ModelChange(ModelChangeEntry {
+                base,
+                provider: serde_json::from_value(
+                    obj.remove("provider")
+                        .ok_or_else(|| E::custom("model_change missing \"provider\""))?,
+                )
+                .map_err(E::custom)?,
+                model_id: serde_json::from_value(
+                    obj.remove("modelId")
+                        .ok_or_else(|| E::custom("model_change missing \"modelId\""))?,
+                )
+                .map_err(E::custom)?,
+            }),
             "thinking_level_change" => Entry::ThinkingLevel(ThinkingLevelEntry {
                 base,
                 thinking_level: serde_json::from_value(
-                    obj.get("thinkingLevel").cloned().ok_or_else(|| {
-                        serde::de::Error::custom("thinking_level_change missing \"thinkingLevel\"")
+                    obj.remove("thinkingLevel").ok_or_else(|| {
+                        E::custom("thinking_level_change missing \"thinkingLevel\"")
                     })?,
                 )
-                .map_err(serde::de::Error::custom)?,
+                .map_err(E::custom)?,
             }),
             "active_tools_change" => Entry::ActiveTools(ActiveToolsEntry {
                 base,
                 active_tool_names: serde_json::from_value(
-                    obj.get("activeToolNames").cloned().ok_or_else(|| {
-                        serde::de::Error::custom("active_tools_change missing \"activeToolNames\"")
+                    obj.remove("activeToolNames").ok_or_else(|| {
+                        E::custom("active_tools_change missing \"activeToolNames\"")
                     })?,
                 )
-                .map_err(serde::de::Error::custom)?,
+                .map_err(E::custom)?,
             }),
             "compaction" => {
-                let retained_tail =
-                    serde_json::from_value(obj.get("retainedTail").cloned().ok_or_else(|| {
-                        serde::de::Error::custom("compaction missing \"retainedTail\"")
-                    })?)
-                    .map_err(serde::de::Error::custom)?;
-                let summary =
-                    serde_json::from_value(obj.get("summary").cloned().ok_or_else(|| {
-                        serde::de::Error::custom("compaction missing \"summary\"")
-                    })?)
-                    .map_err(serde::de::Error::custom)?;
-                let tokens_before =
-                    serde_json::from_value(obj.get("tokensBefore").cloned().ok_or_else(|| {
-                        serde::de::Error::custom("compaction missing \"tokensBefore\"")
-                    })?)
-                    .map_err(serde::de::Error::custom)?;
+                let retained_tail = serde_json::from_value(
+                    obj.remove("retainedTail")
+                        .ok_or_else(|| E::custom("compaction missing \"retainedTail\""))?,
+                )
+                .map_err(E::custom)?;
+                let summary = serde_json::from_value(
+                    obj.remove("summary")
+                        .ok_or_else(|| E::custom("compaction missing \"summary\""))?,
+                )
+                .map_err(E::custom)?;
+                let tokens_before = serde_json::from_value(
+                    obj.remove("tokensBefore")
+                        .ok_or_else(|| E::custom("compaction missing \"tokensBefore\""))?,
+                )
+                .map_err(E::custom)?;
                 Entry::Compaction(CompactionEntry {
                     base,
                     summary,
                     retained_tail,
                     tokens_before,
-                    details: obj.get("details").cloned(),
+                    details: obj.remove("details"),
                     usage: obj
-                        .get("usage")
-                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                        .remove("usage")
+                        .and_then(|v| serde_json::from_value(v).ok()),
                 })
             }
             "branch_summary" => Entry::BranchSummary(BranchSummaryEntry {
                 base,
-                from_id: serde_json::from_value(obj.get("fromId").cloned().ok_or_else(|| {
-                    serde::de::Error::custom("branch_summary missing \"fromId\"")
-                })?)
-                .map_err(serde::de::Error::custom)?,
-                summary: serde_json::from_value(obj.get("summary").cloned().ok_or_else(|| {
-                    serde::de::Error::custom("branch_summary missing \"summary\"")
-                })?)
-                .map_err(serde::de::Error::custom)?,
-                details: obj.get("details").cloned(),
+                from_id: serde_json::from_value(
+                    obj.remove("fromId")
+                        .ok_or_else(|| E::custom("branch_summary missing \"fromId\""))?,
+                )
+                .map_err(E::custom)?,
+                summary: serde_json::from_value(
+                    obj.remove("summary")
+                        .ok_or_else(|| E::custom("branch_summary missing \"summary\""))?,
+                )
+                .map_err(E::custom)?,
+                details: obj.remove("details"),
                 usage: obj
-                    .get("usage")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                    .remove("usage")
+                    .and_then(|v| serde_json::from_value(v).ok()),
             }),
             "custom" => Entry::Custom(CustomEntry {
                 base,
                 custom_type: serde_json::from_value(
-                    obj.get("customType")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("custom missing \"customType\""))?,
+                    obj.remove("customType")
+                        .ok_or_else(|| E::custom("custom missing \"customType\""))?,
                 )
-                .map_err(serde::de::Error::custom)?,
-                data: obj.get("data").cloned(),
+                .map_err(E::custom)?,
+                data: obj.remove("data"),
             }),
-            other => {
-                return Err(serde::de::Error::custom(format!(
-                    "unknown entry type {other}"
-                )))
-            }
+            other => return Err(E::custom(format!("unknown entry type {other}"))),
         };
         Ok(entry)
     }
 }
+
+fn object_contains_raw_value_key(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    fn contains(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(obj) => object_contains_raw_value_key(obj),
+            serde_json::Value::Array(values) => values.iter().any(contains),
+            _ => false,
+        }
+    }
+    obj.contains_key("$serde_json::private::RawValue") || obj.values().any(contains)
+}
+
+#[cfg(test)]
+#[path = "entry_decode_tests.rs"]
+pub(crate) mod entry_decode_tests;
 
 fn deserialize_base(obj: &serde_json::Map<String, serde_json::Value>) -> Result<EntryBase, String> {
     Ok(EntryBase {
@@ -1897,6 +1932,20 @@ pub trait SessionStorage: Send + Sync {
         ))
     }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>>;
+
+    /// Read a reserved entry and return `(tool_call_id, tool_name)` if it is a
+    /// tool result. The default hydrates the full entry; metadata-backed stores
+    /// may decode less, but must retain selected-payload integrity checks.
+    async fn tool_result_identity(&self, id: &str) -> SessionResult<Option<(String, String)>> {
+        let Some(Entry::Message(message)) = self.get_entry(id).await? else {
+            return Ok(None);
+        };
+        let rpi_agent::message::AgentMessage::ToolResult(result) = message.message else {
+            return Ok(None);
+        };
+        Ok(Some((result.tool_call_id, result.tool_name)))
+    }
+
     async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>>;
     async fn find_entries_on_branch(
         &self,
