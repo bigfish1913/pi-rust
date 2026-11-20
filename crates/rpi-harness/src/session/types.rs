@@ -1897,6 +1897,20 @@ pub trait SessionStorage: Send + Sync {
         ))
     }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>>;
+
+    /// Read a reserved entry and return `(tool_call_id, tool_name)` if it is a
+    /// tool result. The default hydrates the full entry; metadata-backed stores
+    /// may decode less, but must retain selected-payload integrity checks.
+    async fn tool_result_identity(&self, id: &str) -> SessionResult<Option<(String, String)>> {
+        let Some(Entry::Message(message)) = self.get_entry(id).await? else {
+            return Ok(None);
+        };
+        let rpi_agent::message::AgentMessage::ToolResult(result) = message.message else {
+            return Ok(None);
+        };
+        Ok(Some((result.tool_call_id, result.tool_name)))
+    }
+
     async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>>;
     async fn find_entries_on_branch(
         &self,

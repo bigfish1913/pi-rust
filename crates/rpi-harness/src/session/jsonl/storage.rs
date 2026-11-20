@@ -2225,6 +2225,14 @@ impl SessionStorage for JsonlSessionStorage {
         ))
     }
 
+    async fn tool_result_identity(&self, id: &str) -> SessionResult<Option<(String, String)>> {
+        let selected = self.state.lock().await.entry_ref(id);
+        match selected {
+            Some(payload) => payload.tool_result_identity().await,
+            None => Ok(None),
+        }
+    }
+
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
         let selected = self.state.lock().await.entry_ref(id);
         match selected {
