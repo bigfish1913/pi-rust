@@ -119,9 +119,16 @@ impl PreparedJsonlRestore {
         // Verifying before the lease would leave a window where a concurrent
         // append lands between the check and acquisition and is then silently
         // replaced by the repair.
+        // Timing-only phases; input/output are zero (not payload counts).
+        let lease = crate::session::diagnostics::RecoveryPhase::start("prepared_writer_lease");
         storage.ensure_writer_lease().await?;
+        lease.finish(0, 0);
+        let verify = crate::session::diagnostics::RecoveryPhase::start("prepared_source_verify");
         storage.verify_loaded_history().await?;
+        verify.finish(0, 0);
+        let repair = crate::session::diagnostics::RecoveryPhase::start("prepared_repair");
         storage.commit_pending_repair().await?;
+        repair.finish(0, 0);
         Ok(storage)
     }
 }
