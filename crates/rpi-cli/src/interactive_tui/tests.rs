@@ -1393,7 +1393,7 @@ fn test_layout_renders_welcome_message() {
         .filter(|l| !l.trim().is_empty())
         .count();
     assert!(
-        logo_rows >= 12,
+        logo_rows >= 10,
         "Welcome logo not found (only {logo_rows} inked rows). Rendered: {}",
         all
     );
@@ -1501,17 +1501,17 @@ fn welcome_header_renders_the_brand_mark() {
     let lines: Vec<String> = chat.render(80).iter().map(|l| strip_ansi(l)).collect();
     let all = lines.join("\n");
 
-    // The fixed-width 3D badge is rendered with single-cell characters and
-    // spans the first rows of the welcome header.
-    let logo: Vec<&String> = lines.iter().take(22).collect();
+    // The fixed-width lockup is rendered with single-cell half blocks and spans
+    // the first rows of the welcome header.
+    let logo: Vec<&String> = lines.iter().take(crate::brand::render::ROWS).collect();
     assert!(
-        logo.iter().filter(|l| !l.trim().is_empty()).count() >= 14,
+        logo.iter().filter(|l| !l.trim().is_empty()).count() >= 10,
         "brand logo missing: {all}"
     );
     assert!(
         logo.iter()
-            .any(|l| l.contains('#') || l.contains('%') || l.contains('*')),
-        "brand logo has no solid shading: {all}"
+            .any(|l| l.contains('█') || l.contains('▀') || l.contains('▄')),
+        "brand logo has no solid ink: {all}"
     );
     assert!(
         all.contains("interactive TUI"),
