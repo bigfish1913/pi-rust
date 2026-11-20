@@ -580,6 +580,13 @@ fn tree_entry_item(entry: &Entry, is_current: bool) -> SelectItem {
         .with_search_text(&search_text)
 }
 
+/// Index of the current leaf in the `/tree` entry list, so the selector opens
+/// centered on where the user already is instead of the oldest entry.
+fn tree_current_index(entries: &[Entry], current: Option<&str>) -> Option<usize> {
+    let current_id = current?;
+    entries.iter().position(|entry| entry.id() == current_id)
+}
+
 /// Open a selector for the current session's persisted entry tree. Selecting a
 /// message moves the main lane leaf to that entry, then the caller reloads the
 /// visible branch from durable storage.
@@ -624,6 +631,10 @@ pub(super) async fn open_tree_selector(
         return;
     }
     let list = Arc::new(SelectList::new(items, 12));
+    // Open centered on the current leaf instead of the first (oldest) entry.
+    if let Some(index) = tree_current_index(&entries, current.as_deref()) {
+        list.set_selected_index(index);
+    }
     let state_sel = state.clone();
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
@@ -1460,5 +1471,40 @@ mod tree_preview_tests {
 
         let not_current = tree_entry_item(&entry, false);
         assert_eq!(not_current.label, "message #9");
+    }
+
+    #[test]
+    fn tree_current_index_finds_leaf_position() {
+        let entries: Vec<Entry> = ["e1", "e2", "e3"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                user_entry(
+                    i as u64 + 1,
+                    id,
+                    rpi_ai::types::UserContent::Text(format!("msg {id}")),
+                )
+            })
+            .collect();
+        assert_eq!(tree_current_index(&entries, Some("e2")), Some(1));
+        assert_eq!(tree_current_index(&entries, Some("e3")), Some(2));
+    }
+
+    #[test]
+    fn tree_current_index_without_current_or_missing_id_is_none() {
+        let entries: Vec<Entry> = ["e1", "e2"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                user_entry(
+                    i as u64 + 1,
+                    id,
+                    rpi_ai::types::UserContent::Text(format!("msg {id}")),
+                )
+            })
+            .collect();
+        assert_eq!(tree_current_index(&entries, None), None);
+        assert_eq!(tree_current_index(&entries, Some("gone")), None);
+        assert_eq!(tree_current_index(&[], Some("e1")), None);
     }
 }
