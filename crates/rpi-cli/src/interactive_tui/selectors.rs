@@ -528,11 +528,34 @@ fn user_message_preview(entry: &Entry) -> Option<String> {
     let AgentMessage::User(user) = entry.as_message()? else {
         return None;
     };
-    let collapsed = user_message_text(user)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if collapsed.chars().count() > TREE_PREVIEW_MAX_CHARS {
+    // Collapse whitespace runs while copying, stopping one character past the
+    // budget: a long paste costs a bounded amount of work instead of a
+    // `collect::<Vec<_>>()` of every word plus a joined copy. The prefix built
+    // here is character-identical to `split_whitespace().join(" ")`.
+    let text = user_message_text(user);
+    let mut collapsed = String::new();
+    let mut chars = 0usize;
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = !collapsed.is_empty();
+            continue;
+        }
+        if pending_space {
+            if chars > TREE_PREVIEW_MAX_CHARS {
+                break;
+            }
+            collapsed.push(' ');
+            chars += 1;
+            pending_space = false;
+        }
+        if chars > TREE_PREVIEW_MAX_CHARS {
+            break;
+        }
+        collapsed.push(ch);
+        chars += 1;
+    }
+    if chars > TREE_PREVIEW_MAX_CHARS {
         let truncated: String = collapsed.chars().take(TREE_PREVIEW_MAX_CHARS).collect();
         return Some(format!("{truncated}…"));
     }
@@ -1354,6 +1377,43 @@ mod tree_preview_tests {
         assert_eq!(chars.last().copied(), Some('…'));
         // All 60 kept characters are intact CJK chars, no split multi-byte panics.
         assert!(chars[..TREE_PREVIEW_MAX_CHARS].iter().all(|&c| c == '好'));
+    }
+
+    #[test]
+    fn user_message_preview_stops_at_the_budget_instead_of_collapsing_everything() {
+        // Many words whose collapsed form far exceeds the budget: the preview
+        // must be exactly the first `TREE_PREVIEW_MAX_CHARS` collapsed chars
+        // plus the ellipsis, without materializing the whole collapsed string.
+        let long = "word ".repeat(10_000);
+        let entry = user_entry(20, "e20", rpi_ai::types::UserContent::Text(long));
+        let preview = user_message_preview(&entry).expect("long text yields a preview");
+        let chars: Vec<char> = preview.chars().collect();
+        assert_eq!(chars.len(), TREE_PREVIEW_MAX_CHARS + 1);
+        assert_eq!(chars.last().copied(), Some('…'));
+        let collapsed_prefix: String = "word "
+            .repeat(20)
+            .chars()
+            .take(TREE_PREVIEW_MAX_CHARS)
+            .collect();
+        assert_eq!(
+            chars[..TREE_PREVIEW_MAX_CHARS].iter().collect::<String>(),
+            collapsed_prefix,
+            "the bounded builder must match the collapsed prefix"
+        );
+
+        // Exactly at the budget: no ellipsis. One past it: ellipsis.
+        let exact = "好".repeat(TREE_PREVIEW_MAX_CHARS);
+        let exact_entry = user_entry(21, "e21", rpi_ai::types::UserContent::Text(exact.clone()));
+        assert_eq!(
+            user_message_preview(&exact_entry).as_deref(),
+            Some(exact.as_str())
+        );
+
+        let over = "好".repeat(TREE_PREVIEW_MAX_CHARS + 1);
+        let over_entry = user_entry(22, "e22", rpi_ai::types::UserContent::Text(over));
+        let over_preview = user_message_preview(&over_entry).expect("preview");
+        assert_eq!(over_preview.chars().count(), TREE_PREVIEW_MAX_CHARS + 1);
+        assert!(over_preview.ends_with('…'));
     }
 
     #[test]
