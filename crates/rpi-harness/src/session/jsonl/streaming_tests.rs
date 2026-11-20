@@ -5,6 +5,7 @@ use crate::session::{
     state::SessionState,
     types::{EntryOrder, ForkPosition, MessageSummaryQuery, MessageWindowQuery, ProvisionedKind},
 };
+use sha2::Digest;
 use std::sync::atomic::AtomicUsize;
 
 struct StrictReader {
@@ -373,8 +374,8 @@ async fn scanner_delimiters_preserve_raw_lines_offsets_flags_and_digest() {
         assert!(scanner.next().await.unwrap().is_none());
         assert_eq!(scanner.offset, bytes.len() as u64);
         assert_eq!(
-            <[u8; 32]>::from(scanner.hash.finalize()),
-            <[u8; 32]>::from(Sha256::digest(&bytes))
+            scanner.hash.finalize(),
+            <[u8; 32]>::from(sha2::Sha256::digest(&bytes))
         );
     }
 }

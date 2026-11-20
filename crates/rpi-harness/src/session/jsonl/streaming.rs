@@ -110,7 +110,7 @@ pub(super) async fn hash_reader(
         hash.update(&bytes);
         offset += count as u64;
     }
-    Ok(hash.finalize().into())
+    Ok(hash.finalize())
 }
 
 impl JsonlSessionStorage {
@@ -283,7 +283,7 @@ impl JsonlSessionStorage {
                 Err(error) => return Err(invalid_file(path, line_no, &error)),
             }
         }
-        let source_digest = <[u8; 32]>::from(scan.hash.clone().finalize());
+        let source_digest = scan.hash.clone().finalize();
         *storage.loaded_history_digest.lock().unwrap() = Some(source_digest);
         if !storage.progress.required {
             *storage.legacy_history_digest.lock().unwrap() = Some(source_digest);
@@ -310,7 +310,7 @@ impl JsonlSessionStorage {
                             )?;
                             hash.update(b"\n");
                         }
-                        *output.lock().unwrap() = Some(<[u8; 32]>::from(hash.finalize()));
+                        *output.lock().unwrap() = Some(hash.finalize());
                         Ok(())
                     })
                 })
@@ -341,7 +341,7 @@ impl JsonlSessionStorage {
                 }
             }
             if !storage.progress.required && allow_repair {
-                *storage.legacy_history_digest.lock().unwrap() = Some(scan.hash.finalize().into());
+                *storage.legacy_history_digest.lock().unwrap() = Some(scan.hash.finalize());
             }
         }
         policy.check((line_no - 1) as usize)?;
@@ -374,7 +374,7 @@ impl JsonlSessionStorage {
                             )?;
                             hash.update(b"\n");
                         }
-                        *output.lock().unwrap() = Some(<[u8; 32]>::from(hash.finalize()));
+                        *output.lock().unwrap() = Some(hash.finalize());
                         Ok(())
                     })
                 })
@@ -384,7 +384,7 @@ impl JsonlSessionStorage {
                 }
             }
             PendingRepair::Eager { bytes } => {
-                let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
+                let digest = Sha256::digest(&bytes);
                 let path = self.metadata.path.clone();
                 publish_file_atomically(&self.fs, &path, move |fs, temp| {
                     Box::pin(async move {

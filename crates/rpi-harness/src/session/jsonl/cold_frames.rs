@@ -2,6 +2,7 @@
 
 //! JSONL-private payload references. Query plans own only selected sources; no
 //! warm cache and no published plan holds or clones the resident history index.
+use super::digest::Sha256;
 use super::{codec::parse_mutation, errors::file_result};
 use crate::{
     error::{SessionError, SessionResult},
@@ -12,7 +13,6 @@ use crate::{
 };
 use rpi_tools::env::{AppendReceipt, ReadFile};
 use serde::{de::IgnoredAny, Deserialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
@@ -151,7 +151,7 @@ impl Location {
             retired: false,
             offset,
             length: raw.len(),
-            digest: Sha256::digest(raw).into(),
+            digest: Sha256::digest(raw),
             id,
             lane: Arc::from(lane),
             run: Arc::from(run),
@@ -164,7 +164,7 @@ impl Location {
         if raw.len() != self.length {
             return Err(SessionError::storage("short cold history read"));
         }
-        if <[u8; 32]>::from(Sha256::digest(raw)) != self.digest {
+        if Sha256::digest(raw) != self.digest {
             return Err(SessionError::invalid_entry(
                 "cold history source changed; reopen session",
             ));
@@ -576,7 +576,7 @@ impl ResidentState {
             retired: false,
             offset,
             length: raw.len(),
-            digest: Sha256::digest(raw).into(),
+            digest: Sha256::digest(raw),
             id: metadata.id.into_owned(),
             lane,
             run,

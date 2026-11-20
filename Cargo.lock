@@ -2243,6 +2243,7 @@ dependencies = [
  "base64",
  "fs2",
  "futures",
+ "ring",
  "rpi-agent",
  "rpi-ai",
  "rpi-durable",

@@ -11,6 +11,7 @@
 pub mod codec;
 mod cold_decode;
 mod cold_frames;
+mod digest;
 pub mod errors;
 mod progress;
 pub mod repo;
