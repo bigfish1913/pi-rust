@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rpi TUI 启动标志 · 现状 vs 候选（齿轮 + rpi）</title>
+<style>
+  :root {
+    --bg: #121213; --panel: #1a1a1c; --panel-2: #202024; --line: #2c2c31;
+    --text: #e6e6e6; --muted: #808080; --dim: #666666; --accent: #8abeb7;
+    --border-muted: #505050; --warn: #cc6666; --gold: #f0c674;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 80px; background: var(--bg); color: var(--text);
+    font-family: Menlo, "SF Mono", Consolas, "DejaVu Sans Mono", monospace;
+    font-size: 13px; line-height: 1.5;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  h2 { font-size: 14px; margin: 40px 0 12px; color: var(--accent); font-weight: 600; }
+  h3 { font-size: 13px; margin: 0 0 4px; font-weight: 600; }
+  p.lead { color: var(--muted); margin: 0 0 10px; max-width: 96ch; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); gap: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px 16px; }
+  .card .meta { color: var(--muted); font-size: 12px; margin: 2px 0 10px; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px;
+    border: 1px solid var(--line); color: var(--muted); margin-left: 6px; vertical-align: 1px; }
+  .tag.bad { color: var(--warn); border-color: #3a2626; }
+  .tag.good { color: var(--accent); border-color: #24322f; }
+  .term { width: max-content; max-width: 100%; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; overflow-x: auto; font-variant-ligatures: none; }
+  .term .line { white-space: pre; height: 1.5em; }
+  .art { white-space: pre; line-height: 1; margin: 0; }
+  .art#badge { line-height: 1.18; }
+  .art .c0 { color: var(--dim); }
+  .art .c1 { color: var(--muted); }
+  .art .c2 { color: var(--accent); }
+  .art .c3 { color: var(--text); }
+  .dim { color: var(--dim); }
+  .muted { color: var(--muted); }
+  .accent { color: var(--accent); }
+  .bold { font-weight: 700; }
+  .rule { border: 0; border-top: 1px solid var(--border-muted); margin: 6px 0; }
+  .annot { margin-top: 10px; font-size: 12px; color: var(--warn); }
+  .annot.plain { color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 14px; max-width: 96ch; }
+  code { color: var(--gold); }
+  ul.lead { padding-left: 18px; color: var(--text); line-height: 1.8; }
+  .source { display: flex; gap: 16px; align-items: center; margin: 6px 0 4px; }
+  .source img { width: 132px; height: 132px; border-radius: 8px; background: #fff; padding: 4px; }
+  .source .txt { color: var(--muted); font-size: 12px; max-width: 62ch; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>rpi TUI 启动标志 · 现状 vs 候选</h1>
+  <div class="source">
+    <img src="../images/rpi-logo.jpg" alt="rpi logo">
+    <div class="txt">
+      <b style="color: var(--text)">品牌源图</b>（<code>docs/images/rpi-logo.jpg</code>）：
+      齿轮环 + 内部细圆 + 镂空的 <code>r p i</code> 线稿，顶部有一对小钩。
+      <br>下面所有候选都是<strong>这一张图</strong>的终端化版本（不是三条柱子）。
+    </div>
+  </div>
+
+  <h2>A. 现在：44 × 22 的 3D 徽章</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>欢迎页首屏 <span class="tag bad">logo 占 22 行</span></h3>
+      <div class="meta">80 列终端 · dark 主题 · <code>brand/render.rs</code> 的真实输出（yaw = 0）</div>
+      <div class="term">
+<pre class="art" id="badge"></pre>
+<div class="line muted">interactive TUI · library-first agent runtime</div>
+<div class="line">&nbsp;</div>
+<div class="line dim">Type your message and press Enter to send.</div>
+<div class="line dim">Enter send · Shift+Enter newline · Esc abort · /help</div>
+<div class="line">&nbsp;</div>
+<div class="line">Tools (6) read · bash · edit · write · docs</div>
+<div class="line">Skills (0) none</div>
+<hr class="rule">
+<div class="line dim">↑26k ↓1.7k R105k CH96.7% · (openai) gpt-medium</div>
+      </div>
+      <div class="annot">↑ 24 行的屏幕里徽章自己吃掉 22 行：首屏几乎看不到正文，滚动区也没了。</div>
+    </div>
+
+    <div class="card">
+      <h3>为什么现在“又丑又大”</h3>
+      <div class="meta">不只是尺寸问题</div>
+      <ul class="lead">
+        <li><b>画的不是这张 logo</b>：现在渲染的是“实心圆盘 + 镂空 rpi 笔画”，源图是<strong>线稿</strong>——齿轮环、内部细圆、字母笔画。少了线稿结构，远看就是一团斑块。</li>
+        <li><b>22 行 × 44 列</b>：小窗口 / 分屏下直接顶掉整个首屏，滚动区为 0。</li>
+        <li><b>字符密度太高</b>（大片 <code>* # %</code> 实心），小字号终端里糊成噪点。</li>
+        <li><b>7 秒自转片头 + 每帧重绘</b>：装饰性动画长期占用渲染 tick。</li>
+        <li><b>正面视角下齿形挤在 ~30 列里</b>，齿宽和字母笔画都不到 1 格，形状必然丢失。</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>B. 候选：同一张 logo 的终端化（线稿 → 点阵）</h2>
+  <div class="grid">
+
+    <div class="card">
+      <h3>B1 · 盲文点阵 24 × 12 <span class="tag good">12 行 × 24 列</span></h3>
+      <div class="meta">48 × 48 点阵 · 盲文点本身是方的，正好配 logo 的正圆</div>
+      <div class="term">
+<pre class="art accent">      ⣠⣄  ⣸⠉⠉⣇  ⣠⣀
+     ⣯ ⠈⠓⠋⢉⣀⣀⡉⠙⠚⠁ ⡽
+  ⣠⣄⣠⠞⢀⣤⠖⠋⠉⠉⠉⠉⠛⠲⣤ ⠳⣄⣠⣄
+ ⢸⡁  ⣰⠏          ⠹⣆  ⢘⡇
+  ⣹ ⣸⠃   ⢀⣦⠤⠤⣶⡀   ⠘⣇ ⡏
+⣴⠒⠋ ⡏   ⢠⡏⢡⡴⢦⡌⢻⡄   ⢹ ⠙⠒⣦
+⠻⢤⣀ ⣇  ⢀⣈ ⢸⣄⣠⠇⢠⡇⢀⡀ ⣸ ⣀⡤⠟
+  ⢹ ⢹⡄⢸⠋⠉ ⢸ ⣤⡴⠛ ⢠⡅⢠⡏ ⡇
+ ⢰⡉  ⠙⣾   ⢸ ⣿   ⢸⣷⠋  ⢙⡆
+  ⠙⠚⠙⢦⠈⠐⠦⣄⣼ ⣿⣀⣤⠴⠈⠁⡴⠋⠓⠋
+     ⣾⡀⢀⡤⣄⣀  ⣀⣤⢤⡀⢀⣧
+      ⠉⠋  ⢹⣤⣤⡏  ⠙⠉</pre>
+<div class="line">&nbsp;</div>
+<div class="line dim">Type your message and press Enter to send.</div>
+<div class="line dim">Enter send · Shift+Enter newline · Esc abort · /help</div>
+<div class="line">&nbsp;</div>
+<div class="line">Tools (6) read · bash · edit · write · docs</div>
+<div class="line">Skills (0) none</div>
+      </div>
+      <div class="annot plain">齿轮、内圆、<code>r p i</code> 都还认得出来；比现在矮一半，还更“像 logo”。</div>
+    </div>
+
+    <div class="card">
+      <h3>B2 · 盲文点阵 16 × 8 <span class="tag good">8 行 × 16 列</span></h3>
+      <div class="meta">32 × 32 点阵 · B1 缩到一半（点阵从 48×48 降到 32×32）</div>
+      <div class="term">
+<pre class="art">   ⢠⠔⣄⡠⠋⠹⢄⣠⠢⡀
+ ⢀⣀⡼⢀⡤⠒⠒⠒⠒⢤⡀⢧⣀⡀
+ ⢧ ⡴⠁      ⠘⢆ ⡼
+⡠⠜⢰⠁ ⢀⠞⡩⢍⢳⡀ ⠘⡄⠣⢄
+⠓⢢⠸⡀⣠⠬ ⡧⠜⣰⠃⠄⢠⠃⡔⠊
+ ⡜ ⠳⡇  ⡇⡏⠁ ⣧⠎ ⢣
+ ⠈⠉⢳ ⠐⠲⠇⠧⠔⠂ ⡞⠉⠁
+   ⠈⠒⠊⠙⣄⣰⠋⠑⠒⠁</pre>
+<div class="line">&nbsp;</div>
+<div class="line dim">Type your message and press Enter to send.</div>
+<div class="line dim">Enter send · Shift+Enter newline · Esc abort · /help</div>
+<div class="line">&nbsp;</div>
+<div class="line">Tools (6) read · bash · edit · write · docs</div>
+<div class="line">Skills (0) none</div>
+      </div>
+      <div class="annot plain">齿轮环、内圆还在；<code>r p i</code> 的笔画已经到 1 点的极限，靠整体轮廓辨认。</div>
+    </div>
+
+    <div class="card">
+      <h3>B3 · 半块字符 32 × 16 <span class="tag good">白色 · 16 行 × 32 列</span></h3>
+      <div class="meta">字体覆盖最广（<code>█ ▀ ▄</code>），改白色后不再抢主题色，代价是字母发糊</div>
+      <div class="term">
+<pre class="art">
+              ▄▄▄
+         ▄▀▄ ▄▀  █▄▄▄ ▄
+        ▀▄   ▄▄▄▄▄▄▀  █
+     ▄▄▄▀ ▄▀▀      ▀█▄ ▀▄▄▄
+     ▄  ▄▀            █   █
+     █ ▄▀    ▄▄▄▄▄     █ █
+   ▄▀▀ █    ▄▀▄▄▄ ▀▄   █▄ ▀█▄
+   ▀▄▄ █    ▀ █▄▄▀ █   ██ ▄█▀
+     █ ▀▄ █▀▀ █ ▄▄▀  ▄ █ █
+    ▄▀  ▀██   █ █    ██   █
+     ▀▄▀▄  ▄▄ █ █  ▄ ▀ ▄ ▄▀
+        ▄▀   ▀▀ ▀▀    █
+         ▀▄▀▀▀▄  █▀▀▀ ▀
+              ▀▀▀
+</pre>
+<div class="line">&nbsp;</div>
+<div class="line dim">Type your message and press Enter to send.</div>
+<div class="line dim">Enter send · Shift+Enter newline · Esc abort · /help</div>
+<div class="line">&nbsp;</div>
+<div class="line">Tools (6) read · bash · edit · write · docs</div>
+<div class="line">Skills (0) none</div>
+      </div>
+      <div class="annot plain">白色＝用主题的默认前景色（<code>Color::Default</code>），浅色主题下自动变黑。</div>
+    </div>
+
+  </div>
+
+  <h2>C. 对比</h2>
+  <table>
+    <thead>
+      <tr><th>方案</th><th>高度</th><th>宽度</th><th>点阵</th><th>字符集</th><th>字形风险</th><th>还原度</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>A · 现状 3D 徽章</td><td class="num">22 行</td><td class="num">44 列</td><td class="num">44 × 22</td>
+        <td><code>.-:=+*#%@</code></td><td>低（单宽）</td><td>低（实心盘，不是线稿）</td>
+      </tr>
+      <tr>
+        <td>B1 · 盲文 24×12</td><td class="num">12 行</td><td class="num">24 列</td><td class="num">48 × 48</td>
+        <td>盲文 <code>U+2800</code></td><td>中（需字体覆盖盲文）</td><td>高</td>
+      </tr>
+      <tr>
+        <td>B2 · 盲文 16×8</td><td class="num">8 行</td><td class="num">16 列</td><td class="num">32 × 32</td>
+        <td>盲文 <code>U+2800</code></td><td>中</td><td>中（靠轮廓辨认）</td>
+      </tr>
+      <tr>
+        <td>B3 · 半块 32×16（白）</td><td class="num">16 行</td><td class="num">32 列</td><td class="num">64 × 32</td>
+        <td><code>█ ▀ ▄</code></td><td>低（覆盖最广）</td><td>中</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p class="note">
+    <b style="color: var(--text)">生成方式</b>：把 <code>docs/images/rpi-logo.jpg</code> 缩到 160×160，
+    取墨迹阈值 140 得到二值掩膜，按外接方框裁剪成正方形；每个盲文点 / 半块用 3×3 子采样算覆盖率，
+    覆盖率 ≥ 48% 记为墨点（半块 ≤ 45%）。盲文点宽高相同（终端格 1:2，盲文格 2×4 点 → 点正好是方的），
+    所以圆形不会被拉扁；半块方案纵向分辨率只有盲文的一半，这就是 B3 字母发糊的原因。
+    <br>
+    <b style="color: var(--text)">宽度安全性</b>：盲文点阵 <code>U+2800–U+28FF</code> 的 East-Asian Width 是
+    Neutral，<code>unicode-width</code> 一律算 1 格（<code>rpi-tui</code> 的 <code>visible_width</code> 也是 1），
+    不像 <code>π</code> 那样在 CJK locale 下会变成 2 格。
+  </p>
+
+  <h2>D. 结论（已落地）</h2>
+  <ul class="lead">
+    <li><b>半块字符、白色、24 列 × 12 行</b>：80×24 的转录视口只有 17 行，12 行标志 + 5 行信息刚好装进首屏；
+      32×16 在这类小窗口里会把顶部 8 行挤出可视区（真机抓帧见 <code>tui-logo-real-80x24.png</code>）。</li>
+    <li><b>去掉和 footer 重复的那行提示</b>（“Type your message and press Enter to send.”），
+      顺带去掉了标志后的空行——这两行是首屏预算里最不值钱的部分。</li>
+    <li><b>不再 3D 扫描</b>：静态半块表 + 主题默认前景色，删掉 <code>shape.rs</code>/<code>spin.rs</code>
+      和渲染 tick 里的自转重绘。</li>
+  </ul>
+  <p class="note">
+    真机抓帧（PTY 里跑 <code>rpi</code>，还原终端帧后按等宽字形出图）：
+    <code>tui-logo-real-80x44.png</code>（三种版本并排）、<code>tui-logo-real-80x24.png</code>（小窗口）。
+  </p>
+
+</div>
+
+<script>
+  // 现状徽章：brand/render.rs 在 yaw = 0（静止正面）下的真实输出，逐行核对过。
+  const BADGE = [
+    "                                            ",
+    "                                            ",
+    "                     =-                     ",
+    "              ++     *+     +=              ",
+    "              **-=*****+++=+*+              ",
+    "        ==- +=***************+-- ++:        ",
+    "        =*++*******************+***:        ",
+    "         =******** -++++- ********:         ",
+    "     ====**** ** :+******+: ******=+++-     ",
+    "     +******  +  **+    +**  ******#**=     ",
+    "        ***+ =*+ **=:  :=** +******+        ",
+    "        ***  **+= ***  *** =+++****+        ",
+    "     ******  ****==-    -==*********+++     ",
+    "     -**+**==+*******  ************+**:     ",
+    "         -***********  ***********:         ",
+    "        +************: ***********=:        ",
+    "        =+= :+*********+==****+: =+:        ",
+    "              +**+********+**-              ",
+    "              +*     **     *=              ",
+    "                     *=                     ",
+    "                                            ",
+    "                                            ",
+  ];
+
+  const LEVEL_CLASS = ["c0", "c1", "c2", "c3"];
+  function levelOf(ch) {
+    if (ch === " ") return -1;
+    if (".:-".includes(ch)) return 0;
+    if ("=+".includes(ch)) return 1;
+    if ("*#".includes(ch)) return 2;
+    return 3;
+  }
+
+  const out = [];
+  for (const line of BADGE) {
+    let run = "", level = null, row = "";
+    const flush = () => {
+      if (run) row += '<span class="' + (level < 0 ? "c0" : LEVEL_CLASS[level]) + '">' + run + "</span>";
+      run = "";
+    };
+    for (const ch of line) {
+      const l = levelOf(ch);
+      if (l !== level) { flush(); level = l; }
+      run += ch;
+    }
+    flush();
+    out.push(row || " ");
+  }
+  document.getElementById("badge").innerHTML = out.join("\n");
+</script>
+</body>
+</html>

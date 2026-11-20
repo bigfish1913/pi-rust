@@ -241,6 +241,9 @@ jobs:
           python3 -B scripts/test_workflow_infrastructure.py
           python3 -B scripts/test_ci_transient_recovery.py
 
+      - name: Test the linked-issue check
+        run: python3 -B scripts/test_pr_issue_link.py
+
       - uses: actions/setup-node@v4
         with:
           node-version: '24'

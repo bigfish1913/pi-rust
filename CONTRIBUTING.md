@@ -16,7 +16,8 @@ By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
   [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package). Bugs in the
   ABI or the loader itself belong in this repository.
 - **Documentation** — `README.md`, `docs/`, and the static site in `website/`
-  are all fair game. Typos and broken links are welcome as direct PRs.
+  are all fair game. Typos and broken links are welcome as direct PRs; open one
+  small issue for the sweep and reference it, because every PR needs an issue.
 - **Code** — see below.
 
 ## Prerequisites
@@ -152,13 +153,22 @@ keep the type prefix and scope in the conventional form.
 
 ## Pull requests
 
-1. Fork, branch from `main`, and keep the branch focused on one change.
-2. Fill in the PR template — including which crates are affected and how you
+1. **Open or find the issue first.** Every PR must reference an existing issue
+   in this repository, for example `Closes #123`. The **Require linked issue**
+   check (`.github/workflows/pr-issue-link.yml`) fails without one and re-runs
+   when you edit the description. Maintainer-owned PRs, the repository owner and
+   repository automation (release PRs, dependency bots) are exempt.
+2. Fork, branch from `main`, and keep the branch focused on one change.
+3. Fill in the PR template — including which crates are affected and how you
    verified the change.
-3. Make sure CI is green. `Cargo test` and both `Cargo check` jobs (Linux and
+4. Make sure CI is green. `Cargo test` and both `Cargo check` jobs (Linux and
    Windows) must pass without warnings.
-4. Expect review comments on API additions; the public surface of these crates
+5. Expect review comments on API additions; the public surface of these crates
    is intended to be small and stable.
+
+The rule covers documentation PRs too: a typo sweep or a broken-link fix links
+the issue it belongs to (open one small "docs sweep" issue if none exists) so the
+history keeps a reason for every change.
 
 If your change touches the plugin ABI (`rpi-plugin-sdk`), call it out
 explicitly in the PR description. ABI changes affect every already-built
