@@ -24,7 +24,7 @@ async fn first_and_second_reply_keep_startup_logo_tools_and_notes_in_scroll_hist
         .take(crate::brand::render::ROWS)
         .filter(|l| !l.trim().is_empty())
         .count();
-    assert!(badge_rows >= 10, "lockup rows: {badge_rows}");
+    assert!(badge_rows >= 8, "lockup rows: {badge_rows}");
     assert!(header.contains("Tools (2) read · bash"));
     assert!(header.contains("Skills (1) synthetic-skill"));
     assert!(header.contains("Context (1)"));
@@ -107,13 +107,13 @@ async fn first_and_second_reply_keep_startup_logo_tools_and_notes_in_scroll_hist
         let tail = strip_ansi(&scroll.render_with_viewport(width, 8).join("\n"));
         assert!(tail.contains("synthetic-reply-1"), "{tail}");
         assert!(
-            !tail.contains("█▀▀"),
+            !tail.contains("▄▀▀"),
             "logo should scroll offscreen: {tail}"
         );
         scroll.scroll_to_start();
         let top = strip_ansi(&scroll.render_with_viewport(width, 8).join("\n"));
         assert!(
-            top.contains("█▀▀"),
+            top.contains("▄▀▀"),
             "logo should remain in scrollback: {top}"
         );
     }

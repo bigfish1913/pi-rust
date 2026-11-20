@@ -77,22 +77,17 @@ pub(super) fn add_welcome_message_with_capabilities(
     // The mark, wordmark and language mark live in `crate::brand`. See that
     // module for why the layout is built from single-width characters only.
     container.add_child(Arc::new(crate::brand::BrandLockup::new()));
-    container.add_child(Arc::new(Spacer::new(1)));
     // The mark carries the product name, so the line under it is the tagline
     // rather than a second logotype.
     let title = c.muted.fg("interactive TUI · library-first agent runtime");
     container.add_child(Arc::new(Text::new(title, 1, 0)));
-    container.add_child(Arc::new(Spacer::new(1)));
-    container.add_child(Arc::new(Text::new(
-        c.dim.fg("Type your message and press Enter to send."),
-        1,
-        0,
-    )));
+    // No spacer rows: the header has a hard row budget (see `crate::brand::render`),
+    // and "Type your message and press Enter to send" repeated what the footer
+    // already shows, so it cost a row for nothing.
     let hint = c
         .dim
         .fg("Enter send · Shift+Enter newline · Ctrl+C clear · Esc abort · /help");
     container.add_child(Arc::new(Text::new(hint, 1, 0)));
-    container.add_child(Arc::new(Spacer::new(1)));
     let context_listing = Arc::new(Container::new());
     render_context_files(&context_listing, context_files);
     container.add_child(context_listing.clone());

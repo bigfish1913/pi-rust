@@ -1393,12 +1393,12 @@ fn test_layout_renders_welcome_message() {
         .filter(|l| !l.trim().is_empty())
         .count();
     assert!(
-        logo_rows >= 10,
+        logo_rows >= 8,
         "Welcome logo not found (only {logo_rows} inked rows). Rendered: {}",
         all
     );
     assert!(
-        all.contains("Type your message"),
+        all.contains("Enter send · Shift+Enter newline"),
         "Help text not found. Rendered: {}",
         all
     );
@@ -1505,7 +1505,7 @@ fn welcome_header_renders_the_brand_mark() {
     // the first rows of the welcome header.
     let logo: Vec<&String> = lines.iter().take(crate::brand::render::ROWS).collect();
     assert!(
-        logo.iter().filter(|l| !l.trim().is_empty()).count() >= 10,
+        logo.iter().filter(|l| !l.trim().is_empty()).count() >= 8,
         "brand logo missing: {all}"
     );
     assert!(

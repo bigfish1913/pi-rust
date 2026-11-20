@@ -58,9 +58,10 @@ mod tests {
     fn lockup_fits_the_welcome_header() {
         let rows = BrandLockup::new().render(80);
         assert_eq!(rows.len(), render::ROWS);
-        assert_eq!(rows.len(), 16);
+        // 首屏预算：80×24 下欢迎页只剩 17 行给转录区（见 `render` 的模块文档）。
+        assert_eq!(rows.len(), 12);
         assert!(rows.iter().all(|row| visible_width(row) == render::COLS));
-        assert!(strip_ansi(&rows[7]).contains('█'));
+        assert!(strip_ansi(&rows[5]).contains('█'));
     }
 
     #[test]

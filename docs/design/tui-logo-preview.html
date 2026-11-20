@@ -221,13 +221,19 @@
     不像 <code>π</code> 那样在 CJK locale 下会变成 2 格。
   </p>
 
-  <h2>D. 建议</h2>
+  <h2>D. 结论（已落地）</h2>
   <ul class="lead">
-    <li><b>默认 B1（24×12，盲文）或 B3（半块 32×16，白色）</b>；B2（16×8）留给窄窗口/分屏。</li>
-    <li><b>别再 3D 扫描</b>：logo 是线稿，用二维 SDF（齿轮环 / 内圆 / 笔画）或一次性光栅化 + 缓存即可，
-      去掉 <code>spin.rs</code> 的 7 秒片头和每帧重绘。</li>
-    <li><b>首屏预算</b>：logo ≤ 8 行、其余启动信息 ≤ 6 行，80×24 下正文至少留 10 行。</li>
+    <li><b>半块字符、白色、24 列 × 12 行</b>：80×24 的转录视口只有 17 行，12 行标志 + 5 行信息刚好装进首屏；
+      32×16 在这类小窗口里会把顶部 8 行挤出可视区（真机抓帧见 <code>tui-logo-real-80x24.png</code>）。</li>
+    <li><b>去掉和 footer 重复的那行提示</b>（“Type your message and press Enter to send.”），
+      顺带去掉了标志后的空行——这两行是首屏预算里最不值钱的部分。</li>
+    <li><b>不再 3D 扫描</b>：静态半块表 + 主题默认前景色，删掉 <code>shape.rs</code>/<code>spin.rs</code>
+      和渲染 tick 里的自转重绘。</li>
   </ul>
+  <p class="note">
+    真机抓帧（PTY 里跑 <code>rpi</code>，还原终端帧后按等宽字形出图）：
+    <code>tui-logo-real-80x44.png</code>（三种版本并排）、<code>tui-logo-real-80x24.png</code>（小窗口）。
+  </p>
 
 </div>
 
