@@ -3,12 +3,13 @@
 //! Displays images using Kitty or iTerm2 protocols.
 
 use std::any::Any;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use super::component::Component;
+use super::component::{Component, RenderedDocument};
 use super::terminal_image::{
-    allocate_image_id, get_capabilities, get_image_dimensions, register_kitty_image, render_image,
-    ImageProtocol, ImageRenderOptions, KittyImageMetadata,
+    allocate_image_id, encode_kitty_placement, frame_holds_image, get_capabilities,
+    get_image_dimensions, register_kitty_image, render_image, ImageProtocol, ImageRenderOptions,
+    KittyImageMetadata,
 };
 use crate::utils::visible_width;
 
@@ -68,12 +69,19 @@ impl Default for ImageOptions {
 /// kept a stale geometry after the terminal's cell size changed (font zoom, a
 /// move to a monitor with another DPI) and made old images disagree with new
 /// ones in the same frame.
+///
+/// `uploaded` is part of the key because it changes the row's *form*, not just
+/// its spelling: the frame that first shows an image has to carry the payload,
+/// every later frame only places an image the terminal already holds (see
+/// [`frame_holds_image`]). Caching one form under the other would either resend
+/// megabytes per frame or paint an id the terminal does not have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RenderKey {
     width: usize,
     cell_width: u16,
     cell_height: u16,
     protocol: ImageProtocol,
+    uploaded: bool,
 }
 
 /// Image component.
@@ -83,7 +91,15 @@ pub struct Image {
     options: ImageOptions,
     theme: ImageTheme,
     image_id: Mutex<Option<u32>>,
-    cached_render: Mutex<Option<(RenderKey, String)>>,
+    /// Rendered rows, shared with the frame being assembled.
+    ///
+    /// A kitty payload row is megabytes. Handing out owned rows made every
+    /// repaint of the transcript copy (and re-split) those megabytes even when
+    /// nothing changed, which pinned a core on sessions that read a handful of
+    /// screenshots. The rows are cached behind an `Arc` and
+    /// [`Component::render_document`] hands out the handle, so a repeat frame
+    /// costs a refcount bump.
+    cached_render: Mutex<Option<(RenderKey, Arc<Vec<String>>)>>,
     inline_visible: Mutex<bool>,
     /// Number of times `render_image` had to derive a placement instead of
     /// returning the cached one.
@@ -208,35 +224,72 @@ impl Image {
         self.derives.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Render the image.
-    fn render_image(&self, width: usize) -> String {
+    /// Render the image as rows.
+    ///
+    /// Returns shared rows so a frame can place them without copying. The cache
+    /// is keyed on the width, the polled cell geometry and whether the terminal
+    /// already holds the payload.
+    fn render_rows(&self, width: usize) -> Arc<Vec<String>> {
         if width == 0 {
-            return String::new();
+            return Arc::new(vec![String::new()]);
         }
         if !*self.inline_visible.lock().unwrap() {
-            return crate::utils::truncate_to_width("[Image]", width, "");
+            return Arc::new(vec![crate::utils::truncate_to_width("[Image]", width, "")]);
         }
         let caps = get_capabilities();
         // The frame being painted was laid out for the geometry its renderer
         // polled; the process-wide cache is only the fallback outside a frame.
         let cell_dims = crate::terminal_image::effective_cell_dimensions();
+        let uploaded = self.uploaded(caps.protocol);
         let key = RenderKey {
             width,
             cell_width: cell_dims.width,
             cell_height: cell_dims.height,
             protocol: caps.protocol,
+            uploaded,
         };
 
-        // Check if we have cached render for this width *and* this geometry.
+        // Check if we have cached rows for this width, geometry and upload state.
         if let Ok(cached) = self.cached_render.lock() {
-            if let Some((cached_key, rendered)) = cached.as_ref() {
+            if let Some((cached_key, rows)) = cached.as_ref() {
                 if *cached_key == key {
-                    return rendered.clone();
+                    return rows.clone();
                 }
             }
         }
 
-        // Calculate dimensions
+        let rows = Arc::new(self.derive_rows(width, caps.protocol, cell_dims, uploaded));
+
+        // Cache the rows against the inputs they were computed for.
+        if let Ok(mut cached) = self.cached_render.lock() {
+            *cached = Some((key, rows.clone()));
+        }
+        rows
+    }
+
+    /// Whether the terminal being painted already holds this image's payload.
+    ///
+    /// Only the Kitty protocol can place an image by id; the iTerm2 protocol
+    /// carries the data inline in every frame.
+    fn uploaded(&self, protocol: ImageProtocol) -> bool {
+        if protocol != ImageProtocol::Kitty {
+            return false;
+        }
+        self.image_id
+            .lock()
+            .ok()
+            .and_then(|id| *id)
+            .is_some_and(frame_holds_image)
+    }
+
+    /// Derive the rows for one (width, geometry, upload state) combination.
+    fn derive_rows(
+        &self,
+        width: usize,
+        protocol: ImageProtocol,
+        cell_dims: crate::terminal_image::CellDimensions,
+        uploaded: bool,
+    ) -> Vec<String> {
         #[cfg(test)]
         self.derives
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -285,7 +338,7 @@ impl Image {
         };
 
         // Render based on protocol
-        let result = if caps.protocol == ImageProtocol::None {
+        let result = if protocol == ImageProtocol::None {
             // Fallback: render placeholder
             crate::utils::truncate_to_width(
                 self.options.alt_text.as_deref().unwrap_or("[Image]"),
@@ -297,7 +350,7 @@ impl Image {
                 let id = self.image_id.lock().ok().and_then(|id| *id);
                 // The layout crops a placement to the rows that are on screen,
                 // which needs the pixel geometry behind the cell rectangle.
-                if caps.protocol == ImageProtocol::Kitty {
+                if protocol == ImageProtocol::Kitty {
                     if let (Some(id), Some((w, h))) = (id, dimensions) {
                         register_kitty_image(KittyImageMetadata {
                             id,
@@ -319,9 +372,16 @@ impl Image {
                 };
                 // Keep cursor position stable and reserve the image's rows in
                 // the retained layout so following text cannot overlap it.
-                let sequence = render_image(img_data, &options);
+                //
+                // A terminal that already holds the payload only needs the
+                // placement, which is a few dozen bytes instead of the whole
+                // PNG: this is the difference between a transcript of
+                // screenshots costing a few kilobytes or ~80 MB per repaint.
+                let placement = (uploaded && protocol == ImageProtocol::Kitty)
+                    .then(|| encode_kitty_placement(&options));
+                let sequence = placement.unwrap_or_else(|| render_image(img_data, &options));
                 let rows = img_height.saturating_sub(1) as usize;
-                if caps.protocol == ImageProtocol::Kitty {
+                if protocol == ImageProtocol::Kitty {
                     format!("{sequence}{}", "\n".repeat(rows))
                 } else {
                     let up = if rows > 0 {
@@ -338,12 +398,7 @@ impl Image {
             self.render_placeholder(img_width as usize, img_height as usize, width)
         };
 
-        // Cache the result against the geometry it was computed for.
-        if let Ok(mut cached) = self.cached_render.lock() {
-            *cached = Some((key, result.clone()));
-        }
-
-        result
+        result.split('\n').map(|row| row.to_string()).collect()
     }
 
     /// Hide terminal graphics while retaining an attachment placeholder.
@@ -426,8 +481,16 @@ impl Default for Image {
 
 impl Component for Image {
     fn render(&self, width: usize) -> Vec<String> {
-        let rendered = self.render_image(width);
-        rendered.split('\n').map(|s| s.to_string()).collect()
+        self.render_rows(width).as_ref().clone()
+    }
+
+    /// Hand the cached rows to the frame instead of copying them.
+    ///
+    /// The scroll view builds its document from these handles, so a repaint of
+    /// an unchanged transcript retains the same image rows instead of cloning
+    /// megabytes of base64 per frame.
+    fn render_document(&self, width: usize) -> RenderedDocument {
+        RenderedDocument::from_shared(self.render_rows(width))
     }
 
     fn invalidate(&self) {
@@ -517,6 +580,108 @@ mod tests {
         // A width change must invalidate it too.
         image.render(40);
         assert_eq!(image.derive_count(), 3, "a width change must re-derive");
+    }
+
+    /// A repeat render must not re-derive *and* must hand out the same rows.
+    ///
+    /// Sharing the row allocation is what makes a repaint of an unchanged
+    /// transcript cheap: the scroll view builds its document from these
+    /// handles, so a kitty payload row (megabytes) is never copied again.
+    #[test]
+    fn a_repeat_render_shares_its_rows() {
+        let _g = crate::terminal_image::capability_test_lock();
+        let saved = crate::terminal_image::get_capabilities();
+        struct Restore(crate::terminal_image::TerminalCapabilities);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::terminal_image::set_capabilities(self.0.clone());
+            }
+        }
+        let _restore = Restore(saved);
+        let mut caps = crate::terminal_image::get_capabilities();
+        caps.protocol = ImageProtocol::Kitty;
+        caps.cell_width = 10;
+        caps.cell_height = 20;
+        crate::terminal_image::set_capabilities(caps);
+
+        let image = Image::from_data(png_header(400, 200), ImageOptions::default());
+        let first = image.render_document(80);
+        let second = image.render_document(80);
+        assert_eq!(
+            image.derive_count(),
+            1,
+            "a repeat document render must hit the cache"
+        );
+        assert_eq!(first.len(), second.len());
+        assert_eq!(first.line(0), second.line(0));
+    }
+
+    /// Once the terminal holds the payload, the row must place the image
+    /// instead of carrying the PNG again.
+    ///
+    /// This is the difference between an idle repaint touching a few kilobytes
+    /// and touching every megabyte of every screenshot in the transcript.
+    #[test]
+    fn an_uploaded_image_is_rendered_as_a_placement_only_row() {
+        let _g = crate::terminal_image::capability_test_lock();
+        let saved = crate::terminal_image::get_capabilities();
+        struct Restore(crate::terminal_image::TerminalCapabilities);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::terminal_image::set_capabilities(self.0.clone());
+            }
+        }
+        let _restore = Restore(saved);
+        let mut caps = crate::terminal_image::get_capabilities();
+        caps.protocol = ImageProtocol::Kitty;
+        caps.cell_width = 10;
+        caps.cell_height = 20;
+        crate::terminal_image::set_capabilities(caps);
+
+        let mut png = png_header(400, 200);
+        png.resize(256 * 1024, 0);
+        let image = Image::from_data(png, ImageOptions::default());
+        let id = image.image_id.lock().unwrap().unwrap();
+
+        // No renderer published a ledger: the payload has to be sent.
+        let transmitted = image.render(80);
+        assert!(
+            transmitted[0].contains("a=T"),
+            "unknown terminal must be sent the payload"
+        );
+        assert!(
+            transmitted[0].len() > 200 * 1024,
+            "the payload row is the multi-megabyte case: {}",
+            transmitted[0].len()
+        );
+
+        // The renderer reports the upload: the same image now costs a placement.
+        let uploaded = Arc::new(std::collections::HashSet::from([id]));
+        let placed =
+            crate::terminal_image::with_frame_uploaded_images(uploaded, || image.render(80));
+        assert_eq!(
+            placed.len(),
+            transmitted.len(),
+            "the placement must reserve the same rows"
+        );
+        assert!(
+            placed[0].contains("a=p"),
+            "an uploaded image is placed, not transmitted: {:?}",
+            placed[0]
+        );
+        assert!(
+            !placed[0].contains("a=T"),
+            "the payload must not be sent twice"
+        );
+        assert!(
+            placed[0].len() < 200,
+            "a placement row is bytes, not megabytes: {}",
+            placed[0].len()
+        );
+        assert!(
+            image.derive_count() == 2,
+            "the upload form is derived once and then cached"
+        );
     }
 
     #[test]

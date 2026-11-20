@@ -4,6 +4,7 @@
 //! transcript and fixed bottom dock, as described in `tui-plan.md`.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -20,7 +21,7 @@ use super::scroll_view::ScrollView;
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
 use crate::ansi::{visible_width, CURSOR_MARKER};
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
-use crate::terminal_image::CellDimensions;
+use crate::terminal_image::{kitty_image_id, with_frame_uploaded_images, CellDimensions};
 use crate::thinking_region::{
     collect_regions as collect_thinking_regions, strip_markers as strip_thinking_region_markers,
 };
@@ -961,6 +962,45 @@ impl TuiAltScreen {
             .invalidate();
     }
 
+    /// Image ids the terminal is known to hold, as the set a layout pass reads.
+    ///
+    /// Published to components for the duration of a render (see
+    /// [`with_frame_uploaded_images`]) so a row for an image the terminal
+    /// already has is emitted as a small placement instead of carrying the
+    /// multi-megabyte payload again. Copying the ids is a few numbers; holding
+    /// the ledger lock across a layout pass would serialize the render thread
+    /// against the frame writer.
+    fn uploaded_image_ids(&self) -> Arc<HashSet<u32>> {
+        let ids: HashSet<u32> = self
+            .kitty_uploads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .painted_ids()
+            .iter()
+            .copied()
+            .collect();
+        Arc::new(ids)
+    }
+
+    /// Record the images a just-rendered frame shows as held by the terminal.
+    ///
+    /// Both row forms count (`a=T` and `a=p`): the frame that carries a payload
+    /// is followed by frames that only place it, and forgetting those would send
+    /// the payload again on every repaint — the exact cost this bookkeeping
+    /// exists to avoid.
+    fn record_painted_images(&self, rows: &[String]) {
+        let mut uploads = self
+            .kitty_uploads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for row in rows {
+            if let Some(id) = kitty_image_id(row) {
+                uploads.note_painted(id);
+            }
+        }
+        uploads.end_frame();
+    }
+
     /// Hand the terminal back to the shell so the process can be stopped
     /// (upstream's `handleCtrlZ`): pause the renderer, leave the alternate
     /// buffer, and restore cooked mode. [`TuiAltScreen::resume`] reverses it
@@ -1040,9 +1080,14 @@ impl TuiAltScreen {
             .unwrap_or_else(|| Arc::new(self.container.clone()));
         // Components inside the frame read the geometry this renderer polled
         // (frame-scoped), not the process-wide cache.
-        let raw_lines = crate::render::with_main_screen_frame(|| {
-            crate::terminal_image::with_frame_cell_geometry(cells, || root.render(width))
-        });
+        let raw_lines = {
+            let uploaded = self.uploaded_image_ids();
+            crate::render::with_main_screen_frame(|| {
+                crate::terminal_image::with_frame_cell_geometry(cells, || {
+                    with_frame_uploaded_images(uploaded, || root.render(width))
+                })
+            })
+        };
         let cursor = raw_lines.iter().enumerate().rev().find_map(|(row, line)| {
             line.find(CURSOR_MARKER)
                 .map(|idx| (row, visible_width(&line[..idx])))
@@ -1052,6 +1097,10 @@ impl TuiAltScreen {
         // renderer must still strip the markers: an assistant message carries
         // them on its thinking rows in every mode.
         let lines = normalize_main_screen_lines(raw_lines);
+        // This document *is* the screen, so every image row in it is (or is
+        // about to be) written: record them before the branches below, one of
+        // which can `invalidate_kitty_uploads` for a repaired live suffix.
+        self.record_painted_images(&lines);
         let previous = self
             .previous_screen
             .lock()
@@ -1160,7 +1209,13 @@ impl TuiAltScreen {
             }
             clear.push_str("\x1b[H");
             terminal.write(&clear);
-            self.invalidate_kitty_uploads();
+            // Erasing cells drops the *placements* on them, not the image data
+            // the terminal already holds — so the ledger stays valid and the
+            // rows rewritten below re-place each image instead of re-sending
+            // its payload. Forgetting the uploads here made every repaired live
+            // suffix (a status tick, a late notice) retransmit every screenshot
+            // in the window, which is what pinned a core on image-heavy
+            // sessions.
             terminal.write(&lines[next_top..].join("\r\n"));
             terminal.write("\x1b[?2026l");
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
@@ -1371,17 +1426,24 @@ impl TuiAltScreen {
         // overlay image keeps the old row count while the body below it has
         // already resized.
         let (frame, mut visible) = crate::terminal_image::with_frame_cell_geometry(cells, || {
-            let frame = if reuse_scroll_content {
-                render_layout_frame_reusing_scroll_content(root_component.clone(), width, height)
-            } else {
-                render_layout_frame(root_component.clone(), width, height)
-            };
-            // Get screen lines and composite modal overlays above the layout.
-            let mut visible = frame.lines.clone();
-            self.jump_to_end
-                .paint(&frame, &mut visible, self.has_overlay());
-            self.paint_overlays(&mut visible, width, height);
-            (frame, visible)
+            let uploaded = self.uploaded_image_ids();
+            with_frame_uploaded_images(uploaded, || {
+                let frame = if reuse_scroll_content {
+                    render_layout_frame_reusing_scroll_content(
+                        root_component.clone(),
+                        width,
+                        height,
+                    )
+                } else {
+                    render_layout_frame(root_component.clone(), width, height)
+                };
+                // Get screen lines and composite modal overlays above the layout.
+                let mut visible = frame.lines.clone();
+                self.jump_to_end
+                    .paint(&frame, &mut visible, self.has_overlay());
+                self.paint_overlays(&mut visible, width, height);
+                (frame, visible)
+            })
         });
 
         // Cursor markers are an internal layout protocol, not terminal output.
@@ -1499,9 +1561,10 @@ impl TuiAltScreen {
             // Every image on screen this frame is in the terminal: keep it
             // trusted for the next frame. An image that scrolled away is
             // forgotten, so its payload is re-sent when it comes back instead
-            // of placing an id the terminal may no longer hold.
+            // of placing an id the terminal may no longer hold. Placement-only
+            // rows count: they are the steady state after the payload frame.
             for line in &visible {
-                if let Some(id) = crate::terminal_image::kitty_transmission_id(line) {
+                if let Some(id) = kitty_image_id(line) {
                     uploads.note_painted(id);
                 }
             }
