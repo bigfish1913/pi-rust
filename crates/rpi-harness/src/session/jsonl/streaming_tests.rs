@@ -1218,6 +1218,51 @@ struct LeaseRacingFs {
     /// Added to the reported mtime, to simulate a stat-only difference. Set it
     /// after the replay, so the recorded identity keeps the original stamp.
     mtime_skew_ms: std::sync::atomic::AtomicI64,
+    /// Report `mtime_ms = 0`, i.e. a filesystem that cannot tell when a file
+    /// was written. A stat that always compares equal must not disable the
+    /// digest.
+    force_zero_mtime: std::sync::atomic::AtomicBool,
+    /// Append these bytes while the replay is reading its last range, i.e. a
+    /// concurrent writer landing between "replay saw N bytes" and "commit".
+    grow_on_read: std::sync::Mutex<Option<Vec<u8>>>,
+    grew: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Appends `grow` once, right after the final ranged read of the replayed
+/// transcript, to reproduce a foreign writer racing the replay itself.
+struct GrowAfterLastRange {
+    inner: Arc<dyn ReadFile>,
+    fs: Arc<dyn FileSystem>,
+    path: String,
+    total: u64,
+    grow: Vec<u8>,
+    grew: Arc<std::sync::atomic::AtomicBool>,
+    ranges: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ReadFile for GrowAfterLastRange {
+    async fn read_all(&self) -> Result<Vec<u8>, rpi_tools::FileError> {
+        self.ranges.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_all().await
+    }
+    async fn byte_len(&self) -> Result<Option<u64>, rpi_tools::FileError> {
+        self.inner.byte_len().await
+    }
+    async fn read_range(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, rpi_tools::FileError> {
+        self.ranges.fetch_add(1, Ordering::Relaxed);
+        let bytes = self.inner.read_range(offset, length).await?;
+        if offset + bytes.len() as u64 >= self.total && !self.grew.swap(true, Ordering::SeqCst) {
+            self.fs
+                .append_file(&self.path, FileContent::Bytes(self.grow.clone()), None)
+                .await?;
+        }
+        Ok(bytes)
+    }
 }
 
 struct CountingReader {
@@ -1303,12 +1348,35 @@ impl FileSystem for LeaseRacingFs {
         &self,
         path: &str,
     ) -> Result<Option<Arc<dyn ReadFile>>, rpi_tools::FileError> {
-        Ok(self.inner.open_read_file(path).await?.map(|reader| {
-            Arc::new(CountingReader {
-                inner: reader,
-                ranges: self.ranges.clone(),
-            }) as Arc<dyn ReadFile>
-        }))
+        let grow = self
+            .grow_on_read
+            .lock()
+            .map_err(|_| {
+                rpi_tools::FileError::new(rpi_tools::FileErrorCode::Invalid, "poisoned grow slot")
+            })?
+            .clone();
+        let Some(reader) = self.inner.open_read_file(path).await? else {
+            return Ok(None);
+        };
+        let counting: Arc<dyn ReadFile> = Arc::new(CountingReader {
+            inner: reader,
+            ranges: self.ranges.clone(),
+        });
+        if let Some(grow) = grow {
+            if path == self.path {
+                let total = counting.byte_len().await?.unwrap_or(0);
+                return Ok(Some(Arc::new(GrowAfterLastRange {
+                    inner: counting,
+                    fs: self.inner.clone(),
+                    path: path.to_string(),
+                    total,
+                    grow,
+                    grew: self.grew.clone(),
+                    ranges: self.ranges.clone(),
+                }) as Arc<dyn ReadFile>));
+            }
+        }
+        Ok(Some(counting))
     }
     async fn file_info(
         &self,
@@ -1317,7 +1385,11 @@ impl FileSystem for LeaseRacingFs {
     ) -> Result<rpi_tools::env::FileInfo, rpi_tools::FileError> {
         let mut info = self.inner.file_info(path, cancel).await?;
         if path == self.path {
-            info.mtime_ms += self.mtime_skew_ms.load(Ordering::Relaxed);
+            if self.force_zero_mtime.load(Ordering::Relaxed) {
+                info.mtime_ms = 0;
+            } else {
+                info.mtime_ms += self.mtime_skew_ms.load(Ordering::Relaxed);
+            }
         }
         Ok(info)
     }
@@ -1444,6 +1516,9 @@ async fn prepared_restore_verifies_the_source_after_taking_ownership() {
         stolen: std::sync::Mutex::new(Some(stolen.clone().into_bytes())),
         ranges: Arc::new(AtomicUsize::new(0)),
         mtime_skew_ms: std::sync::atomic::AtomicI64::new(0),
+        force_zero_mtime: std::sync::atomic::AtomicBool::new(false),
+        grow_on_read: std::sync::Mutex::new(None),
+        grew: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     fs.write_file("racing.jsonl", FileContent::Text(history), None)
         .await
@@ -1480,6 +1555,9 @@ fn replay_wrapper(temp: &tempfile::TempDir, path: &'static str) -> Arc<LeaseRaci
         stolen: std::sync::Mutex::new(None),
         ranges: Arc::new(AtomicUsize::new(0)),
         mtime_skew_ms: std::sync::atomic::AtomicI64::new(0),
+        force_zero_mtime: std::sync::atomic::AtomicBool::new(false),
+        grow_on_read: std::sync::Mutex::new(None),
+        grew: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -1513,6 +1591,89 @@ async fn prepared_commit_skips_the_digest_when_the_source_stat_is_unchanged() {
         fs.ranges.load(Ordering::Relaxed),
         before,
         "an unchanged source must not be rehashed during commit"
+    );
+    assert_eq!(storage.state.lock().await.sequence(), 1);
+}
+
+#[tokio::test]
+async fn prepared_commit_rejects_a_transcript_that_grew_during_the_replay() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs = replay_wrapper(&temp, "racing-replay.jsonl");
+    fs.write_file(
+        "racing-replay.jsonl",
+        FileContent::Text(format!(
+            "{}{}",
+            encode_header(&header()),
+            encode_mutation(&message("e1", 1, None, "one")),
+        )),
+        None,
+    )
+    .await
+    .unwrap();
+    // A foreign writer appends after the replay has read its last range: the
+    // replay describes the old generation while the file already has one more
+    // frame. The recorded identity must not be taken from a later stat, or the
+    // commit would accept the stale replay and append on top of a generation it
+    // never saw.
+    *fs.grow_on_read.lock().unwrap() =
+        Some(encode_mutation(&message("e2", 2, Some("e1"), "two")).into_bytes());
+
+    let prepared = JsonlSessionStorage::prepare_restore(
+        fs.clone(),
+        "racing-replay.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        fs.grew.load(Ordering::SeqCst),
+        "the test must actually race the replay"
+    );
+    let before = fs.ranges.load(Ordering::Relaxed);
+    let error = match prepared.commit().await {
+        Ok(_) => panic!("prepared restore accepted a transcript grown during the replay"),
+        Err(error) => error,
+    };
+    assert!(
+        fs.ranges.load(Ordering::Relaxed) > before,
+        "a source that changed during the replay must be re-read, not trusted from a stat"
+    );
+    assert!(error
+        .to_string()
+        .contains("changed during restore preparation"));
+}
+
+#[tokio::test]
+async fn prepared_commit_falls_back_when_the_filesystem_cannot_report_mtime() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs = replay_wrapper(&temp, "no-mtime.jsonl");
+    fs.force_zero_mtime.store(true, Ordering::SeqCst);
+    fs.write_file(
+        "no-mtime.jsonl",
+        FileContent::Text(format!(
+            "{}{}",
+            encode_header(&header()),
+            encode_mutation(&message("e1", 1, None, "one")),
+        )),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let prepared = JsonlSessionStorage::prepare_restore(
+        fs.clone(),
+        "no-mtime.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
+    .await
+    .unwrap();
+    let before = fs.ranges.load(Ordering::Relaxed);
+    let storage = prepared.commit().await.unwrap();
+    assert!(
+        fs.ranges.load(Ordering::Relaxed) > before,
+        "mtime 0 is unknown, not `unchanged`: the digest must still run"
     );
     assert_eq!(storage.state.lock().await.sequence(), 1);
 }

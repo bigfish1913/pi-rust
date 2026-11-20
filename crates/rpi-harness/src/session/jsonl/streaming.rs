@@ -158,6 +158,12 @@ impl JsonlSessionStorage {
             clock,
             ids,
         );
+        // Record the generation this replay describes from the same stat the
+        // reader was sized from: `length` is the byte length captured at open, so
+        // a stat taken later (after a concurrent append) must not be used.
+        if defer_repair {
+            storage.record_replay_identity(&info, length);
+        }
         // A sibling staging file is never authoritative. Only a writable
         // restore may remove it, and ownership is acquired before mutation.
         if allow_repair {
@@ -345,11 +351,6 @@ impl JsonlSessionStorage {
             }
         }
         policy.check((line_no - 1) as usize)?;
-        // Capture the published generation once, after any streaming repair, so
-        // the prepared commit can prove the replay is current with one stat.
-        if defer_repair {
-            storage.capture_replay_identity(&fs, path).await?;
-        }
         Ok(storage)
     }
 
