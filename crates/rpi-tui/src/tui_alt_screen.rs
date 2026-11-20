@@ -1075,6 +1075,22 @@ impl TuiAltScreen {
         // through `ensure_size`. The terminal lock is already held, so this
         // polls through it rather than re-locking.
         let cells = self.poll_cell_dimensions_with(terminal.as_ref());
+        let (previous_width, previous_height) = *self.painted_size.lock().unwrap();
+        let previous_cells = *self.painted_cells.lock().unwrap();
+        let force_repaint = self.main_force_repaint.swap(false, Ordering::AcqRel);
+        let resize_dirty = self.resize_dirty.swap(false, Ordering::AcqRel);
+        let previous_uploads = self.uploaded_image_ids();
+        if (previous_width, previous_height) != (width, height)
+            || previous_cells != cells
+            || resize_dirty
+            || force_repaint
+        {
+            // Revoke trust BEFORE layout chooses placement-only rows. An
+            // explicit repaint is also the recovery path if the terminal lost
+            // pixels without notifying us. Ordinary suffix repairs keep the
+            // store warm; they erase cells, not image data.
+            self.invalidate_kitty_uploads();
+        }
         let root: Arc<dyn Component> = self
             .get_layout_root()
             .unwrap_or_else(|| Arc::new(self.container.clone()));
@@ -1097,25 +1113,18 @@ impl TuiAltScreen {
         // renderer must still strip the markers: an assistant message carries
         // them on its thinking rows in every mode.
         let lines = normalize_main_screen_lines(raw_lines);
-        // This document *is* the screen, so every image row in it is (or is
-        // about to be) written: record them before the branches below, one of
-        // which can `invalidate_kitty_uploads` for a repaired live suffix.
+        // This is the retained primary document: keep both transmission and
+        // placement rows trusted across ordinary live-suffix repairs.
         self.record_painted_images(&lines);
         let previous = self
             .previous_screen
             .lock()
             .map(|p| p.clone())
             .unwrap_or_default();
-        // The previous frame's geometry, recorded by whichever renderer ran
-        // last. A mismatch means the terminal reflowed its rows.
-        let (previous_width, previous_height) = *self.painted_size.lock().unwrap();
-        let previous_cells = *self.painted_cells.lock().unwrap();
         let previous_cursor = *self.main_previous_cursor.lock().unwrap();
 
         let canonical_changed = previous != lines;
         let viewport_top = *self.main_viewport_top.lock().unwrap();
-        let force_repaint = self.main_force_repaint.swap(false, Ordering::AcqRel);
-        let resize_dirty = self.resize_dirty.swap(false, Ordering::AcqRel);
         // An empty logical document can follow a real paint (page eviction,
         // clear, collapsed panels). It must not start a second initial replay.
         let initialized = previous_width != 0 && previous_height != 0;
@@ -1133,7 +1142,7 @@ impl TuiAltScreen {
         let layout_only_reflow = initialized && previous_width != width && {
             let old_width_raw = crate::render::with_main_screen_frame(|| {
                 crate::terminal_image::with_frame_cell_geometry(previous_cells, || {
-                    root.render(previous_width)
+                    with_frame_uploaded_images(previous_uploads, || root.render(previous_width))
                 })
             });
             normalize_main_screen_lines(old_width_raw) == previous
@@ -1401,6 +1410,22 @@ impl TuiAltScreen {
         // the columns did not move. Doing it here (not only in `ensure_size`)
         // covers a host that renders without a periodic tick.
         let cells = self.poll_cell_dimensions();
+        // A full redraw clears the terminal. Decide that before components
+        // choose a=T vs a=p, not afterwards in the write loop: invalidating
+        // only there cannot turn an already-rendered placement back into data.
+        let previous = self
+            .previous_screen
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_default();
+        let painted = *self.painted_size.lock().unwrap();
+        let resize_dirty = self.resize_dirty.swap(false, Ordering::AcqRel);
+        let cells_changed = *self.painted_cells.lock().unwrap() != cells;
+        let full_redraw =
+            previous.is_empty() || painted != (width, height) || resize_dirty || cells_changed;
+        if full_redraw {
+            self.invalidate_kitty_uploads();
+        }
 
         // Get layout root or use container
         let root = self.get_layout_root();
@@ -1477,28 +1502,8 @@ impl TuiAltScreen {
         // dialog, before the diff so the highlight reaches the terminal.
         crate::selection::apply_selection_highlight(&mut visible, &self.selection, &frame);
 
-        // Check for full redraw
-        let previous = self
-            .previous_screen
-            .lock()
-            .map(|p| p.clone())
-            .unwrap_or_default();
-        let painted = *self.painted_size.lock().unwrap();
-        let resize_dirty = self.resize_dirty.swap(false, Ordering::AcqRel);
-        // A resize reflows the terminal's rows, so a frame captured at another
-        // geometry (or before a resize notification) can no longer be patched
-        // cell-by-cell: the skipped "unchanged" rows would keep the terminal's
-        // reflowed leftovers (short borders, duplicated spinner rows). Repaint
-        // every row when it moved.
-        //
-        // The cell size counts as geometry too: an image's row count is derived
-        // from it, so a frame laid out for another cell size holds placements of
-        // the wrong height even though every column count matches.
-        let cells_changed = *self.painted_cells.lock().unwrap() != cells;
-        let full_redraw =
-            previous.is_empty() || painted != (width, height) || resize_dirty || cells_changed;
-
-        // Build output buffer
+        // Build output buffer. Full-redraw detection and upload invalidation
+        // happened before layout so every missing image carries its pixels.
         let mut buffer = String::new();
         buffer.push_str(&crate::terminal_image::removed_kitty_placements(
             &previous, &visible,
@@ -1517,9 +1522,8 @@ impl TuiAltScreen {
                 // whole width, and a terminal that reset the mode on resize
                 // would wrap the last cell and shift every following row.
                 buffer.push_str("\x1b[2J");
-                // A clear drops every image the terminal holds, so the next
-                // image row has to carry its payload again.
-                uploads.invalidate();
+                // Upload trust was revoked before layout, so the rows below
+                // already contain payloads for every image this clear drops.
                 buffer.push_str("\x1b[?7l");
             }
 

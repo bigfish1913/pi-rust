@@ -323,6 +323,14 @@ pub(crate) fn with_frame_uploaded_images<T>(
     result
 }
 
+/// Snapshot of the upload scope used to derive retained image rows.
+///
+/// A cached document containing placements is only reusable under the same
+/// scope: a terminal clear or an image leaving the viewport can revoke ids.
+pub(crate) fn frame_uploaded_images() -> Option<Arc<HashSet<u32>>> {
+    FRAME_UPLOADED.with(|slot| slot.borrow().clone())
+}
+
 /// Whether the terminal being painted already holds this image's payload.
 ///
 /// `false` outside a renderer frame: an unknown terminal has to be sent the

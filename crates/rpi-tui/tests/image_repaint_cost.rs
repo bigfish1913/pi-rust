@@ -61,6 +61,8 @@ fn png_with_payload(width: u32, height: u32, payload: usize) -> Vec<u8> {
 struct RecordingTerminal {
     written_bytes: Arc<AtomicUsize>,
     log: Arc<Mutex<String>>,
+    size: Arc<Mutex<(usize, usize)>>,
+    cells: Arc<Mutex<(u16, u16)>>,
 }
 
 impl RecordingTerminal {
@@ -68,6 +70,8 @@ impl RecordingTerminal {
         Self {
             written_bytes: Arc::new(AtomicUsize::new(0)),
             log: Arc::new(Mutex::new(String::new())),
+            size: Arc::new(Mutex::new((80, 12))),
+            cells: Arc::new(Mutex::new((10, 20))),
         }
     }
 
@@ -81,11 +85,23 @@ impl RecordingTerminal {
 
 impl Terminal for RecordingTerminal {
     fn info(&self) -> TerminalInfo {
+        let (columns, rows) = *self.size.lock().unwrap();
         TerminalInfo {
-            columns: 80,
-            rows: 12,
+            columns,
+            rows,
             ..Default::default()
         }
+    }
+
+    fn window_size(&self) -> Option<crossterm::terminal::WindowSize> {
+        let (columns, rows) = *self.size.lock().unwrap();
+        let (cell_width, cell_height) = *self.cells.lock().unwrap();
+        Some(crossterm::terminal::WindowSize {
+            columns: columns as u16,
+            rows: rows as u16,
+            width: columns as u16 * cell_width,
+            height: rows as u16 * cell_height,
+        })
     }
 
     fn write(&self, data: &str) {
@@ -220,4 +236,142 @@ fn single_repaint_bytes(payload: usize) -> usize {
     // A steady-state repaint.
     tui.request_render(false);
     term.take().0
+}
+
+/// Establish the placement-only steady state before exercising invalidation.
+fn warmed_screenshot(main_screen: bool) -> (RecordingTerminal, TuiAltScreen) {
+    let term = RecordingTerminal::new();
+    let tui = TuiAltScreen::new(Box::new(term.clone()), false, None);
+    tui.set_main_screen_mode(main_screen);
+    tui.set_layout_root(Some(screenshot_transcript(64 * 1024)));
+    tui.start_readerless();
+    assert!(term.take().1.contains("a=T"));
+    tui.request_render(false);
+    assert!(term.take().1.contains("a=p"));
+    (term, tui)
+}
+
+fn assert_payload_recovery(term: &RecordingTerminal, tui: &TuiAltScreen) {
+    let (_, frame) = term.take();
+    assert!(
+        frame.contains("a=T"),
+        "an invalidated image must transmit pixels, not just place a missing id"
+    );
+    tui.request_render(false);
+    assert!(!term.take().1.contains("a=T"));
+    tui.request_render(false);
+    assert!(!term.take().1.contains("a=T"));
+}
+
+#[test]
+fn a_forced_fullscreen_clear_retransmits_images() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _caps = kitty_capabilities();
+    let (term, tui) = warmed_screenshot(false);
+    tui.request_render(true);
+    assert_payload_recovery(&term, &tui);
+}
+
+#[test]
+fn fullscreen_geometry_changes_retransmit_images_before_placing_them() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _caps = kitty_capabilities();
+    let (term, tui) = warmed_screenshot(false);
+
+    *term.size.lock().unwrap() = (90, 14);
+    tui.request_render(false);
+    assert_payload_recovery(&term, &tui);
+
+    // Font zoom / DPI change: same character grid, new pixel geometry.
+    *term.cells.lock().unwrap() = (12, 24);
+    tui.request_render_reusing_scroll_content();
+    assert_payload_recovery(&term, &tui);
+
+    // A resize event can return to the original size before we paint it.
+    tui.note_resize();
+    assert_payload_recovery(&term, &tui);
+}
+
+#[test]
+fn a_forced_main_screen_repaint_can_recover_missing_terminal_images() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _caps = kitty_capabilities();
+    let (term, tui) = warmed_screenshot(true);
+    // The terminal may have lost its pixels without telling the application.
+    // An explicit full repaint must be a recovery path, even in regular mode.
+    tui.request_render(true);
+    assert_payload_recovery(&term, &tui);
+}
+
+#[test]
+fn a_cached_scroll_reuploads_an_image_after_it_leaves_the_viewport() {
+    use rpi_tui::scroll_view::{ScrollView, ScrollViewOptions, ScrollbarMode};
+    use rpi_tui::FollowMode;
+
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _caps = kitty_capabilities();
+    let transcript = screenshot_transcript(64 * 1024);
+    for row in 0..30 {
+        transcript.add_child(Arc::new(Text::new(format!("later row {row}"), 0, 0)));
+    }
+    let scroll = Arc::new(ScrollView::new(
+        transcript,
+        ScrollViewOptions {
+            follow: FollowMode::None,
+            scrollbar: ScrollbarMode::Hidden,
+            ..Default::default()
+        },
+    ));
+    let term = RecordingTerminal::new();
+    let tui = TuiAltScreen::new(Box::new(term.clone()), false, None);
+    tui.set_layout_root(Some(scroll.clone()));
+    tui.start_readerless();
+    assert!(term.take().1.contains("a=T"));
+    tui.request_render(false);
+    assert!(term.take().1.contains("a=p"));
+
+    scroll.scroll_to_end();
+    tui.request_render_reusing_scroll_content();
+    assert!(!term.take().1.contains("a=T"));
+    scroll.scroll_to_start();
+    tui.request_render_reusing_scroll_content();
+    assert_payload_recovery(&term, &tui);
+}
+
+#[test]
+fn main_screen_geometry_changes_reupload_without_clearing_scrollback() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _caps = kitty_capabilities();
+    let (term, tui) = warmed_screenshot(true);
+    *term.size.lock().unwrap() = (90, 14);
+    tui.request_render(false);
+    let (bytes, frame) = term.take();
+    assert!(bytes > 64 * 1024 && frame.contains("a=T"));
+    assert!(!frame.contains("\x1b[2J"), "do not archive the live screen");
+    assert!(!frame.contains("\x1b[3J"), "do not erase saved history");
+    tui.request_render(false);
+    let _ = term.take();
+
+    *term.cells.lock().unwrap() = (12, 24);
+    tui.request_render(false);
+    assert_payload_recovery(&term, &tui);
+    tui.note_resize();
+    assert_payload_recovery(&term, &tui);
+}
+
+#[test]
+fn returning_from_a_foreign_ui_retransmits_images_in_both_modes() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _caps = kitty_capabilities();
+    for main_screen in [false, true] {
+        let (term, tui) = warmed_screenshot(main_screen);
+        tui.set_render_suspended(true);
+        tui.request_render(false);
+        assert_eq!(term.take().0, 0);
+        // The foreign UI could have reset the terminal's image store. Resume
+        // forces a repaint, which must transmit the payload rather than trust
+        // the placements from before suspension.
+        tui.set_render_suspended(false);
+        assert_payload_recovery(&term, &tui);
+    }
 }
