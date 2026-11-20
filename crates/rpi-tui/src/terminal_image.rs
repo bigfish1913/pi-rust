@@ -2,8 +2,8 @@
 //!
 //! Provides support for displaying images in terminals using Kitty and iTerm2 protocols.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 /// Image protocol type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +291,58 @@ pub(crate) fn effective_cell_dimensions() -> CellDimensions {
         .unwrap_or_else(get_cell_dimensions)
 }
 
+thread_local! {
+    /// Image ids the terminal this frame is painted on already holds.
+    ///
+    /// A Kitty transmission carries the whole PNG payload, so a retained row
+    /// only has to carry it while the terminal is missing the data: afterwards
+    /// a placement (`a=p`) of the same id is enough. That difference is what
+    /// keeps a transcript full of screenshots cheap — a payload row is
+    /// megabytes, a placement row is a few dozen bytes, and every repaint of
+    /// the transcript copies, wraps, diffs and hashes these rows.
+    ///
+    /// The renderer publishes the ids its screen is known to hold for the
+    /// duration of a layout pass (same scoping rule as
+    /// [`FRAME_CELL_GEOMETRY`]): `Image` reads it to choose which form to emit.
+    /// Outside a frame nothing is trusted, so a row always carries its payload
+    /// — a renderer that never publishes a ledger still paints correctly.
+    static FRAME_UPLOADED: std::cell::RefCell<Option<Arc<HashSet<u32>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `uploaded` as the set of images the terminal already holds.
+///
+/// The renderer wraps its layout pass in this (see [`FRAME_UPLOADED`]).
+pub(crate) fn with_frame_uploaded_images<T>(
+    uploaded: Arc<HashSet<u32>>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let previous = FRAME_UPLOADED.with(|slot| slot.replace(Some(uploaded)));
+    let result = f();
+    FRAME_UPLOADED.with(|slot| slot.replace(previous));
+    result
+}
+
+/// Snapshot of the upload scope used to derive retained image rows.
+///
+/// A cached document containing placements is only reusable under the same
+/// scope: a terminal clear or an image leaving the viewport can revoke ids.
+pub(crate) fn frame_uploaded_images() -> Option<Arc<HashSet<u32>>> {
+    FRAME_UPLOADED.with(|slot| slot.borrow().clone())
+}
+
+/// Whether the terminal being painted already holds this image's payload.
+///
+/// `false` outside a renderer frame: an unknown terminal has to be sent the
+/// data before a placement of it can be displayed.
+pub fn frame_holds_image(id: u32) -> bool {
+    FRAME_UPLOADED.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|uploaded| uploaded.contains(&id))
+    })
+}
+
 /// Allocate a unique image ID.
 pub fn allocate_image_id() -> u32 {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
@@ -356,6 +408,27 @@ pub fn encode_kitty(data: &[u8], options: &ImageRenderOptions) -> String {
     parts.join("")
 }
 
+/// Placement-only escape for an image whose payload the terminal already holds.
+///
+/// Byte-identical to what [`kitty_placement_line`] rewrites a transmission row
+/// into at write time, so a row can be emitted in this form from the start once
+/// the renderer reports the upload (see [`frame_holds_image`]): the write path
+/// then has nothing left to rewrite, and every frame between placements carries
+/// dozens of bytes instead of the whole PNG.
+pub fn encode_kitty_placement(options: &ImageRenderOptions) -> String {
+    let mut keys = String::from("C=1");
+    if let Some(id) = options.id {
+        keys.push_str(&format!(",i={id},p={KITTY_PLACEMENT_ID}"));
+    }
+    if let Some(z) = options.z_index {
+        keys.push_str(&format!(",z={z}"));
+    }
+    if let (Some(w), Some(h)) = (options.width, options.height) {
+        keys.push_str(&format!(",c={w},r={h}"));
+    }
+    format!("\x1b_Ga=p,q=2,{keys}\x1b\\")
+}
+
 /// Encode image data for iTerm2 protocol.
 pub fn encode_iterm2(data: &[u8], options: &ImageRenderOptions) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -407,10 +480,14 @@ pub fn delete_kitty_placement(id: u32) -> String {
 /// An image that is still on screen in the new frame is not deleted at all —
 /// re-placing it with the same `(i=, p=)` pair moves its placement, and the
 /// terminal replaces the old one instead of leaving a stale copy behind.
+///
+/// Both forms count as "on screen": a row that has already been placed carries
+/// `a=p` (no payload), and treating it as absent would delete a placement the
+/// frame still paints — a scrolling transcript would blink.
 pub(crate) fn removed_kitty_placements(previous: &[String], current: &[String]) -> String {
     let live: Vec<u32> = current
         .iter()
-        .filter_map(|line| kitty_transmission_id(line))
+        .filter_map(|line| kitty_image_id(line))
         .collect();
     let mut output = String::new();
     for (row, line) in previous.iter().enumerate() {
@@ -418,8 +495,13 @@ pub(crate) fn removed_kitty_placements(previous: &[String], current: &[String]) 
             continue;
         }
         for chunk in line.split("\x1b_G").skip(1) {
-            let control = chunk.split(';').next().unwrap_or_default();
-            if !control.split(',').any(|field| field == "a=T") {
+            let control = kitty_chunk_control(chunk);
+            // Only the escape that draws something owns a placement: `a=t`
+            // transmits without displaying, and `a=d` deletes.
+            if !control
+                .split(',')
+                .any(|field| field == "a=T" || field == "a=p")
+            {
                 continue;
             }
             if let Some(id) = control
@@ -508,8 +590,23 @@ pub fn is_image_line(line: &str) -> bool {
 /// Control string of the first Kitty escape on `line` (`a=T,...,i=1`).
 fn kitty_control(line: &str) -> Option<&str> {
     let start = line.find("\x1b_G")? + 3;
-    let end = start + line[start..].find(';')?;
-    Some(&line[start..end])
+    Some(kitty_chunk_control(&line[start..]))
+}
+
+/// Control part of an escape whose terminator has to be found either way.
+///
+/// A transmission ends its control at the payload separator (`;`); a
+/// placement-only escape carries no payload, so its control ends at the string
+/// terminator. Both forms describe an image the frame shows, so every reader
+/// has to accept both.
+fn kitty_chunk_control(chunk: &str) -> &str {
+    let end = match (chunk.find(';'), chunk.find("\x1b\\")) {
+        (Some(semi), Some(st)) => semi.min(st),
+        (Some(semi), None) => semi,
+        (None, Some(st)) => st,
+        (None, None) => chunk.len(),
+    };
+    &chunk[..end]
 }
 
 /// Metadata of the placement carried by `line`, if it is a registered image.
@@ -557,13 +654,17 @@ pub fn crop_kitty_image_line(line: &str, hidden_rows: u16, visible_rows: u16) ->
         return line.to_string();
     };
     let control_start = escape + 3;
-    let Some(control_len) = line[control_start..].find(';') else {
-        return line.to_string();
-    };
-    let control_end = control_start + control_len;
+    let control = kitty_chunk_control(&line[control_start..]);
+    let control_end = control_start + control.len();
+    // A transmission ends its control at the payload separator; a row that only
+    // places an already-uploaded image has no payload, so its control ends at
+    // the string terminator. Both have to be cropped: the anchor row of a
+    // partially scrolled placement is just as likely to be a placement as a
+    // transmission.
+    let has_payload = line[control_start..].find(';').is_some();
     // Drop any previous crop: it describes the placement as it was rendered,
     // not the rows this frame can show.
-    let mut controls: Vec<&str> = line[control_start..control_end]
+    let mut controls: Vec<&str> = control
         .split(',')
         .filter(|field| {
             !field.starts_with("y=") && !field.starts_with("h=") && !field.starts_with("r=")
@@ -572,12 +673,21 @@ pub fn crop_kitty_image_line(line: &str, hidden_rows: u16, visible_rows: u16) ->
     let (source_y, source_height) = crop_source_rect(&metadata, hidden, visible);
     let crop = format!("y={source_y},h={source_height},r={visible}");
     controls.push(&crop);
-    format!(
-        "{}\x1b_G{};{}",
-        &line[..escape],
-        controls.join(","),
-        &line[control_end + 1..]
-    )
+    if has_payload {
+        format!(
+            "{}\x1b_G{};{}",
+            &line[..escape],
+            controls.join(","),
+            &line[control_end + 1..]
+        )
+    } else {
+        format!(
+            "{}\x1b_G{}\x1b\\{}",
+            &line[..escape],
+            controls.join(","),
+            &line[(control_end + 2).min(line.len())..]
+        )
+    }
 }
 
 /// Per-terminal record of the image payloads the terminal is known to hold.
@@ -617,6 +727,15 @@ impl KittyUploads {
         self.painted.contains(&id)
     }
 
+    /// Ids the last painted frame showed.
+    ///
+    /// The renderer publishes these to components for the duration of a layout
+    /// pass so an image row can be emitted as a placement instead of carrying
+    /// its payload again (see [`with_frame_uploaded_images`]).
+    pub fn painted_ids(&self) -> &[u32] {
+        &self.painted
+    }
+
     /// Record that the image is on screen in the frame being built.
     pub fn note_painted(&mut self, id: u32) {
         if !self.next.contains(&id) {
@@ -641,6 +760,26 @@ impl KittyUploads {
 pub fn kitty_transmission_id(line: &str) -> Option<u32> {
     let control = kitty_control(line)?;
     if !control.split(',').any(|field| field == "a=T") {
+        return None;
+    }
+    control
+        .split(',')
+        .find_map(|field| field.strip_prefix("i=")?.parse::<u32>().ok())
+}
+
+/// Image id of a row that displays a Kitty image, in either form.
+///
+/// A row carries the payload exactly once (`a=T`); afterwards it places an
+/// image the terminal already holds (`a=p`). Bookkeeping that answers "which
+/// images does this frame show" has to count both, or the ledger would forget
+/// an image the frame still paints and the next frame would re-send its
+/// megabytes.
+pub fn kitty_image_id(line: &str) -> Option<u32> {
+    let control = kitty_control(line)?;
+    if !control
+        .split(',')
+        .any(|field| field == "a=T" || field == "a=p")
+    {
         return None;
     }
     control
@@ -1206,6 +1345,58 @@ mod tests {
         assert_eq!(crop_kitty_image_line("hello", 1, 2), "hello");
         assert!(!is_image_line("hello"));
         assert!(is_image_line("\x1b]1337;File=name=id1:AAAA\x07"));
+    }
+
+    /// A row that only places an already-uploaded image has to behave exactly
+    /// like the transmission row it replaced.
+    ///
+    /// The steady state of an image-heavy transcript is placement rows, so this
+    /// is the form the viewport clips, crops, moves and diffs on every frame.
+    /// Reading its control (which ends at the string terminator, not at a
+    /// payload separator) has to work for all of them.
+    #[test]
+    fn a_placement_only_row_is_understood_and_cropped() {
+        register_kitty_image(KittyImageMetadata {
+            id: 9_004,
+            columns: 10,
+            rows: 4,
+            width_px: 200,
+            height_px: 80,
+        });
+        let placed = encode_kitty_placement(&ImageRenderOptions {
+            id: Some(9_004),
+            width: Some(10),
+            height: Some(4),
+            ..Default::default()
+        });
+        assert!(is_image_line(&placed));
+        assert_eq!(kitty_image_id(&placed), Some(9_004));
+        assert_eq!(
+            kitty_transmission_id(&placed),
+            None,
+            "a placement carries no payload"
+        );
+        let metadata = kitty_image_metadata(&placed).expect("registered placement");
+        assert_eq!((metadata.columns, metadata.rows), (10, 4));
+
+        // Fully visible: unchanged.
+        assert_eq!(crop_kitty_image_line(&placed, 0, 4), placed);
+
+        // Half scrolled out: the source rectangle and the row count are
+        // rewritten, and the row keeps placing (not transmitting) the image.
+        let cropped = crop_kitty_image_line(&placed, 2, 2);
+        assert!(
+            cropped.contains("a=p"),
+            "the crop must stay a placement: {cropped:?}"
+        );
+        assert!(
+            cropped.contains(",y=40,h=40,r=2\x1b\\"),
+            "expected a top crop without a payload separator: {cropped:?}"
+        );
+        assert!(cropped.ends_with("\x1b\\"), "terminator kept: {cropped:?}");
+
+        // A placement that leaves the screen is dropped, like a transmission.
+        assert_eq!(crop_kitty_image_line(&placed, 4, 2), String::new());
     }
 
     #[test]
