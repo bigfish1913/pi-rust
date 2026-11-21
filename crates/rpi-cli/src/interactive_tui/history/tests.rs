@@ -3,6 +3,8 @@ use super::*;
 use rpi_harness::session::types::{ProvisionedEntry, ProvisionedKind, SessionMetadata};
 use rpi_harness::session::{CounterIdGenerator, FakeClock, InMemorySessionStorage};
 
+#[path = "tests/entry_visibility.rs"]
+mod entry_visibility;
 #[path = "tests/startup_header.rs"]
 mod startup_header;
 #[path = "tests/update_notices.rs"]
