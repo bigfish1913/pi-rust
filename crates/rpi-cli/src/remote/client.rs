@@ -1,6 +1,6 @@
 //! TCP JSON-RPC client for the `rpi --server` endpoint.
 //!
-//! Wire shape (one JSON object per line), spoken by `rpi-package`'s
+//! Wire shape (one JSON object per line), spoken by `rpi-extension`'s
 //! `rpi-server` extension:
 //!
 //! ```text

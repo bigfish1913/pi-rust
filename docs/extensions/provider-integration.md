@@ -3,7 +3,7 @@
 本文约定当前 provider package 的实现、认证与验收要求。架构背景见
 [Provider packages](../architecture/provider-packages.md)，底层 ABI 见
 [扩展开发](authoring.md)。生产统一包 `rpi-providers`（含 DeepSeek / OpenRouter / llama.cpp / Proxy）见
-[独立 package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)。正式 provider 的源码、流式测试和宿主集成测试均维护在该 package；本仓库不再保留 DeepSeek 示例实现。
+[独立 package 项目](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)。正式 provider 的源码、流式测试和宿主集成测试均维护在该 package；本仓库不再保留 DeepSeek 示例实现。
 
 ## 1. 选择接入方式
 
@@ -34,7 +34,7 @@
 不同，不能套用上述完整端点示例。这里的地址应不含查询参数或片段：当前 helper 按字符串
 后缀处理路径，不做通用 URL 规范化。
 
-核心保留 OpenAI、Anthropic 与离线测试用的 Faux；DeepSeek 已迁到独立 `rpi-package` 项目。新增供应商适配默认放入
+核心保留 OpenAI、Anthropic 与离线测试用的 Faux；DeepSeek 已迁到独立 `rpi-extension` 项目。新增供应商适配默认放入
 独立 package，不给 CLI 增加供应商分支或默认依赖。协议兼容不等于支持该供应商的所有
 功能；README 必须列出已验证能力和限制。
 
@@ -121,7 +121,7 @@ serde_json = "1"
 `crate::registration::register_provider!` 生成注册函数，并在根模块登记；不要在各模块
 重复调用 `export_provider!`，否则会重复导出原生插件入口。
 
-生产 package 的实现位于 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)。新增 provider 应从该 package 的注册宏和测试结构开始，而不是复制本仓库已删除的 DeepSeek 示例。
+生产 package 的实现位于 [rpi-providers](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)。新增 provider 应从该 package 的注册宏和测试结构开始，而不是复制本仓库已删除的 DeepSeek 示例。
 
 ```rust,ignore
 use rpi_ai::{Api, Model, Provider, SimpleStreamOptions};
@@ -273,7 +273,7 @@ factory 优先于内置 API factory，两者使用同一 `ConfiguredProvider` �
 在仓库根目录运行正式 package 的离线验证：
 
 ```sh
-cd /path/to/rpi-package
+cd /path/to/rpi-extension
 cargo build -p rpi-providers
 cargo test -p rpi-providers --test streaming
 cargo test -p rpi-providers --test host
@@ -289,10 +289,10 @@ cargo test --workspace
 
 这些命令验证正式 `rpi-providers` package；新增 package 必须加入自身的动态库加载与协议测试，不能只依赖宿主测试。
 真实 API 测试应默认 ignored，通过环境变量注入 key 后显式运行，并限制超时、重试与用量；具体命令见
-`rpi-package/packages/rpi-providers/README.md`。
+`rpi-extension/packages/rpi-providers/README.md`。
 本仓库不再提供 DeepSeek 的重复教学实现；CLI 跨项目测试使用正式 `rpi_providers` 动态库。
 
-统一包验证在 rpi-package 仓库运行 `cargo build -p rpi-providers`、`cargo test -p rpi-providers`。
+统一包验证在 rpi-extension 仓库运行 `cargo build -p rpi-providers`、`cargo test -p rpi-providers`。
 本仓库 CLI 测试通过 `RPI_TEST_PROVIDER_LIBRARY` 指定该包的 DLL / so / dylib，
 通过 `RPI_TEST_PROVIDER_PACKAGE` 指定 `packages/rpi-providers` 源码目录，覆盖 link / unlink。
 不设置路径的跳过结果不能作为跨项目验收；具体命令见 [Provider packages](../architecture/provider-packages.md#验证)。

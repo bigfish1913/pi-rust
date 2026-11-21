@@ -58,7 +58,7 @@ cargo test -p rpi-extensions --lib side_questions
 cargo test -p rpi-harness --lib side_
 ```
 
-Build `rpi-package/packages/rpi-btw`, set `RPI_TEST_BTW_LIBRARY` to the actual DLL/so/dylib, then run:
+Build `rpi-extension/packages/rpi-btw`, set `RPI_TEST_BTW_LIBRARY` to the actual DLL/so/dylib, then run:
 
 ```sh
 cargo test -p rpi-cli --test btw_package
