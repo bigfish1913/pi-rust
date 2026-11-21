@@ -615,8 +615,12 @@ jobs:
           import json
           import pathlib
           import tomllib
-          host = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
-          catalog = json.loads(pathlib.Path("rpi-extension/catalog/packages.json").read_text())
+          # The catalog carries bilingual descriptions; read UTF-8 explicitly
+          # because the Windows runner's default locale codec is cp1252.
+          host = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          catalog = json.loads(
+              pathlib.Path("rpi-extension/catalog/packages.json").read_text(encoding="utf-8")
+          )
           print(f"host-version={host['workspace']['package']['version']}")
           print(f"official-extension-count={len(catalog)}")
           print("official-extensions=" + ",".join(item["name"] for item in catalog))
