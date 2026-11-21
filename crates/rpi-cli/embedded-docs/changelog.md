@@ -11,6 +11,20 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.27.1](https://github.com/bigfish1913/pi-rust/compare/v0.27.0...v0.27.1) - 2026-11-21
+
+### Added
+
+- *(extensions)* follow the catalog move to pi-rust/rpi-extension ([#398](https://github.com/bigfish1913/pi-rust/pull/398))
+
+### Fixed
+
+- *(rpc)* correlate and settle every native execution lease ([#396](https://github.com/bigfish1913/pi-rust/pull/396))
+
+### Other
+
+- reduce history restore allocations and interrupted recovery hydration ([#394](https://github.com/bigfish1913/pi-rust/pull/394))
+
 ### Fixed
 
 - *(rpc)* correlate RPC and autonomous execution leases without mistaking
