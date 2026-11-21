@@ -529,8 +529,14 @@ transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿�
   type 注册渲染器不会被调用。
 - `{"lines":[…]}` 会以 `\n` 拼成**一个**纯文本行，不是每行一个组件；需要多行时自己在
   `text` 里带换行。
+- entry renderer 可返回 `rc == 0` 与 `{"display":false}`，明确表示「已处理但隐藏」：
+  不添加组件或空行，不执行原始条目兜底，也不再询问后续 renderer。仅布尔值 `false`
+  生效，且优先于 `text`/`lines`；缺省、`true`、字符串 `"false"`、`null` 等保持旧行为。
+  非 0 返回码仍是「不处理」，不能用来隐藏。此字段仅适用于 entry renderer，不改变
+  message renderer、Markdown transformer、持久化或模型上下文。旧宿主可能忽略该字段
+  并显示兜底文本；插件未加载时也维持原有兜底。该能力不新增实时 entry 事件。
 - message renderer 的响应既没有 `text` 也没有 `lines` 时，TUI 降级显示 `[customType]`；
-  entry renderer 的响应缺这两个字段时不渲染，改由宿主自己的条目文案显示。
+  entry renderer 除显式 `display:false` 外，响应缺这两个字段时改由宿主自己的条目文案显示。
 - message renderer 除渲染自定义消息外，还会以
   `{"customType":"token-usage","usage":{...}}` 被调用一次以生成用量文本，因此要能容忍这个
   payload（没有匹配的 type 时返回非 0）。
