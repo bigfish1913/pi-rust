@@ -408,6 +408,11 @@ pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
             "messageIds": "sessionEntryId-v1",
             "promptResponse": "accepted",
             "settlementEvent": "agent_settled",
+            "executionLifecycle": "correlated-v1",
+            "executionLifecycleOptIn": {
+                "environment": super::execution::LIFECYCLE_ENV,
+                "value": super::execution::LIFECYCLE_VERSION
+            },
             "agentEndIsTerminal": false
         },
         "limits": {"frameBytes": MAX_FRAME_BYTES, "maxConcurrentPrompts": 1},

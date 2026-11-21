@@ -162,6 +162,7 @@ impl Fixture {
                 None,
                 crate::args::RpcMessageUpdates::default(),
                 enabled,
+                true,
                 input,
                 output,
             )

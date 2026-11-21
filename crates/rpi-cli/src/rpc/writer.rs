@@ -152,6 +152,33 @@ pub(crate) async fn write_agent_event(out: &RpcWriter, event: &rpi_agent::events
     let _ = out.enqueue(line).await;
 }
 
+pub(crate) async fn write_observed_agent_event(
+    out: &RpcWriter,
+    event: &rpi_agent::events::AgentEvent,
+    identity: &rpi_harness::execution::ExecutionIdentity,
+    run_id: &str,
+) {
+    let Ok(mut line) = super::events::encode(event, out.mode) else {
+        out.failed.cancel();
+        return;
+    };
+    // Preserve the snapshot encoder's allocation behavior: append identity
+    // without materializing and reserializing the entire message as a Value.
+    let metadata = serde_json::to_vec(&serde_json::json!({
+        "executionId":identity.execution_id, "requestId":identity.request_id,
+        "lane":identity.lane, "runId":run_id,
+    }))
+    .unwrap();
+    if line.pop() != Some(b'}') {
+        out.failed.cancel();
+        return;
+    }
+    line.push(b',');
+    line.extend_from_slice(&metadata[1..]);
+    line.push(b'\n');
+    let _ = out.enqueue(line).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

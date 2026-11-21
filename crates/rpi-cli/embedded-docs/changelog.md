@@ -11,6 +11,16 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- *(rpc)* correlate RPC and autonomous execution leases without mistaking
+  per-attempt `agent_end` for completion. Correlated lifecycle framing requires
+  the parent to set `RPI_RPC_EXECUTION_LIFECYCLE=correlated-v1` on its child;
+  upgrade extcore to a launcher supporting this opt-in. Older clients retain
+  legacy framing and its limitations. Tool-partial congestion may drop partials
+  (the final tool result remains reliable), not the whole connection
+  ([#396](https://github.com/bigfish1913/pi-rust/pull/396)).
+
 ## [0.27.0](https://github.com/bigfish1913/pi-rust/compare/v0.26.1...v0.27.0) - 2026-11-20
 
 ### Added
