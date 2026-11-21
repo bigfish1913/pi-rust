@@ -582,39 +582,48 @@ where
 
     let commit_task = RetainedRpcTask::new(commit_task, pump_stop.clone());
 
-    // A completion response is queued only after its final events, so a
-    // subsequent prompt cannot overtake the previous run's agent_end.
-    let (event_flush_tx, mut event_flush_rx) =
-        tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
-    // Stream fine-grained AgentEvents as JSONL until the receiver closes.
-    let event_task = agent_events.take().map(|mut rx| {
+    // Preserve only the pre-observation backlog for existing callers. All live
+    // RPC events below come from the identity-bearing execution stream.
+    let mut startup_events = Vec::new();
+    if let Some(mut events) = agent_events.take() {
+        loop {
+            match events.try_recv() {
+                Ok(event) => startup_events.push(event),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    }
+    let (execution_observer, mut execution_events) =
+        rpi_harness::execution::ExecutionObserver::channel(256, writer_failed.clone());
+    let execution_observation =
+        crate::rpc::execution::Observation::new(harness, execution_observer.clone());
+    let events_ready = tokio_util::sync::CancellationToken::new();
+    let event_task = {
         let out = stdout.clone();
         let stop = pump_stop.clone();
+        let ready = events_ready.clone();
         tokio::spawn(async move {
+            tokio::select! {
+                _ = ready.cancelled() => {},
+                _ = stop.cancelled() => return,
+            }
             loop {
                 let received = tokio::select! {
                     _ = stop.cancelled() => {
-                        drain_rpc_events(&out, &mut rx).await;
+                        while let Ok(event) = execution_events.try_recv() {
+                            crate::rpc::execution::forward(&out, event).await;
+                        }
                         break;
                     }
-                    Some(done) = event_flush_rx.recv() => {
-                        drain_rpc_events(&out, &mut rx).await;
-                        let _ = done.send(());
-                        continue;
-                    }
-                    event = rx.recv() => event,
+                    event = execution_events.recv() => event,
                 };
-                match received {
-                    Ok(event) => write_agent_event(&out, &event).await,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
+                let Some(event) = received else { break };
+                crate::rpc::execution::forward(&out, event).await;
             }
         })
-    });
-
-    let event_task = event_task.map(|task| RetainedRpcTask::new(task, pump_stop.clone()));
-    let event_flush = event_task.as_ref().map(|_| event_flush_tx);
+    };
+    let event_task = RetainedRpcTask::new(event_task, pump_stop.clone());
 
     // Bridge the extension `UiDialog` mailbox over the rpc channel so a
     // permission-gate extension can ask the client a question mid-run: we emit
@@ -712,6 +721,10 @@ where
         }
     }
     write_line(&stdout, &ready).await;
+    for event in startup_events {
+        write_agent_event(&stdout, &event).await;
+    }
+    events_ready.cancel();
     setup_timing.finish();
 
     loop {
@@ -1003,8 +1016,7 @@ where
                 let lane_task = Arc::clone(&lane);
                 let out_task = stdout.clone();
                 let active_task = Arc::clone(&run_active);
-                let mailbox_task = ui_dialog.clone();
-                let flush_events = event_flush.clone();
+                let flush_events = execution_observer.clone();
                 let lifecycle_session = extension_session.clone();
                 let instructions = msg
                     .get("customInstructions")
@@ -1046,10 +1058,14 @@ where
                                 return;
                             }
                         };
+                        let execution_request =
+                            rpi_harness::execution::ExecutionRequest::new(id.clone());
+                        let pending_settlement =
+                            crate::rpc::execution::PendingSettlement::new(out_task.failure());
                         write_line(
                             &out_task,
                             &rpc_protocol::response(
-                                Some(id),
+                                Some(id.clone()),
                                 &kind,
                                 Ok(Some(serde_json::json!({"accepted": true}))),
                             ),
@@ -1072,9 +1088,13 @@ where
                                     );
                                 }
                             }
-                            let result =
-                                rpc_compact_cancellable(&lane_task, instructions, cancel_task)
-                                    .await;
+                            let result = execution_request
+                                .scope(rpc_compact_cancellable(
+                                    &lane_task,
+                                    instructions,
+                                    cancel_task,
+                                ))
+                                .await;
                             if result
                                 .as_ref()
                                 .ok()
@@ -1099,18 +1119,17 @@ where
                             }
                             result
                         } else if resume {
-                            rpc_resume_cancellable(&lane_task, cancel_task).await
+                            execution_request
+                                .scope(rpc_resume_cancellable(&lane_task, cancel_task))
+                                .await
                         } else {
-                            rpc_prompt_cancellable(&lane_task, content, cancel_task).await
+                            execution_request
+                                .scope(rpc_prompt_cancellable(&lane_task, content, cancel_task))
+                                .await
                         };
                         execute_timing.finish();
                         let flush_timing = RpcPhaseTiming::start(phase_diagnostics, "event_flush");
-                        if let Some(flush) = flush_events {
-                            let (done, drained) = tokio::sync::oneshot::channel();
-                            if flush.send(done).is_ok() {
-                                let _ = drained.await;
-                            }
-                        }
+                        flush_events.flush().await;
                         flush_timing.finish();
                         let (outcome, aborted, error) = match &result {
                             Ok(value) => {
@@ -1143,6 +1162,10 @@ where
                             .cloned();
                         let settled = serde_json::json!({
                             "type": "agent_settled",
+                            "requestId": id,
+                            "executionId": execution_request.last_execution().map(|e| e.execution_id),
+                            "lane": "main",
+                            "finalText": result.as_ref().ok().and_then(|value| value.get("finalText")),
                             "runId": result.as_ref().ok().and_then(|value| value.get("runId")),
                             "outcome": outcome,
                             "aborted": aborted,
@@ -1163,7 +1186,9 @@ where
                         // it: the independent writer can expose an enqueued event
                         // immediately. The dispatcher still joins this retained task
                         // before starting its successor, preserving output ordering.
-                        mailbox_task.cancel_all();
+                        // Tool/dialog owners close their own requests. A global
+                        // cancel_all here could cancel an autonomous successor's
+                        // question after this operation released its lease.
                         active_task.store(false, std::sync::atomic::Ordering::Release);
                         #[cfg(test)]
                         if let Some(finished) = &_finished {
@@ -1173,6 +1198,7 @@ where
                             RpcPhaseTiming::start(phase_diagnostics, "settled_enqueue");
                         write_line(&out_task, &settled).await;
                         enqueue_timing.finish();
+                        pending_settlement.complete();
                     }),
                     run_cancel.clone(),
                 ));
@@ -1357,9 +1383,9 @@ where
         exit_code = 1;
     }
     let _ = dialog_task.await;
-    if let Some(task) = event_task {
-        let _ = task.await;
-    }
+    drop(execution_observation);
+    drop(execution_observer);
+    let _ = event_task.await;
     // All producers have joined; close the queue and flush every queued line.
     drop(stdout);
     match writer_task.await {
@@ -1508,6 +1534,7 @@ fn rpc_execute_command(
     .unwrap_or_else(|_| Err(format!("command panicked: {name}")))
 }
 
+#[cfg(test)]
 async fn drain_rpc_events(
     out: &RpcWriter,
     events: &mut tokio::sync::broadcast::Receiver<AgentEvent>,
@@ -1686,7 +1713,7 @@ async fn rpc_compact_cancellable(
 
 /// Reduce a compaction result to what a client needs: the verdict, and a line
 /// a transcript can print.
-fn compaction_json(result: &CompactionResult) -> serde_json::Value {
+pub(crate) fn compaction_json(result: &CompactionResult) -> serde_json::Value {
     let mut value = match &result.outcome {
         CompactionOutcome::Completed { leaf_id, entry } => {
             let (tokens_before, retained) = match entry {
@@ -1762,7 +1789,9 @@ async fn rpc_resume_cancellable(
     }
 }
 
-fn rpc_outcome_str(outcome: &HarnessRunOutcome) -> (&'static str, Option<String>, Option<String>) {
+pub(crate) fn rpc_outcome_str(
+    outcome: &HarnessRunOutcome,
+) -> (&'static str, Option<String>, Option<String>) {
     match outcome {
         HarnessRunOutcome::Completed { final_message, .. } => {
             ("completed", Some(assistant_text(final_message)), None)

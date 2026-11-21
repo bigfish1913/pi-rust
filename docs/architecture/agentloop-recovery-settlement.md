@@ -177,6 +177,82 @@ serializing a payload. An entry cleanup guard releases constructed event strings
 once, including stale-snapshot and no-handler paths. Plugins borrow event strings;
 they do not own or free the host's dispatch allocation.
 
+## Correlated RPC execution admission
+
+Durable terminal publication, execution release and RPC request completion are
+three different boundaries. Main-lane plugin `send_message(triggerTurn: true)`
+can acquire a lease without an RPC `prompt`, so command wrappers alone cannot
+cover native execution. Ordinary `AgentEnd` is still a per-attempt event.
+
+The RPC ready handshake advertises
+`semantics.executionLifecycle = "correlated-v1"`. Its identities are:
+
+- `requestId`: the originating RPC request, or null for autonomous execution.
+  It is captured in the caller scope at admission, not inferred from recent
+  traffic. Spawned plugin tasks do not inherit the caller scope.
+- `executionId`: a fresh identity for each admission lease. Deferred polls can
+  continue the same durable run under different execution identities.
+- `runId`: durable operation identity, not an execution or request identifier.
+  It is null on `execution_started`: admission precedes recovery/poll lookup,
+  which may discover an existing durable run. Later progress/release carries
+  the resolved durable identity rather than a provisional admission ID.
+
+A reliable bounded harness stream publishes `execution_started`, associated
+progress and `execution_released`. For normal terminal operations the order is:
+committed result -> existing RunEnd/plugin callbacks -> callback context drain
+-> lease release -> RPC event enqueue/command cleanup -> `agent_settled`.
+The release is enqueued while holding the admission mutex, before a successor
+can enqueue its start; no stdout write or external listener runs under that
+mutex. Suspended operations release their lease without a terminal RunEnd and
+keep their durable operation open. A deferred tool continuation may release a
+skipped poll lease and acquire another lease for the same request.
+
+RPC is the only wire settlement publisher: autonomous leases settle from the
+lifecycle stream; RPC-owned leases settle from their retained command wrapper
+after an event barrier and cleanup. Their `execution_released` alone does not
+complete the originating request. No global idle wait or `cancel_all` may
+complete/cancel an unrelated successor. Tool and dialog owners close their own
+requests. Context-only message frames remain session events rather than output
+of whichever request happens to be active.
+
+Lifecycle overflow, reader loss, uncertain recovery/intent/finalization, and an
+accepted command disappearing before settlement fail the host/transport closed.
+A staged outcome or RAII lease drop is not proof of durable completion. A
+failed release can carry `recoveryRequired: true`; it never grants permission
+to replay unfinished work. Existing restart/recovery remains authoritative.
+
+The companion rpi-extcore implementation gates strict consumption on the ready
+capability. Admission, RunTracker, HostState and resource exclusion use matching
+request/execution/lane identity; stale, duplicate or unrelated settlements cannot
+complete a request or make another execution idle. An unaccepted, correlated
+`resume_pending` response with `success: true, data: {resumed: false}` clears only
+that local intent: no execution was started and no settlement will follow.
+A timeout or dropped caller still cannot clear a published intent.
+
+**Roll out native and extcore together.** The new extcore retains an explicit
+legacy path for old native hosts, but legacy framing cannot provide strict
+correlation. Old extcore does not understand the new identity semantics and is
+not safe to pair independently with the added autonomous settlements.
+The protocol gaps above have deterministic regression coverage; without the
+original user's wire transcript they are not proof of that incident's cause.
+
+Cross-repository validation uses a real child and the production dispatcher,
+with FauxProvider and the plugin ActionHost's `send_message` execution path (not
+a dynamically loaded plugin). It requires neither credentials nor goal DLL:
+
+```bash
+# In the pi-rust checkout:
+cargo build -p rpi-cli --example execution_admission_fixture
+# In the matching rpi-extension checkout, supply the explicitly trusted example:
+RPI_ADMISSION_NATIVE_FIXTURE="$PI_RUST/target/debug/examples/execution_admission_fixture" \
+  cargo test -p rpi-extcore --test admission_native -- --ignored --nocapture
+```
+
+The test covers no-op resume, RPC-owned and autonomous settlements with distinct
+execution identities, and admission of a subsequent prompt. It shuts down and
+reaps its child on success, panic or timeout. The existing external goal DLL
+smoke remains a separate ignored test and is not covered by this fixture.
+
 ## Bounded history reads and indexed SQLite snapshots
 
 `SessionStorage::record_page` is a required storage API, not a fallback which
