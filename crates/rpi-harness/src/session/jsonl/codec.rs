@@ -463,6 +463,11 @@ fn parse_fact_mutation(
 // ============================ shared field helpers ============================
 
 fn parse_object(line: &str) -> Result<serde_json::Map<String, Value>, JsonlDecodeError> {
+    if let Ok(map) = super::envelope::parse(line) {
+        return Ok(map);
+    }
+    // Preserve Value's private protocols and canonical syntax/schema errors,
+    // including non-object roots. This retries only already-read bytes.
     let value: Value = serde_json::from_str(line).map_err(|_| syntax("is not valid JSON"))?;
     match value {
         Value::Object(map) => Ok(map),

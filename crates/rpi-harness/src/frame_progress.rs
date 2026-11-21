@@ -46,8 +46,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::result::{HarnessError, HarnessResult};
 use crate::session::session::Session;
 use crate::session::types::{
-    AssistantFrameOp, AssistantFrameRecord, Entry, EntryOrder, EntryQuery, LaneRecord, RecordBase,
-    RecordQuery, ToolStartedRecord,
+    AssistantFrameOp, AssistantFrameRecord, BranchBounds, Entry, EntryCursor, EntryOrder,
+    EntryQuery, LaneRecord, RecordBase, RecordQuery, ToolStartedRecord,
 };
 
 const FRAME_CHUNK_RECORDS: usize = 32;
@@ -520,6 +520,74 @@ pub async fn unknown_tool_outcomes(
     unknown_tool_outcomes_with_started(session, lane, assistant_entry_id, partial, &started).await
 }
 
+/// Hydrate only the anchored assistant and its descendants, while retaining the
+/// ordinary full-ancestry walk. Do not use stop_at_id: besides changing ancestry
+/// validation, oldest-first stop bounds do not describe this descendant range.
+async fn recovery_batch_entries(
+    session: &Session,
+    lane: &str,
+    assistant_entry_id: Option<&str>,
+) -> HarnessResult<Vec<Entry>> {
+    let view = session.view(lane);
+    let query = EntryQuery {
+        order: Some(EntryOrder::OldestFirst),
+        exclude_tool_program_bodies: true,
+        ..Default::default()
+    };
+    let Some(id) = assistant_entry_id else {
+        return view
+            .find_entries_on_branch(&query, &BranchBounds::default())
+            .await
+            .map_err(|error| HarnessError::io(error.to_string()));
+    };
+    let Some(leaf) = view
+        .get_leaf_id()
+        .await
+        .map_err(|error| HarnessError::io(error.to_string()))?
+    else {
+        return Ok(Vec::new());
+    };
+    let bounds = BranchBounds {
+        start: Some(leaf),
+        ..Default::default()
+    };
+    let anchor = view
+        .find_entries_on_branch(
+            &EntryQuery {
+                entry_id: Some(id.to_string()),
+                limit: Some(1),
+                ..query.clone()
+            },
+            &bounds,
+        )
+        .await
+        .map_err(|error| HarnessError::io(error.to_string()))?
+        .into_iter()
+        .next();
+    let Some(anchor) = anchor else {
+        // Preserve the old read/error path when the anchor is not on the branch.
+        return view
+            .find_entries_on_branch(&query, &bounds)
+            .await
+            .map_err(|error| HarnessError::io(error.to_string()));
+    };
+    // The anchor was actually read and verified, not accepted from an id cache.
+    let mut entries = view
+        .find_entries_on_branch(
+            &EntryQuery {
+                cursor: Some(EntryCursor {
+                    after_seq: anchor.base().seq,
+                }),
+                ..query
+            },
+            &bounds,
+        )
+        .await
+        .map_err(|error| HarnessError::io(error.to_string()))?;
+    entries.insert(0, anchor);
+    Ok(entries)
+}
+
 /// Recovery already read these records for the run. Reuse them rather than
 /// querying/cloning the history again for each assistant batch.
 pub(crate) async fn unknown_tool_outcomes_with_started(
@@ -541,18 +609,9 @@ pub(crate) async fn unknown_tool_outcomes_with_started(
         return Ok(Vec::new());
     }
 
-    let entries = session
-        .view(lane)
-        .find_entries_on_branch(
-            &EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
-                exclude_tool_program_bodies: true,
-                ..Default::default()
-            },
-            &Default::default(),
-        )
-        .await
-        .map_err(|error| HarnessError::io(error.to_string()))?;
+    let entries_phase = crate::session::diagnostics::RecoveryPhase::start("tool_outcome_entries");
+    let entries = recovery_batch_entries(session, lane, assistant_entry_id).await?;
+    entries_phase.finish(0, entries.len());
     // Results belong to the assistant batch, never to a different lane or an
     // earlier assistant that happened to reuse a provider call id.
     let start = assistant_entry_id.and_then(|id| entries.iter().position(|entry| entry.id() == id));

@@ -67,6 +67,7 @@ use crate::session::context::{
     build_session_context, build_session_context_owned, ContextEntryTransform,
     CustomEntryContextMessageProjector, SessionContextBuildOptions,
 };
+use crate::session::diagnostics::RecoveryPhase;
 use crate::session::session::Session;
 use crate::session::types::{
     AssistantFrameOp, AssistantFrameRecord, BranchBounds, CompactionReason, Entry, EntryCursor,
@@ -84,6 +85,10 @@ use crate::types::{
     SendMessageOptions, Skill,
 };
 use crate::watcher::{watch_listener, HarnessWatcher};
+
+#[cfg(test)]
+#[path = "recovery_tail_tests.rs"]
+mod recovery_tail_tests;
 
 // ===========================================================================
 // Outcomes — mirror the TS RunOutcome / CompactionOutcome / NavigationOutcome
@@ -1076,6 +1081,8 @@ impl AgentHarness {
         options: AgentHarnessOptions,
         experimental_durable: Option<crate::durable::ExperimentalDurablePolicy>,
     ) -> HarnessResult<Self> {
+        let create_phase = RecoveryPhase::start("create_total");
+        let admission_phase = RecoveryPhase::start("create_admission");
         // Admission is read-only and precedes progress retirement/recovery.
         // Reuse the same control decoder for every session open: legacy durable
         // journals are unsupported even when native durable is not enabled.
@@ -1109,12 +1116,15 @@ impl AgentHarness {
             }
         }
 
+        admission_phase.finish(0, 0);
         if options.allow_existing_session {
+            let phase = RecoveryPhase::start("create_progress_prune");
             options
                 .session
                 .prune_completed_progress()
                 .await
                 .map_err(session_to_harness_err)?;
+            phase.finish(0, 0);
         }
 
         // Recovery repaired whatever the previous process left behind. If that
@@ -1131,6 +1141,7 @@ impl AgentHarness {
 
         let mut pending_resume = None;
         if options.allow_existing_session {
+            let phase = RecoveryPhase::start("create_open_lookup");
             let interrupted = options
                 .session
                 .find_open_operations("main", Some(1))
@@ -1138,13 +1149,17 @@ impl AgentHarness {
                 .map_err(session_to_harness_err)?
                 .first()
                 .cloned();
+            phase.finish(0, usize::from(interrupted.is_some()));
             // A run that died waiting to retry is continued too, and its failed
             // attempt is not salvaged. Decided before recovery so the salvage and
             // the resume gate agree.
+            let phase = RecoveryPhase::start("create_retry_check");
             let died_awaiting_retry = match &interrupted {
                 Some(dead) => Self::died_awaiting_retry(&options.session, &dead.base.id).await,
                 None => false,
             };
+            phase.finish(0, 0);
+            let phase = RecoveryPhase::start("create_interrupted_finish");
             Self::finish_interrupted_operation(
                 &options.session,
                 "main",
@@ -1158,9 +1173,13 @@ impl AgentHarness {
                 None,
             )
             .await?;
+            phase.finish(0, 0);
             if let Some(dead) = interrupted {
+                let phase = RecoveryPhase::start("create_resume_check");
+                let tip_phase = RecoveryPhase::start("create_user_tip");
                 let died_before_any_output =
                     Self::tip_is_user_message(&options.session, "main").await;
+                tip_phase.finish(0, 0);
                 if died_awaiting_retry
                     || died_before_any_output
                     || Self::lane_is_resumable(&options.session, "main").await
@@ -1172,6 +1191,7 @@ impl AgentHarness {
                         attempt,
                     });
                 }
+                phase.finish(0, 0);
             }
         }
 
@@ -1237,9 +1257,12 @@ impl AgentHarness {
             stop_round: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         if options.allow_existing_session {
+            let phase = RecoveryPhase::start("create_context_flush");
             let messages = harness.flush_context_messages_locked().await?;
             harness.emit_appended_messages(messages).await;
+            phase.finish(0, 0);
         }
+        create_phase.finish(0, 0);
         Ok(harness)
     }
 
@@ -3408,6 +3431,7 @@ impl AgentHarness {
         salvage_failed_attempts: bool,
     ) -> HarnessResult<()> {
         Self::ensure_recovery_active(signal)?;
+        let records_phase = RecoveryPhase::start("repair_tool_records");
         let records = session
             .find_records(&RecordQuery {
                 lane: Some(lane.to_owned()),
@@ -3425,47 +3449,38 @@ impl AgentHarness {
                 _ => None,
             })
             .collect();
+        records_phase.finish(0, started.len());
 
         // Finish the durable tail's tool batch BEFORE appending any newer
         // stream. Otherwise even a synthetic abort stream can hide an older
         // missing result behind a new assistant/context boundary. Extension
         // state is not such a boundary.
-        let entries = session
-            .view(lane)
-            .find_entries_on_branch(
-                &EntryQuery {
-                    exclude_tool_program_bodies: true,
-                    order: Some(EntryOrder::NewestFirst),
-                    ..Default::default()
-                },
-                &BranchBounds::default(),
-            )
-            .await
-            .map_err(session_to_harness_err)?;
-        for entry in entries {
-            match entry {
-                Entry::Custom(_) => continue,
-                Entry::Message(message) => match message.message {
-                    AgentMessage::ToolResult(_) => continue,
-                    AgentMessage::Assistant(partial) => {
-                        Self::repair_tool_batch(
-                            session,
-                            lane,
-                            tools,
-                            signal,
-                            &started,
-                            &message.base.id,
-                            &partial,
-                        )
-                        .await?;
-                        break;
-                    }
-                    _ => break,
-                },
-                _ => break,
+        let entries_phase = RecoveryPhase::start("repair_tail_entries");
+        let (entry, hydrated) = Self::newest_recovery_entry(session, lane, |entry| match entry {
+            Entry::Custom(_) => true,
+            Entry::Message(message) => matches!(message.message, AgentMessage::ToolResult(_)),
+            _ => false,
+        })
+        .await?;
+        entries_phase.finish(0, hydrated);
+        let batch_phase = RecoveryPhase::start("repair_tail_batch");
+        if let Some(Entry::Message(message)) = entry {
+            if let AgentMessage::Assistant(partial) = message.message {
+                Self::repair_tool_batch(
+                    session,
+                    lane,
+                    tools,
+                    signal,
+                    &started,
+                    &message.base.id,
+                    &partial,
+                )
+                .await?;
             }
         }
 
+        batch_phase.finish(0, 0);
+        let streams_phase = RecoveryPhase::start("repair_streams");
         if salvage_failed_attempts {
             for stream in crate::frame_progress::replay_run_streams(session, run_id).await? {
                 Self::ensure_recovery_active(signal)?;
@@ -3500,6 +3515,7 @@ impl AgentHarness {
                 .await?;
             }
         }
+        streams_phase.finish(0, 0);
         Self::ensure_recovery_active(signal)
     }
 
@@ -3571,6 +3587,70 @@ impl AgentHarness {
         Ok(())
     }
 
+    /// Find the first decision-relevant entry, normally from bounded newest
+    /// pages. Pin one leaf and keep ordinary full-ancestry validation. Fall back
+    /// to the old full scan after a long skipped prefix to avoid O(N²) repeated
+    /// metadata walks. Every selected payload is read and verified.
+    /// Return hydrated reads (including fallback rereads), not unique entries.
+    async fn newest_recovery_entry(
+        session: &Session,
+        lane: &str,
+        skip: impl Fn(&Entry) -> bool,
+    ) -> HarnessResult<(Option<Entry>, usize)> {
+        let view = session.view(lane);
+        let Some(leaf) = view.get_leaf_id().await.map_err(session_to_harness_err)? else {
+            return Ok((None, 0));
+        };
+        let bounds = BranchBounds {
+            start: Some(leaf),
+            ..Default::default()
+        };
+        let mut cursor = None;
+        let mut hydrated = 0;
+        loop {
+            let entries = view
+                .find_entries_on_branch(
+                    &EntryQuery {
+                        exclude_tool_program_bodies: true,
+                        order: Some(EntryOrder::NewestFirst),
+                        limit: Some(16),
+                        cursor,
+                        ..Default::default()
+                    },
+                    &bounds,
+                )
+                .await
+                .map_err(session_to_harness_err)?;
+            let Some(last) = entries.last() else {
+                return Ok((None, hydrated));
+            };
+            cursor = Some(EntryCursor {
+                after_seq: last.base().seq,
+            });
+            hydrated += entries.len();
+            for entry in entries {
+                if !skip(&entry) {
+                    return Ok((Some(entry), hydrated));
+                }
+            }
+            if hydrated >= 128 {
+                let entries = view
+                    .find_entries_on_branch(
+                        &EntryQuery {
+                            exclude_tool_program_bodies: true,
+                            order: Some(EntryOrder::NewestFirst),
+                            ..Default::default()
+                        },
+                        &bounds,
+                    )
+                    .await
+                    .map_err(session_to_harness_err)?;
+                hydrated += entries.len();
+                return Ok((entries.into_iter().find(|entry| !skip(entry)), hydrated));
+            }
+        }
+    }
+
     /// Whether the branch tip is a user message the run died on.
     ///
     /// That is the `starting` crash: the operation opened, the prompt was
@@ -3578,29 +3658,16 @@ impl AgentHarness {
     /// was produced, so the tip is still the prompt — and the run should simply
     /// continue, which is what upstream does by re-entering its `starting` state.
     async fn tip_is_user_message(session: &Session, lane: &str) -> bool {
-        let entries = match session
-            .view(lane)
-            .find_entries_on_branch(
-                &EntryQuery {
-                    exclude_tool_program_bodies: true,
-                    order: Some(EntryOrder::OldestFirst),
-                    ..Default::default()
-                },
-                &BranchBounds::default(),
-            )
-            .await
+        // Extension state does not advance the conversation. Preserve the
+        // legacy best-effort behavior on read errors; repair itself is fallible.
+        let tip = match Self::newest_recovery_entry(session, lane, |entry| {
+            matches!(entry, Entry::Custom(_))
+        })
+        .await
         {
-            Ok(entries) => entries,
+            Ok((tip, _)) => tip,
             Err(_) => return false,
         };
-        // Extension state (for example durable's AgentStart journal) can be
-        // appended after the prompt without advancing the conversation. Match
-        // lane_is_resumable: inspect the last non-custom entry, not an arbitrary
-        // older user message hidden behind an assistant reply.
-        let tip = entries
-            .iter()
-            .rev()
-            .find(|entry| !matches!(entry, Entry::Custom(_)));
         let Some(Entry::Message(message)) = tip else {
             return false;
         };
@@ -3750,6 +3817,7 @@ impl AgentHarness {
             return Ok(());
         };
         let run_id = operation.base.id.clone();
+        let repair_phase = RecoveryPhase::start("interrupted_repair");
 
         if let Err(error) = Self::repair_interrupted_run(
             session,
@@ -3771,12 +3839,16 @@ impl AgentHarness {
             return Err(error);
         }
 
+        repair_phase.finish(0, 0);
         // All recovered entries are now durable. A failed retirement leaves the
         // operation open for retry; a later terminal-write failure is also safe
         // because transcript identity/bindings no longer depend on payloads.
+        let retire_phase = RecoveryPhase::start("interrupted_retire_frames");
         crate::frame_progress::retire_run_frames(session, lane, &run_id).await?;
+        retire_phase.finish(0, 0);
         Self::ensure_recovery_active(signal)?;
         // This terminal record is the recovery commit barrier, not its intent.
+        let close_phase = RecoveryPhase::start("interrupted_close");
         session
             .append_record(LaneRecord::OperationFinished(OperationFinishedRecord {
                 base: RecordBase {
@@ -3795,6 +3867,7 @@ impl AgentHarness {
             }))
             .await
             .map_err(session_to_harness_err)?;
+        close_phase.finish(0, 0);
 
         Ok(())
     }

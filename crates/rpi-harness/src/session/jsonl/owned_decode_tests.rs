@@ -2,8 +2,16 @@
 use super::*;
 use serde_json::json;
 
+fn legacy_parse_object(line: &str) -> Result<serde_json::Map<String, Value>, JsonlDecodeError> {
+    let value: Value = serde_json::from_str(line).map_err(|_| syntax("is not valid JSON"))?;
+    match value {
+        Value::Object(map) => Ok(map),
+        _ => Err(schema("is not a JSON object")),
+    }
+}
+
 fn legacy_parse_mutation(line: &str) -> Result<SessionMutation, JsonlDecodeError> {
-    let value = parse_object(line)?;
+    let value = legacy_parse_object(line)?;
     let seq = require_sequence(&value)?;
     match value.get("kind").and_then(|v| v.as_str()) {
         Some("entry") => legacy_parse_entry_mutation(&value, seq),
@@ -101,7 +109,27 @@ fn legacy_parse_record_mutation(
     Ok(SessionMutation::Record { record })
 }
 
+fn assert_object_parity(line: &str) {
+    match (legacy_parse_object(line), parse_object(line)) {
+        (Ok(expected), Ok(actual)) => {
+            assert_eq!(actual, expected, "{line}");
+            // Map equality alone does not compare insertion order or -0.0 bits.
+            assert_eq!(
+                serde_json::to_string(&actual).unwrap(),
+                serde_json::to_string(&expected).unwrap(),
+                "{line}"
+            );
+        }
+        (Err(expected), Err(actual)) => {
+            assert_eq!(actual.kind, expected.kind, "{line}");
+            assert_eq!(actual.message, expected.message, "{line}");
+        }
+        (expected, actual) => panic!("different objects for {line}: {expected:?} vs {actual:?}"),
+    }
+}
+
 fn assert_parity(line: &str) {
+    assert_object_parity(line);
     let reference = legacy_parse_mutation(line);
     let actual = parse_mutation(line);
     match (reference, actual) {
@@ -241,6 +269,216 @@ fn benchmark_owned_codec_against_frozen_decoder_on_real_transcript() {
                 "round={round} owned={owned} rows={} elapsed_ms={:.3}",
                 lines.len(),
                 started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "release-mode stage probe; set RPI_CODEC_BENCH_TRANSCRIPT"]
+fn benchmark_mutation_decode_stages_on_real_transcript() {
+    let path = std::env::var("RPI_CODEC_BENCH_TRANSCRIPT").expect("RPI_CODEC_BENCH_TRANSCRIPT");
+    let transcript = std::fs::read_to_string(path).unwrap();
+    // Use streaming's frame recognizer only as a selection filter, not a full
+    // replay (duplicate/backward sequence handling is not modeled here).
+    // This read-only probe excludes recognized cold frames and measures only
+    // canonical codec rows, without storage open, leases or transcript writes.
+    let lines: Vec<_> = transcript
+        .lines()
+        .skip(1)
+        .filter(|line| super::super::cold_decode::parse_cold_frame(line).is_none())
+        .collect();
+    assert!(!lines.is_empty());
+    for line in &lines {
+        parse_mutation(line).unwrap();
+    }
+    for round in 0..5 {
+        let mut parse_ns = 0u128;
+        let mut typed_ns = 0u128;
+        let mut drop_ns = 0u128;
+        for line in &lines {
+            let started = std::time::Instant::now();
+            let value = parse_object(line).unwrap();
+            parse_ns += started.elapsed().as_nanos();
+            let started = std::time::Instant::now();
+            let seq = require_sequence(&value).unwrap();
+            let mutation = match value.get("kind").and_then(|v| v.as_str()) {
+                Some("entry") => parse_entry_mutation(value, seq),
+                Some("record") => parse_record_mutation(value, seq),
+                Some("lane") => parse_lane_mutation(&value, seq),
+                Some("fact") => parse_fact_mutation(&value, seq),
+                _ => panic!("unknown mutation kind in accepted fixture"),
+            }
+            .unwrap();
+            typed_ns += started.elapsed().as_nanos();
+            let started = std::time::Instant::now();
+            drop(std::hint::black_box(mutation));
+            drop_ns += started.elapsed().as_nanos();
+        }
+        eprintln!(
+            "round={round} rows={} parse_value_ms={:.3} typed_decode_ms={:.3} drop_ms={:.3}",
+            lines.len(),
+            parse_ns as f64 / 1e6,
+            typed_ns as f64 / 1e6,
+            drop_ns as f64 / 1e6
+        );
+    }
+}
+
+#[test]
+fn reserved_envelopes_preserve_private_protocols_escapes_and_syntax_errors() {
+    for row in rows() {
+        let line = row.to_string();
+        for key in [
+            "$serde_json::private::RawValue",
+            r"\u0024serde_json::private::RawValue",
+            r"$serde_json::private::\u0052awValue",
+            "$serde_json::private::Number",
+        ] {
+            for raw in ["null", "[]", "not-json", "{\"x\":1}", line.as_str()] {
+                let encoded = serde_json::to_string(raw).unwrap();
+                assert_parity(&format!("{{\"{key}\":{encoded}}}"));
+                assert_parity(&format!("{{\"{key}\":{encoded},{}", &line[1..]));
+                assert_parity(&format!(
+                    "{},\"{key}\":{encoded}}}",
+                    &line[..line.len() - 1]
+                ));
+            }
+        }
+        for suffix in ["x", "{}", ",", "\nnull"] {
+            assert_parity(&format!("{line}{suffix}"));
+        }
+        // Boundary/truncation errors must still come from the canonical parser.
+        for offset in line.char_indices().map(|(offset, _)| offset) {
+            assert_parity(&line[..offset]);
+        }
+    }
+    for line in [
+        "",
+        "true",
+        "false",
+        "0",
+        "-0.0",
+        "1.7976931348623157e308",
+        "{\"x\":1e400}",
+        "{\"x\":-1e400}",
+        "{\"x\":01}",
+        "{\"x\":NaN}",
+        r#"{"\ud800":1}"#,
+        r#"{"x":"\udc00"}"#,
+        "{\"x\":\"\n\"}",
+        r#"{"x":"\uD83E\uDDEA","é中🧪":"\n\t\\\"","x":-0.0}"#,
+        "{\"x\":1,}",
+        "{null:1}",
+        "{\"x\":}",
+        "[]{}",
+        "{\"x\":[1,]}",
+    ] {
+        assert_parity(line);
+    }
+    for depth in [126, 127, 128, 129, 256] {
+        assert_parity(&format!(
+            "{{\"x\":{}null{}}}",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        ));
+    }
+}
+
+#[test]
+fn reserved_envelopes_match_canonical_value_on_generated_nested_json() {
+    fn next(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *seed >> 32
+    }
+    fn value(seed: &mut u64, depth: u8) -> Value {
+        match next(seed) % if depth == 0 { 6 } else { 8 } {
+            0 => Value::Null,
+            1 => json!(next(seed) % 2 == 0),
+            2 => json!(next(seed)),
+            3 => json!(-(next(seed) as f64) / 17.0),
+            4 => json!("ASCII / 中文 / é / 🧪 / \n\t\\\""),
+            5 => json!("{\"x\":1}"),
+            6 => Value::Array(
+                (0..next(seed) % 4)
+                    .map(|_| value(seed, depth - 1))
+                    .collect(),
+            ),
+            _ => {
+                let keys = [
+                    "a",
+                    "b",
+                    "$serde_json::private::RawValue",
+                    "é中🧪",
+                    "",
+                    "$serde_json::private::Number",
+                ];
+                let mut map = serde_json::Map::new();
+                for _ in 0..next(seed) % 5 {
+                    let key = keys[next(seed) as usize % keys.len()];
+                    map.insert(key.into(), value(seed, depth - 1));
+                }
+                Value::Object(map)
+            }
+        }
+    }
+    let mut seed = 0x4527_1829;
+    for _ in 0..2000 {
+        let extra = value(&mut seed, 4);
+        assert_parity(&extra.to_string());
+        let line = format!(
+            "{{\"kind\":\"fact\",\"seq\":1,\"fact\":\"name\",\"name\":null,\"extra\":{extra}}}"
+        );
+        assert_parity(&line);
+    }
+}
+
+#[test]
+#[ignore = "release-mode envelope probe; set RPI_CODEC_BENCH_TRANSCRIPT"]
+fn benchmark_reserved_envelope_with_current_typed_decoder() {
+    fn decode(line: &str, reserved: bool) -> Result<SessionMutation, JsonlDecodeError> {
+        let value = if reserved {
+            parse_object(line)
+        } else {
+            legacy_parse_object(line)
+        }?;
+        let seq = require_sequence(&value)?;
+        match value.get("kind").and_then(|v| v.as_str()) {
+            Some("entry") => parse_entry_mutation(value, seq),
+            Some("record") => parse_record_mutation(value, seq),
+            Some("lane") => parse_lane_mutation(&value, seq),
+            Some("fact") => parse_fact_mutation(&value, seq),
+            _ => Err(schema("has unknown mutation kind")),
+        }
+    }
+    let path = std::env::var("RPI_CODEC_BENCH_TRANSCRIPT").expect("RPI_CODEC_BENCH_TRANSCRIPT");
+    let transcript = std::fs::read_to_string(path).unwrap();
+    let lines: Vec<_> = transcript
+        .lines()
+        .skip(1)
+        .filter(|line| super::super::cold_decode::parse_cold_frame(line).is_none())
+        .collect();
+    assert!(!lines.is_empty());
+    // Same typed decoder for both branches: this isolates the reservation from
+    // the older frozen decoder's object clones. No storage/lease/repair writes.
+    for line in &lines {
+        assert_object_parity(line);
+        assert_eq!(decode(line, false).unwrap(), decode(line, true).unwrap());
+    }
+    for round in 0..7 {
+        for reserved in if round % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let start = std::time::Instant::now();
+            for line in &lines {
+                drop(std::hint::black_box(decode(line, reserved).unwrap()));
+            }
+            eprintln!(
+                "round={round} reserved={reserved} rows={} elapsed_ms={:.3}",
+                lines.len(),
+                start.elapsed().as_secs_f64() * 1000.0
             );
         }
     }
