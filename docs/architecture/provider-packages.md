@@ -1,7 +1,7 @@
 # Provider packages
 
-供应商策略统一放在独立 rpi-package 项目的
-[`rpi-providers`](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)。
+供应商策略统一放在独立 rpi-extension 项目的
+[`rpi-providers`](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)。
 一个 Cargo package、一个动态库、一个安装 / 升级入口，内部按供应商分模块。
 新增接入遵循 [Provider 接入规范](../extensions/provider-integration.md)。
 
@@ -25,7 +25,7 @@ AI、Tokio 与 HTTP 依赖；默认 ABI SDK 保持轻量。桥接层不内置供
 
 ## 安装、使用与迁移
 
-在 rpi-package 仓库根目录，使用本分支构建的宿主安装一次：
+在 rpi-extension 仓库根目录，使用本分支构建的宿主安装一次：
 
 ```sh
 rpi package link providers --path packages/rpi-providers --debug
@@ -165,7 +165,7 @@ rpi auth check --provider openrouter --extension /path/to/provider.dll --json
 可运行的 DeepSeek 流式实现和测试位于独立的 `rpi-providers` package，provider ID 为 `deepseek`。
 
 ```sh
-cd /path/to/rpi-package
+cd /path/to/rpi-extension
 cargo build -p rpi-providers
 cargo test -p rpi-providers --test streaming
 cargo test -p rpi-providers --test host
@@ -177,7 +177,7 @@ cargo test -p rpi-providers --test host
 端到端测试用真实 DLL、CLI 子进程和本机 SSE 服务，覆盖无凭据目录、禁用扩展、认证隔离、带认证的
 OpenRouter、匿名 llama.cpp / Proxy，以及实际流式输出。其他协议可以沿同样的声明和 factory 边界接入。
 
-生产统一包在 rpi-package 仓库根目录运行 `cargo build -p rpi-providers` 与
+生产统一包在 rpi-extension 仓库根目录运行 `cargo build -p rpi-providers` 与
 `cargo test -p rpi-providers`。包的单 DLL 测试覆盖四份目录与认证策略，以及并发请求的
 factory / key 隔离；DeepSeek 思考工具续轮、取消与错误测试也在包内。
 
@@ -185,7 +185,7 @@ factory / key 隔离；DeepSeek 思考工具续轮、取消与错误测试也在
 
 ```powershell
 $env:RPI_TEST_PROVIDER_LIBRARY = 'C:\path\to\target\debug\rpi_providers.dll'
-$env:RPI_TEST_PROVIDER_PACKAGE = 'C:\path\to\rpi-package\packages\rpi-providers'
+$env:RPI_TEST_PROVIDER_PACKAGE = 'C:\path\to\rpi-extension\packages\rpi-providers'
 cargo test -p rpi-cli --test provider_packages
 ```
 

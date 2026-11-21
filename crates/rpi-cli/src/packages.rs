@@ -530,17 +530,25 @@ fn global_update_args(
     cdn: Option<&str>,
 ) -> Vec<String> {
     let mut install_args = vec!["install".into(), package.name.clone()];
+    // Pre-provenance prebuilt installs (records that only stored a
+    // `prebuilt:<repository>` marker) keep upgrading from their publisher —
+    // version discovery follows a repository move — instead of falling back to
+    // an explicit source rebuild.
+    let legacy_repository = package.legacy_prebuilt_repository();
+    let prebuilt = package.prebuilt.is_some() || legacy_repository.is_some();
     if let Some(source) = &package.prebuilt {
         if source.custom_repository {
             install_args.extend(["--github".into(), source.repository.clone()]);
         }
+    } else if let Some(repository) = legacy_repository {
+        install_args.extend(["--github".into(), repository.to_string()]);
     } else {
         install_args.push("--build".into());
     }
-    if package.prebuilt.is_none() && args.iter().any(|arg| arg == "--locked") {
+    if !prebuilt && args.iter().any(|arg| arg == "--locked") {
         install_args.push("--locked".into());
     }
-    if package.prebuilt.is_some() {
+    if prebuilt {
         if let Some(cdn) = cdn {
             install_args.extend(["--cdn".into(), cdn.into()]);
         }
@@ -1043,6 +1051,49 @@ mod tests {
                 ]]
             );
         });
+    }
+
+    #[test]
+    fn update_preserves_a_legacy_prebuilt_publisher() {
+        let mut record = prebuilt_package(true);
+        record.prebuilt = None;
+        record.source = Some("prebuilt:https://github.com/pi-rust/rpi-package".into());
+        with_registry(&serde_json::to_vec(&[record]).unwrap(), |cwd| {
+            let mut commands = Vec::new();
+            assert_eq!(
+                update_at(cwd, &[], |package, args, cdn| {
+                    commands.push(global_update_args(package, args, cdn));
+                    true
+                }),
+                0
+            );
+            assert_eq!(
+                commands,
+                [vec![
+                    "install",
+                    "rpi-im-message",
+                    "--github",
+                    "https://github.com/pi-rust/rpi-package"
+                ]]
+            );
+        });
+        // `--locked` only means something to a Cargo build, and a legacy
+        // prebuilt record is still a prebuilt install: `--cdn` applies.
+        let mut record = prebuilt_package(true);
+        record.prebuilt = None;
+        record.source = Some("prebuilt:https://github.com/pi-rust/rpi-package".into());
+        let args = vec!["--locked".to_string()];
+        assert_eq!(
+            global_update_args(&record, &args, Some("https://cdn.example.test")),
+            [
+                "install",
+                "rpi-im-message",
+                "--github",
+                "https://github.com/pi-rust/rpi-package",
+                "--cdn",
+                "https://cdn.example.test"
+            ]
+        );
     }
 
     #[test]

@@ -354,7 +354,7 @@ and it does not replace `rpi-plugin-sdk`; a simple tool plugin should not add it
 unnecessarily.
 
 Ready-to-install extensions live in the companion
-[`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
+[`pi-rust/rpi-extension`](https://github.com/pi-rust/rpi-extension) repository, with
 an [online catalog](https://rpi.bigfisharc.cn/packages.html).
 
 ### Optional web and subagent tools
@@ -494,4 +494,4 @@ The `rpi-*` crates are a Rust-native coding-agent stack.
 
 ## Star history
 
-[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-package&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-package&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-extension&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-extension&Date)

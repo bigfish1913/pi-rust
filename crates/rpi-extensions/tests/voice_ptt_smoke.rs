@@ -21,12 +21,12 @@
 //! The test binary lives under `<target>/<profile>/deps/`, so `current_exe()` →
 //! up two levels is where `rpi_voice.{dll,so,dylib}` lands. We **skip** (not
 //! fail) when it isn't built — `rpi-voice` lives in the *other* repo
-//! (`rpi-package`), so a plain `cargo test` here must not go red just because
+//! (`rpi-extension`), so a plain `cargo test` here must not go red just because
 //! that crate wasn't compiled.
 //!
 //! Build it first:
 //! ```sh
-//! # in ../rpi-package
+//! # in ../rpi-extension
 //! cargo build -p rpi-voice --release --features local-stt
 //! ```
 //! The test uses `RPI_VOICE_PTT_KEY` to assert the key name is honored rather
@@ -75,7 +75,7 @@ fn locate_cdylib() -> Option<PathBuf> {
                     if candidate.exists() {
                         return Some(candidate);
                     }
-                    // rpi-package builds into its own (or the shared) target dir.
+                    // rpi-extension builds into its own (or the shared) target dir.
                     for sub in ["release", "debug"] {
                         let candidate = dir.join(sub).join(name);
                         if candidate.exists() {
@@ -90,7 +90,7 @@ fn locate_cdylib() -> Option<PathBuf> {
     // 2. The sibling repo's target dir, resolved relative to this crate.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest.parent()?.parent()?; // <pi-rust>/crates/rpi-extensions -> <pi-rust>
-    let sibling = repo_root.parent()?.join("rpi-package");
+    let sibling = repo_root.parent()?.join("rpi-extension");
     for profile in ["release", "debug"] {
         let candidate = sibling.join("target").join(profile).join(name);
         if candidate.exists() {
@@ -132,7 +132,7 @@ fn voice_registers_ptt_shortcut_and_input_handler() {
     let Some((diag, snapshot)) = load_voice() else {
         eprintln!(
             "rpi_voice cdylib not built — skipping \
-             (build it with `cargo build -p rpi-voice --release` in ../rpi-package)"
+             (build it with `cargo build -p rpi-voice --release` in ../rpi-extension)"
         );
         return;
     };

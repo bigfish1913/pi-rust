@@ -2,7 +2,7 @@
 """Run the published ACP/Web/native protocol compatibility gate.
 
 The caller supplies binaries built from the current checkout and from the
-official rpi-package checkout. Every process gets an isolated agent directory,
+official rpi-extension checkout. Every process gets an isolated agent directory,
 model catalog, session directory and project. No provider request is made.
 """
 

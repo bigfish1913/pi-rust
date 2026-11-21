@@ -47,8 +47,27 @@ pub struct InstalledNativePackage {
 impl InstalledNativePackage {
     /// Prebuilt provenance also uses `source`; only local development builds
     /// should be excluded from registry update discovery and commands.
+    ///
+    /// Hosts that predate exact prebuilt provenance recorded only the
+    /// `prebuilt:<repository>` source marker. Those installs are still
+    /// registry-updatable, otherwise they would silently never see an update
+    /// again — including the ones published before a repository move.
     pub(crate) fn supports_registry_update(&self) -> bool {
-        self.source.is_none() || self.prebuilt.is_some()
+        self.source.is_none()
+            || self.prebuilt.is_some()
+            || self.legacy_prebuilt_repository().is_some()
+    }
+
+    /// Repository from the `prebuilt:<repository>` marker written by hosts
+    /// without exact prebuilt provenance, when it is a usable GitHub URL.
+    pub(crate) fn legacy_prebuilt_repository(&self) -> Option<&str> {
+        if self.prebuilt.is_some() {
+            return None;
+        }
+        self.source
+            .as_deref()?
+            .strip_prefix("prebuilt:")
+            .filter(|repository| repository.starts_with("https://github.com/"))
     }
 }
 
@@ -1824,7 +1843,7 @@ fn help_requested() -> &'static str {
 }
 
 pub fn print_help() {
-    println!("Usage: rpi install [<crate>] [options]\n\nInstall or upgrade a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata.\nNewer versions upgrade automatically; an already installed version is skipped.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --cdn <URL>           Download release archives from this HTTPS CDN; manifests remain on GitHub\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Reinstall the same version or allow a downgrade/replacement\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
+    println!("Usage: rpi install [<crate>] [options]\n\nInstall or upgrade a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata, and a repository move is followed for version discovery while previously published releases stay installable.\nNewer versions upgrade automatically; an already installed version is skipped.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --cdn <URL>           Download release archives from this HTTPS CDN; manifests remain on GitHub\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Reinstall the same version or allow a downgrade/replacement\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
 }
 
 fn print_uninstall_help() {
@@ -2413,6 +2432,41 @@ mod tests {
             ])),
             2
         );
+    }
+
+    #[test]
+    fn legacy_prebuilt_markers_remain_registry_updatable() {
+        let record: InstalledNativePackage = serde_json::from_value(serde_json::json!({
+            "name":"demo", "version":"1.2.3",
+            "source":"prebuilt:https://github.com/pi-rust/rpi-package",
+            "artifacts":["custom.so"]
+        }))
+        .unwrap();
+        assert!(record.supports_registry_update());
+        assert_eq!(
+            record.legacy_prebuilt_repository(),
+            Some("https://github.com/pi-rust/rpi-package")
+        );
+        // Exact provenance wins; local development builds stay excluded.
+        let mut exact = record.clone();
+        exact.prebuilt = Some(crate::prebuilt_extensions::PrebuiltRecord {
+            repository: "https://github.com/pi-rust/rpi-package".into(),
+            target: "x86_64-apple-darwin".into(),
+            manifest_sha256: "a".repeat(64),
+            source_commit: "b".repeat(40),
+            sdk_version: "0.4.0".into(),
+            plugin_abi: 4,
+            archive_sha256: "c".repeat(64),
+            library_sha256: "d".repeat(64),
+            custom_repository: true,
+            assets: Vec::new(),
+        });
+        assert!(exact.supports_registry_update());
+        assert_eq!(exact.legacy_prebuilt_repository(), None);
+        let mut local = record;
+        local.source = Some("../local-ext".into());
+        assert!(!local.supports_registry_update());
+        assert_eq!(local.legacy_prebuilt_repository(), None);
     }
 
     #[test]

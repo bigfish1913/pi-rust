@@ -13,7 +13,7 @@ By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 - **Feature requests** — use the [feature request form](../../issues/new?template=feature_request.yml).
   Describe the problem first, then the proposed solution.
 - **Extensions** — publish `cdylib` extensions in
-  [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package). Bugs in the
+  [`pi-rust/rpi-extension`](https://github.com/pi-rust/rpi-extension). Bugs in the
   ABI or the loader itself belong in this repository.
 - **Documentation** — `README.md`, `docs/`, and the static site in `website/`
   are all fair game. Typos and broken links are welcome as direct PRs; open one

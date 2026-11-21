@@ -112,11 +112,11 @@ if ($LASTEXITCODE -ne 0) { throw "已安装状态扩展回归失败，诊断目�
 
 ### 3. 与相邻仓库新构建的状态扩展对比
 
-相邻仓库默认是 `../rpi-package`。仅构建和测试，不执行 install，也不替换安装中的扩展。先完成步骤 1，确保待测宿主是当前源码产物，再运行：
+相邻仓库默认是 `../rpi-extension`。仅构建和测试，不执行 install，也不替换安装中的扩展。先完成步骤 1，确保待测宿主是当前源码产物，再运行：
 
 ```powershell
 $siblingTarget = Join-Path $PWD 'target/session-smoke-sibling-cargo'
-cargo build --manifest-path ../rpi-package/Cargo.toml -p rpi-todo -p rpi-durable --locked --target-dir "$siblingTarget"
+cargo build --manifest-path ../rpi-extension/Cargo.toml -p rpi-todo -p rpi-durable --locked --target-dir "$siblingTarget"
 if ($LASTEXITCODE -ne 0) { throw '相邻扩展构建失败；不能记为扩展测试通过' }
 $diag = 'target/session-smoke-sibling-state-' + [guid]::NewGuid().ToString('N')
 python -B scripts/session-smoke.py --rpi target/session-smoke-cargo/debug/rpi.exe --diagnostics-dir "$diag" --extension "$siblingTarget/debug/rpi_todo.dll" --extension "$siblingTarget/debug/rpi_durable.dll"
@@ -236,7 +236,7 @@ cargo test -p rpi-cli --test btw_package --locked --target-dir target/session-sm
 $extensions = Join-Path $env:USERPROFILE '.rpi/agent/extensions'
 $values = @{
     RPI_TEST_PROVIDER_LIBRARY = "$extensions/rpi_providers.dll"
-    RPI_TEST_PROVIDER_PACKAGE = (Join-Path $PWD '../rpi-package/packages/rpi-providers')
+    RPI_TEST_PROVIDER_PACKAGE = (Join-Path $PWD '../rpi-extension/packages/rpi-providers')
     RPI_TEST_SUBAGENT_LIBRARY = "$extensions/rpi_subagents.dll"
     RPI_TEST_BTW_LIBRARY = "$extensions/rpi_btw.dll"
 }
