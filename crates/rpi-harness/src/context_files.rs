@@ -222,6 +222,15 @@ async fn find_shadowed_context_file(env: &Arc<dyn ExecutionEnv>, cwd: &Path) -> 
         .absolute_path(&repo_dir.join(git_dir).to_string_lossy(), None)
         .await
         .ok()?;
+    // Match native findGitPaths: stale/incomplete worktree metadata must not
+    // suppress ancestor instructions when the worktree has no HEAD.
+    if !env
+        .exists(&git_dir.join("HEAD").to_string_lossy(), None)
+        .await
+        .ok()?
+    {
+        return None;
+    }
     // Submodules have a gitdir but no commondir; do not treat them as worktrees.
     let common_dir = env
         .read_text_file(&git_dir.join("commondir").to_string_lossy(), None)

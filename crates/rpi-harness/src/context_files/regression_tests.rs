@@ -23,6 +23,10 @@ async fn nested_worktree() -> Arc<dyn ExecutionEnv> {
         ("/scope/AGENTS.md", "OUTER"),
         ("/scope/repo/AGENTS.md", "MAIN"),
         ("/scope/repo/.git/config", "[core]"),
+        (
+            "/scope/repo/.git/worktrees/feature/HEAD",
+            "ref: refs/heads/feature\n",
+        ),
         ("/scope/repo/.git/worktrees/feature/commondir", "../..\n"),
         (
             "/scope/repo/worktrees/feature/.git",
@@ -134,6 +138,26 @@ async fn malformed_git_metadata_does_not_suppress_context() {
 }
 
 #[tokio::test]
+async fn missing_worktree_head_keeps_main_instructions() {
+    let env = nested_worktree().await;
+    env.remove(
+        "/scope/repo/.git/worktrees/feature/HEAD",
+        false,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(find_shadowed_context_file(&env, Path::new(CWD))
+        .await
+        .is_none());
+    assert_eq!(
+        contents(&env, CWD).await,
+        ["GLOBAL", "OUTER", "MAIN", "INTERMEDIATE", "FEATURE", "SUB"]
+    );
+}
+
+#[tokio::test]
 async fn submodule_gitdir_without_commondir_keeps_context() {
     let env = nested_worktree().await;
     env.remove(
@@ -158,6 +182,10 @@ async fn sibling_worktree_does_not_shadow_ancestors() {
     let concrete = InMemoryExecutionEnv::with_cwd(PathBuf::from("/scope/sibling"));
     for (path, content) in [
         ("/scope/repo/.git/config", "[core]"),
+        (
+            "/scope/repo/.git/worktrees/feature/HEAD",
+            "ref: refs/heads/feature",
+        ),
         ("/scope/repo/.git/worktrees/feature/commondir", "../.."),
         (
             "/scope/sibling/.git",
@@ -181,6 +209,7 @@ async fn sibling_worktree_does_not_shadow_ancestors() {
 async fn bare_repository_layout_does_not_hide_outer_instructions() {
     let concrete = InMemoryExecutionEnv::with_cwd(PathBuf::from("/scope/main"));
     for (path, content) in [
+        ("/scope/.bare/worktrees/main/HEAD", "ref: refs/heads/main"),
         ("/scope/.bare/worktrees/main/commondir", "../.."),
         ("/scope/main/.git", "gitdir: ../.bare/worktrees/main"),
         ("/scope/AGENTS.md", "OUTER"),
@@ -310,6 +339,11 @@ async fn symlinked_worktree_context_survives_main_shadowing_and_symlinked_cwd() 
     std::fs::create_dir_all(main.join(".git/worktrees/feature")).unwrap();
     std::fs::create_dir_all(worktree.join("src")).unwrap();
     std::fs::write(main.join("AGENTS.md"), "SHARED").unwrap();
+    std::fs::write(
+        main.join(".git/worktrees/feature/HEAD"),
+        "ref: refs/heads/feature\n",
+    )
+    .unwrap();
     std::fs::write(main.join(".git/worktrees/feature/commondir"), "../..\n").unwrap();
     std::fs::write(worktree.join(".git"), "gitdir: ../.git/worktrees/feature\n").unwrap();
     std::os::unix::fs::symlink("../AGENTS.md", worktree.join("AGENTS.md")).unwrap();
