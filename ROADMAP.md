@@ -57,7 +57,7 @@ OpenAI, and a first-class Ollama preset.
 
 The ABI and loader work; the ecosystem is thin. Concretely:
 
-- Keep [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) building
+- Keep [`pi-rust/rpi-extension`](https://github.com/pi-rust/rpi-extension) building
   green against the current ABI and publish a compatibility table per ABI
   version.
 - Ship an extension template (`cargo generate`-style) so a new extension is one
@@ -92,7 +92,7 @@ long session, compaction cost, and interactive TUI frame cost.
 
 Provider boundary cleanup keeps Anthropic and OpenAI in core. DeepSeek,
 OpenRouter, llama.cpp and Proxy share one optional rpi-providers package in the
-independent rpi-package project, with one install and upgrade entry point.
+independent rpi-extension project, with one install and upgrade entry point.
 See [Provider packages](docs/architecture/provider-packages.md) for installation,
 catalog registration, credential isolation and migration details.
 

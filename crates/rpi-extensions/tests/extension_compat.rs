@@ -1,7 +1,7 @@
 //! Native loader gate for the externally built official extension set.
 //!
 //! This is intentionally ignored during ordinary workspace tests. CI invokes it
-//! after building and staging the `rpi-package` catalog, so a missing or ABI
+//! after building and staging the `rpi-extension` catalog, so a missing or ABI
 //! incompatible cdylib cannot be silently skipped by the production loader.
 
 use rpi_extensions::{load_session, PluginDiagnostics};
@@ -35,7 +35,7 @@ fn is_cdylib(path: &Path) -> bool {
 }
 
 #[test]
-#[ignore = "requires the externally built rpi-package extension catalog"]
+#[ignore = "requires the externally built rpi-extension extension catalog"]
 fn every_staged_official_extension_loads_without_skipping() {
     let directory = std::env::var_os("RPI_SMOKE_PLUGIN_DIR")
         .map(PathBuf::from)

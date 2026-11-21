@@ -589,9 +589,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
     env:
-      # Update this deliberately when rpi-package compatibility is reviewed.
+      # Update this deliberately when rpi-extension compatibility is reviewed.
       # The SHA makes the extension set reproducible and auditable.
-      RPI_PACKAGE_REF: 0d8b0d4fe51964a4c8484819df2d47bcb5d4ca36
+      RPI_EXTENSION_REF: e37cb36010ed20db40a9b3a327ae182c8a4637c7
       COMPAT_DIAGNOSTICS_NAME: extension-compat-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out host
@@ -600,9 +600,9 @@ jobs:
       - name: Check out pinned official extension catalog
         uses: actions/checkout@v4
         with:
-          repository: pi-rust/rpi-package
-          ref: ${{ env.RPI_PACKAGE_REF }}
-          path: rpi-package
+          repository: pi-rust/rpi-extension
+          ref: ${{ env.RPI_EXTENSION_REF }}
+          path: rpi-extension
           fetch-depth: 1
 
       - name: Record source revisions and official catalog
@@ -610,13 +610,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "host=$(git rev-parse HEAD)"
-          echo "rpi-package=$(git -C rpi-package rev-parse HEAD)"
+          echo "rpi-extension=$(git -C rpi-extension rev-parse HEAD)"
           python - <<'PY'
           import json
           import pathlib
           import tomllib
           host = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
-          catalog = json.loads(pathlib.Path("rpi-package/catalog/packages.json").read_text())
+          catalog = json.loads(pathlib.Path("rpi-extension/catalog/packages.json").read_text())
           print(f"host-version={host['workspace']['package']['version']}")
           print(f"official-extension-count={len(catalog)}")
           print("official-extensions=" + ",".join(item["name"] for item in catalog))
@@ -657,11 +657,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/sherpa-onnx-archives
-          key: sherpa-onnx-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rpi-package/Cargo.lock') }}
+          key: sherpa-onnx-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rpi-extension/Cargo.lock') }}
 
       - name: Prefetch sherpa-onnx archive
         shell: bash
-        working-directory: rpi-package
+        working-directory: rpi-extension
         run: |
           set -euo pipefail
           version="$(python - <<'PY'
@@ -728,7 +728,7 @@ jobs:
         with:
           workspaces: |
             . -> target/extension-compat
-            rpi-package -> rpi-package/target
+            rpi-extension -> rpi-extension/target
 
       - name: Build the current host
         shell: bash
@@ -736,16 +736,16 @@ jobs:
 
       - name: Build every official extension and protocol bridge
         shell: bash
-        working-directory: rpi-package
+        working-directory: rpi-extension
         run: cargo build --workspace --release --locked
 
       - name: Stage exactly the catalog extensions
         shell: bash
-        working-directory: rpi-package
+        working-directory: rpi-extension
         run: |
           set -euo pipefail
-          cargo run --release --locked -p rpi-package-install -- pack --no-archive --out "$RUNNER_TEMP/rpi-package-dist"
-          stage="$(python - "$RUNNER_TEMP/rpi-package-dist" <<'PY'
+          cargo run --release --locked -p rpi-package-install -- pack --no-archive --out "$RUNNER_TEMP/rpi-extension-dist"
+          stage="$(python - "$RUNNER_TEMP/rpi-extension-dist" <<'PY'
           import pathlib
           import sys
           matches = sorted(pathlib.Path(sys.argv[1]).glob("rpi-packages-*"))
@@ -767,8 +767,8 @@ jobs:
         run: |
           set -euo pipefail
           rpi_bin="target/extension-compat/release/rpi"
-          acp_bin="rpi-package/target/release/rpi-acp-bridge"
-          web_bin="rpi-package/target/release/rpi-web"
+          acp_bin="rpi-extension/target/release/rpi-acp-bridge"
+          web_bin="rpi-extension/target/release/rpi-web"
           case "$RUNNER_OS" in
             Windows) rpi_bin="$rpi_bin.exe"; acp_bin="$acp_bin.exe"; web_bin="$web_bin.exe" ;;
           esac
@@ -786,7 +786,7 @@ jobs:
           name: ${{ env.COMPAT_DIAGNOSTICS_NAME }}-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/${{ env.COMPAT_DIAGNOSTICS_NAME }}
-            ${{ runner.temp }}/rpi-package-dist/**/web.log
+            ${{ runner.temp }}/rpi-extension-dist/**/web.log
           if-no-files-found: ignore
           include-hidden-files: true
 

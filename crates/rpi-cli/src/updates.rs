@@ -3984,4 +3984,50 @@ Connection: close
         assert_eq!(stop_and_join(stop, server, &url), 1);
         assert_eq!(result, Some(("0.11.0".into(), true)));
     }
+
+    #[test]
+    fn legacy_prebuilt_records_still_receive_update_notices() {
+        let _guard = crate::config::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let agent = tempfile::tempdir().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, agent.path());
+        // Records written before exact prebuilt provenance carry only the
+        // publisher marker; a repository move must not stop their notices.
+        let record: crate::install::InstalledNativePackage =
+            serde_json::from_value(serde_json::json!({
+                "name":"demo", "version":"1.0.0",
+                "source":"prebuilt:https://github.com/pi-rust/rpi-package",
+                "artifacts":["custom.so"]
+            }))
+            .unwrap();
+        std::fs::write(
+            agent.path().join("native-packages.json"),
+            serde_json::to_vec(&[record.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(super::native_cache_key(&record), "demo");
+        let mut cache = super::UpdateCache::default();
+        cache
+            .native_packages
+            .insert(super::native_cache_key(&record), "2.0.0".into());
+        let report = super::report_from_cache(&cache);
+        assert_eq!(report.notices.len(), 1);
+        assert_eq!(report.notices[0].command, "rpi extension update demo");
+
+        // A local development build must never be advertised as updatable.
+        let local: crate::install::InstalledNativePackage = serde_json::from_value(
+            serde_json::json!({"name":"local","version":"1.0.0","source":"../local-ext"}),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.path().join("native-packages.json"),
+            serde_json::to_vec(&[local]).unwrap(),
+        )
+        .unwrap();
+        let mut cache = super::UpdateCache::default();
+        cache.native_packages.insert("local".into(), "9.9.9".into());
+        assert!(super::report_from_cache(&cache).notices.is_empty());
+    }
 }
