@@ -25,7 +25,7 @@ by Mario Zechner. It now includes its own Rust-native plugin ABI and execution
 infrastructure. See [Acknowledgements](#acknowledgements) and [NOTICE](NOTICE)
 for upstream attribution.
 
-[Website](https://rpi.bigfisharc.cn/) · [Docs](https://rpi.bigfisharc.cn/docs.html) · [Extension catalog](https://rpi.bigfisharc.cn/packages.html) · [Submit an extension](https://rpi.bigfisharc.cn/submit.html) · [rpi-package](https://github.com/pi-rust/rpi-package)
+[Website](https://rpi.bigfisharc.cn/) · [Docs](https://rpi.bigfisharc.cn/docs.html) · [Extension catalog](https://rpi.bigfisharc.cn/packages.html) · [Submit an extension](https://rpi.bigfisharc.cn/submit.html) · [rpi-extension](https://github.com/pi-rust/rpi-extension)
 
 ## See it in action
 
