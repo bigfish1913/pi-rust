@@ -184,14 +184,22 @@ three different boundaries. Main-lane plugin `send_message(triggerTurn: true)`
 can acquire a lease without an RPC `prompt`, so command wrappers alone cannot
 cover native execution. Ordinary `AgentEnd` is still a per-attempt event.
 
-The RPC ready handshake advertises
-`semantics.executionLifecycle = "correlated-v1"`. Its identities are:
+The parent must set `RPI_RPC_EXECUTION_LIFECYCLE=correlated-v1` **on the child
+command**, not in the global shell environment. Only then does the RPC ready
+handshake advertise `semantics.executionLifecycle = "correlated-v1"`. The
+`semantics.executionLifecycleOptIn` metadata describes the supported opt-in.
+Without it, native keeps legacy progress framing and RPC-command settlements:
+no `execution_started`, `execution_released`, or autonomous `agent_settled` is
+sent, and the active `executionLifecycle` capability is absent. Unknown opt-in
+values also select legacy framing. Its identities in correlated mode are:
 
 - `requestId`: the originating RPC request, or null for autonomous execution.
   It is captured in the caller scope at admission, not inferred from recent
   traffic. Spawned plugin tasks do not inherit the caller scope.
 - `executionId`: a fresh identity for each admission lease. Deferred polls can
-  continue the same durable run under different execution identities.
+  continue the same durable run under different execution identities. An RPC
+  command settlement uses the last lease admitted within that request's scope;
+  a skipped deferred poll does not settle its still-running command.
 - `runId`: durable operation identity, not an execution or request identifier.
   It is null on `execution_started`: admission precedes recovery/poll lookup,
   which may discover an existing durable run. Later progress/release carries
@@ -215,6 +223,14 @@ complete/cancel an unrelated successor. Tool and dialog owners close their own
 requests. Context-only message frames remain session events rather than output
 of whichever request happens to be active.
 
+The bounded stream reserves two queue slots for lifecycle events. Awaited
+progress retains backpressure; only synchronous `ToolExecutionUpdate` partials
+may be dropped under congestion, counted by `ExecutionObserver::dropped_progress`.
+`ToolExecutionEnd` carries the complete result. Assistant deltas and message
+boundaries are never silently dropped, including in compact-delta mode.
+Reader loss is fatal even for a tool partial; lifecycle-only overflow is still
+fatal (a bounded queue cannot accommodate unlimited unconsumed executions).
+
 Lifecycle overflow, reader loss, uncertain recovery/intent/finalization, and an
 accepted command disappearing before settlement fail the host/transport closed.
 A staged outcome or RAII lease drop is not proof of durable completion. A
@@ -229,10 +245,12 @@ complete a request or make another execution idle. An unaccepted, correlated
 that local intent: no execution was started and no settlement will follow.
 A timeout or dropped caller still cannot clear a published intent.
 
-**Roll out native and extcore together.** The new extcore retains an explicit
-legacy path for old native hosts, but legacy framing cannot provide strict
-correlation. Old extcore does not understand the new identity semantics and is
-not safe to pair independently with the added autonomous settlements.
+**Upgrade extcore to enable correlated admission.** Its launcher sets the
+child-only opt-in above and still checks the ready capability: old native hosts
+ignore the opt-in and use extcore's legacy path. Old extcore never opts in, so
+new native does not send it the added autonomous settlements. Both mismatched
+combinations retain legacy limitations (not strict correlation); no installed
+plugin version is used to guess the parent client's protocol support.
 The protocol gaps above have deterministic regression coverage; without the
 original user's wire transcript they are not proof of that incident's cause.
 

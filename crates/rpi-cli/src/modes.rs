@@ -388,6 +388,9 @@ pub async fn rpc_with_durable(
         extension_session,
         message_updates,
         native_durable,
+        crate::rpc::execution::lifecycle_enabled(
+            std::env::var_os(crate::rpc::execution::LIFECYCLE_ENV).as_deref(),
+        ),
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
     )
@@ -512,6 +515,7 @@ where
         extension_session,
         message_updates,
         false,
+        true,
         input,
         output,
     )
@@ -527,6 +531,7 @@ async fn rpc_with_native_durable_io<R, W>(
     extension_session: Option<crate::session::ExtensionSessionCell>,
     message_updates: crate::args::RpcMessageUpdates,
     native_durable: bool,
+    correlated_execution: bool,
     mut input: R,
     output: W,
 ) -> i32
@@ -612,14 +617,14 @@ where
                 let received = tokio::select! {
                     _ = stop.cancelled() => {
                         while let Ok(event) = execution_events.try_recv() {
-                            crate::rpc::execution::forward(&out, event).await;
+                            crate::rpc::execution::forward(&out, event, correlated_execution).await;
                         }
                         break;
                     }
                     event = execution_events.recv() => event,
                 };
                 let Some(event) = received else { break };
-                crate::rpc::execution::forward(&out, event).await;
+                crate::rpc::execution::forward(&out, event, correlated_execution).await;
             }
         })
     };
@@ -692,6 +697,14 @@ where
         }
     };
     let mut ready = rpc_protocol::ready(message_updates);
+    // Advertise active semantics, not merely support. Legacy clients must not
+    // receive autonomous settlements that can clear another request's admission.
+    if !correlated_execution {
+        ready["semantics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("executionLifecycle");
+    }
     ready["durable"] =
         crate::native_durable::experimental_epoch::capabilities_for(harness, native_durable);
     ready["resourceState"] = serde_json::json!({
@@ -4150,11 +4163,24 @@ mod tests {
         RpcOutput,
         tokio::task::JoinHandle<i32>,
     ) {
+        start_test_rpc_with_execution(harness, ui, extension_session, true)
+    }
+
+    pub(super) fn start_test_rpc_with_execution(
+        harness: AgentHarness,
+        ui: rpi_extensions::UiDialogMailbox,
+        extension_session: Option<crate::session::ExtensionSessionCell>,
+        correlated_execution: bool,
+    ) -> (
+        tokio::io::DuplexStream,
+        RpcOutput,
+        tokio::task::JoinHandle<i32>,
+    ) {
         let (client, input) = tokio::io::duplex(4096);
         let output = RpcOutput::default();
         let captured = output.clone();
         let task = tokio::spawn(async move {
-            rpc_with_io_and_lifecycle(
+            rpc_with_native_durable_io(
                 &harness,
                 None,
                 vec![],
@@ -4162,6 +4188,8 @@ mod tests {
                 None,
                 extension_session,
                 crate::args::RpcMessageUpdates::default(),
+                false,
+                correlated_execution,
                 tokio::io::BufReader::new(input),
                 captured,
             )

@@ -5,9 +5,12 @@ use rpi_agent::{AgentEmitter, AgentEvent};
 use serde_json::Value;
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -68,31 +71,114 @@ pub enum ExecutionEvent {
     Barrier(oneshot::Sender<()>),
 }
 
+// Progress holds a separate budget until it leaves the queue. Two slots remain
+// available for Started/Released even when a synchronous tool floods updates.
+struct QueuedEvent {
+    event: ExecutionEvent,
+    _progress: Option<OwnedSemaphorePermit>,
+}
+
+pub struct ExecutionReceiver(mpsc::Receiver<QueuedEvent>);
+impl ExecutionReceiver {
+    pub async fn recv(&mut self) -> Option<ExecutionEvent> {
+        self.0.recv().await.map(|queued| queued.event)
+    }
+    pub fn try_recv(&mut self) -> Result<ExecutionEvent, mpsc::error::TryRecvError> {
+        self.0.try_recv().map(|queued| queued.event)
+    }
+}
+
 #[derive(Clone)]
 pub struct ExecutionObserver {
-    sender: mpsc::Sender<ExecutionEvent>,
+    sender: mpsc::Sender<QueuedEvent>,
+    progress: Arc<Semaphore>,
+    dropped_progress: Arc<AtomicU64>,
     failed: CancellationToken,
 }
 impl ExecutionObserver {
-    pub fn channel(
-        capacity: usize,
-        failed: CancellationToken,
-    ) -> (Self, mpsc::Receiver<ExecutionEvent>) {
+    pub fn channel(capacity: usize, failed: CancellationToken) -> (Self, ExecutionReceiver) {
+        assert!(
+            capacity >= 3,
+            "execution queue needs two lifecycle slots plus progress"
+        );
         let (sender, receiver) = mpsc::channel(capacity);
-        (Self { sender, failed }, receiver)
+        (
+            Self {
+                sender,
+                progress: Arc::new(Semaphore::new(capacity.saturating_sub(2))),
+                dropped_progress: Default::default(),
+                failed,
+            },
+            ExecutionReceiver(receiver),
+        )
     }
-    // Admission/release and tool on_update cannot await. Loss is a transport
-    // failure, never a dropped lifecycle event followed by a healthy connection.
+    /// Only synchronous tool partials can be dropped: ToolExecutionEnd carries
+    /// their complete result. Assistant deltas and message boundaries are not
+    /// disposable (compact-delta clients cannot reconstruct a missing delta).
+    pub fn dropped_progress(&self) -> u64 {
+        self.dropped_progress.load(Ordering::Relaxed)
+    }
+    fn is_progress(event: &ExecutionEvent) -> bool {
+        matches!(
+            event,
+            ExecutionEvent::Progress { .. } | ExecutionEvent::SessionProgress(_)
+        )
+    }
+    fn is_tool_partial(event: &ExecutionEvent) -> bool {
+        matches!(
+            event,
+            ExecutionEvent::Progress {
+                event: AgentEvent::ToolExecutionUpdate { .. },
+                ..
+            } | ExecutionEvent::SessionProgress(AgentEvent::ToolExecutionUpdate { .. })
+        )
+    }
+    // Admission/release and tool on_update cannot await. Lifecycle loss and
+    // reader loss are transport failures; tool-partial congestion is not.
     pub(crate) fn publish(&self, event: ExecutionEvent) {
-        if self.sender.try_send(event).is_err() {
+        let progress = if Self::is_progress(&event) {
+            match self.progress.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) if Self::is_tool_partial(&event) && !self.sender.is_closed() => {
+                    self.dropped_progress.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(_) => {
+                    self.failed.cancel();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if self
+            .sender
+            .try_send(QueuedEvent {
+                event,
+                _progress: progress,
+            })
+            .is_err()
+        {
             self.failed.cancel();
         }
     }
     async fn send(&self, event: ExecutionEvent) {
+        let progress = if Self::is_progress(&event) {
+            tokio::select! {
+                biased;
+                _ = self.failed.cancelled() => return,
+                _ = self.sender.closed() => { self.failed.cancel(); return; },
+                permit = self.progress.clone().acquire_owned() => Some(permit.expect("progress budget stays open")),
+            }
+        } else {
+            None
+        };
         tokio::select! {
             biased;
             _ = self.failed.cancelled() => {},
-            sent = self.sender.send(event) => { if sent.is_err() { self.failed.cancel(); } }
+            sent = self.sender.send(QueuedEvent { event, _progress: progress }) => {
+                if sent.is_err() { self.failed.cancel(); }
+            }
         }
     }
     pub async fn flush(&self) {

@@ -37,6 +37,69 @@ async fn stop(client: &mut tokio::io::DuplexStream, task: tokio::task::JoinHandl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_legacy_client_gets_no_autonomous_settlement_or_execution_frames() {
+    let provider = FauxProvider::new(FauxScript::new().with_text("autonomous").with_text("rpc"));
+    let harness = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+        model: provider.default_model().clone(),
+        models: vec![provider],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let retained = harness.clone();
+    let (mut client, output, task) = super::tests::start_test_rpc_with_execution(
+        harness,
+        rpi_extensions::UiDialogMailbox::new(),
+        None,
+        false,
+    );
+    let ready = output.wait_for(|m| m["type"] == "ready").await;
+    assert!(ready["semantics"]["executionLifecycle"].is_null());
+    assert_eq!(
+        ready["semantics"]["executionLifecycleOptIn"]["value"],
+        "correlated-v1"
+    );
+    retained
+        .lane("main")
+        .send_message(
+            rpi_ai::UserMessage::new("plugin kickoff", 0).into(),
+            rpi_harness::types::SendMessageOptions {
+                trigger_turn: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    output.wait_for(|m| m["type"] == "agent_end").await;
+    // A normal RPC command still settles exactly once in legacy mode.
+    send(
+        &mut client,
+        json!({"type":"prompt", "id":"legacy", "message":"next"}),
+    )
+    .await;
+    let settled = output
+        .wait_for(|m| m["type"] == "agent_settled" && m["requestId"] == "legacy")
+        .await;
+    assert_eq!(settled["outcome"], "completed");
+    stop(&mut client, task).await;
+    let messages = output.messages();
+    assert!(!messages
+        .iter()
+        .any(|m| m["type"] == "execution_started" || m["type"] == "execution_released"));
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["type"] == "agent_settled")
+            .count(),
+        1
+    );
+    assert!(messages
+        .iter()
+        .filter(|m| m["type"] == "agent_start")
+        .all(|m| m.get("executionId").is_none()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_plugin_execution_settles_without_an_rpc_prompt() {
     let (harness, _) = rpc_test_harness("autonomous", 0.0).await;
     let retained = harness.clone();

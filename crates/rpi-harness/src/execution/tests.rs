@@ -117,13 +117,126 @@ async fn release_follows_run_end_callbacks_and_their_durable_context_writes() {
 async fn overflow_and_reader_loss_fail_closed_instead_of_losing_release() {
     for close_reader in [false, true] {
         let failed = CancellationToken::new();
-        let (observer, receiver) = ExecutionObserver::channel(1, failed.clone());
-        let lease = ExecutionLease::new(observer, "main");
+        let (observer, receiver) = ExecutionObserver::channel(3, failed.clone());
+        let first = ExecutionLease::new(observer.clone(), "main");
+        let second = ExecutionLease::new(observer, "main");
         if close_reader {
             drop(receiver);
         }
-        lease.release("run".into(), false);
+        first.release("first".into(), false);
+        second.release("second".into(), false);
         assert!(failed.is_cancelled());
+    }
+}
+
+fn tool_partial() -> AgentEvent {
+    AgentEvent::ToolExecutionUpdate {
+        tool_call_id: "call".into(),
+        tool_name: "bash".into(),
+        args: serde_json::json!({}),
+        partial_result: Arc::new(rpi_agent::types::AgentToolResult::default()),
+    }
+}
+
+#[tokio::test]
+async fn tool_partial_flood_preserves_start_release_and_barrier_order() {
+    let failed = CancellationToken::new();
+    let (observer, mut events) = ExecutionObserver::channel(4, failed.clone());
+    let lease = ExecutionLease::new(observer.clone(), "main");
+    let emitter = lease.emitter(Arc::new(rpi_agent::CollectorEmitter::default()), "run");
+    for _ in 0..1000 {
+        emitter.try_emit(tool_partial());
+    }
+    lease.release("run".into(), false);
+    assert_eq!(observer.dropped_progress(), 998);
+    assert!(!failed.is_cancelled());
+    let flush_observer = observer.clone();
+    let flush = tokio::spawn(async move { flush_observer.flush().await });
+    let mut sequence = Vec::new();
+    loop {
+        match events.recv().await.unwrap() {
+            ExecutionEvent::Started { .. } => sequence.push("start"),
+            ExecutionEvent::Progress {
+                event: AgentEvent::ToolExecutionUpdate { .. },
+                ..
+            } => sequence.push("partial"),
+            ExecutionEvent::Released { .. } => sequence.push("release"),
+            ExecutionEvent::Barrier(done) => {
+                let _ = done.send(());
+                break;
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+    flush.await.unwrap();
+    assert_eq!(sequence, ["start", "partial", "partial", "release"]);
+    assert!(!failed.is_cancelled());
+}
+
+#[tokio::test]
+async fn awaited_message_boundaries_backpressure_without_consuming_release_capacity() {
+    let failed = CancellationToken::new();
+    let (observer, mut events) = ExecutionObserver::channel(3, failed.clone());
+    let lease = ExecutionLease::new(observer.clone(), "main");
+    observer
+        .send(ExecutionEvent::SessionProgress(AgentEvent::TurnStart))
+        .await;
+    // The progress budget is full, but the second async event waits, not drops.
+    let next_observer = observer.clone();
+    let mut next =
+        Box::pin(next_observer.send(ExecutionEvent::SessionProgress(AgentEvent::AgentStart)));
+    assert!(futures::poll!(&mut next).is_pending());
+    assert_eq!(observer.dropped_progress(), 0);
+    lease.release("run".into(), false);
+    assert!(!failed.is_cancelled());
+    assert!(matches!(
+        events.recv().await,
+        Some(ExecutionEvent::Started { .. })
+    ));
+    assert!(matches!(
+        events.recv().await,
+        Some(ExecutionEvent::SessionProgress(AgentEvent::TurnStart))
+    ));
+    next.await;
+    assert!(matches!(
+        events.recv().await,
+        Some(ExecutionEvent::Released { .. })
+    ));
+    assert!(matches!(
+        events.recv().await,
+        Some(ExecutionEvent::SessionProgress(AgentEvent::AgentStart))
+    ));
+    assert!(!failed.is_cancelled());
+}
+
+#[tokio::test]
+async fn reader_loss_unblocks_an_awaited_progress_budget() {
+    let failed = CancellationToken::new();
+    let (observer, events) = ExecutionObserver::channel(3, failed.clone());
+    observer.publish(ExecutionEvent::SessionProgress(tool_partial()));
+    let mut next = Box::pin(observer.send(ExecutionEvent::SessionProgress(AgentEvent::AgentStart)));
+    assert!(futures::poll!(&mut next).is_pending());
+    drop(events);
+    tokio::time::timeout(Duration::from_secs(1), next)
+        .await
+        .unwrap();
+    assert!(failed.is_cancelled());
+}
+
+#[tokio::test]
+async fn partial_reader_loss_and_unexpected_sync_boundary_loss_still_fail_closed() {
+    for close_reader in [false, true] {
+        let failed = CancellationToken::new();
+        let (observer, events) = ExecutionObserver::channel(3, failed.clone());
+        observer.publish(ExecutionEvent::SessionProgress(tool_partial()));
+        if close_reader {
+            drop(events);
+            observer.publish(ExecutionEvent::SessionProgress(tool_partial()));
+        } else {
+            observer.publish(ExecutionEvent::SessionProgress(AgentEvent::AgentStart));
+        }
+        assert!(failed.is_cancelled());
+        assert_eq!(observer.dropped_progress(), 0);
     }
 }
 
