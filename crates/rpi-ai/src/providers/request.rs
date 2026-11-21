@@ -101,7 +101,7 @@ fn transport_error(error: reqwest::Error) -> crate::AiError {
 
     let error = error.without_url();
     let mut message = format!(
-        "http transport error (connect={}, timeout={}, request={}, body={}): {}",
+        "http transport error (connect={}, timed_out={}, request={}, body={}): {}",
         error.is_connect(),
         error.is_timeout(),
         error.is_request(),
@@ -184,7 +184,7 @@ mod tests {
         server.abort();
         let _ = server.await;
         assert!(error.is_retryable());
-        assert!(error.to_string().contains("timeout=true"), "{error}");
+        assert!(error.to_string().contains("timed_out=true"), "{error}");
         assert!(!error.to_string().contains(&address.to_string()), "{error}");
     }
 
