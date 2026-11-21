@@ -339,6 +339,24 @@ pub trait FileSystem: Send + Sync {
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<FileInfo>, FileError>;
 
+    /// Whether a directory contains a file or symlink whose name ends with
+    /// `suffix`. Does not follow symlinks and does not cache negative results.
+    /// Backends may avoid collecting unrelated entries' sizes/timestamps.
+    /// The default preserves compatibility with existing filesystem adapters.
+    async fn has_file_with_suffix(
+        &self,
+        path: &str,
+        suffix: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<bool, FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let entries = self.list_dir(path, cancel).await?;
+        check_cancel_file(cancel, Some(path))?;
+        Ok(entries
+            .iter()
+            .any(|entry| entry.kind != FileKind::Directory && entry.name.ends_with(suffix)))
+    }
+
     /// Follows symlinks (`canonicalize`). Mirrors TS `canonicalPath`. Backends
     /// may return `not_found` or `not_supported` for missing/unsupported paths;
     /// callers (mutation queue) fall back to absolute path on those codes.

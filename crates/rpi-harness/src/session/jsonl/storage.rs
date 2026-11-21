@@ -124,20 +124,31 @@ impl PreparedJsonlRestore {
         self.facts.metadata.clone()
     }
 
+    /// Publish using the ordinary stat fast path. Matching size/mtime is a
+    /// heuristic: same-stamp rewrites/replacements may escape detection. Use
+    /// `commit_strict` when exact replay-generation validation is required.
     pub async fn commit(self) -> SessionResult<JsonlSessionStorage> {
+        self.commit_verified(false).await
+    }
+
+    /// Claim the writer lease, verify the full replay fingerprint once, then
+    /// apply deferred repair. A matching stat never skips content verification.
+    /// This does not protect against writers that ignore an already-held lease.
+    pub async fn commit_strict(self) -> SessionResult<JsonlSessionStorage> {
+        self.commit_verified(true).await
+    }
+
+    async fn commit_verified(self, strict: bool) -> SessionResult<JsonlSessionStorage> {
         let mut storage = self.storage;
-        // Ownership first, then the single fingerprint check: while the lease is
-        // held no compliant writer can change the source, so this digest proves
-        // the replay still matches the generation the deferred repair publishes.
-        // Verifying before the lease would leave a window where a concurrent
-        // append lands between the check and acquisition and is then silently
-        // replaced by the repair.
+        // Ownership precedes verification and deferred repair. Strict mode
+        // always hashes once under the lease; ordinary mode may trust its stat
+        // heuristic. Never move verification ahead of lease acquisition.
         // Timing-only phases; input/output are zero (not payload counts).
         let lease = crate::session::diagnostics::RecoveryPhase::start("prepared_writer_lease");
         storage.ensure_writer_lease().await?;
         lease.finish(0, 0);
         let verify = crate::session::diagnostics::RecoveryPhase::start("prepared_source_verify");
-        storage.verify_loaded_history().await?;
+        storage.verify_loaded_history(strict).await?;
         verify.finish(0, 0);
         let repair = crate::session::diagnostics::RecoveryPhase::start("prepared_repair");
         storage.commit_pending_repair().await?;
@@ -248,9 +259,9 @@ pub struct JsonlSessionStorage {
     /// Exact loaded legacy history, including its header, before writable opt-in.
     legacy_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
     loaded_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
-    /// Physical identity of the replayed generation. A matching stat lets a
-    /// prepared commit skip the full-history digest without weakening change
-    /// detection: any size/mtime difference falls back to the digest.
+    /// Stat hint for the replayed generation, not a content identity. Ordinary
+    /// commits may skip the digest; strict commits always verify the digest.
+    /// Any detected size/mtime difference falls back to the digest.
     loaded_history_identity: Arc<StdMutex<Option<ReplaySourceIdentity>>>,
     pending_repair: Arc<StdMutex<Option<PendingRepair>>>,
 }
@@ -646,23 +657,23 @@ impl JsonlSessionStorage {
         }
     }
 
-    async fn verify_loaded_history(&self) -> SessionResult<()> {
-        let identity = *self
-            .loaded_history_identity
-            .lock()
-            .map_err(|_| SessionError::storage("session history identity lock poisoned"))?;
+    async fn verify_loaded_history(&self, strict: bool) -> SessionResult<()> {
+        let identity = if strict {
+            None
+        } else {
+            *self
+                .loaded_history_identity
+                .lock()
+                .map_err(|_| SessionError::storage("session history identity lock poisoned"))?
+        };
         if let Some(identity) = identity {
             let info = file_result(
                 self.fs.file_info(&self.metadata.path, None).await,
                 "stat prepared session history verifier",
             )?;
-            // Appends, truncations and atomic replacements all change one of
-            // these, so an unchanged stat is evidence that the replay still
-            // describes the published generation and the full digest read can be
-            // skipped. It is not proof: a filesystem with one-second mtime
-            // granularity cannot see a same-size in-place rewrite inside that
-            // second, which is why the identity is only recorded when the mtime
-            // is real (`record_replay_identity` rejects 0).
+            // Heuristic only: same-length rewrites or atomic replacements may
+            // preserve even a nonzero mtime. Strict mode bypasses this shortcut;
+            // unknown mtime (0) also always falls back to the digest.
             if identity.matches(&info) && identity.mtime_ms != 0 {
                 return Ok(());
             }
