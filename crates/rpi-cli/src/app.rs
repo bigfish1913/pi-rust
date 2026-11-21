@@ -494,7 +494,7 @@ async fn run_inner() -> i32 {
         })
         .unwrap_or(false);
     if web_requested && (!web_registered || !stdio_claimed) {
-        eprintln!("error: --web requires the rpi-web server extension; it is missing, disabled, or failed to load.\nInstall it with: rpi install rpi-web --github pi-rust/rpi-package\nThen restart with: rpi --web");
+        eprintln!("error: --web requires the rpi-web server extension; it is missing, disabled, or failed to load.\nInstall it with: rpi install rpi-web --github pi-rust/rpi-extension\nThen restart with: rpi --web");
         return EXIT_USAGE;
     }
     let stdio_lifecycle = reload_context

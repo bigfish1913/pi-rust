@@ -396,11 +396,17 @@ and it does not replace `rpi-plugin-sdk`; a simple tool plugin should not add it
 unnecessarily.
 
 Ready-to-install extensions live in the companion
-[`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
+[`pi-rust/rpi-extension`](https://github.com/pi-rust/rpi-extension) repository, with
 an [online catalog](https://rpi.bigfisharc.cn/packages.html).
 
+The catalog moved from `pi-rust/rpi-package` to `pi-rust/rpi-extension`. Both
+spellings identify the same publisher: existing installs (including records that
+only stored a `prebuilt:<repository>` marker), `--github pi-rust/rpi-package`
+invocations, and the previous CDN prefix keep working, while version discovery
+and startup update checks follow the move and rewrite the recorded source.
+
 Browse the catalog for install commands, or open the
-[`packages/` source directory](https://github.com/pi-rust/rpi-package/tree/main/packages)
+[`packages/` source directory](https://github.com/pi-rust/rpi-extension/tree/main/packages)
 for extension READMEs and examples. Start with `rpi install rpi-todo` above,
 then use the [extension authoring guide](docs/extensions/authoring.md) to build your own.
 
@@ -577,7 +583,7 @@ open an issue. / 微信群图片链接每日更新日期参数以刷新缓存；
 
 ## Star history
 
-[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-package&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-package&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-extension&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-extension&Date)
 
 ## Contributors
 

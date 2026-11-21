@@ -30,7 +30,7 @@ Memory/JSONL/SQLite 继续使用同一个状态机；harness 的 `AssistantFrame
 - completed proof 按 lane/run 区分，不能用 UI 完成或模型结束代替；
 - 不增加工具执行/replay、worker、scheduler，不保证外部副作用 exactly-once。
 
-原生 crate 与外部 `rpi-package` 工作流插件目前同名，不能视为已经完成命名/升级迁移。
+原生 crate 与外部 `rpi-extension` 工作流插件目前同名，不能视为已经完成命名/升级迁移。
 workspace 依赖与发布顺序元数据需要识别新依赖，但本改动不 bump、不 tag、不发布。
 
 ### 2. 选择性队列恢复

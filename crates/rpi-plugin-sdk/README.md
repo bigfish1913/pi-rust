@@ -388,7 +388,7 @@ Rebuild extensions when the SDK contract they require changes.
   templates, safety rules, testing and release checklist.
 - Host-side loader: [`rpi-extensions`](https://crates.io/crates/rpi-extensions).
 - Ready-to-install extensions:
-  [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package).
+  [`pi-rust/rpi-extension`](https://github.com/pi-rust/rpi-extension).
 
 ## License
 

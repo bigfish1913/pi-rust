@@ -1,4 +1,4 @@
-//! Build rpi-providers in the independent rpi-package workspace, then set
+//! Build rpi-providers in the independent rpi-extension workspace, then set
 //! RPI_TEST_PROVIDER_LIBRARY to its DLL/so/dylib and RPI_TEST_PROVIDER_PACKAGE
 //! to its package directory. The host has no vendor crate dependency.
 //! Then run cargo test -p rpi-cli --test provider_packages.

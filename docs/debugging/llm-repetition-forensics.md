@@ -348,7 +348,7 @@ deltas= 8000  elapsed=105ms     (4× 增量 → 7.8× 时间)
 —— 模型把**带编号的计划行原文**当 todo 项传了进来。全会话 6 次 `todo` 调用只建出 2 个真实条目，
 5 项计划从未被完整登记，这正是 re-plan 的直接燃料。
 
-**修复**（`rpi-package/packages/rpi-todo/src/lib.rs`）：
+**修复**（`rpi-extension/packages/rpi-todo/src/lib.rs`）：
 - `save` 改为 temp 文件 + `rename`（Unix / Windows 均原子替换），消灭整类「非截断覆盖」损坏；
 - `normalize_text` 去掉 `1.` / `12)` / `-` / `*` / `•` / `·` 前缀并折叠空白（`1.5x` 这类小数不误伤）；
 - `add` 对**已 pending** 的同名任务返回既有 id，不再重复登记；
@@ -447,7 +447,7 @@ curl -sS -N -X POST "$BASE_URL/chat/completions" \
 |---|---|---|
 | 4.4 直发用户消息回显 | 已修 | `interactive_tui.rs` 三处提交时渲染 + harness 回归测试 |
 | 4.5 `now_ms()` 计数器 | 已修 | `pi-agent/src/clock.rs`（新增），`agent_loop.rs` / `agent.rs` 调用点 |
-| 4.8 todo 非原子写 + 重复登记 | 已修 | `rpi-package/packages/rpi-todo/src/lib.rs`（含 3 个兄弟包） |
+| 4.8 todo 非原子写 + 重复登记 | 已修 | `rpi-extension/packages/rpi-todo/src/lib.rs`（含 3 个兄弟包） |
 | 4.9 working 动画频率 / 帧序 | 已修 | `pi-tui/src/editor.rs`、`loader.rs`、`interactive_tui.rs` tick |
 | 4.10 Ctrl+C 无法退出 | 已修 | `interactive_tui.rs::emergency_exit` |
 | 4.7 O(n²) per-delta 深拷贝 | **未修**（需改事件契约） | `pi-ai/providers/openai_completions.rs`、`pi-agent/agent_loop.rs:426,441` |

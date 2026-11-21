@@ -446,7 +446,7 @@ fn flush_batch(events: Vec<Value>) -> Result<(), String> {
 
 ### 审查报告摘要
 
-根据 [REVIEW.md](https://github.com/pi-rust/rpi-package/blob/main/packages/rpi-langfuse/REVIEW.md) 审查报告：
+根据 [REVIEW.md](https://github.com/pi-rust/rpi-extension/blob/main/packages/rpi-langfuse/REVIEW.md) 审查报告：
 
 **发现的问题（已全部修复）**：
 
@@ -515,8 +515,8 @@ cargo build --package rpi-langfuse --release
 
 | 资源                 | 链接                                                                                                               |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| 📦 源码仓库          | [pi-rust/rpi-package/packages/rpi-langfuse](https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-langfuse) |
-| 📋 审查报告          | [REVIEW.md](https://github.com/pi-rust/rpi-package/blob/main/packages/rpi-langfuse/REVIEW.md)                       |
+| 📦 源码仓库          | [pi-rust/rpi-extension/packages/rpi-langfuse](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-langfuse) |
+| 📋 审查报告          | [REVIEW.md](https://github.com/pi-rust/rpi-extension/blob/main/packages/rpi-langfuse/REVIEW.md)                       |
 | 🔍 Langfuse 官网     | [langfuse.com](https://langfuse.com)                                                                                |
 | 📚 Langfuse API 文档 | [langfuse.com/docs](https://langfuse.com/docs)                                                                      |
 | 🏠 rpi 官网          | [rpi.laofu.online](https://rpi.laofu.online)                                                                        |
@@ -545,4 +545,4 @@ rpi -p "Hello, observable agent!"
 
 ---
 
-*MIT License · Rust 1.78+ · [GitHub](https://github.com/pi-rust/rpi-package) · [Langfuse](https://langfuse.com)*
+*MIT License · Rust 1.78+ · [GitHub](https://github.com/pi-rust/rpi-extension) · [Langfuse](https://langfuse.com)*
