@@ -25,7 +25,7 @@ by Mario Zechner. It now includes its own Rust-native plugin ABI and execution
 infrastructure. See [Acknowledgements](#acknowledgements) and [NOTICE](NOTICE)
 for upstream attribution.
 
-[Website](https://rpi.bigfisharc.cn/) · [Docs](https://rpi.bigfisharc.cn/docs.html) · [Extension catalog](https://rpi.bigfisharc.cn/packages.html) · [rpi-package](https://github.com/pi-rust/rpi-package)
+[Website](https://rpi.bigfisharc.cn/) · [Docs](https://rpi.bigfisharc.cn/docs.html) · [Extension catalog](https://rpi.bigfisharc.cn/packages.html) · [Submit an extension](https://rpi.bigfisharc.cn/submit.html) · [rpi-package](https://github.com/pi-rust/rpi-package)
 
 ## See it in action
 
@@ -506,6 +506,9 @@ Issues and PRs are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for th
 build/test commands and the repository layout, and the
 [roadmap](ROADMAP.md) for what is already planned. Security problems should go
 through [SECURITY.md](SECURITY.md), not a public issue.
+
+Built an extension? [Submit it to the extension catalog](https://rpi.bigfisharc.cn/submit.html).
+欢迎[自主贡献扩展](https://rpi.bigfisharc.cn/submit.html)，与社区分享你的作品。
 
 The whole test suite runs offline: `cargo test --workspace --locked`.
 
