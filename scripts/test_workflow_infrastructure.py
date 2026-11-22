@@ -131,6 +131,50 @@ class AptWorkflowTests(unittest.TestCase):
 
 
 class ChannelWorkflowTests(unittest.TestCase):
+    def drift_workflow(self):
+        return (ROOT / ".github/workflows/release-drift.yml").read_text(encoding="utf-8")
+
+    def step_block(self, text, name):
+        return text.split(f"      - name: {name}\n", 1)[1].split("\n      - name:", 1)[0]
+
+    def test_drift_step_feeds_the_token_env_the_monitor_reads(self):
+        text = self.drift_workflow()
+        monitor = (ROOT / "scripts/check-channel-drift.py").read_text(encoding="utf-8")
+        documented = re.search(r'"--token-env", default="([A-Z_]+)"', monitor)[1]
+        block = self.step_block(text, "Compare every install channel")
+        # release-drift.yml used to export GH_TOKEN for the gh CLI steps only,
+        # which left this API call anonymous and turned its 403 into fake drift.
+        self.assertIn(f"          {documented}: ${{{{ github.token }}}}", block)
+
+    def test_monitor_error_never_opens_the_drift_issue(self):
+        text = self.drift_workflow()
+        self.assertIn("if: steps.drift.outputs.outcome == 'drift'",
+                      self.step_block(text, "Keep one open issue for the current gap"))
+        self.assertIn("if: steps.drift.outputs.outcome == 'clean'",
+                      self.step_block(text, "Close the issue once every tracked channel matches"))
+        failure = self.step_block(text, "Fail when a channel lags or the monitor breaks")
+        self.assertIn("outcome }}\" == 'drift'", failure)
+        self.assertIn("could not determine any channel state", failure)
+
+    def test_compare_step_maps_exit_codes_to_distinct_outcomes(self):
+        text = self.drift_workflow()
+        code = script(text, "Compare every install channel")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory, "output")
+            env = os.environ | {"RUNNER_TEMP": directory.replace("\\", "/"),
+                                "GITHUB_OUTPUT": str(output),
+                                "GITHUB_STEP_SUMMARY": str(Path(directory, "summary"))}
+            for status, expected in ((0, "clean"), (1, "drift"), (2, "error"), (7, "error")):
+                with self.subTest(monitor_exit=status):
+                    output.write_text("", encoding="utf-8")
+                    mock = (f'python3() {{ echo "| npm | 0.22.1 |"; return {status}; }}\n'
+                            'tee() { cat; }\n'
+                            'echo() { builtin echo "$@"; }\n')
+                    result = subprocess.run(["bash"], input=mock + code, text=True,
+                                            capture_output=True, env=env, timeout=15)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    self.assertIn(f"outcome={expected}", output.read_text(encoding="utf-8"))
+
     def test_winget_submission_failure_is_not_hidden_by_tee(self):
         text = (ROOT / ".github/workflows/release-channels.yml").read_text(encoding="utf-8")
         name = "Submit or update the Microsoft winget PR"

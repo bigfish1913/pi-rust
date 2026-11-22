@@ -39,23 +39,38 @@ jobs:
         id: drift
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ github.token }}
+          # The monitor reads GITHUB_TOKEN; GH_TOKEN above is only for the gh CLI
+          # in the reporting steps. Passing only GH_TOKEN here made the API call
+          # unauthenticated and turned a 403 into a false drift report.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
           python3 scripts/check-channel-drift.py \
             --json "$RUNNER_TEMP/drift.json" | tee "$RUNNER_TEMP/drift.md"
           status="${PIPESTATUS[0]}"
           cat "$RUNNER_TEMP/drift.md" >> "$GITHUB_STEP_SUMMARY"
+          # 0 = every tracked channel matches, 1 = real drift, 2 = the monitor
+          # itself failed. Only a real result may create, update or close the
+          # issue; a monitor error must not be reported as a channel problem.
+          case "$status" in
+            0) outcome=clean ;;
+            1) outcome=drift ;;
+            *)
+              outcome=error
+              echo "::error::The channel drift monitor failed (exit $status); no channel result is known."
+              ;;
+          esac
+          echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
           exit "$status"
       - name: Keep one open issue for the current gap
-        if: steps.drift.outcome == 'failure'
+        if: steps.drift.outputs.outcome == 'drift'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           title='Release channel drift'
           {
-            echo 'At least one install channel still serves an older version than the latest stable release. Release automation only warns once; this issue stays open until the channel catches up.'
+            echo 'At least one tracked install channel lags the latest stable release, or could not be verified. Release automation only warns once; this issue stays open until every tracked channel matches.'
             echo
             cat "$RUNNER_TEMP/drift.md"
           } > "$RUNNER_TEMP/issue.md"
@@ -68,7 +83,7 @@ jobs:
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/issue.md"
           fi
       - name: Close the issue once every tracked channel matches
-        if: steps.drift.outcome == 'success'
+        if: steps.drift.outputs.outcome == 'clean'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -80,8 +95,12 @@ jobs:
                 gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
                 gh issue close "$number" --repo "$GITHUB_REPOSITORY"
               done
-      - name: Fail when a channel lags
+      - name: Fail when a channel lags or the monitor breaks
         if: steps.drift.outcome == 'failure'
         run: |
-          echo "::error::An install channel lags the latest stable release; see the drift issue."
+          if [[ "${{ steps.drift.outputs.outcome }}" == 'drift' ]]; then
+            echo "::error::An install channel lags the latest stable release; see the drift issue."
+          else
+            echo "::error::The channel drift monitor could not determine any channel state."
+          fi
           exit 1
