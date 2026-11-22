@@ -22,10 +22,13 @@ compaction, add [`rpi-harness`](https://crates.io/crates/rpi-harness).
 
 ## Design
 
-The only LLM boundary is `StreamFn`, which returns an
-`AssistantMessageEventStream` synchronously. Everything else in the loop speaks
+The LLM boundary is `StreamSource`: either the original synchronous `StreamFn`
+or a borrowed `AsyncStreamFn` that is awaited before consuming its
+`AssistantMessageEventStream`. Both use the same loop. Everything else speaks
 `AgentMessage` and never touches a provider wire format, so a provider, a test
-double and a recorded transcript are interchangeable.
+double and a recorded transcript are interchangeable. Existing `StreamFn`,
+`AgentOptions` struct literals and loop entry points remain compatible; the
+`*_with_stream` entry points accept either contract.
 
 The invariants that the loop guarantees:
 
@@ -76,7 +79,7 @@ async fn main() {
     let agent = AgentBuilder::new()
         .model(model)
         .system_prompt("You are a helpful assistant.")
-        .stream_fn(make_stream_fn(provider))
+        .async_stream_fn(make_stream_fn(provider))
         .build()
         .expect("agent builds");
 
@@ -91,17 +94,20 @@ async fn main() {
     println!("{} messages after the run", agent.state().messages.len());
 }
 
-fn make_stream_fn(provider: Arc<FauxProvider>) -> rpi_agent::StreamFn {
-    rpi_agent::stream_fn(move |model, ctx, opts| {
-        let p = Arc::clone(&provider);
-        let (model, ctx, opts) = (model.clone(), ctx.clone(), opts.clone());
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { p.stream_simple(&model, &ctx, &opts).await })
-        })
+fn make_stream_fn(provider: Arc<FauxProvider>) -> rpi_agent::AsyncStreamFn {
+    rpi_agent::async_stream_fn(move |model, ctx, opts| {
+        let provider = Arc::clone(&provider);
+        Box::pin(async move { provider.stream_simple(model, ctx, opts).await })
     })
 }
 ```
+
+The async factory borrows the model, context and options across opening: it does
+not clone the whole history, block a runtime worker or forward events through an
+extra channel. It also works on a current-thread runtime when its provider does.
+Cancellation drops a pending open and emits an aborted assistant lifecycle.
+Calling `.stream_fn(...)` after `.async_stream_fn(...)`, or vice versa, selects
+the last setter. Synchronous factories retain their original behavior.
 
 A runnable version of this lives in
 [`examples/minimal`](https://github.com/bigfish1913/pi-rust/tree/main/examples/minimal)

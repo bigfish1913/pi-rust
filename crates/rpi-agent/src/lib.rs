@@ -1,8 +1,9 @@
 //! Mirrors `packages/agent/src` (core layer: agent + agent-loop + types + stream-fn).
 //!
-//! Provider-agnostic agent runtime. The only LLM boundary is [`StreamFn`]
-//! (sync return → [`AssistantMessageEventStream`]); everything else talks in
-//! [`AgentMessage`] and never touches a provider wire format.
+//! Provider-agnostic agent runtime. The LLM boundary is [`StreamSource`]: the
+//! original synchronous [`StreamFn`] or a borrowed [`AsyncStreamFn`] opening an
+//! [`rpi_ai::AssistantMessageEventStream`]. Everything else talks in [`AgentMessage`]
+//! and never touches a provider wire format.
 //!
 //! M2 scope per the plan: `AgentTool` trait, `Agent` + `AgentBuilder`,
 //! `run_agent_loop` / `run_agent_loop_continue` free functions, events, hooks,
@@ -31,8 +32,9 @@ pub mod types;
 pub use abort::AbortHandle;
 pub use agent::{Agent, AgentBuilder, AgentOptions};
 pub use agent_loop::{
-    run_agent_loop, run_agent_loop_continue, run_agent_loop_from_assistant, LoopOutcome,
-    NewMessages,
+    run_agent_loop, run_agent_loop_continue, run_agent_loop_continue_with_stream,
+    run_agent_loop_from_assistant, run_agent_loop_from_assistant_with_stream,
+    run_agent_loop_with_stream, LoopOutcome, NewMessages,
 };
 pub use agent_tool::AgentTool;
 pub use error::AgentError;
@@ -44,7 +46,7 @@ pub use hooks::{
 };
 pub use message::{AgentMessage, AgentMessageRole, CustomMessage};
 pub use queue::PendingMessageQueue;
-pub use stream_fn::{stream_fn, StreamFn};
+pub use stream_fn::{async_stream_fn, stream_fn, AsyncStreamFn, StreamFn, StreamSource};
 pub use types::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, AgentLoopTurnUpdate, AgentState,
     AgentToolResult, BeforeToolCallContext, BeforeToolCallResult, QueueMode,

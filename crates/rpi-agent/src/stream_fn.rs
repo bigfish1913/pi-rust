@@ -3,16 +3,17 @@
 //!
 //! TS `StreamFn = (model, context, options?) => AssistantMessageEventStream |
 //! Promise<AssistantMessageEventStream>` — note it may return the stream
-//! *synchronously*. The agent loop never awaits the call itself; it only awaits
-//! `stream.next()` / `stream.result()`. The Rust port models the same contract:
-//! the closure returns the consumer synchronously and a producer task is
-//! already running by the time it returns.
+//! *synchronously*. The original Rust [`StreamFn`] retains that contract.
+//! [`AsyncStreamFn`] additionally allows a borrowed asynchronous open without
+//! blocking a runtime worker or cloning the complete request context.
+//! [`StreamSource`] selects either form; both feed the same event/tool loop.
 //!
 //! `AgentBuilder` lets callers install an explicit `StreamFn`. When omitted,
 //! `get_default_stream_fn` is used; like TS, it errors if no default has been
 //! installed via `set_default_stream_fn` — `pi-ai` providers are not silently
 //! picked so the agent crate stays free of provider wiring.
 
+use futures::future::BoxFuture;
 use rpi_ai::provider::SimpleStreamOptions;
 use rpi_ai::types::Context;
 use rpi_ai::{AssistantMessageEventStream, Model};
@@ -28,6 +29,92 @@ use std::sync::{Arc, OnceLock};
 pub type StreamFn = Arc<
     dyn Fn(&Model, &Context, &SimpleStreamOptions) -> AssistantMessageEventStream + Send + Sync,
 >;
+
+/// Asynchronous provider opening. The future may borrow model/context/options
+/// until it returns the stream; the stream must not retain those borrows.
+/// Like [`StreamFn`], encode failures as terminal Error events, not panics.
+/// Factories must propagate `options.signal` to any work they spawn. Dropping
+/// the opening future on cancellation must release its owned resources.
+pub type AsyncStreamFn = Arc<
+    dyn for<'a> Fn(
+            &'a Model,
+            &'a Context,
+            &'a SimpleStreamOptions,
+        ) -> BoxFuture<'a, AssistantMessageEventStream>
+        + Send
+        + Sync,
+>;
+
+/// A synchronous compatibility factory or native asynchronous factory.
+#[derive(Clone)]
+pub enum StreamSource {
+    Sync(StreamFn),
+    Async(AsyncStreamFn),
+}
+
+impl From<StreamFn> for StreamSource {
+    fn from(factory: StreamFn) -> Self {
+        Self::Sync(factory)
+    }
+}
+
+impl From<AsyncStreamFn> for StreamSource {
+    fn from(factory: AsyncStreamFn) -> Self {
+        Self::Async(factory)
+    }
+}
+
+impl StreamSource {
+    /// Open the stream without retaining a context clone. Native async opening
+    /// is cancellation-aware even if a factory never returns. A synthetic
+    /// aborted terminal stream preserves MessageEnd/TurnEnd/AgentEnd lifecycle.
+    /// The synchronous branch preserves its original call contract verbatim.
+    pub async fn open(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: &SimpleStreamOptions,
+    ) -> AssistantMessageEventStream {
+        match self {
+            Self::Sync(factory) => factory(model, context, options),
+            Self::Async(factory) => {
+                tokio::select! {
+                    biased;
+                    _ = options.signal.cancelled() => {
+                        let (mut producer, stream) = rpi_ai::event_stream::create_assistant_message_event_stream();
+                        let message = rpi_ai::AssistantMessage::terminal(
+                            model.api.clone(), &model.provider, &model.id,
+                            rpi_ai::StopReason::Aborted, "Aborted while opening provider stream", crate::clock::now_ms(),
+                        );
+                        producer.push(rpi_ai::AssistantMessageEvent::Error {
+                            reason: rpi_ai::ErrorReason::Aborted, error: message,
+                        }).await;
+                        stream
+                    }
+                    // Keep factory construction lazy too: pre-cancellation
+                    // must not run hooks or begin external work.
+                    stream = async { factory(model, context, options).await } => stream,
+                }
+            }
+        }
+    }
+}
+
+/// Construct a borrowed asynchronous factory. Return `Box::pin(async move { ... })`
+/// from the closure, cloning only shared service handles needed by its future.
+pub fn async_stream_fn<F>(factory: F) -> AsyncStreamFn
+where
+    F: for<'a> Fn(
+            &'a Model,
+            &'a Context,
+            &'a SimpleStreamOptions,
+        ) -> BoxFuture<'a, AssistantMessageEventStream>
+        + Send
+        + Sync
+        + 'static,
+{
+    Arc::new(factory)
+}
 
 /// Build a `StreamFn` from any `Fn(&Model,&Context,&SimpleStreamOptions) ->
 /// AssistantMessageEventStream + Send + Sync`.

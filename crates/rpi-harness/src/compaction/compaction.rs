@@ -999,5 +999,15 @@ mod tests {
         assert!(is_retryable_assistant_error(&error(
             "503 service unavailable"
         )));
+        // Diagnostic booleans must not accidentally match the retry keyword
+        // classifier: "timed_out=false" is not a timeout, and ConnectionRefused
+        // must not become a retry storm that delays settlement.
+        let refused = "http error: http transport error (connect=true, timed_out=false, request=true, body=false): error sending request; io_kind=ConnectionRefused, os_error=Some(61)";
+        assert!(!is_retryable_assistant_error(&error(refused)), "{refused}");
+        let timed_out = "http error: http transport error (connect=false, timed_out=true, request=true, body=false): operation timed out";
+        assert!(
+            is_retryable_assistant_error(&error(timed_out)),
+            "{timed_out}"
+        );
     }
 }

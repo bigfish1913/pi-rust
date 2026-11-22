@@ -914,6 +914,61 @@ impl FileSystem for OsExecutionEnv {
         Ok(out)
     }
 
+    async fn has_file_with_suffix(
+        &self,
+        path: &str,
+        suffix: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<bool, FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let abs = Self::resolve_path(&self.cwd, path);
+        let error_path = abs.to_string_lossy().into_owned();
+        let suffix = String::from(suffix);
+        let cancel = cancel.cloned();
+        // One blocking job, not one lstat + runtime round-trip per entry. Session
+        // existence checks need names/types only, not every sidecar's metadata.
+        tokio::task::spawn_blocking(move || {
+            check_cancel_file(cancel.as_ref(), Some(&abs.to_string_lossy()))?;
+            let entries = std::fs::read_dir(&abs)
+                .map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))?;
+            for entry in entries {
+                check_cancel_file(cancel.as_ref(), Some(&abs.to_string_lossy()))?;
+                let entry = entry.map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))?;
+                if !entry.file_name().to_string_lossy().ends_with(&suffix) {
+                    continue;
+                }
+                let kind = match entry.file_type() {
+                    Ok(kind) => kind,
+                    Err(error)
+                        if crate::error::io_to_file_code(&error) == FileErrorCode::NotSupported =>
+                    {
+                        continue
+                    }
+                    Err(error) => {
+                        return Err(io_to_file_error(
+                            error,
+                            Some(&entry.path().to_string_lossy()),
+                        ))
+                    }
+                };
+                check_cancel_file(cancel.as_ref(), Some(&abs.to_string_lossy()))?;
+                if kind.is_file() || kind.is_symlink() {
+                    return Ok(true);
+                }
+            }
+            check_cancel_file(cancel.as_ref(), Some(&abs.to_string_lossy()))?;
+            Ok(false)
+        })
+        .await
+        .map_err(|error| {
+            FileError::new(
+                FileErrorCode::Unknown,
+                format!("directory scan task failed: {error}"),
+            )
+            .with_path(error_path)
+        })?
+    }
+
     async fn canonical_path(
         &self,
         path: &str,

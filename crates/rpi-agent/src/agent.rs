@@ -14,14 +14,14 @@
 //! - a per-run `ActiveRun` (abort handle + completion notify) so `prompt`
 //!   blocks until the run settles and `abort`/`wait_for_idle` can act on it.
 
-use crate::agent_loop::{run_agent_loop, run_agent_loop_continue};
+use crate::agent_loop::{run_agent_loop_continue_with_stream, run_agent_loop_with_stream};
 use crate::events::{AgentEmitter, AgentEvent, BroadcastEmitter};
 use crate::hooks::{
     default_convert_to_llm_fn, default_convert_to_llm_incremental_fn, AgentLoopConfig, ConvertToLlm,
 };
 use crate::message::AgentMessage;
 use crate::queue::PendingMessageQueue;
-use crate::stream_fn::{get_default_stream_fn, StreamFn};
+use crate::stream_fn::{get_default_stream_fn, AsyncStreamFn, StreamFn, StreamSource};
 use crate::types::{AgentContext, AgentState, QueueMode, ToolExecutionMode};
 
 use rpi_ai::types::{AssistantMessage, UserContent, UserMessage};
@@ -165,7 +165,7 @@ struct Inner {
     state: Arc<Mutex<MutableAgentState>>,
     convert_to_llm: ConvertToLlm,
     convert_to_llm_incremental: Option<crate::hooks::IncrementalConvertToLlm>,
-    stream_fn: StreamFn,
+    stream_fn: StreamSource,
     steering_queue: SharedQueue,
     follow_up_queue: SharedQueue,
     session_id: Option<String>,
@@ -177,12 +177,15 @@ struct Inner {
 /// Builder for [`Agent`] with a fluent API. Mirrors the TS `new Agent(opts)`.
 pub struct AgentBuilder {
     opts: AgentOptions,
+    // Keep AgentOptions' existing public struct-literal API unchanged.
+    async_stream_fn: Option<AsyncStreamFn>,
 }
 
 impl AgentBuilder {
     pub fn new() -> Self {
         Self {
             opts: AgentOptions::default(),
+            async_stream_fn: None,
         }
     }
 
@@ -226,8 +229,18 @@ impl AgentBuilder {
         self
     }
 
+    /// Select the synchronous compatibility factory. The last stream setter wins.
     pub fn stream_fn(mut self, stream_fn: StreamFn) -> Self {
         self.opts.stream_fn = Some(stream_fn);
+        self.async_stream_fn = None;
+        self
+    }
+
+    /// Select native borrowed asynchronous opening, without a blocking bridge.
+    /// The last stream setter wins; no process-wide async default is installed.
+    pub fn async_stream_fn(mut self, stream_fn: AsyncStreamFn) -> Self {
+        self.async_stream_fn = Some(stream_fn);
+        self.opts.stream_fn = None;
         self
     }
 
@@ -256,12 +269,15 @@ impl AgentBuilder {
         self
     }
 
-    /// Build the `Agent`. Errors if no `stream_fn` was supplied and no default
-    /// has been installed process-wide.
+    /// Build the `Agent`. Errors if neither factory form was supplied and no
+    /// synchronous default has been installed process-wide.
     pub fn build(self) -> Result<Agent, crate::AgentError> {
-        let stream_fn = match self.opts.stream_fn {
-            Some(f) => f,
-            None => get_default_stream_fn()?,
+        let stream_fn = match self.async_stream_fn {
+            Some(factory) => StreamSource::Async(factory),
+            None => StreamSource::Sync(match self.opts.stream_fn {
+                Some(factory) => factory,
+                None => get_default_stream_fn()?,
+            }),
         };
 
         let initial = self.opts.initial_state.unwrap_or_default();
@@ -574,8 +590,8 @@ impl Agent {
             state: Arc::clone(&self.inner.state),
             broadcast: BroadcastEmitter::from_sender(self.inner.event_tx.clone()),
         });
-        let stream_fn = Arc::clone(&self.inner.stream_fn);
-        run_agent_loop(messages, context, config, emit, stream_fn).await?;
+        let stream_fn = self.inner.stream_fn.clone();
+        run_agent_loop_with_stream(messages, context, config, emit, stream_fn).await?;
         Ok(())
     }
 
@@ -597,8 +613,8 @@ impl Agent {
             state: Arc::clone(&self.inner.state),
             broadcast: BroadcastEmitter::from_sender(self.inner.event_tx.clone()),
         });
-        let stream_fn = Arc::clone(&self.inner.stream_fn);
-        run_agent_loop_continue(context, config, emit, stream_fn).await?;
+        let stream_fn = self.inner.stream_fn.clone();
+        run_agent_loop_continue_with_stream(context, config, emit, stream_fn).await?;
         Ok(())
     }
 }

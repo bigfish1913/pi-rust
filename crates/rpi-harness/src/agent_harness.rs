@@ -36,14 +36,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
 use rpi_agent::message::AgentMessage;
 use rpi_agent::{
-    run_agent_loop, run_agent_loop_from_assistant, AfterToolCall, AfterToolResults, AgentContext,
-    AgentEmitter, AgentEvent, AgentLoopConfig, AgentTool, BeforeToolCall, ConvertToLlm, QueueMode,
-    ShouldStopAfterTurnContext, StreamFn, TransformContext,
+    run_agent_loop_from_assistant_with_stream, run_agent_loop_with_stream, AfterToolCall,
+    AfterToolResults, AgentContext, AgentEmitter, AgentEvent, AgentLoopConfig, AgentTool,
+    AsyncStreamFn, BeforeToolCall, ConvertToLlm, QueueMode, ShouldStopAfterTurnContext,
+    TransformContext,
 };
 use rpi_ai::types::{
     AssistantMessage, Content, DeferredHandle, StopReason, ThinkingLevel, Usage, UserContent,
@@ -2505,7 +2505,11 @@ impl AgentHarness {
 
     // -- internal helpers for the surface above ------------------------------
 
-    fn active_operation_snapshot(&self) -> Option<ActiveOperationSnapshot> {
+    /// Cheap observation for supervisors, including pre-provider preparation and
+    /// recovery. Unlike `snapshot`, this performs no Session reads. It is not an
+    /// admission token or a settlement guarantee; cancellation must still target
+    /// the observed run ID, and cleanup must await `wait_for_idle` and drain.
+    pub fn active_operation_snapshot(&self) -> Option<ActiveOperationSnapshot> {
         let inner = self.inner.lock().unwrap();
         inner.active_run.as_ref().map(|a| ActiveOperationSnapshot {
             run_id: a.run_id.clone(),
@@ -2573,6 +2577,28 @@ impl AgentHarness {
                 .then(|| deferred.clone()));
         }
         Ok(None)
+    }
+
+    /// Read the current conversation's parked provider handle without polling it
+    /// or acquiring execution admission. Selected payloads are verified and the
+    /// same bounded recovery query retains full ancestry validation.
+    pub async fn pending_deferred(&self) -> HarnessResult<Option<DeferredHandle>> {
+        let (entry, _) = Self::newest_recovery_entry(&self.session, &self.lane, |entry| {
+            !matches!(entry, Entry::Message(message)
+                if matches!(&message.message, AgentMessage::Assistant(_)))
+        })
+        .await?;
+        match entry {
+            Some(Entry::Message(message)) => match message.message {
+                AgentMessage::Assistant(assistant)
+                    if assistant.stop_reason == StopReason::Deferred =>
+                {
+                    Ok(assistant.deferred)
+                }
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
     }
 
     /// Drive a reconstructed deferred handle to a terminal outcome. Kept
@@ -3979,9 +4005,8 @@ impl AgentHarness {
             })
     }
 
-    /// Build a `StreamFn` that bridges the sync-return contract to the async
-    /// `Provider::stream_simple`. Mirrors `examples/minimal`'s `make_stream_fn`:
-    /// `block_in_place` + `Handle::current().block_on`.
+    /// Build a borrowed asynchronous provider factory. Opening is awaited by
+    /// the agent loop, without `block_in_place` or a nested runtime bridge.
     ///
     /// B4: the closure also captures `provider_hooks`; before each
     /// `stream_simple` it fires `before_request` and applies the returned
@@ -3997,53 +4022,36 @@ impl AgentHarness {
         models: Vec<Arc<dyn AiProvider>>,
         provider_hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
         stream_options: AgentHarnessStreamOptions,
-    ) -> HarnessResult<StreamFn> {
-        // Resolve the provider lazily per call (the model may change between
-        // turns via prepare_next_turn). If no provider matches, emit an Error
-        // terminal event on a synthetic stream.
-        let stream_fn = rpi_agent::stream_fn(
-            move |model: &Model,
-                  ctx: &rpi_ai::types::Context,
-                  opts: &rpi_ai::SimpleStreamOptions| {
-                let provider = models.iter().find(|p| p.id() == model.provider).cloned();
+    ) -> HarnessResult<AsyncStreamFn> {
+        // Resolve lazily per call: prepare_next_turn may change the model.
+        // The immutable pinned options are shared without cloning their maps.
+        let stream_options = Arc::new(stream_options);
+        let stream_fn = rpi_agent::async_stream_fn(move |model, ctx, opts| {
+            let provider = models.iter().find(|p| p.id() == model.provider).cloned();
+            let provider_hooks = provider_hooks.clone();
+            let stream_options = Arc::clone(&stream_options);
+            Box::pin(async move {
                 match provider {
                     Some(p) => {
-                        let model = model.clone();
                         // Hooks usually observe the context without replacing it.
-                        // Keep the history borrowed until an actual patch needs
-                        // a private mutable copy for this request.
+                        // Keep history borrowed until a real patch needs a copy.
                         let mut ctx = std::borrow::Cow::Borrowed(ctx);
-                        // B4 [merge_into]: the loop builds `opts` via
-                        // `AgentLoopConfig::to_stream_options`, which DROPS the
-                        // harness's pinned `headers`/`metadata` (AgentLoopConfig
-                        // has no such fields → to_stream_options sets them None).
-                        // Fold the pinned `AgentHarnessStreamOptions` into the
-                        // live opts here, at the per-call site, so headers/metadata
-                        // reach the provider — then layer the per-call
-                        // `ProviderHooks::before_request` patch on top.
+                        // The loop's options omit pinned headers/metadata. Merge
+                        // those first, then apply per-request extension patches.
                         let mut opts = stream_options.merge_into(opts.clone());
                         if let Some(hooks) = &provider_hooks {
-                            // pi's `transform_context`: the last chance to change
-                            // what the model reads. Applied to `ctx` before the
-                            // request, so a plugin's forced prompt is what this
-                            // request carries — and only this one, since `ctx` is
-                            // rebuilt per call from the loop's context.
-                            if let Some(patch) = hooks.transform_context(&model, &ctx) {
+                            if let Some(patch) = hooks.transform_context(model, &ctx) {
                                 if patch != rpi_ai::ContextPatch::default() {
                                     patch.apply(ctx.to_mut());
                                 }
                             }
-                            if let Some(patch) = hooks.before_request(&model, &ctx, &opts) {
+                            if let Some(patch) = hooks.before_request(model, &ctx, &opts) {
                                 patch.apply(&mut opts);
                             }
                         }
-                        tokio::task::block_in_place(|| {
-                            Handle::current()
-                                .block_on(async move { p.stream_simple(&model, &ctx, &opts).await })
-                        })
+                        p.stream_simple(model, &ctx, &opts).await
                     }
                     None => {
-                        // No provider: synthesize an Error terminal stream.
                         let (mut producer, stream) =
                             rpi_ai::event_stream::create_assistant_message_event_stream();
                         let msg = AssistantMessage::terminal(
@@ -4054,18 +4062,18 @@ impl AgentHarness {
                             format!("No provider registered for '{}'", model.provider),
                             0,
                         );
-                        // Terminal publication never waits for ordinary queue capacity.
-                        let _ = futures::executor::block_on(producer.push(
-                            rpi_ai::types::AssistantMessageEvent::Error {
+                        // Terminal publication does not wait on ordinary capacity.
+                        producer
+                            .push(rpi_ai::types::AssistantMessageEvent::Error {
                                 reason: rpi_ai::types::ErrorReason::Error,
                                 error: msg,
-                            },
-                        ));
+                            })
+                            .await;
                         stream
                     }
                 }
-            },
-        );
+            })
+        });
         Ok(stream_fn)
     }
 
@@ -5414,20 +5422,20 @@ impl AgentHarness {
             // Entering from an assistant runs that message's tools as its very
             // first action, which is exactly why it is never retried (see below).
             let attempt_result = if from_assistant {
-                run_agent_loop_from_assistant(
+                run_agent_loop_from_assistant_with_stream(
                     attempt_context,
                     config.clone(),
                     Arc::clone(&emitter),
-                    Arc::clone(&stream_fn),
+                    Arc::clone(&stream_fn).into(),
                 )
                 .await
             } else {
-                run_agent_loop(
+                run_agent_loop_with_stream(
                     Vec::new(),
                     attempt_context,
                     config.clone(),
                     Arc::clone(&emitter),
-                    Arc::clone(&stream_fn),
+                    Arc::clone(&stream_fn).into(),
                 )
                 .await
             };
@@ -7862,6 +7870,7 @@ mod borrowed_context_tests {
             context: &rpi_ai::Context,
             _: &rpi_ai::SimpleStreamOptions,
         ) -> rpi_ai::AssistantMessageEventStream {
+            tokio::task::yield_now().await;
             *self.0.lock().unwrap() = (
                 context.messages.as_ptr() as usize,
                 context.system_prompt.clone(),
@@ -7893,7 +7902,30 @@ mod borrowed_context_tests {
             }
         }
     }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
+    async fn missing_provider_has_terminal_error_without_a_blocking_runtime() {
+        let factory = AgentHarness::build_stream_fn(vec![], None, Default::default()).unwrap();
+        let model = Model::new(
+            "missing",
+            "Missing",
+            rpi_ai::Api::Faux,
+            "absent",
+            "http://localhost",
+        );
+        let context = rpi_ai::Context::new(vec![]);
+        let result = factory(&model, &context, &Default::default())
+            .await
+            .result()
+            .await
+            .unwrap();
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert!(result
+            .error_message
+            .unwrap()
+            .contains("No provider registered"));
+    }
+
+    #[tokio::test]
     async fn observational_hooks_borrow_history_and_mutating_hooks_are_isolated() {
         for hook in [None, Some(0), Some(1), Some(2)] {
             let observed = Arc::new(Mutex::new((0, None)));
@@ -7911,6 +7943,7 @@ mod borrowed_context_tests {
             context.system_prompt = Some("original".into());
             let model = Model::new("m", "M", rpi_ai::Api::Faux, "probe", "http://localhost");
             stream_fn(&model, &context, &Default::default())
+                .await
                 .result()
                 .await
                 .unwrap();
