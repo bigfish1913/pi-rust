@@ -6,6 +6,7 @@ mod autocomplete_flicker;
 mod clipboard_persistence;
 mod context_panel;
 mod enter_completion;
+mod entry_rendering;
 mod extension_arguments;
 mod native_durable;
 mod session_regressions;
