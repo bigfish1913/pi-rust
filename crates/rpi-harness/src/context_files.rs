@@ -14,12 +14,11 @@
 //! - `loadProjectContextFiles` walks from the global `agentDir` first, then
 //!   ancestor-walks `cwd → root`, **unshift**-ing each dir's match so the
 //!   deepest (closest to cwd) file is concatenated **last** (`:118-156`).
-//! - Each canonical path appears at most once (`seenPaths`, `:126`).
-//!
-//! v1 divergences (documented): the TS worktree *shadowed* context-file
-//! deduplication (`findShadowedContextFile`, `:100-116`) is deferred — it
-//! suppresses a linked worktree's duplicate of the main repo's file and is a
-//! git-layout edge case rpi's resource discovery does not yet need.
+//! - Each resolved path appears at most once (`seenPaths`, `:126`).
+//! - A nested linked worktree's context file shadows the main worktree's
+//!   same-named file. Other ancestor instructions are still inherited.
+//! - Symbolic links to regular files are followed, without changing the
+//!   addressed path shown in the prompt.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,8 +48,9 @@ pub struct ContextFile {
 /// Load the first context file present in `dir`, or `None`. Mirrors
 /// `loadContextFileFromDir` (`resource-loader.ts:70-89`): iterate the candidate
 /// list in order, return the first that exists and is a regular file. A
-/// candidate that exists but is a directory is skipped (`continue`); a read
-/// failure returns `None` (the TS path logs a warning — here the caller's
+/// candidate that exists but is a directory is skipped (`continue`). Symlinks
+/// are followed to verify that their target is a regular file. A read failure
+/// tries the next candidate (the TS path logs a warning — here the caller's
 /// `Diagnostics` channel is owned by the project layer, so this loader is
 /// quiet on read errors, matching the "missing dir is skipped" posture of the
 /// sibling `load_skills`).
@@ -58,18 +58,36 @@ pub async fn load_context_file_from_dir(
     env: &Arc<dyn ExecutionEnv>,
     dir: impl AsRef<Path>,
 ) -> Option<ContextFile> {
-    let dir_str = dir.as_ref().to_string_lossy().to_string();
     let cancel = CancellationToken::new();
+    let dir = env
+        .absolute_path(&dir.as_ref().to_string_lossy(), Some(&cancel))
+        .await
+        .ok()?;
     for name in CONTEXT_FILE_CANDIDATES {
-        let candidate = Path::new(&dir_str).join(name);
+        let candidate = dir.join(name);
         let path_str = candidate.to_string_lossy().to_string();
         let info = match env.file_info(&path_str, Some(&cancel)).await {
             Ok(info) => info,
             Err(e) if e.code == rpi_tools::FileErrorCode::NotFound => continue,
             Err(_) => continue,
         };
-        // Skip directories masquerading as a candidate name.
-        if info.kind != FileKind::File {
+        // file_info uses lstat. Follow only the candidate's symlink here,
+        // preserving the addressed path for display and worktree shadowing.
+        let kind = if info.kind == FileKind::Symlink {
+            let Ok(target) = env.canonical_path(&path_str, Some(&cancel)).await else {
+                continue;
+            };
+            let Ok(target_info) = env
+                .file_info(&target.to_string_lossy(), Some(&cancel))
+                .await
+            else {
+                continue;
+            };
+            target_info.kind
+        } else {
+            info.kind
+        };
+        if kind != FileKind::File {
             continue;
         }
         let content = match env.read_text_file(&path_str, Some(&cancel)).await {
@@ -92,7 +110,8 @@ pub async fn load_context_file_from_dir(
 /// 2. Then walk `cwd → filesystem root`, loading each ancestor dir's first
 ///    match and **unshift**-ing it in front of the accumulated ancestor list,
 ///    so the deepest (closest to `cwd`) file ends up **last** in the output.
-/// 3. Each canonical *path* is included at most once (`seen`).
+/// 3. Each resolved *path* is included at most once (`seen`). A nested linked
+///    worktree's file shadows the same-named file at the main worktree root.
 ///
 /// The result is concatenated in order into the `<project_context>` block by
 /// [`format_project_context`], yielding global-then-shallow-then-deep order,
@@ -107,19 +126,34 @@ pub async fn load_project_context_files(
 
     // 1. Global context (agentDir).
     if let Some(global) = load_context_file_from_dir(env, agent_dir).await {
-        let key = canonical(&global.path);
-        seen.insert(key.clone());
+        let key = path_key(&global.path);
+        seen.insert(key);
         context_files.push(global);
     }
 
+    let Ok(cwd) = env.absolute_path(&cwd.to_string_lossy(), None).await else {
+        return context_files;
+    };
+    let shadowed = find_shadowed_context_file(env, &cwd).await;
+
     // 2. Ancestor walk cwd → root, unshift-ing so cwd's file is last.
     let mut ancestors: Vec<ContextFile> = Vec::new();
-    let mut current = cwd.to_path_buf();
+    let mut current = cwd;
     loop {
         if let Some(file) = load_context_file_from_dir(env, &current).await {
-            let key = canonical(&file.path);
-            if !seen.contains(&key) {
-                seen.insert(key);
+            // Canonicalize the directory, NOT the file: a worktree's symlink
+            // to the main file must remain eligible while the main copy is
+            // shadowed (matching upstream's directory-based comparison).
+            let is_shadowed = if let Some(shadowed) = &shadowed {
+                let real_dir = env
+                    .canonical_path(&current.to_string_lossy(), None)
+                    .await
+                    .unwrap_or_else(|_| current.clone());
+                path_key(&real_dir.join(file.path.file_name().unwrap())) == *shadowed
+            } else {
+                false
+            };
+            if !is_shadowed && seen.insert(path_key(&file.path)) {
                 // `unshift`: prepend so earlier (shallower) discoveries get
                 // pushed down as we walk further toward root — the final
                 // ancestor list is root-first, cwd-last.
@@ -161,23 +195,85 @@ pub fn format_project_context(files: &[ContextFile]) -> String {
     out
 }
 
-/// Best-effort canonicalization for dedup. Mirrors pi's `canonicalizePath`
-/// intent (resolve symlinks + normalize) but without a syscall round-trip when
-/// the path is already absolute: we normalize separators and collapse `.`/`..`
-/// lexically, which is sufficient to dedup the ancestor walk (the same file is
-/// never reached via two non-canonical spellings within a single walk).
-fn canonical(path: &Path) -> String {
-    let normalized = path
-        .components()
-        .filter(|c| {
-            use std::path::Component::*;
-            !matches!(c, CurDir | ParentDir)
-        })
-        .fold(PathBuf::new(), |mut acc, c| {
-            acc.push(c.as_os_str());
-            acc
-        });
-    normalized.to_string_lossy().replace('\\', "/")
+/// Find the main worktree's file hidden by a nested linked worktree. Git's
+/// `.git`/`commondir` files are read through ExecutionEnv, not the host FS or a
+/// subprocess. Missing/malformed metadata leaves normal inheritance intact.
+async fn find_shadowed_context_file(env: &Arc<dyn ExecutionEnv>, cwd: &Path) -> Option<String> {
+    let mut repo_dir = cwd.to_path_buf();
+    let git_file = loop {
+        let candidate = repo_dir.join(".git");
+        match env.file_info(&candidate.to_string_lossy(), None).await {
+            Ok(info) if info.kind == FileKind::Directory => return None,
+            Ok(_) => break candidate,
+            Err(error) if error.code == rpi_tools::FileErrorCode::NotFound => {}
+            Err(_) => return None,
+        }
+        repo_dir = repo_dir.parent()?.to_path_buf();
+    };
+    let git_file = env
+        .read_text_file(&git_file.to_string_lossy(), None)
+        .await
+        .ok()?;
+    let git_dir = git_file.trim().strip_prefix("gitdir:")?.trim();
+    if git_dir.is_empty() {
+        return None;
+    }
+    let git_dir = env
+        .absolute_path(&repo_dir.join(git_dir).to_string_lossy(), None)
+        .await
+        .ok()?;
+    // Match native findGitPaths: stale/incomplete worktree metadata must not
+    // suppress ancestor instructions when the worktree has no HEAD.
+    if !env
+        .exists(&git_dir.join("HEAD").to_string_lossy(), None)
+        .await
+        .ok()?
+    {
+        return None;
+    }
+    // Submodules have a gitdir but no commondir; do not treat them as worktrees.
+    let common_dir = env
+        .read_text_file(&git_dir.join("commondir").to_string_lossy(), None)
+        .await
+        .ok()?;
+    if common_dir.trim().is_empty() {
+        return None;
+    }
+    let common_dir = env
+        .canonical_path(&git_dir.join(common_dir.trim()).to_string_lossy(), None)
+        .await
+        .ok()?;
+    let worktree_root = env
+        .canonical_path(&repo_dir.to_string_lossy(), None)
+        .await
+        .ok()?;
+    let main_root = common_dir.parent()?;
+    let main_key = PathBuf::from(path_key(main_root));
+    let worktree_key = PathBuf::from(path_key(&worktree_root));
+    if !worktree_key.starts_with(&main_key) || worktree_key == main_key {
+        return None;
+    }
+    // Bare layouts (repo/.bare + repo/main) do not have a main checkout here.
+    let main_git_dir = env
+        .canonical_path(&main_root.join(".git").to_string_lossy(), None)
+        .await
+        .ok()?;
+    if path_key(&main_git_dir) != path_key(&common_dir) {
+        return None;
+    }
+    let context = load_context_file_from_dir(env, &worktree_root).await?;
+    Some(path_key(&main_root.join(context.path.file_name()?)))
+}
+
+/// Comparison key for already resolved paths. Do not resolve file symlinks:
+/// distinct repository scopes can intentionally address the same target.
+fn path_key(path: &Path) -> String {
+    let key = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    }
 }
 
 /// Escape a path for safe interpolation into a `path="..."` attribute. The
@@ -194,6 +290,9 @@ fn escape_path(s: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {

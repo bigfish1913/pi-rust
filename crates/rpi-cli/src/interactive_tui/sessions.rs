@@ -654,16 +654,25 @@ pub(super) fn render_history_entries(
                 ) {
                     continue;
                 }
-                let rendered = extension_session.as_ref().and_then(|session| {
-                    extension_entry_component(session, &custom.custom_type, custom.data.clone())
-                });
-                if let Some(component) = rendered {
-                    chat.add_child(component);
-                    chat.add_child(Arc::new(Spacer::new(1)));
-                } else if let Some(text) =
-                    custom_entry_display_text(&custom.custom_type, custom.data.as_ref())
-                {
-                    add_note_message(chat, &text);
+                let rendered = extension_session
+                    .as_ref()
+                    .map(|session| {
+                        extension_entry_component(session, &custom.custom_type, custom.data.clone())
+                    })
+                    .unwrap_or(EntryRenderOutcome::Unhandled);
+                match rendered {
+                    EntryRenderOutcome::Hidden => {}
+                    EntryRenderOutcome::Rendered(component) => {
+                        chat.add_child(component);
+                        chat.add_child(Arc::new(Spacer::new(1)));
+                    }
+                    EntryRenderOutcome::Unhandled => {
+                        if let Some(text) =
+                            custom_entry_display_text(&custom.custom_type, custom.data.as_ref())
+                        {
+                            add_note_message(chat, &text);
+                        }
+                    }
                 }
             }
             Entry::ModelChange(change) => {
@@ -890,21 +899,38 @@ pub(super) fn extension_usage_text(
         .map(ToOwned::to_owned)
 }
 
+/// Entry visibility is distinct from declining a renderer: hidden entries must
+/// not fall back to the host's raw text or leave a transcript spacer behind.
+pub(super) enum EntryRenderOutcome {
+    Unhandled,
+    Hidden,
+    Rendered(Arc<dyn rpi_tui::Component>),
+}
+
 pub(super) fn extension_entry_component(
     session: &crate::session::ExtensionSessionCell,
     custom_type: &str,
     data: Option<serde_json::Value>,
-) -> Option<Arc<dyn rpi_tui::Component>> {
+) -> EntryRenderOutcome {
     let payload = serde_json::json!({
         "customType": custom_type,
         "data": data,
     });
-    let value = invoke_extension_renderer(
+    let Some(value) = invoke_extension_renderer(
         session,
         rpi_extensions::RegisteredRendererKind::Entry,
         &payload,
-    )?;
+    ) else {
+        return EntryRenderOutcome::Unhandled;
+    };
+    // Only the literal boolean false opts in. It takes precedence over text
+    // and lines; missing, true or malformed display preserves legacy behavior.
+    if value.get("display").and_then(serde_json::Value::as_bool) == Some(false) {
+        return EntryRenderOutcome::Hidden;
+    }
     extension_text_component(&value)
+        .map(EntryRenderOutcome::Rendered)
+        .unwrap_or(EntryRenderOutcome::Unhandled)
 }
 
 /// Project an assistant message's content into the provider-free
