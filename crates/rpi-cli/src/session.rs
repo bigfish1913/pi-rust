@@ -58,10 +58,10 @@ use crate::args::Args;
 use crate::docs_tool::create_docs_tool;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
-    discover_append_system_prompt_file, discover_system_prompt_file, extension_dirs,
-    global_extension_dirs, global_prompt_template_dirs, global_skill_dirs,
+    discover_append_system_prompt_file_at, discover_system_prompt_file_at, extension_dirs_at,
+    global_extension_dirs_at, global_prompt_template_dirs_at, global_skill_dirs_at,
     load_prompt_templates_with_precedence, load_skills_with_precedence, project_extension_dirs,
-    project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
+    project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs_at, skill_dirs_at,
 };
 use crate::startup_diagnostics::{Phase, StartupSpan};
 use rpi_extensions::{
@@ -324,10 +324,14 @@ pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
         .session_dir
         .clone()
         .or_else(|| {
-            crate::settings::load_settings()
+            crate::settings::load_settings_at(args.agent_dir.as_deref())
                 .ok()
                 .and_then(|settings| settings.session_dir)
         })
+        // An explicit agent home owns its transcripts unless the caller named
+        // a session dir: `<agent-dir>/sessions` mirrors the profile layout
+        // (`<home>/sessions`) instead of leaking into `<cwd>/.rpi/sessions`.
+        .or_else(|| args.agent_dir.as_ref().map(|home| home.join("sessions")))
         .unwrap_or_else(|| default_session_dir(cwd));
     // Relative roots belong to the launch project, even if an extension later
     // changes the process working directory.
@@ -920,7 +924,7 @@ pub async fn build_prepared(
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted && resource_selection.is_none() => {
-            match discover_system_prompt_file(cwd) {
+            match discover_system_prompt_file_at(args.agent_dir.as_deref(), cwd, true) {
                 Some(path) => {
                     read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
                 }
@@ -951,7 +955,7 @@ pub async fn build_prepared(
     }
     if args.append_system_prompt.is_empty() && resource_selection.is_none() {
         if let Some(path) = project_trusted
-            .then(|| discover_append_system_prompt_file(cwd))
+            .then(|| discover_append_system_prompt_file_at(args.agent_dir.as_deref(), cwd))
             .flatten()
         {
             if let Some(text) = read_prompt_source(&path, &mut context_paths) {
@@ -976,7 +980,7 @@ pub async fn build_prepared(
     // `isProjectTrusted()` (global resources are unconditional). rpi v1 has no
     // trust prompt — project resources are discovered unconditionally (a copied
     // `.rpi/` dir drops in and works). Full trust gating is deferred.
-    let agent_dir = crate::config::agent_dir().ok();
+    let agent_dir = crate::config::agent_dir_at(args.agent_dir.as_deref()).ok();
 
     // ---- B5b: extension resources_discover ----
     // If any plugin registered a `resources_discover` handler, fan the event out
@@ -1014,9 +1018,9 @@ pub async fn build_prepared(
         let mut dirs = if args.dev_local_only || args.project_only {
             project_skill_dirs(cwd)
         } else if project_trusted {
-            skill_dirs(cwd)
+            skill_dirs_at(cwd, args.agent_dir.as_deref())
         } else {
-            global_skill_dirs()
+            global_skill_dirs_at(args.agent_dir.as_deref())
         };
         dirs.extend(args.skill.iter().cloned());
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
@@ -1032,9 +1036,9 @@ pub async fn build_prepared(
         let mut dirs = if args.dev_local_only || args.project_only {
             project_prompt_template_dirs(cwd)
         } else if project_trusted {
-            prompt_template_dirs(cwd)
+            prompt_template_dirs_at(cwd, args.agent_dir.as_deref())
         } else {
-            global_prompt_template_dirs()
+            global_prompt_template_dirs_at(args.agent_dir.as_deref())
         };
         dirs.extend(args.prompt_template.iter().cloned());
         dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
@@ -1125,7 +1129,7 @@ pub async fn build_prepared(
         eprintln!("=== --debug-system-prompt ===");
         let base_src = if args.system_prompt.is_some() {
             "--system-prompt"
-        } else if discover_system_prompt_file(cwd).is_some() {
+        } else if discover_system_prompt_file_at(args.agent_dir.as_deref(), cwd, true).is_some() {
             "SYSTEM.md"
         } else {
             "default"
@@ -1216,7 +1220,8 @@ pub async fn build_prepared(
     // Saved user defaults. Best-effort: a missing or malformed file must not stop
     // a session from starting, and every accessor falls back to the harness
     // default when its key is absent.
-    let saved_settings = crate::settings::load_settings().unwrap_or_default();
+    let saved_settings =
+        crate::settings::load_settings_at(args.agent_dir.as_deref()).unwrap_or_default();
 
     // `httpProxy` applies to rpi's own HTTP clients. Setting the environment is how
     // they are configured (`pi-ai/src/http.rs`), and upstream does the same thing
@@ -2422,7 +2427,7 @@ where
     let context_files = if effective_args.no_context_files || !project_trusted {
         Vec::new()
     } else {
-        let agent_dir = crate::config::agent_dir().ok();
+        let agent_dir = crate::config::agent_dir_at(effective_args.agent_dir.as_deref()).ok();
         let agent_dir_path = agent_dir.unwrap_or_else(|| ctx.cwd.clone());
         load_project_context_files(&env_dyn, &ctx.cwd, &agent_dir_path).await
     };
@@ -2511,7 +2516,11 @@ where
     let mut context_paths = Vec::new();
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None if project_trusted => match discover_system_prompt_file(&ctx.cwd) {
+        None if project_trusted => match discover_system_prompt_file_at(
+            effective_args.agent_dir.as_deref(),
+            &ctx.cwd,
+            true,
+        ) {
             Some(path) => {
                 read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
             }
@@ -2526,7 +2535,9 @@ where
     }
     if effective_args.append_system_prompt.is_empty() {
         if let Some(path) = project_trusted
-            .then(|| discover_append_system_prompt_file(&ctx.cwd))
+            .then(|| {
+                discover_append_system_prompt_file_at(effective_args.agent_dir.as_deref(), &ctx.cwd)
+            })
             .flatten()
         {
             if let Some(text) = read_prompt_source(&path, &mut context_paths) {
@@ -2676,7 +2687,7 @@ fn load_reload_settings_snapshot(
     if !reload_reads_settings(args) {
         return Ok(None);
     }
-    let global = crate::settings::load_settings()
+    let global = crate::settings::load_settings_at(args.agent_dir.as_deref())
         .map_err(|error| format!("could not load global settings: {error}"))?
         .into();
     let project = if project_trusted {
@@ -2724,9 +2735,9 @@ where
     } else if args.project_only {
         project_extension_dirs(cwd)
     } else if project_trusted {
-        extension_dirs(cwd)
+        extension_dirs_at(cwd, args.agent_dir.as_deref())
     } else {
-        global_extension_dirs()
+        global_extension_dirs_at(args.agent_dir.as_deref())
     };
     if !args.no_extensions {
         extension_dirs.extend(args.extensions_dir.iter().cloned());
@@ -2737,9 +2748,9 @@ where
     } else if args.dev_local_only || args.project_only {
         project_skill_dirs(cwd)
     } else if project_trusted {
-        skill_dirs(cwd)
+        skill_dirs_at(cwd, args.agent_dir.as_deref())
     } else {
-        global_skill_dirs()
+        global_skill_dirs_at(args.agent_dir.as_deref())
     };
 
     let prompt_base_dirs = if args.no_prompt_templates {
@@ -2747,9 +2758,9 @@ where
     } else if args.dev_local_only || args.project_only {
         project_prompt_template_dirs(cwd)
     } else if project_trusted {
-        prompt_template_dirs(cwd)
+        prompt_template_dirs_at(cwd, args.agent_dir.as_deref())
     } else {
-        global_prompt_template_dirs()
+        global_prompt_template_dirs_at(args.agent_dir.as_deref())
     };
 
     before_verify();
@@ -2853,7 +2864,7 @@ pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
     if let Some(override_value) = args.trust_override {
         return override_value;
     }
-    crate::config::project_trust_decision(cwd)
+    crate::config::project_trust_decision_at(args.agent_dir.as_deref(), cwd)
         .ok()
         .flatten()
         .unwrap_or(true)
@@ -2872,9 +2883,9 @@ fn startup_extension_dirs(args: &Args, cwd: &Path, project_trusted: bool) -> Vec
     } else if args.project_only {
         project_extension_dirs(cwd)
     } else if project_trusted {
-        extension_dirs(cwd)
+        extension_dirs_at(cwd, args.agent_dir.as_deref())
     } else {
-        global_extension_dirs()
+        global_extension_dirs_at(args.agent_dir.as_deref())
     };
     dirs.extend(args.extensions_dir.iter().cloned());
     dirs
@@ -2911,10 +2922,11 @@ pub(crate) fn load_extensions(
 fn registry_aware_extension_inputs(
     dirs: &[PathBuf],
     explicit_files: &[PathBuf],
+    agent_dir_home: Option<&Path>,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     // `agent_dir` owns the registry file; `global_dir` is the directory the
     // loader would otherwise scan. Keep both: the helpers take the agent dir.
-    let agent_dir = crate::config::agent_dir().ok();
+    let agent_dir = crate::config::agent_dir_at(agent_dir_home).ok();
     let global_dir = agent_dir.as_ref().map(|dir| dir.join("extensions"));
     let mut filtered_dirs = Vec::with_capacity(dirs.len());
     let mut files = explicit_files.to_vec();
@@ -2967,7 +2979,8 @@ fn load_extensions_from_dirs(
     host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> ExtensionSession {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
-    let (dirs, files) = registry_aware_extension_inputs(dirs, &args.extension);
+    let (dirs, files) =
+        registry_aware_extension_inputs(dirs, &args.extension, args.agent_dir.as_deref());
     // B5a: the action bridge is cloned into every loaded plugin's vtable
     // `user_data` so post-register `runtime_action` calls recover the harness
     // host from any thread. The call site already gates `load_extensions` behind
@@ -3049,6 +3062,11 @@ fn merge_extension_tools(
 /// forgotten `timeout` from hanging the run forever — the "卡住" report).
 /// `RPI_BASH_TIMEOUT` overrides; a model-supplied timeout always wins.
 pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
+    bash_options_at(None)
+}
+
+/// [`bash_options`] under an explicit agent home (`--agent-dir`).
+pub fn bash_options_at(agent_dir: Option<&Path>) -> rpi_tools::tools::bash::BashToolOptions {
     use rpi_tools::tools::bash::BashToolOptions;
     let default = std::env::var("RPI_BASH_TIMEOUT")
         .ok()
@@ -3059,7 +3077,7 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     // alias/`shopt` setup). Native's `shellPath` is *not* wired: neither
     // `BashToolOptions` nor `ShellCaptureOptions` carries a shell binary today, so
     // honouring it means plumbing one through pi-tools first.
-    let settings = crate::settings::load_settings().unwrap_or_default();
+    let settings = crate::settings::load_settings_at(agent_dir).unwrap_or_default();
     BashToolOptions {
         command_prefix: settings.shell_command_prefix.clone(),
         default_timeout: Some(default),
@@ -3104,7 +3122,10 @@ fn build_tools_bound(
         ),
         (
             "bash",
-            HarnessTool::new(create_bash_tool(ctx, Some(bash_options()))),
+            HarnessTool::new(create_bash_tool(
+                ctx,
+                Some(bash_options_at(args.agent_dir.as_deref())),
+            )),
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
@@ -3131,7 +3152,7 @@ fn build_tools_bound(
     // Apply default_tools from settings (if no CLI override)
     if args.tools.is_none() && args.resource_config.is_none() && args.resource_transition.is_none()
     {
-        if let Ok(settings) = crate::settings::load_settings() {
+        if let Ok(settings) = crate::settings::load_settings_at(args.agent_dir.as_deref()) {
             if let Some(default_tools) = &settings.default_tools {
                 all.retain(|(name, _)| default_tools.iter().any(|t| t == name));
             }
@@ -5873,6 +5894,105 @@ mod tests {
         assert_eq!(outcome.project_trusted, Some(true));
     }
 
+    /// An explicit agent home owns its transcripts: the default session root
+    /// is `<agent-dir>/sessions`, while `--session-dir` still wins.
+    #[test]
+    fn agent_dir_defaults_the_session_root_under_the_home() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let args = Args {
+            agent_dir: Some(home.path().to_path_buf()),
+            ..Args::default()
+        };
+        assert_eq!(
+            configured_session_dir(&args, cwd.path()),
+            home.path().join("sessions")
+        );
+
+        let explicit = cwd.path().join("explicit-sessions");
+        let args = Args {
+            agent_dir: Some(home.path().to_path_buf()),
+            session_dir: Some(explicit.clone()),
+            ..Args::default()
+        };
+        assert_eq!(configured_session_dir(&args, cwd.path()), explicit);
+    }
+
+    /// `/reload` must re-read resources from the `--agent-dir` home, not the
+    /// process default and not a startup snapshot.
+    #[test]
+    fn reload_inputs_reread_the_selected_agent_home() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let process_home = tempfile::tempdir().unwrap();
+        let selected_home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, process_home.path());
+        let process_skills = process_home.path().join("process-only-skills");
+        std::fs::create_dir_all(&process_skills).unwrap();
+        let selected_skills = selected_home.path().join("skills");
+        std::fs::create_dir_all(selected_skills.join("base")).unwrap();
+        std::fs::write(
+            selected_skills.join("base").join("SKILL.md"),
+            "---\nname: base\ndescription: base skill\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(selected_home.path().join("settings.json"), "{}").unwrap();
+
+        let args = Args {
+            agent_dir: Some(selected_home.path().to_path_buf()),
+            no_session: true,
+            no_extensions: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            ..Args::default()
+        };
+
+        let first = prepare_reload_inputs(&args, cwd.path(), false).unwrap();
+        assert!(
+            first
+                .skill_base_dirs
+                .iter()
+                .any(|dir| dir == &selected_skills),
+            "{:?}",
+            first.skill_base_dirs
+        );
+        assert!(
+            first
+                .skill_base_dirs
+                .iter()
+                .all(|dir| !dir.starts_with(process_home.path())),
+            "{:?}",
+            first.skill_base_dirs
+        );
+
+        // A settings change in the selected home is observed by the next
+        // reload pass (the file is re-read, not cached at startup).
+        let extra = selected_home.path().join("extra-skills");
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(
+            selected_home.path().join("settings.json"),
+            serde_json::json!({"skillDirs": [extra]}).to_string(),
+        )
+        .unwrap();
+        let second = prepare_reload_inputs(&args, cwd.path(), false).unwrap();
+        assert!(
+            second.skill_base_dirs.iter().any(|dir| dir == &extra),
+            "{:?}",
+            second.skill_base_dirs
+        );
+    }
+
     #[test]
     fn registry_aware_global_selection_falls_back_when_the_registry_is_corrupt() {
         struct RestoreConfigDir(Option<std::ffi::OsString>);
@@ -5898,7 +6018,7 @@ mod tests {
         // An unreadable registry cannot tell us which artifacts are retired. Keep
         // the historical directory scan instead of silently loading nothing.
         let dirs = vec![extensions.clone()];
-        let (scan_dirs, files) = registry_aware_extension_inputs(&dirs, &[]);
+        let (scan_dirs, files) = registry_aware_extension_inputs(&dirs, &[], None);
         assert!(
             scan_dirs.contains(&extensions),
             "a corrupt registry must not disable every global extension"
@@ -5955,8 +6075,11 @@ mod tests {
         };
         let startup_dirs = startup_extension_dirs(&args, &cwd, false);
         assert!(startup_dirs.contains(&extensions));
-        let (startup_scan_dirs, startup_files) =
-            registry_aware_extension_inputs(&startup_dirs, &args.extension);
+        let (startup_scan_dirs, startup_files) = registry_aware_extension_inputs(
+            &startup_dirs,
+            &args.extension,
+            args.agent_dir.as_deref(),
+        );
         assert!(!startup_scan_dirs.contains(&extensions));
         assert!(startup_files.contains(&active));
         assert!(startup_files.contains(&legacy));
@@ -5964,8 +6087,11 @@ mod tests {
         assert!(!startup_files.contains(&stale_rpi_web));
 
         let prepared = prepare_reload_inputs_inner(&args, &cwd, false, || {}).unwrap();
-        let (reload_scan_dirs, reload_files) =
-            registry_aware_extension_inputs(&prepared.extension_dirs, &args.extension);
+        let (reload_scan_dirs, reload_files) = registry_aware_extension_inputs(
+            &prepared.extension_dirs,
+            &args.extension,
+            args.agent_dir.as_deref(),
+        );
         assert!(!reload_scan_dirs.contains(&extensions));
         assert_eq!(reload_files, startup_files);
     }
@@ -5993,7 +6119,7 @@ mod tests {
         std::fs::write(&legacy, b"cdylib").unwrap();
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
-        let (dirs, files) = registry_aware_extension_inputs(&[extensions.clone()], &[]);
+        let (dirs, files) = registry_aware_extension_inputs(&[extensions.clone()], &[], None);
         assert!(dirs.is_empty());
         assert_eq!(files, vec![legacy]);
     }

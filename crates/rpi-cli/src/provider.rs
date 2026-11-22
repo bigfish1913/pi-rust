@@ -42,7 +42,11 @@ fn runtime_settings(settings: settings::Settings) -> rpi_runtime::RuntimeSetting
         http_idle_timeout_ms: timeout,
     }
 }
-fn resolve_with_factories(
+/// Resolve with an explicit agent home (`--agent-dir`): models.json and
+/// auth.json are read from that home, never the process home.
+#[allow(clippy::too_many_arguments)]
+fn resolve_with_factories_at(
+    agent_dir: Option<&std::path::Path>,
     provider: Option<&str>,
     model: Option<&str>,
     thinking: Option<ThinkingLevel>,
@@ -52,8 +56,8 @@ fn resolve_with_factories(
     factories: &RuntimeFactories,
 ) -> Result<ResolvedModel, ResolveError> {
     rpi_runtime::RuntimeConfig {
-        models: config::load_models_config()?,
-        credentials: config::read_auth()?,
+        models: config::load_models_config_at(agent_dir)?,
+        credentials: config::read_auth_at(agent_dir)?,
         settings: runtime_settings(settings),
     }
     .resolve(
@@ -76,8 +80,29 @@ pub fn resolve(
     cli_api_key: Option<&str>,
     cli_base_url: Option<&str>,
 ) -> Result<ResolvedModel, ResolveError> {
-    let settings = settings::load_settings().unwrap_or_default();
-    resolve_with_settings(
+    resolve_with_home(
+        None,
+        cli_provider,
+        cli_model,
+        cli_thinking,
+        cli_api_key,
+        cli_base_url,
+    )
+}
+
+/// Resolve against an explicit agent home (`--agent-dir`). `None` = process
+/// default (`RPI_CODING_AGENT_DIR` / `~/.rpi/agent`).
+pub fn resolve_with_home(
+    agent_dir: Option<&std::path::Path>,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    cli_thinking: Option<ThinkingLevel>,
+    cli_api_key: Option<&str>,
+    cli_base_url: Option<&str>,
+) -> Result<ResolvedModel, ResolveError> {
+    let settings = settings::load_settings_at(agent_dir).unwrap_or_default();
+    resolve_with_settings_at(
+        agent_dir,
         cli_provider,
         cli_model,
         cli_thinking,
@@ -97,8 +122,32 @@ pub fn resolve_for_cwd(
     cwd: &std::path::Path,
     project_trusted: bool,
 ) -> Result<ResolvedModel, ResolveError> {
-    let settings = settings::load_effective_model_settings(cwd, project_trusted)?;
-    resolve_with_settings(
+    resolve_for_cwd_with_home(
+        None,
+        cli_provider,
+        cli_model,
+        cli_thinking,
+        cli_api_key,
+        cli_base_url,
+        cwd,
+        project_trusted,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_for_cwd_with_home(
+    agent_dir: Option<&std::path::Path>,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    cli_thinking: Option<ThinkingLevel>,
+    cli_api_key: Option<&str>,
+    cli_base_url: Option<&str>,
+    cwd: &std::path::Path,
+    project_trusted: bool,
+) -> Result<ResolvedModel, ResolveError> {
+    let settings = settings::load_effective_model_settings_at(agent_dir, cwd, project_trusted)?;
+    resolve_with_settings_at(
+        agent_dir,
         cli_provider,
         cli_model,
         cli_thinking,
@@ -108,7 +157,9 @@ pub fn resolve_for_cwd(
     )
 }
 
-fn resolve_with_settings(
+#[allow(clippy::too_many_arguments)]
+fn resolve_with_settings_at(
+    agent_dir: Option<&std::path::Path>,
     cli_provider: Option<&str>,
     cli_model: Option<&str>,
     cli_thinking: Option<ThinkingLevel>,
@@ -116,7 +167,8 @@ fn resolve_with_settings(
     cli_base_url: Option<&str>,
     settings: settings::Settings,
 ) -> Result<ResolvedModel, ResolveError> {
-    resolve_with_factories(
+    resolve_with_factories_at(
+        agent_dir,
         cli_provider,
         cli_model,
         cli_thinking,
@@ -133,8 +185,10 @@ pub fn resolve_with_extensions(
     trusted: bool,
     session: &rpi_extensions::ExtensionSession,
 ) -> Result<ResolvedModel, ResolveError> {
-    let settings = settings::load_effective_model_settings(cwd, trusted)?;
-    resolve_with_factories(
+    let settings =
+        settings::load_effective_model_settings_at(args.agent_dir.as_deref(), cwd, trusted)?;
+    resolve_with_factories_at(
+        args.agent_dir.as_deref(),
         args.provider.as_deref(),
         args.model.as_deref(),
         args.thinking,

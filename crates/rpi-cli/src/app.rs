@@ -179,11 +179,15 @@ async fn run_inner() -> i32 {
     match argv.first().map(String::as_str) {
         Some("auth") => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-            let args = crate::args::parse_args(&argv[1..]);
+            let mut args = crate::args::parse_args(&argv[1..]);
             if !args.errors.is_empty() {
                 for error in &args.errors {
                     eprintln!("error: {error}");
                 }
+                return EXIT_USAGE;
+            }
+            if let Err(error) = install_agent_dir_override(&mut args) {
+                eprintln!("error: {error}");
                 return EXIT_USAGE;
             }
             let trusted = crate::session::resolve_project_trust(&args, &cwd);
@@ -236,6 +240,10 @@ async fn run_inner() -> i32 {
         eprintln!(
             "error: --resource-config is restart-only and cannot be combined with dev/dev-local"
         );
+        return EXIT_USAGE;
+    }
+    if let Err(error) = install_agent_dir_override(&mut parsed) {
+        eprintln!("error: {error}");
         return EXIT_USAGE;
     }
     let cwd = match resolve_cwd() {
@@ -677,7 +685,7 @@ async fn run_inner() -> i32 {
                         let session = reload_context.extension_session.lock().unwrap();
                         session.snapshot_arc()
                     };
-                    crate::modes::rpc_with_durable(
+                    crate::modes::rpc_with_durable_home(
                         &harness,
                         Some(event_rx),
                         model_catalog,
@@ -686,6 +694,7 @@ async fn run_inner() -> i32 {
                         Some(reload_context.extension_session.clone()),
                         parsed.rpc_message_updates,
                         parsed.native_durable,
+                        parsed.agent_dir.clone(),
                     )
                     .await
                 };
@@ -741,6 +750,23 @@ fn handle_parse_short_circuits(parsed: &Args) -> Option<i32> {
     }
 
     None
+}
+
+/// Apply the CLI `--agent-dir` home once, before any config/resource read.
+///
+/// Pins the historical `RPI_CODING_AGENT_DIR` override to the validated home so
+/// legacy readers that still call `config::agent_dir()` directly (settings,
+/// trust, the extension event log, installer state) and the explicit `_at`
+/// paths all observe one home. Because this runs after process env is inherited
+/// and before any consumer, `--agent-dir` wins over an inherited
+/// `RPI_CODING_AGENT_DIR`.
+fn install_agent_dir_override(args: &mut Args) -> Result<(), String> {
+    let validated = crate::config::validate_agent_dir_override(args.agent_dir.as_deref())?;
+    if let Some(dir) = &validated {
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, dir);
+    }
+    args.agent_dir = validated;
+    Ok(())
 }
 
 fn resolve_cwd() -> Result<std::path::PathBuf, i32> {

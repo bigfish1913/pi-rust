@@ -18,6 +18,7 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::io::{BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rpi_agent::events::AgentEvent;
@@ -371,6 +372,33 @@ pub async fn rpc(
 
 pub async fn rpc_with_durable(
     harness: &AgentHarness,
+    agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    model_catalog: Vec<rpi_ai::Model>,
+    ui_dialog: rpi_extensions::UiDialogMailbox,
+    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    extension_session: Option<crate::session::ExtensionSessionCell>,
+    message_updates: crate::args::RpcMessageUpdates,
+    native_durable: bool,
+) -> i32 {
+    rpc_with_durable_home(
+        harness,
+        agent_events,
+        model_catalog,
+        ui_dialog,
+        oauth_snapshot,
+        extension_session,
+        message_updates,
+        native_durable,
+        None,
+    )
+    .await
+}
+
+/// [`rpc_with_durable`] with the session's `--agent-dir` home, so RPC
+/// write/status commands operate on the same home as the running session.
+#[allow(clippy::too_many_arguments)]
+pub async fn rpc_with_durable_home(
+    harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
@@ -378,6 +406,7 @@ pub async fn rpc_with_durable(
     extension_session: Option<crate::session::ExtensionSessionCell>,
     message_updates: crate::args::RpcMessageUpdates,
     native_durable: bool,
+    agent_dir: Option<PathBuf>,
 ) -> i32 {
     rpc_with_native_durable_io(
         harness,
@@ -391,6 +420,7 @@ pub async fn rpc_with_durable(
         crate::rpc::execution::lifecycle_enabled(
             std::env::var_os(crate::rpc::execution::LIFECYCLE_ENV).as_deref(),
         ),
+        agent_dir,
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
     )
@@ -516,6 +546,7 @@ where
         message_updates,
         false,
         true,
+        None,
         input,
         output,
     )
@@ -532,6 +563,7 @@ async fn rpc_with_native_durable_io<R, W>(
     message_updates: crate::args::RpcMessageUpdates,
     native_durable: bool,
     correlated_execution: bool,
+    agent_dir: Option<PathBuf>,
     mut input: R,
     output: W,
 ) -> i32
@@ -1320,14 +1352,18 @@ where
             "clear_queue" => rpc_clear_queue(&lane).await,
             "navigate" => rpc_navigate(&lane, &msg, extension_session.as_ref()).await,
             "get_available_models" => Ok(rpc_get_available_models(&model_catalog)),
-            "get_auth_status" => Ok(rpc_get_auth_status(&model_catalog, oauth_snapshot.as_ref())),
+            "get_auth_status" => Ok(rpc_get_auth_status(
+                &model_catalog,
+                oauth_snapshot.as_ref(),
+                agent_dir.as_deref(),
+            )),
             "get_provider_models" => rpc_get_provider_models(&msg).await,
             "test_provider_config" => rpc_test_provider_config(&msg).await,
-            "oauth" => rpc_oauth(&oauth_snapshot, &msg),
-            "set_api_key" => rpc_set_api_key(&msg).await,
-            "set_provider_config" => rpc_set_provider_config(&msg),
-            "update_provider_config" => rpc_update_provider_config(&msg),
-            "delete_provider_config" => rpc_delete_provider_config(&msg),
+            "oauth" => rpc_oauth(&oauth_snapshot, &msg, agent_dir.as_deref()),
+            "set_api_key" => rpc_set_api_key(&msg, agent_dir.as_deref()).await,
+            "set_provider_config" => rpc_set_provider_config(&msg, agent_dir.as_deref()),
+            "update_provider_config" => rpc_update_provider_config(&msg, agent_dir.as_deref()),
+            "delete_provider_config" => rpc_delete_provider_config(&msg, agent_dir.as_deref()),
             "set_model" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
                 Err("cannot set model while a run or prompt validation is active".into())
             }
@@ -2691,11 +2727,14 @@ fn rpc_project_transcript(
     Ok(items)
 }
 
-fn rpc_auth_provider_ids(model_catalog: &[rpi_ai::Model]) -> std::collections::BTreeSet<String> {
+fn rpc_auth_provider_ids(
+    model_catalog: &[rpi_ai::Model],
+    agent_dir: Option<&Path>,
+) -> std::collections::BTreeSet<String> {
     let mut providers =
         std::collections::BTreeSet::from(["anthropic".to_string(), "openai".to_string()]);
     providers.extend(model_catalog.iter().map(|model| model.provider.clone()));
-    if let Ok(models) = crate::config::load_models_config() {
+    if let Ok(models) = crate::config::load_models_config_at(agent_dir) {
         providers.extend(models.providers.keys().cloned());
     }
     providers
@@ -2704,9 +2743,10 @@ fn rpc_auth_provider_ids(model_catalog: &[rpi_ai::Model]) -> std::collections::B
 fn rpc_get_auth_status(
     model_catalog: &[rpi_ai::Model],
     oauth_snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
+    agent_dir: Option<&Path>,
 ) -> serde_json::Value {
-    let store = crate::config::read_auth().unwrap_or_default();
-    let models = crate::config::load_models_config().unwrap_or_default();
+    let store = crate::config::read_auth_at(agent_dir).unwrap_or_default();
+    let models = crate::config::load_models_config_at(agent_dir).unwrap_or_default();
     let manifests = oauth_snapshot.map_or_else(Vec::new, |snapshot| {
         snapshot
             .providers()
@@ -2715,7 +2755,7 @@ fn rpc_get_auth_status(
             .collect()
     });
     let auth_states = crate::credentials::statuses(&models, &store, &manifests);
-    let providers = rpc_auth_provider_ids(model_catalog)
+    let providers = rpc_auth_provider_ids(model_catalog, agent_dir)
         .into_iter()
         .map(|provider| {
             let credential = store.get(&provider);
@@ -2744,6 +2784,7 @@ fn rpc_get_auth_status(
 fn rpc_oauth(
     snapshot: &Option<Arc<rpi_extensions::RegistrySnapshot>>,
     msg: &serde_json::Value,
+    agent_dir: Option<&Path>,
 ) -> Result<serde_json::Value, String> {
     let snapshot = snapshot
         .as_ref()
@@ -2774,7 +2815,8 @@ fn rpc_oauth(
                 .credential()
                 .map_err(|_| "OAuth provider returned an invalid credential".to_string())?
                 .ok_or_else(|| "OAuth provider returned no credential".to_string())?;
-            crate::config::upsert_oauth_token(
+            crate::config::upsert_oauth_token_at(
+                agent_dir,
                 provider,
                 credential.access,
                 credential.refresh,
@@ -2856,7 +2898,10 @@ async fn rpc_test_provider_config(msg: &serde_json::Value) -> Result<serde_json:
     Ok(serde_json::to_value(result).map_err(|error| error.to_string())?)
 }
 
-fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+fn rpc_set_provider_config(
+    msg: &serde_json::Value,
+    agent_dir: Option<&Path>,
+) -> Result<serde_json::Value, String> {
     let required = |name: &str| {
         msg.get(name)
             .and_then(serde_json::Value::as_str)
@@ -2883,7 +2928,8 @@ fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value,
     let supports_images = msg
         .get("supportsImages")
         .and_then(serde_json::Value::as_bool);
-    crate::config::add_provider(
+    crate::config::add_provider_at(
+        agent_dir,
         provider,
         api,
         base_url,
@@ -2902,7 +2948,10 @@ fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value,
     }))
 }
 
-fn rpc_update_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+fn rpc_update_provider_config(
+    msg: &serde_json::Value,
+    agent_dir: Option<&Path>,
+) -> Result<serde_json::Value, String> {
     let required = |name: &str| {
         msg.get(name)
             .and_then(serde_json::Value::as_str)
@@ -2922,7 +2971,8 @@ fn rpc_update_provider_config(msg: &serde_json::Value) -> Result<serde_json::Val
     let api = required("api")?;
     let base_url = required("baseUrl")?;
     let model_id = required("modelId")?;
-    crate::config::update_provider(
+    crate::config::update_provider_at(
+        agent_dir,
         provider,
         api,
         base_url,
@@ -2942,21 +2992,27 @@ fn rpc_update_provider_config(msg: &serde_json::Value) -> Result<serde_json::Val
     }))
 }
 
-fn rpc_delete_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+fn rpc_delete_provider_config(
+    msg: &serde_json::Value,
+    agent_dir: Option<&Path>,
+) -> Result<serde_json::Value, String> {
     let provider = msg
         .get("provider")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "delete_provider_config requires provider".to_string())?;
-    crate::config::delete_provider(provider)?;
+    crate::config::delete_provider_at(agent_dir, provider)?;
     Ok(serde_json::json!({
         "provider": provider,
         "requiresRestart": true,
     }))
 }
 
-async fn rpc_set_api_key(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+async fn rpc_set_api_key(
+    msg: &serde_json::Value,
+    agent_dir: Option<&Path>,
+) -> Result<serde_json::Value, String> {
     let provider = msg
         .get("provider")
         .and_then(serde_json::Value::as_str)
@@ -2969,7 +3025,8 @@ async fn rpc_set_api_key(msg: &serde_json::Value) -> Result<serde_json::Value, S
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "set_api_key requires a non-empty apiKey".to_string())?;
-    crate::config::upsert_credential(
+    crate::config::upsert_credential_at(
+        agent_dir,
         provider,
         crate::config::Credential::ApiKey {
             key: Some(api_key.to_string()),
@@ -4041,7 +4098,7 @@ mod tests {
         std::fs::write(directory.path().join("auth.json"), serde_json::json!({
             "expired-account": {"type":"oauth", "access":"expired-secret", "refresh":"refresh-secret", "expires":1}
         }).to_string()).unwrap();
-        let status = rpc_get_auth_status(&[], None);
+        let status = rpc_get_auth_status(&[], None, None);
         let providers = status["providers"].as_array().unwrap();
         let header = providers
             .iter()
@@ -4057,6 +4114,68 @@ mod tests {
         assert_eq!(expired["ready"], false);
         assert_eq!(expired["status"], "expired");
         assert!(!status.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn rpc_auth_writes_and_status_read_the_explicit_agent_home() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        struct RestoreConfig(Option<std::ffi::OsString>);
+        impl Drop for RestoreConfig {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+        let _restore = RestoreConfig(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let process_home = tempfile::tempdir().unwrap();
+        let session_home = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, process_home.path());
+        std::fs::write(process_home.path().join("models.json"), serde_json::json!({
+            "providers": {
+                "alpha": {"api":"anthropic-messages","apiKey":"key-alpha","models":[{"id":"alpha-model"}]}
+            }
+        }).to_string()).unwrap();
+
+        let reply = rpc_set_api_key(
+            &serde_json::json!({"provider": "beta", "apiKey": "TENANT-B-SECRET"}),
+            Some(session_home.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["ready"], true);
+
+        // The secret lands in the selected home, never in the process home
+        // inherited from RPI_CODING_AGENT_DIR.
+        let session_auth = std::fs::read_to_string(session_home.path().join("auth.json")).unwrap();
+        assert!(session_auth.contains("TENANT-B-SECRET"));
+        assert!(!process_home.path().join("auth.json").exists());
+
+        // A provider catalog that lives only in the selected home is visible;
+        // the process home's catalog is not.
+        std::fs::write(
+            session_home.path().join("models.json"),
+            serde_json::json!({
+                "providers": {
+                    "beta": {"api":"anthropic-messages","models":[{"id":"beta-model"}]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let status = rpc_get_auth_status(&[], None, Some(session_home.path()));
+        let providers = status["providers"].as_array().unwrap();
+        let beta = providers
+            .iter()
+            .find(|row| row["provider"] == "beta")
+            .unwrap();
+        assert_eq!(beta["ready"], true);
+        assert_eq!(beta["source"], "auth.json");
+        // A provider that exists only in the process home must not leak into
+        // the session home's status.
+        assert!(providers.iter().all(|row| row["provider"] != "alpha"));
+        assert!(!status.to_string().contains("TENANT-B-SECRET"));
     }
 
     #[test]
@@ -4190,6 +4309,7 @@ mod tests {
                 crate::args::RpcMessageUpdates::default(),
                 false,
                 correlated_execution,
+                None,
                 tokio::io::BufReader::new(input),
                 captured,
             )

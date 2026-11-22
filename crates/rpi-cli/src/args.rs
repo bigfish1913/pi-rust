@@ -176,6 +176,14 @@ pub struct Args {
     /// scopedModels — the same set /scoped-models edits). Empty = all models.
     pub models: Option<Vec<String>>,
     pub session_dir: Option<PathBuf>,
+    /// `--agent-dir <dir>`: per-session agent home (auth.json / models.json /
+    /// settings.json / trust.json / skills / extensions / SYSTEM.md) instead of
+    /// `~/.rpi/agent`. Must be an absolute existing directory. Sessions default
+    /// to `<dir>/sessions` unless `--session-dir`/`sessionDir` overrides, and
+    /// startup pins `RPI_CODING_AGENT_DIR` to the same home so every write
+    /// (including TUI settings and `/trust`) stays inside it. `None` keeps the
+    /// historical env/home behavior.
+    pub agent_dir: Option<PathBuf>,
     pub no_session: bool,
     pub name: Option<String>,
 
@@ -496,6 +504,11 @@ pub fn parse_args(args: &[String]) -> Args {
                     result.session_dir = Some(PathBuf::from(v));
                 }
             }
+            "--agent-dir" => {
+                if let Some(v) = take_value(&mut result, "--agent-dir") {
+                    result.agent_dir = Some(PathBuf::from(v));
+                }
+            }
             "--thinking" => {
                 if let Some(v) = take_value(&mut result, "--thinking") {
                     match parse_thinking_level(&v) {
@@ -699,6 +712,8 @@ pub fn print_help() {
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
   --session-dir <dir>            Directory for session storage
+  --agent-dir <dir>              Agent home: auth/models/settings/trust, skills/extensions,
+                                 SYSTEM.md, and <dir>/sessions (absolute, must exist)
   --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
   --tools, -t <list>             Comma-separated allowlist of tool names to enable
@@ -773,7 +788,7 @@ pub fn print_help() {
   ANTHROPIC_BASE_URL             Override the Anthropic endpoint (e.g. a compatible proxy)
   OPENAI_API_KEY                 Bearer token for openai-completions/responses
   RPI_OFFLINE                     Disable startup network operations when set to 1/true/yes
-  RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
+  RPI_CODING_AGENT_DIR           Override the ~/.rpi agent home (auth/models/settings/trust)
   RPI_SESSION_ID                 Session id served by a plugin (set by the host; also honored as an override)
 
 {u}Notes:{r}
