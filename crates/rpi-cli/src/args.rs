@@ -773,7 +773,7 @@ pub fn print_help() {
   ANTHROPIC_BASE_URL             Override the Anthropic endpoint (e.g. a compatible proxy)
   OPENAI_API_KEY                 Bearer token for openai-completions/responses
   RPI_OFFLINE                     Disable startup network operations when set to 1/true/yes
-  RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
+  RPI_CODING_AGENT_DIR           Override the ~/.rpi agent home (auth/models/settings/trust)
   RPI_SESSION_ID                 Session id served by a plugin (set by the host; also honored as an override)
 
 {u}Notes:{r}

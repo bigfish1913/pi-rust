@@ -100,6 +100,7 @@ async fn native_durable_reload_reuses_session_binding_and_preserves_durable_stat
         ..Default::default()
     };
     let resolved = crate::provider::resolve(
+        &crate::config::AgentHome::process(),
         Some("anthropic"),
         Some(crate::provider::DEFAULT_MODEL_ID),
         None,
@@ -107,10 +108,23 @@ async fn native_durable_reload_reuses_session_binding_and_preserves_durable_stat
         None,
     )
     .unwrap();
-    let prepared = prepare_extensions(&args, temp.path(), false).unwrap();
-    let (harness, _, context) = build_prepared(&resolved, &args, temp.path(), false, prepared)
-        .await
-        .unwrap();
+    let prepared = prepare_extensions(
+        &crate::config::AgentHome::process(),
+        &args,
+        temp.path(),
+        false,
+    )
+    .unwrap();
+    let (harness, _, context) = build_prepared(
+        &crate::config::AgentHome::process(),
+        &resolved,
+        &args,
+        temp.path(),
+        false,
+        prepared,
+    )
+    .await
+    .unwrap();
     let service = rpi_harness::durable::DurableService::bind(
         &harness,
         rpi_harness::durable::DurableActor::owner("test").unwrap(),

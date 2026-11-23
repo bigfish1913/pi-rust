@@ -47,6 +47,7 @@ async fn selected_root_survives_build_runtime_actions_and_both_reload_host_paths
             },
         );
         let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
             Some("anthropic"),
             Some(crate::provider::DEFAULT_MODEL_ID),
             None,
@@ -65,7 +66,8 @@ async fn selected_root_survives_build_runtime_actions_and_both_reload_host_paths
             system_prompt: Some("test".into()),
             ..Default::default()
         };
-        let prepared = prepare_extensions(&args, &cwd, false).unwrap();
+        let prepared =
+            prepare_extensions(&crate::config::AgentHome::process(), &args, &cwd, false).unwrap();
         assert_eq!(prepared.session_dir, root);
         // Extension discovery must not make later session setup re-resolve the
         // root from changed settings or process environment.
@@ -76,9 +78,16 @@ async fn selected_root_survives_build_runtime_actions_and_both_reload_host_paths
             serde_json::json!({"sessionDir": changed_root}).to_string(),
         )
         .unwrap();
-        let (harness, _events, context) = build_prepared(&resolved, &args, &cwd, false, prepared)
-            .await
-            .unwrap();
+        let (harness, _events, context) = build_prepared(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            false,
+            prepared,
+        )
+        .await
+        .unwrap();
         assert_eq!(context.session_dir(), root);
         let initial_id = harness.session().storage().metadata().id.clone();
         harness.session().set_name(Some("original")).await.unwrap();

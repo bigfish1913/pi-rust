@@ -43,10 +43,10 @@ impl Scope {
     pub fn is_project(&self) -> bool {
         *self == Self::Project
     }
-    pub fn root(self, cwd: &Path) -> Result<PathBuf> {
+    pub fn root(self, home: &crate::config::AgentHome, cwd: &Path) -> Result<PathBuf> {
         let logical = match self {
             Self::Project => cwd.join(".rpi"),
-            Self::Global => crate::config::agent_dir().map_err(err)?,
+            Self::Global => home.root().map_err(err)?,
         };
         resolve_scope_root(&logical)
     }
@@ -380,7 +380,17 @@ fn ensure_complete(root: &Path) -> Result<()> {
     Ok(())
 }
 pub(crate) fn host_leases(cwd: &Path) -> Result<Arc<Vec<Lease>>> {
-    let mut roots = vec![Scope::Project.root(cwd)?, Scope::Global.root(cwd)?];
+    host_leases_for(&crate::config::AgentHome::process(), cwd)
+}
+
+pub(crate) fn host_leases_for(
+    home: &crate::config::AgentHome,
+    cwd: &Path,
+) -> Result<Arc<Vec<Lease>>> {
+    let mut roots = vec![
+        Scope::Project.root(home, cwd)?,
+        Scope::Global.root(home, cwd)?,
+    ];
     roots.sort();
     roots.dedup();
     let mut leases = Vec::new();
@@ -1481,7 +1491,10 @@ pub fn run(args: &[String]) -> i32 {
     let result: Result<Value> = (|| {
         let o = parse(args)?;
         let cwd = std::env::current_dir().map_err(err)?;
-        let root = o.scope.unwrap().root(&cwd)?;
+        let root = o
+            .scope
+            .unwrap()
+            .root(&crate::config::AgentHome::process(), &cwd)?;
         let data = if matches!(o.op.as_str(), "list" | "inspect") {
             catalog(&root, &o)?
         } else if o.op == "recover" {

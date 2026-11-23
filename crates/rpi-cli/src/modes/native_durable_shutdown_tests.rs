@@ -163,6 +163,7 @@ impl Fixture {
                 crate::args::RpcMessageUpdates::default(),
                 enabled,
                 true,
+                crate::config::AgentHome::process(),
                 input,
                 output,
             )

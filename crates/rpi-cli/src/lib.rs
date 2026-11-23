@@ -84,6 +84,11 @@ pub mod trust;
 pub mod tui_shell;
 pub mod updates;
 
+/// One session's agent home (auth/models/settings/trust, resources, sessions).
+/// `AgentHome::process()` is the historical CLI home; embedding hosts pass an
+/// explicit path to run isolated sessions in one process.
+pub use config::AgentHome;
+
 /// Crate version, surfaced by `rpi --version`. Mirrors the TS `VERSION` export
 /// (sourced from `package.json`; here from `env!("CARGO_PKG_VERSION")`).
 ///
