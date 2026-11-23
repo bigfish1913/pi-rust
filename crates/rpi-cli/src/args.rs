@@ -171,6 +171,10 @@ pub struct Args {
     /// `--fork <path|id>`: fork the given session into a new one and start in
     /// the fork (pi `--fork`).
     pub fork: Option<String>,
+    /// Optional branch cut for `--fork`: fork at this message entry.
+    pub fork_entry: Option<String>,
+    /// Whether `--fork-entry` includes (`at`) or excludes (`before`) its message.
+    pub fork_position: rpi_harness::session::types::ForkPosition,
     /// `--models <patterns>`: comma-separated model patterns for the Ctrl+P
     /// cycle (globs/fuzzy in pi; v1 writes the matched ids to settings.json's
     /// scopedModels — the same set /scoped-models edits). Empty = all models.
@@ -471,6 +475,22 @@ pub fn parse_args(args: &[String]) -> Args {
             "--session" => result.session = take_value(&mut result, "--session"),
             "--session-id" => result.session_id = take_value(&mut result, "--session-id"),
             "--fork" => result.fork = take_value(&mut result, "--fork"),
+            "--fork-entry" => result.fork_entry = take_value(&mut result, "--fork-entry"),
+            "--fork-position" => {
+                if let Some(value) = take_value(&mut result, "--fork-position") {
+                    match value.as_str() {
+                        "at" | "At" => {
+                            result.fork_position = rpi_harness::session::types::ForkPosition::At
+                        }
+                        "before" | "Before" => {
+                            result.fork_position = rpi_harness::session::types::ForkPosition::Before
+                        }
+                        _ => result.errors.push(format!(
+                            "Invalid --fork-position \"{value}\". Expected at or before"
+                        )),
+                    }
+                }
+            }
             "--models" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.models = Some(split_csv(&v));
@@ -1097,6 +1117,34 @@ mod tests {
         assert!(a.errors.is_empty());
         assert_eq!(a.session_id.as_deref(), Some("01abc"));
         assert_eq!(a.fork.as_deref(), Some("xyz"));
+        assert_eq!(a.fork_entry, None);
+        assert_eq!(
+            a.fork_position,
+            rpi_harness::session::types::ForkPosition::At
+        );
+        let a = parse_args(&s(&[
+            "--fork",
+            "xyz",
+            "--fork-entry",
+            "message-2",
+            "--fork-position",
+            "before",
+        ]));
+        assert!(a.errors.is_empty());
+        assert_eq!(a.fork_entry.as_deref(), Some("message-2"));
+        assert_eq!(
+            a.fork_position,
+            rpi_harness::session::types::ForkPosition::Before
+        );
+        let a = parse_args(&s(&["--fork-position", "middle"]));
+        assert_eq!(
+            a.fork_position,
+            rpi_harness::session::types::ForkPosition::At
+        );
+        assert_eq!(
+            a.errors,
+            vec!["Invalid --fork-position \"middle\". Expected at or before".to_string()]
+        );
         let a = parse_args(&s(&[
             "-e",
             "plugin.dll",

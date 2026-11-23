@@ -307,8 +307,13 @@ pub enum SessionSelection {
     /// `--session-id <id>`: use the EXACT session id, creating it if missing.
     ByExactId { id: String, dir: PathBuf },
     /// `--fork <path|id>`: fork the given session into a new one and start in
-    /// the fork.
-    Fork { source: String, dir: PathBuf },
+    /// the fork. `entry_id` optionally cuts the new branch at a message.
+    Fork {
+        source: String,
+        dir: PathBuf,
+        entry_id: Option<String>,
+        position: rpi_harness::session::types::ForkPosition,
+    },
 }
 
 /// Decide the session selection from parsed args + the resolved cwd.
@@ -377,6 +382,8 @@ pub(crate) fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelecti
         return SessionSelection::Fork {
             source: s.clone(),
             dir,
+            entry_id: args.fork_entry.clone(),
+            position: args.fork_position,
         };
     }
     if let Some(s) = &args.session_id {
@@ -499,7 +506,7 @@ fn preflight_extension_startup_with_restore(
                         let restore_target = StartupSpan::start(Phase::RestoreTarget);
                         let cwd_str = cwd.to_string_lossy();
                         let target = match &selection {
-                            SessionSelection::Fork { source, dir } => {
+                            SessionSelection::Fork { source, dir, .. } => {
                                 match session_metadata_at(Path::new(source)) {
                                     Some(meta) => Some(meta),
                                     None => find_session_metadata(source, &cwd_str, dir).await?,
@@ -577,9 +584,15 @@ fn preflight_extension_startup_with_restore(
                         binding_validate.finish();
                         Ok((
                             match selection {
-                                SessionSelection::Fork { .. } => SessionSelection::Fork {
+                                SessionSelection::Fork {
+                                    entry_id,
+                                    position,
+                                    ..
+                                } => SessionSelection::Fork {
                                     source: meta.path,
                                     dir,
+                                    entry_id: entry_id.clone(),
+                                    position,
                                 },
                                 _ => SessionSelection::ByExactId { id: meta.id, dir },
                             },
@@ -3400,8 +3413,21 @@ async fn build_session(
         | SessionSelection::ByExactId { .. } => {
             restore_session(selection, cwd, prepared_restore).await
         }
-        SessionSelection::Fork { source, dir } => {
-            fork_session_at_launch(source, dir, cwd, selected).await
+        SessionSelection::Fork {
+            source,
+            dir,
+            entry_id,
+            position,
+        } => {
+            fork_session_at_launch(
+                source,
+                dir,
+                cwd,
+                selected,
+                entry_id.as_deref(),
+                *position,
+            )
+            .await
         }
     }
 }
@@ -3579,6 +3605,8 @@ async fn fork_session_at_launch(
     dir: &Path,
     cwd: &str,
     selected: Option<&crate::resource_selection::ResolvedSelection>,
+    entry_id: Option<&str>,
+    position: rpi_harness::session::types::ForkPosition,
 ) -> Result<Session, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
@@ -3625,7 +3653,10 @@ async fn fork_session_at_launch(
                 cwd: cwd.to_string(),
                 metadata: None,
             },
-            &ForkOptions::default(),
+            &ForkOptions::Branch {
+                entry_id: entry_id.map(str::to_owned),
+                position: Some(position),
+            },
             |values| crate::resource_selection::fork_initial_values_for_selection(values, selected),
         )
         .await

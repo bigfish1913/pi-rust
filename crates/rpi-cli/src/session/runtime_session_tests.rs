@@ -214,6 +214,56 @@ async fn importing_a_torn_tail_repairs_only_the_private_copy() {
 }
 
 #[tokio::test]
+async fn fork_entry_cuts_the_new_branch_at_the_selected_message() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path().to_string_lossy();
+    let source_root = temporary.path().join("source");
+    let source = create_jsonl_session(&source_root, &cwd).await.unwrap();
+    let first = source
+        .append_message(rpi_agent::message::AgentMessage::User(
+            rpi_ai::types::UserMessage::new("first", 1),
+        ))
+        .await
+        .unwrap();
+    let second = source
+        .append_message(rpi_agent::message::AgentMessage::User(
+            rpi_ai::types::UserMessage::new("second", 2),
+        ))
+        .await
+        .unwrap();
+    let source_file = list_session_files_sync(&source_root).remove(0);
+    let root = temporary.path().join("sessions");
+    let forked = fork_session_at_launch(
+        &source_file.to_string_lossy(),
+        &root,
+        &cwd,
+        None,
+        Some(&first),
+        rpi_harness::session::types::ForkPosition::At,
+    )
+    .await
+    .unwrap();
+    let ids: Vec<String> = forked
+        .find_entries(&rpi_harness::session::types::EntryQuery {
+            order: Some(rpi_harness::session::types::EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.id().to_owned())
+        .collect();
+    assert!(
+        ids.contains(&first),
+        "inclusive fork must keep the selected entry"
+    );
+    assert!(
+        !ids.contains(&second),
+        "entries after the fork point must be absent"
+    );
+}
+
+#[tokio::test]
 async fn fork_takes_a_session_file_outside_the_session_directory() {
     let temporary = tempfile::tempdir().unwrap();
     let cwd = temporary.path().to_string_lossy();
@@ -233,9 +283,16 @@ async fn fork_takes_a_session_file_outside_the_session_directory() {
     )
     .unwrap();
     let root = temporary.path().join("sessions");
-    let forked = fork_session_at_launch(&copy.to_string_lossy(), &root, &cwd, None)
-        .await
-        .unwrap_or_else(|error| panic!("fork from a file path failed: {error}"));
+    let forked = fork_session_at_launch(
+        &copy.to_string_lossy(),
+        &root,
+        &cwd,
+        None,
+        None,
+        rpi_harness::session::types::ForkPosition::At,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("fork from a file path failed: {error}"));
     let forked_meta = forked.get_metadata().await.unwrap();
     assert_ne!(forked_meta.id, parent_id);
     assert_eq!(forked.get_name().await.unwrap().as_deref(), Some("parent"));
