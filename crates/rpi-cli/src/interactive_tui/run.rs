@@ -140,15 +140,6 @@ pub(super) fn reconcile_streamed_assistant_completion(
     }
 }
 
-/// Drive a single prompt through the lane. When `streaming` is true, the
-/// `AgentEvent` drain task renders the response live and the completed outcome
-/// reconciles its final snapshot. When false (no `event_rx`), this falls back
-/// to the blocking await-final-text path.
-
-/// Drive a single prompt through the lane. When `streaming` is true, the
-/// `AgentEvent` drain task renders the response live and the completed outcome
-/// reconciles its final snapshot. When false (no `event_rx`), this falls back
-/// to the blocking await-final-text path.
 /// The TUI message for a refused session write.
 ///
 /// Refusing to save is not a provider problem: retrying fails the same way, and
@@ -823,9 +814,11 @@ pub(super) fn add_image_preview(
                 }
             }
         };
-        let mut options = ImageOptions::default();
-        options.width = Some(60);
-        options.alt_text = Some("[Attached image]".into());
+        let options = ImageOptions {
+            width: Some(60),
+            alt_text: Some("[Attached image]".into()),
+            ..ImageOptions::default()
+        };
         let preview = Arc::new(Image::from_data(bytes, options));
         preview.set_inline_visible(show);
         chat.add_child(preview);

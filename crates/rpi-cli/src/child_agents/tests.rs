@@ -150,7 +150,9 @@ async fn explicit_timeout_and_parent_scope_cancel_are_observable() {
         if cancel_parent {
             child.scope.cancel();
         }
-        run_child(child, job.clone(), "report".into(), 1, 0).await;
+        run_child(child, job.clone(), "report".into(), 1, 0)
+            .await
+            .unwrap();
         let state = job.state.lock().unwrap();
         let error = state.error.as_deref().unwrap();
         assert!(

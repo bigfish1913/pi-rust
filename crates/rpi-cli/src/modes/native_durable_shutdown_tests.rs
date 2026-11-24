@@ -157,11 +157,13 @@ impl Fixture {
                 &harness,
                 None,
                 vec![],
-                rpi_extensions::UiDialogMailbox::new(),
-                None,
-                None,
-                crate::args::RpcMessageUpdates::default(),
-                enabled,
+                crate::modes::RpcOptions {
+                    ui_dialog: rpi_extensions::UiDialogMailbox::new(),
+                    oauth_snapshot: None,
+                    extension_session: None,
+                    message_updates: crate::args::RpcMessageUpdates::default(),
+                    native_durable: enabled,
+                },
                 input,
                 output,
             )

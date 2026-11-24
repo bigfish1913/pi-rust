@@ -60,7 +60,8 @@ pub enum Command {
     GetCommands,
     /// Invoke an extension handler and return its JSON result as response data.
     /// `command` accepts a registered name with or without a leading slash.
-    ExecuteCommand {
+    #[serde(rename = "execute_command")]
+    ExecuteExtension {
         command: String,
         #[serde(default)]
         args: String,
@@ -534,7 +535,7 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            matches!(request.command, Command::ExecuteCommand { command, args }
+            matches!(request.command, Command::ExecuteExtension { command, args }
             if command == "/example" && args.is_empty())
         );
         assert!(serde_json::from_value::<Request>(json!({

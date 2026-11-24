@@ -26,6 +26,55 @@ use tokio_util::sync::CancellationToken;
 
 const DEADLINE: Duration = Duration::from_secs(15);
 
+#[cfg(unix)]
+#[tokio::test]
+async fn immutable_native_profile_prepares_distinct_owned_environments_without_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let startup = serde_json::from_value::<crate::host::AgentProfileFile>(serde_json::json!({
+        "agent": {
+            "id": AgentId::new().to_string(),
+            "name": "reusable-profile",
+            "cwd": cwd,
+            "session": {"id": "first", "path": cwd.join("first.jsonl")},
+            "model": {"provider": "fixture", "model": "host-fixture"},
+            "tools": []
+        },
+        "runtime": {"providers": {"fixture": {
+            "api": "openai-completions", "baseUrl": "http://127.0.0.1:9/v1",
+            "apiKey": "unused-preflight-key",
+            "models": [{"id": "host-fixture", "contextWindow": 1024, "maxTokens": 128}]
+        }}},
+        "toolEnvironment": {"HOME": cwd, "PATH": "/usr/bin:/bin"},
+        "shell": "/bin/sh"
+    }))
+    .unwrap()
+    .into_startup()
+    .unwrap();
+    let mut second_spec = startup.spec.clone();
+    second_spec.id = AgentId::new();
+    second_spec.session = Some(SessionRef {
+        id: "second".into(),
+        path: cwd.join("second.jsonl"),
+    });
+    let (first, second) = tokio::join!(
+        startup.profile.bind(startup.spec.clone()),
+        startup.profile.bind(second_spec)
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    let first_env = first.environment.as_ref().unwrap();
+    let second_env = second.environment.as_ref().unwrap();
+    assert!(!Arc::ptr_eq(first_env, second_env));
+    // The profile retained neither environment; each binding owns its fresh
+    // cleanup scope, rather than two wrappers around one cached environment.
+    assert_eq!(Arc::strong_count(first_env), 1);
+    assert_eq!(Arc::strong_count(second_env), 1);
+    drop(first);
+    assert_eq!(Arc::strong_count(second_env), 1);
+    assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0);
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     catalog: HostCatalog,
@@ -1069,4 +1118,35 @@ async fn explicit_compaction_uses_the_same_supervisor_and_settles_before_idle() 
     assert!(owner.client().snapshot().await.unwrap().active.is_none());
     owner.close().await.unwrap();
     fixture.catalog.shutdown().await.unwrap();
+}
+
+mod administrative_guards {
+    use super::*;
+    include!("guarded_tests.rs");
+    include!("submitted_cancel_tests.rs");
+}
+
+mod owner_registry {
+    use super::*;
+    include!("service_tests.rs");
+
+    mod deferred_binding {
+        include!("binding_plan_tests.rs");
+    }
+
+    mod extension_custody {
+        include!("extension_custody_tests.rs");
+    }
+
+    mod guarded_lifecycle {
+        include!("service_guarded_tests.rs");
+        include!("service_reservation_tests.rs");
+        include!("administration_owner_tests.rs");
+        include!("submitted_administration_tests.rs");
+    }
+
+    mod admission_faults {
+        include!("admission_fault_tests.rs");
+        include!("instruction_resource_tests.rs");
+    }
 }

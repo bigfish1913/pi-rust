@@ -240,6 +240,26 @@ pub trait FileSystem: Send + Sync {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError>;
 
+    /// Atomically create an absent file and write its initial contents, never
+    /// following or replacing an existing final path. The parent must already
+    /// exist; this capability does not create directories or prove durability.
+    ///
+    /// Unsupported backends fail closed rather than emulating this with an
+    /// existence check plus truncating write. Cancellation/error after creation
+    /// may leave a partial new file; never unlink or overwrite it on retry.
+    async fn write_new_file(
+        &self,
+        path: &str,
+        _content: FileContent,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        Err(FileError::new(
+            FileErrorCode::NotSupported,
+            "exclusive file creation is unsupported",
+        )
+        .with_path(path))
+    }
+
     async fn append_file(
         &self,
         path: &str,
@@ -290,6 +310,26 @@ pub trait FileSystem: Send + Sync {
         _cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         Ok(())
+    }
+
+    /// Sync a regular journal file and its containing directory through an
+    /// explicitly supported physical persistence boundary. Unlike `sync_file`
+    /// and `sync_directory`, the compatibility default fails closed: their
+    /// no-op defaults are not evidence that a journal survived a crash.
+    ///
+    /// The caller must own the journal writer and keep the addressed file and
+    /// parent stable. This does not sync newly-created ancestor directories,
+    /// progress companions, or protect against writers bypassing ownership.
+    async fn sync_file_and_parent(
+        &self,
+        path: &str,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        Err(FileError::new(
+            FileErrorCode::NotSupported,
+            "physical journal synchronization is unsupported",
+        )
+        .with_path(path))
     }
 
     /// Optional stable-generation reader. Unsupported backends retain eager

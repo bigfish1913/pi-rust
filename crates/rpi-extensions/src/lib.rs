@@ -77,11 +77,14 @@ pub use actions::{
     ReloadModelsMailbox, ReloadModelsRequest, RuntimeActionHost, SideQuestionSink, UiDialogMailbox,
     UiDialogRequest,
 };
+pub use cleanup::{PluginCleanupReceipt, PluginCleanupStatus};
 pub use editor_text::{EditorDraft, EditorTextEdit, EditorTextMailbox, EditorTextMode};
 pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
 pub use loader::{
-    load_dir, load_one, load_session, load_session_mixed, load_session_mixed_guarded,
-    merge_registries, ExtensionSession, LoadedPlugin, PluginKeepalive, PluginLoadError,
+    load_dir, load_explicit_session_owned, load_explicit_session_owned_checked, load_one,
+    load_session, load_session_mixed, load_session_mixed_guarded, merge_registries,
+    ExplicitPluginLoadFailure, ExtensionSession, LoadedPlugin, PluginKeepalive, PluginLoadCustody,
+    PluginLoadError,
 };
 pub use oauth::{
     list as list_oauth_providers, request as request_oauth,
@@ -90,20 +93,22 @@ pub use oauth::{
 };
 pub use prompt_transform::emit_before_agent_start;
 pub use provider::PluggableProvider;
-pub use provider_hooks::ExtensionProviderHooks;
+pub use provider_hooks::{ExtensionProviderContext, ExtensionProviderHooks};
 pub use registry::{
     assert_active, current_platform, platform_allows, ArgumentSuggester, BeforeAgentStartHandler,
-    ExtensionRegistry, ExtensionTool, ProviderManifest, RegisteredAutocompleteProvider,
-    RegisteredCommand, RegisteredCommandCompletions, RegisteredFlag, RegisteredHandler,
-    RegisteredOAuthProvider, RegisteredProvider, RegisteredRenderer, RegisteredRendererKind,
-    RegisteredShortcut, RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler,
-    ToolPromptMetadata, DEFAULT_PRIORITY,
+    EventRegistration, ExtensionRegistry, ExtensionTool, ProviderManifest,
+    RegisteredAutocompleteProvider, RegisteredCommand, RegisteredCommandCompletions,
+    RegisteredFlag, RegisteredHandler, RegisteredOAuthProvider, RegisteredProvider,
+    RegisteredRenderer, RegisteredRendererKind, RegisteredShortcut, RegistrationInventory,
+    RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler, ToolPromptMetadata,
+    DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
 pub use suggest_service::{SuggestItem, SuggestService};
 pub use tool_result_transform::{
-    emit_tool_result, emit_tool_result_with_status, with_tool_result_transform,
+    emit_tool_result, emit_tool_result_with_context, emit_tool_result_with_status,
+    with_tool_result_transform, InactiveToolResultRegistry,
 };
 mod panel;
 pub use panel::{ExtensionPanel, PanelAnchor, PanelHighlight, PanelHighlightColor, PanelLayout};
@@ -115,6 +120,7 @@ pub use translate::{
 
 pub use stdio::StdioLifecycle;
 mod actions;
+mod cleanup;
 mod editor_text;
 mod event_log;
 mod loader;
@@ -142,6 +148,11 @@ pub trait PluginDiagnostics: Send + Sync {
     /// A plugin that registered something but a registration slot is not yet
     /// wired on the host (e.g. an event tag the host does not emit yet).
     fn unsupported(&self, message: &str);
+    /// Observe final cleanup for every opened library, before symbol lookup or
+    /// registration can fail. The receipt owns no code/context. Hosts must keep
+    /// observations across reload and failed candidates; this is not a load or
+    /// worker-settlement acknowledgement. Existing sinks may ignore it.
+    fn track_cleanup(&self, _receipt: PluginCleanupReceipt) {}
 }
 
 /// A no-op diagnostics sink (the default when the host does not supply one).

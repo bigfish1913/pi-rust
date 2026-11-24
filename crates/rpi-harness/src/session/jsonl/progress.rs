@@ -85,22 +85,44 @@ impl JsonlProgressStore {
     }
     /// Publish before the primary header advertises this required companion.
     pub async fn initialize(&self) -> SessionResult<()> {
+        self.initialize_inner(false).await
+    }
+    /// Strict new-Session initialization. The primary path is already held by
+    /// an exclusive creator; an existing companion is an orphan/conflict, never
+    /// permission to reset progress belonging to another history image.
+    pub async fn initialize_new(&self) -> SessionResult<()> {
+        self.initialize_inner(true).await
+    }
+    async fn initialize_inner(&self, exclusive: bool) -> SessionResult<()> {
         let mut state = self.state.lock().await;
         let progress = ProgressState::default();
         let bytes = self.checkpoint(&progress)?;
         let length = bytes.len() as u64;
         let mut digest = Sha256::new();
         digest.update(&bytes);
-        file_result(
-            self.fs
-                .write_file(&self.path, FileContent::Bytes(bytes), None)
-                .await,
-            "initialize progress companion",
-        )?;
-        file_result(
-            self.fs.sync_file(&self.path, false, None).await,
-            "sync initialized progress companion",
-        )?;
+        if exclusive {
+            file_result(
+                self.fs
+                    .write_new_file(&self.path, FileContent::Bytes(bytes), None)
+                    .await,
+                "exclusively initialize progress companion",
+            )?;
+            file_result(
+                self.fs.sync_file_and_parent(&self.path, None).await,
+                "strictly sync initialized progress companion",
+            )?;
+        } else {
+            file_result(
+                self.fs
+                    .write_file(&self.path, FileContent::Bytes(bytes), None)
+                    .await,
+                "initialize progress companion",
+            )?;
+            file_result(
+                self.fs.sync_file(&self.path, false, None).await,
+                "sync initialized progress companion",
+            )?;
+        }
         state.length = length;
         state.digest = digest;
         state.progress = Some(progress);

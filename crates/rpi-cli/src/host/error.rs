@@ -45,6 +45,16 @@ pub enum CatalogError {
     RevisionConflict { expected: u64, actual: u64 },
     #[error("Host epoch changed")]
     EpochConflict,
+    #[error("lifecycle request identity conflicts with the stored request or result")]
+    LifecycleConflict,
+    #[error("lifecycle journal capacity exhausted; no intent was accepted")]
+    LifecycleCapacity,
+    #[error("another lifecycle intent conflicts with this action; no new intent was accepted")]
+    LifecycleBusy,
+    #[error("unknown lifecycle request")]
+    UnknownLifecycle,
+    #[error("lifecycle journal synchronization is uncertain; inspect before retrying")]
+    LifecycleUncertain,
     #[error("host catalog worker stopped; inspect state before retrying an uncertain mutation")]
     WorkerStopped,
     #[error("host registry I/O failed")]

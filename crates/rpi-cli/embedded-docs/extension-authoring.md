@@ -362,15 +362,22 @@ let rc = rpi_plugin_sdk::register_command_completions(&api, "office", office_arg
 - **模型看不到、也写不了。** 注入发生在模型参数解析之后、`execute` 之前，不
   会进 `ToolExecutionStart`/`Update` 事件，也不会进会话日志；模型若碰巧传了同
   名键，宿主的值覆盖它。
-- **两个字段都可能是缺失的。** 拿不到工作目录时没有 `cwd`；ephemeral 会话以及
+- **旧CLI的字段可能缺失。** 拿不到工作目录时没有 `cwd`；ephemeral 会话以及
   早于该注入的旧宿主没有 `sessionId`；整个键也可能不存在。
+- **显式多Agent绑定区分“无Session”和“未知”。** 宿主侧
+  `ToolCallContext::for_agent(cwd, agent_id, session_id)` 冻结
+  `{"cwd":"/workspace","agentId":"agent-id","sessionId":null}`（或真实Session ID）。
+  null 是真正Session-free，不能读取环境身份或编造Session补齐；普通CLI的late setter
+  不会重绑这种上下文。该接口是共享Host装配前置，不代表Host已开放扩展/资源加载。
+  `agentId`/`sessionId`只是关联元数据，不是权限凭证或OS沙箱。
 - **所以 tool 的参数类型必须容忍未知的顶层字段。** 用 `serde_json::Value`
   取值天然满足；给参数定义 `#[serde(deny_unknown_fields)]` 的结构体会直接失败。
 - 内置工具不走这条路——它们从 harness 直接拿到 `ExecutionToolContext`。
 
-需要"每个会话一份状态"的插件就用 `sessionId` 做键（`rpi-todo` 存
-`.rpi/todos/<sessionId>.json`，一条会话一个文件），取不到时退回项目级并**在
-回复里说明**，不要编一个共享的伪会话——那正是它要解决的问题。
+需要“每个会话一份状态”的插件可用真实 `sessionId` 做键（例如
+`.rpi/todos/<sessionId>.json`）。旧CLI未知身份可明确说明后退回项目级；显式
+`agentId` + `sessionId:null` 则应使用逐Agent的非Session状态或拒绝需要Session的操作，
+不得把不同Agent合到同一个伪Session/环境Session，也不要因此创建transcript。
 
 ## 5. 事件处理器、资源发现与 Provider
 

@@ -105,6 +105,22 @@ use crate::args::Args;
 use crate::session_driver::{assistant_blocks, assistant_tool_calls};
 use crate::transcript_view::UiEvent;
 
+/// The editor surface temporarily replaced by a selector or OAuth prompt.
+#[derive(Clone, Copy)]
+struct EditorUi<'a> {
+    state: &'a Arc<TuiState>,
+    editor_container: &'a Arc<Container>,
+    editor: &'a Arc<Editor>,
+    tui: &'a Arc<TuiAltScreen>,
+}
+
+/// The harness and exact lane participating in a session switch.
+#[derive(Clone, Copy)]
+struct SessionLane<'a> {
+    harness: &'a AgentHarness,
+    lane: &'a Arc<dyn AgentLane>,
+}
+
 /// B5e: the markdown-transformer trait object the assistant-message render path
 /// applies to raw text BEFORE the [`Markdown`] renderer styles it. A plain
 /// `Fn(&str) -> String` (NO `rpi-extensions` types) so `rpi-tui` stays free of
@@ -668,18 +684,15 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
     tokio::spawn(async move {
         let comp_chunk = comp.clone();
         let tui_chunk = tui.clone();
-        let on_chunk: Box<
-            dyn FnMut(&str, &dyn Fn() -> rpi_tools::shell_output::ShellCaptureProgress) + Send,
-        > = Box::new(move |_chunk, get_progress| {
-            // The capture layer reports the complete tail captured so far, not
-            // a delta; `append_output` replaces its snapshot accordingly.
-            comp_chunk.append_output(&get_progress().output);
-            tui_chunk.request_render(false);
-        });
         let options = rpi_tools::shell_output::ShellCaptureOptions {
             cwd: Some(cwd),
             cancel: Some(&cancel),
-            on_chunk: Some(on_chunk),
+            on_chunk: Some(Box::new(move |_chunk, get_progress| {
+                // The capture layer reports the complete tail captured so far, not
+                // a delta; `append_output` replaces its snapshot accordingly.
+                comp_chunk.append_output(&get_progress().output);
+                tui_chunk.request_render(false);
+            })),
             return_execution_errors: true,
             ..Default::default()
         };
@@ -982,13 +995,16 @@ pub async fn interactive_tui(
     event_rx: Option<broadcast::Receiver<AgentEvent>>,
     args: &Args,
     model_catalog: Vec<rpi_ai::Model>,
-    initial: Option<String>,
-    extra_messages: &[String],
-    initial_images: Vec<rpi_ai::types::ImageContent>,
-    theme: Option<&str>,
-    no_themes: bool,
+    startup: crate::modes::InteractiveStartup<'_>,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
+    let crate::modes::InteractiveStartup {
+        initial,
+        extra_messages,
+        initial_images,
+        theme,
+        no_themes,
+    } = startup;
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     // Reuse the startup snapshot captured before provider/session setup. An
     // extension may mutate the process cwd while loading; that must not change
@@ -3445,8 +3461,10 @@ pub async fn interactive_tui(
                 )
                 .await;
                 switch_to_session(
-                    harness,
-                    &lane,
+                    SessionLane {
+                        harness,
+                        lane: &lane,
+                    },
                     &id,
                     &cwd,
                     &chat_container,
@@ -3464,8 +3482,10 @@ pub async fn interactive_tui(
                 )
                 .await;
                 import_session(
-                    harness,
-                    &lane,
+                    SessionLane {
+                        harness,
+                        lane: &lane,
+                    },
                     &path,
                     &cwd,
                     &chat_container,
@@ -3675,10 +3695,12 @@ pub async fn interactive_tui(
                 flow_id,
             }) => {
                 handle_provider_oauth_result(
-                    &state,
-                    &editor_container,
-                    &editor,
-                    &tui,
+                    EditorUi {
+                        state: &state,
+                        editor_container: &editor_container,
+                        editor: &editor,
+                        tui: &tui,
+                    },
                     &ctx.tx,
                     &provider,
                     &action,
@@ -3909,14 +3931,17 @@ pub async fn interactive_tui(
         let _ = key_handle.await;
     }
     tick_handle.abort();
+    let _ = tick_handle.await;
     if let Some(handle) = drain_handle {
         handle.abort();
+        let _ = handle.await;
     }
     // Drop the reload bridge: clearing the mailbox closes the signal channel,
     // the drain task's `recv` returns `None`, and the task exits. (Aborting is
     // redundant — the recv terminates — but cheap + makes shutdown explicit.)
     reload_context.mailbox.clear();
     reload_bridge_handle.abort();
+    let _ = reload_bridge_handle.await;
     tui.stop(Default::default());
 
     // upstream prints how to resume the session after an interactive exit so

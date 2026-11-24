@@ -43,6 +43,12 @@ struct View {
     tui: Weak<TuiAltScreen>,
     show_terminal_progress: bool,
 }
+struct ViewPresentation {
+    show_terminal_progress: bool,
+    footer: Arc<FooterComponent>,
+    footer_panels: Arc<dyn Component>,
+}
+
 impl View {
     fn new(
         owner: u64,
@@ -51,10 +57,13 @@ impl View {
         runtime: tokio::runtime::Handle,
         tui: &Arc<TuiAltScreen>,
         keys: Arc<rpi_tui::keybindings::Keybindings>,
-        show_terminal_progress: bool,
-        footer: Arc<FooterComponent>,
-        footer_panels: Arc<dyn Component>,
+        presentation: ViewPresentation,
     ) -> Arc<Self> {
+        let ViewPresentation {
+            show_terminal_progress,
+            footer,
+            footer_panels,
+        } = presentation;
         let header = Arc::new(Text::new("BTW", 0, 0));
         let queued = Arc::new(Text::new("", 0, 0));
         let notice = Arc::new(Text::new("", 0, 0));
@@ -349,7 +358,7 @@ impl SideQuestionUi {
     }
     pub(super) fn empty_draft(&self) -> bool {
         self.view()
-            .map_or(true, |view| view.editor.get_expanded_text().is_empty())
+            .is_none_or(|view| view.editor.get_expanded_text().is_empty())
     }
     fn focus(&mut self, side: bool, tui: &Arc<TuiAltScreen>) {
         self.focused = side;
@@ -436,9 +445,11 @@ impl SideQuestionUi {
                         runtime.clone(),
                         tui,
                         keys.clone(),
-                        self.show_terminal_progress,
-                        self.footer.clone(),
-                        self.footer_panels.clone(),
+                        ViewPresentation {
+                            show_terminal_progress: self.show_terminal_progress,
+                            footer: self.footer.clone(),
+                            footer_panels: self.footer_panels.clone(),
+                        },
                     )
                 });
                 view.update(s);

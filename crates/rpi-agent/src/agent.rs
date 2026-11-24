@@ -170,8 +170,17 @@ struct Inner {
     follow_up_queue: SharedQueue,
     session_id: Option<String>,
     tool_execution: ToolExecutionMode,
+    callbacks: Option<Box<AgentCallbacks>>,
     event_tx: broadcast::Sender<AgentEvent>,
     active_run: Mutex<Option<ActiveRun>>,
+}
+
+/// Existing loop callbacks; absent by default without allocating a hook table.
+#[derive(Default)]
+struct AgentCallbacks {
+    before_tool_call: Option<crate::hooks::BeforeToolCall>,
+    after_tool_call: Option<crate::hooks::AfterToolCall>,
+    provider_hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
 }
 
 /// Builder for [`Agent`] with a fluent API. Mirrors the TS `new Agent(opts)`.
@@ -179,6 +188,7 @@ pub struct AgentBuilder {
     opts: AgentOptions,
     // Keep AgentOptions' existing public struct-literal API unchanged.
     async_stream_fn: Option<AsyncStreamFn>,
+    callbacks: Option<Box<AgentCallbacks>>,
 }
 
 impl AgentBuilder {
@@ -186,6 +196,7 @@ impl AgentBuilder {
         Self {
             opts: AgentOptions::default(),
             async_stream_fn: None,
+            callbacks: None,
         }
     }
 
@@ -241,6 +252,33 @@ impl AgentBuilder {
     pub fn async_stream_fn(mut self, stream_fn: AsyncStreamFn) -> Self {
         self.async_stream_fn = Some(stream_fn);
         self.opts.stream_fn = None;
+        self
+    }
+
+    /// Forward the existing loop's tool admission callback. No Session or
+    /// alternate tool executor is created by this setter.
+    pub fn before_tool_call(mut self, hook: crate::hooks::BeforeToolCall) -> Self {
+        self.callbacks
+            .get_or_insert_with(Default::default)
+            .before_tool_call = Some(hook);
+        self
+    }
+
+    /// Forward the existing loop's tool-result transformation callback.
+    pub fn after_tool_call(mut self, hook: crate::hooks::AfterToolCall) -> Self {
+        self.callbacks
+            .get_or_insert_with(Default::default)
+            .after_tool_call = Some(hook);
+        self
+    }
+
+    /// Forward Provider terminal observation to the existing loop. Request
+    /// opening (including before_request) remains the stream factory's job,
+    /// just as for direct AgentLoopConfig callers. No Session is synthesized.
+    pub fn provider_hooks(mut self, hooks: Arc<dyn rpi_ai::ProviderHooks>) -> Self {
+        self.callbacks
+            .get_or_insert_with(Default::default)
+            .provider_hooks = Some(hooks);
         self
     }
 
@@ -324,6 +362,7 @@ impl AgentBuilder {
             follow_up_queue: Arc::new(Mutex::new(PendingMessageQueue::new(follow_up_mode))),
             session_id: self.opts.session_id,
             tool_execution: self.opts.tool_execution.unwrap_or_default(),
+            callbacks: self.callbacks,
             event_tx,
             active_run: Mutex::new(None),
         };
@@ -566,9 +605,21 @@ impl Agent {
                 let follow = follow_count.lock().expect("followup lock").len();
                 steer + follow
             })),
-            before_tool_call: None,
-            after_tool_call: None,
-            provider_hooks: None,
+            before_tool_call: self
+                .inner
+                .callbacks
+                .as_ref()
+                .and_then(|hooks| hooks.before_tool_call.clone()),
+            after_tool_call: self
+                .inner
+                .callbacks
+                .as_ref()
+                .and_then(|hooks| hooks.after_tool_call.clone()),
+            provider_hooks: self
+                .inner
+                .callbacks
+                .as_ref()
+                .and_then(|hooks| hooks.provider_hooks.clone()),
             tool_execution: self.inner.tool_execution,
             thinking_level: state.thinking_level,
             api_key: None,

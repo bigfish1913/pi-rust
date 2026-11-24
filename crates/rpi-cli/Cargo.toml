@@ -99,6 +99,10 @@ default = ["clipboard"]
 # Enables real clipboard support for `/copy` and image paste (best-effort).
 clipboard = ["dep:arboard"]
 
+[build-dependencies]
+# Reuse the already locked compiler helper for target/tool-wrapper conventions.
+cc = "=1.4.7"
+
 [dev-dependencies]
 criterion = "0.5"
 

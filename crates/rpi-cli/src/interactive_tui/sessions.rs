@@ -98,8 +98,7 @@ pub(super) async fn share_session(harness: &AgentHarness, chat: &Arc<Container>)
 /// last-used model is replayed ([`restore_session_model`]) and its recorded
 /// usage folded back into the footer ([`render_session_history`]).
 pub(super) async fn switch_to_session(
-    harness: &AgentHarness,
-    lane: &Arc<dyn AgentLane>,
+    session_lane: SessionLane<'_>,
     id: &str,
     cwd: &std::path::Path,
     chat: &Arc<Container>,
@@ -107,6 +106,7 @@ pub(super) async fn switch_to_session(
     tool_context: &rpi_extensions::ToolCallContext,
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) -> bool {
+    let SessionLane { harness, lane } = session_lane;
     state.history_page.invalidate();
     if *state.status.lock().unwrap() == RunStatus::Working {
         state.set_status(RunStatus::Aborting);
@@ -202,8 +202,7 @@ pub(super) async fn switch_to_session(
 /// `/import <path>`: validate and save a session in the selected repository,
 /// then activate it through the same funnel as other session switches.
 pub(super) async fn import_session(
-    harness: &AgentHarness,
-    lane: &Arc<dyn AgentLane>,
+    session_lane: SessionLane<'_>,
     path: &str,
     cwd: &std::path::Path,
     chat: &Arc<Container>,
@@ -211,6 +210,7 @@ pub(super) async fn import_session(
     tool_context: &rpi_extensions::ToolCallContext,
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) {
+    let SessionLane { harness, lane } = session_lane;
     state.history_page.invalidate();
     use std::path::Path as FsPath;
 

@@ -23,6 +23,9 @@ use rpi_plugin_sdk::{
 
 use crate::tool::PluginToolHandle;
 
+mod inventory;
+pub use inventory::{EventRegistration, RegistrationInventory};
+
 /// A provider package's catalog and authentication policy, supplied through
 /// `declare({"providers":[...]})`. Credentials are always resolved by the host.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

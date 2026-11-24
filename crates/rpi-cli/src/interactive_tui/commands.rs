@@ -171,10 +171,12 @@ impl SlashCommand for ModelCommand {
         }
         let current_id = ctx.state.current_model_id();
         open_model_selector(
-            &ctx.state,
-            &ctx.editor_container,
-            &ctx.editor,
-            &ctx.tui,
+            EditorUi {
+                state: &ctx.state,
+                editor_container: &ctx.editor_container,
+                editor: &ctx.editor,
+                tui: &ctx.tui,
+            },
             &ctx.model_catalog
                 .read()
                 .unwrap_or_else(|error| error.into_inner()),
@@ -882,6 +884,7 @@ impl SlashCommand for UsageCommand {
 /// (B5d): reload the cdylib plugins, invalidate the old `ActionBridge` +
 /// registry snapshot, rebuild skills/prompts/context/SYSTEM.md/APPEND_SYSTEM.md
 /// + the `TeeEmitter`, and push the rebuilt state via the B5d harness setters.
+///
 /// The command itself runs on the blocking submit thread, so it can't drive
 /// the async `reload_extension_resources` routine directly — it signals the main
 /// loop via `TuiMessage::ReloadExtensions`, which awaits it on the async runtime.

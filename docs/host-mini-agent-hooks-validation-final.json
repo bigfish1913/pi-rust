@@ -1,0 +1,204 @@
+{
+  "stage": "session-free raw AgentBuilder existing-loop hook forwarding prerequisite",
+  "production_mini_complete": false,
+  "full_host_goal_complete": false,
+  "todo_65_complete": false,
+  "reason": "strict Agent Clippy acceptance remains blocked; no broad SDK/loop/event ABI rewrite",
+  "inputs": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-before/inputs.json",
+  "preservation": {
+    "core": {
+      "root": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host",
+      "head": "699b73d036138e0fe10bbf9b14e29af4119d6fad",
+      "branch": "feat/shared-host-integration",
+      "index_sha256": "19a457bbc5ef45dca355a0c0f53b2bf56d4d8be72c0aee100423114c407a7c6d",
+      "old_files": 1164,
+      "unchanged_old_files": 1162,
+      "changed_old_files": [
+        "crates/rpi-agent/src/agent.rs",
+        "crates/rpi-cli/src/host/README.md"
+      ],
+      "new_files": [
+        "crates/rpi-agent/tests/agent_builder_hooks.rs",
+        "docs/host-mini-agent-hooks-validation.json",
+        "docs/host-mini-agent-hooks.md"
+      ]
+    },
+    "extension": {
+      "root": "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host",
+      "head": "607c00d3915d16cf26129979766bcd65ec58b059",
+      "branch": "feat/shared-host-management",
+      "index_sha256": "120574b7497ced744dec434e2158a41548381e64ef18bee0550d61baabb4f875",
+      "old_files": 823,
+      "unchanged_old_files": 823,
+      "changed_old_files": [],
+      "new_files": []
+    }
+  },
+  "production_rust_files": 599,
+  "production_source_filter": "crates/[^/]+/src/.*\\.rs$",
+  "earlier_v2_statistics_include_five_examples_and_fixture_src_files": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/docs/host-mini-agent-hooks-validation.json",
+  "unchanged_production_rust_files": 598,
+  "changed_production_rust_files": [
+    "crates/rpi-agent/src/agent.rs"
+  ],
+  "agent_options_source_literal_api_unchanged": true,
+  "agent_loop_harness_sdk_c_abi_and_event_source_unchanged": true,
+  "new_allow_or_expect_attributes": false,
+  "cross_tree_and_previous_contract_hashes": {
+    "protocol.rs": "920a93636c7e87c5a9c7053557e9f044f6030327c0be9466ec274e34ce4721e0",
+    "client.rs": "55cb9897c61594dc554baddcc06dc80dcf88d11458b1a14fff1bc137c5d9e97a",
+    "client_tests.rs": "8df4c991962ddf635b34e7dd67d9821ee3b59f411104b42e1898d2f6433759ae",
+    "fixtures/control-v1.json": "33560f0b5d074b7822710493f7bcb16bec21c63ba5237629db4765bb25dab320"
+  },
+  "unchanged_old_evidence_files": 818,
+  "source_hashes": {
+    "crates/rpi-agent/src/agent.rs": "de02f141709b6d2ead2ad42b0f37abe8375d709c5e37e4bba70bdc1fa7d742f6",
+    "crates/rpi-agent/tests/agent_builder_hooks.rs": "8539f190a96bbe417167ada95070ece6231e2a1f2611e61e0dbd44117d2d4f50",
+    "crates/rpi-cli/src/host/README.md": "c80c25563b0cc6e7ad9053a09106f26d2ed2f71c8397ae6b5e7b2289d9313a36",
+    "docs/host-mini-agent-hooks.md": "74a3223f8e45b64ad8e621b8a8b1b64fd9a6dbebe4408284369d40a401ad6e6f"
+  },
+  "cli_binary": {
+    "path": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/debug/rpi",
+    "sha256": "2859963c801c706868e91f35ef3ba93efaf2572a699fb8a155b394bcf2dfd7ed"
+  },
+  "commands": {
+    "agent_all": "cargo test --locked --offline -j 2 -p rpi-agent --lib --tests",
+    "harness_lib": "cargo test --locked --offline -j 2 -p rpi-harness --lib",
+    "cli_lib_two_threads": "cargo test --locked --offline -j 2 -p rpi-cli --lib -- --test-threads=2",
+    "ordinary_binary_all": "cargo test --locked --offline -j 2 -p rpi-cli --test host_control",
+    "strict_cli": "cargo clippy --locked --offline -j 2 -p rpi-cli --lib --bins --test host_control --no-deps -- -D warnings",
+    "strict_agent": "cargo clippy --locked --offline -j 2 -p rpi-agent --lib --tests --no-deps -- -D warnings",
+    "ordinary_agent": "cargo clippy --locked --offline -j 2 -p rpi-agent --lib --test agent_builder_hooks --no-deps"
+  },
+  "gates": {
+    "focused": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-focused-1.log",
+      "log_sha256": "6f8118362770b0b28eba54f8b3dbdd004007e48e82a7e96e61a9c82000a7bf92",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-focused-1.exit",
+      "observed_exit_code": 0,
+      "result": [
+        3,
+        0,
+        0
+      ],
+      "result_suites": null
+    },
+    "agent_all": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-tests-final.log",
+      "log_sha256": "ad3d8138aa16894539edd94b78cdc6fbc0f9cb9cb0c163984c47727694f9ae53",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-tests-final.exit",
+      "observed_exit_code": 0,
+      "result": [
+        123,
+        0,
+        0
+      ],
+      "result_suites": 19
+    },
+    "harness_lib": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-harness.log",
+      "log_sha256": "9fcccffbf9ea4e0db608a7dfc01e51cee8b67dca7079c4d4768de0c87534076d",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-harness.exit",
+      "observed_exit_code": 0,
+      "result": [
+        546,
+        0,
+        4
+      ],
+      "result_suites": null
+    },
+    "cli_lib_two_threads": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-cli-unit-final.log",
+      "log_sha256": "a1eeb70f9ecdca7dccb92095ce8f35301a93650decbed41111ac0a39d9b6b3c1",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-cli-unit-final.exit",
+      "observed_exit_code": 0,
+      "result": [
+        1538,
+        0,
+        3
+      ],
+      "result_suites": null
+    },
+    "ordinary_binary_all": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-binary.log",
+      "log_sha256": "54d3956a7e745fefd3ec1eaa088ece1220b34ad3cd009f25c25b1afe5f818ec9",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-binary.exit",
+      "observed_exit_code": 0,
+      "result": [
+        39,
+        0,
+        0
+      ],
+      "result_suites": null
+    },
+    "strict_cli_lib_bins_host_control_clippy": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-cli-clippy.log",
+      "log_sha256": "6a734e76cdc164f39b1d9eb64a7c8eb630d45f28d58994fd614ce7b1cc46ad94",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-cli-clippy.exit",
+      "observed_exit_code": 0,
+      "result": null,
+      "result_suites": null
+    },
+    "strict_agent_lib_tests_clippy_BLOCKED": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-clippy.log",
+      "log_sha256": "031deb47c46716b8e3a514375dd89dbba02935d1d36e9096c575d2823046e8d0",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-clippy.exit",
+      "observed_exit_code": 101,
+      "result": null,
+      "result_suites": null
+    },
+    "strict_agent_new_test_clippy_BLOCKED": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-test-clippy.log",
+      "log_sha256": "b3281c0a3f0412cec8d6e8ec0ccefe387221d0c8cb54e7cf988d4f32dd23e7db",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-test-clippy.exit",
+      "observed_exit_code": 101,
+      "result": null,
+      "result_suites": null
+    },
+    "ordinary_agent_clippy_WITH_WARNINGS": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-scoped-agent-clippy.log",
+      "log_sha256": "24af24d82ab6b2b3246f2283ad67c1a29c880caadc3bf51aec37ed879216be28",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-scoped-agent-clippy.exit",
+      "observed_exit_code": 0,
+      "result": null,
+      "result_suites": null
+    },
+    "scoped_format": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-format.exit",
+      "observed_exit_code": 0,
+      "result": null,
+      "result_suites": null
+    }
+  },
+  "uncaptured_exit_due_to_tool_timeout": [
+    {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-tests.log",
+      "tool_timeout_seconds": 120,
+      "cargo_exit_observed": false,
+      "independent_final_gate": "agent_all"
+    },
+    {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-cli-unit.log",
+      "tool_timeout_seconds": 600,
+      "cargo_exit_observed": false,
+      "independent_final_gate": "cli_lib_two_threads"
+    }
+  ],
+  "not_claimed": [
+    "production mini integration",
+    "mini binary+DLL+HTTP E2E",
+    "durable mini receipts",
+    "before_request automatically supplied by AgentBuilder",
+    "workspace/all-target/MSRV/cross-platform green",
+    "Agent strict Clippy green",
+    "SDK strict Clippy green",
+    "default-parallel CLI lib fixed",
+    "new memory benchmark"
+  ],
+  "remaining_owned_processes": [],
+  "unrelated_build_processes_observed": 1,
+  "process_cleanup_scope": "only the two worktrees, explicit phase runner and core build-cache namespace; never stop unrelated builds",
+  "validator_v1_false_positive_preserved": "/tmp/rpi-host-integration-checks/host-mini-agent-hooks-validation.log"
+}

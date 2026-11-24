@@ -570,7 +570,7 @@ async fn unknown_schema_fails_without_retaining_instance_ownership() {
         HostCatalog::open(path.clone(), HostConfig::default()).await,
         Err(CatalogError::UnsupportedVersion(99))
     ));
-    database.execute_batch("PRAGMA user_version=1").unwrap();
+    database.execute_batch("PRAGMA user_version=2").unwrap();
     drop(database);
     HostCatalog::open(path, HostConfig::default())
         .await

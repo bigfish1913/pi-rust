@@ -1,0 +1,44 @@
+{
+  "task": 62,
+  "recorded_at_utc": "2026-11-24T02:43:43.321819+00:00",
+  "status": "passed",
+  "input_manifest": "/tmp/rpi-host-integration-checks/host-all-20261124-before/inputs.json",
+  "input_manifest_sha256": "587cdfcc24928cb2ac784888649f3766f2975f8f049a7b5704afae3c31bfc032",
+  "source_change": {
+    "file": "crates/rpi-cli/src/prebuilt_extensions.rs",
+    "before_sha256": "2ab205835bfb325713a262c61e4f79c06117ea7e9557e98ace74321be746d26b",
+    "after_sha256": "2253792e035c14bbbb92587d99608737dd04fee31851c3a6f188d9a03139d8f6",
+    "tests_only": true
+  },
+  "production_signing_file_unchanged": true,
+  "extension_sources_unchanged": true,
+  "prebuilt_tests": {
+    "passed": 26,
+    "failed": 0,
+    "ignored": 0
+  },
+  "unfiltered_library": {
+    "passed": 1538,
+    "failed": 0,
+    "ignored": 3
+  },
+  "logs": [
+    {
+      "path": "/tmp/rpi-host-integration-checks/host-all-codesign-prebuilt.log",
+      "sha256": "3f0764556743bef0bcd8c4458abf28de0f1b1b129830706136243693e63ac86a",
+      "exit": 0
+    },
+    {
+      "path": "/tmp/rpi-host-integration-checks/host-all-codesign-unit.log",
+      "sha256": "2fd1bdaf203d7192c4066f6472518f504be5e36c7df6e792e1b0733a332386dd",
+      "exit": 0
+    },
+    {
+      "path": "/tmp/rpi-host-integration-checks/host-all-codesign-clippy.log",
+      "sha256": "e66162bdcd9eb1ffbc8e174b798fe47bb2bd9ce7e85aa3240ed965e1f8e00244",
+      "exit": 0
+    }
+  ],
+  "old_evidence_rewritten": false,
+  "report_sha256": "5f588ed4cd6ae7fe076dd0337512f3e9760cf8fc4d89e6be13bf73f586aa7b40"
+}
