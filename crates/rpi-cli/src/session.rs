@@ -343,14 +343,16 @@ pub(crate) fn configured_session_dir_for(
                 .ok()
                 .and_then(|settings| settings.session_dir)
         })
-        // An explicit session-dir env override wins over the home-derived
-        // default; a library-provided home otherwise owns its transcripts.
-        .or_else(|| std::env::var_os("RPI_CODING_AGENT_SESSION_DIR").map(PathBuf::from))
+        // An explicitly provided home owns its transcripts; the process-wide
+        // env override only applies when the home is the process home (CLI).
+        // Otherwise a library host that passes home B while the environment
+        // still names A would silently write B's sessions into A.
         .or_else(|| {
             home.is_explicit()
                 .then(|| home.root().ok().map(|root| root.join("sessions")))
                 .flatten()
         })
+        .or_else(|| std::env::var_os("RPI_CODING_AGENT_SESSION_DIR").map(PathBuf::from))
         .unwrap_or_else(|| default_session_dir(cwd));
     // Relative roots belong to the launch project, even if an extension later
     // changes the process working directory.
@@ -6060,11 +6062,14 @@ mod tests {
     }
 
     /// An explicit agent home owns its transcripts: the default session root
-    /// is `<home>/sessions`, while `--session-dir` still wins.
+    /// is `<home>/sessions`, while `--session-dir` still wins. The process
+    /// session-dir env override must not bleed into an explicit home.
     #[test]
     fn agent_home_defaults_the_session_root_under_the_home() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
+        let env_dir = cwd.path().join("env-sessions");
+        let _env = crate::config::test_support::SessionDirEnv::new(Some(&env_dir));
         let agent_home = crate::config::AgentHome::from_option(Some(home.path().to_path_buf()));
         let args = Args::default();
         assert_eq!(
