@@ -9,7 +9,9 @@ use rpi_harness::{
     types::{AgentHarnessOptions, AgentHarnessResources, HarnessTool},
 };
 use serde::Deserialize;
-use std::{path::PathBuf, sync::Arc};
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::sync::Arc;
 
 #[cfg(unix)]
 #[path = "native_hooks.rs"]
@@ -28,9 +30,14 @@ pub(super) struct NativeHookCallbacks {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NativeHookConfig {
+    // Unsupported platforms reject nonempty hook configuration during parsing;
+    // freeze also rejects an empty hook configuration without loading code.
+    #[cfg(unix)]
     staging_root: PathBuf,
+    #[cfg(unix)]
     registrations: Vec<HookRegistration>,
 }
+#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct HookRegistration {
@@ -40,6 +47,7 @@ struct HookRegistration {
     provider_events: Vec<ProviderEventApproval>,
 }
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ProviderEventApproval {
@@ -48,6 +56,7 @@ struct ProviderEventApproval {
 }
 
 /// Closed observer-only surface; no raw event numbers or ambient subscription.
+#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum ProviderEvent {
@@ -55,8 +64,8 @@ enum ProviderEvent {
     BeforeHeaders,
     AfterResponse,
 }
+#[cfg(unix)]
 impl ProviderEvent {
-    #[cfg(unix)]
     fn tag(&self) -> rpi_plugin_sdk::EventTag {
         use rpi_plugin_sdk::EventTag;
         match self {

@@ -13,14 +13,13 @@ use super::{
 };
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use rpi_harness::agent_harness::HostAdmissionStatus;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::BTreeMap,
     future::Future,
     panic::AssertUnwindSafe,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, MutexGuard,
-    },
+    sync::{Arc, MutexGuard},
 };
 use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 
@@ -52,6 +51,7 @@ type Entry = OwnerEntry<OrdinaryAgent, super::NativeExtensionCustody>;
 struct Inner {
     catalog: HostCatalog,
     runtime: HostRuntime<OrdinaryAgent, super::NativeExtensionCustody>,
+    #[cfg(unix)]
     administration_claimed: AtomicBool,
 }
 impl Inner {
@@ -178,6 +178,7 @@ impl HostService {
             inner: Arc::new(Inner {
                 catalog,
                 runtime: HostRuntime::new(),
+                #[cfg(unix)]
                 administration_claimed: AtomicBool::new(false),
             }),
         }
@@ -191,6 +192,7 @@ impl HostService {
 
     /// Never handed over within one service lifetime, even if the facade is
     /// dropped. Detached/uncertain jobs may still hold custody in this epoch.
+    #[cfg(unix)]
     pub(crate) fn claim_administration(&self) -> bool {
         self.inner
             .administration_claimed

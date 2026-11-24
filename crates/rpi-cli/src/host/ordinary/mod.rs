@@ -191,9 +191,11 @@ impl OrdinaryBinding {
     /// Readonly native preflight before registration/Starting. Consumes this
     /// one-load environment; actual restore must use a fresh binding and repeat
     /// validation, not rely on facts surviving external filesystem changes.
+    #[cfg(unix)]
     pub(crate) async fn preflight_session(self, spec: &super::AgentSpec) -> BackendResult<()> {
         supervisor::preflight(spec, self).await
     }
+    #[cfg(unix)]
     pub(crate) fn execution_environment(&self) -> BackendResult<Arc<OsExecutionEnv>> {
         self.environment.clone().ok_or(BackendError::Binding(
             "explicit execution environment required",

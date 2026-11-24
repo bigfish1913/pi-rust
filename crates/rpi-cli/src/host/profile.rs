@@ -19,9 +19,11 @@ use super::{
 };
 use rpi_harness::types::AgentHarnessStreamOptions;
 use serde::Deserialize;
+#[cfg(any(unix, test))]
+use std::path::Path;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -233,11 +235,13 @@ impl AgentProfileFile {
 
 /// Canonical workspace and Session paths used when creating a new Session.
 /// Existing Session files are left for the ordinary strict restore to verify.
+#[cfg(any(unix, test))]
 pub fn canonical_workspace(spec: &AgentSpec) -> BackendResult<PathBuf> {
     std::fs::canonicalize(&spec.launch.cwd)
         .map_err(|_| BackendError::Binding("profile workspace is unavailable"))
 }
 
+#[cfg(any(unix, test))]
 pub fn session_parent(path: &Path) -> BackendResult<PathBuf> {
     let parent = path
         .parent()

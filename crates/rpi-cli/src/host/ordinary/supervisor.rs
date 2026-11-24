@@ -110,6 +110,7 @@ struct PreparedNativeBinding {
 
 /// Pure readonly preflight: neither Starting/resident metadata nor a Session
 /// writer is claimed. Actual restore repeats it to revalidate current facts.
+#[cfg(unix)]
 pub(super) async fn preflight(
     spec: &crate::host::AgentSpec,
     binding: OrdinaryBinding,
