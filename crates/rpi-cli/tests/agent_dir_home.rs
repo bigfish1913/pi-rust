@@ -266,6 +266,12 @@ async fn builds_two_explicit_homes_in_one_process() {
         .unwrap_or_default();
     assert!(alpha_skills.iter().any(|skill| skill.name == "skill-alpha"));
     assert!(!alpha_skills.iter().any(|skill| skill.name == "skill-beta"));
+    assert!(!alpha_skills
+        .iter()
+        .any(|skill| skill.name == "skill-process"));
     assert!(beta_skills.iter().any(|skill| skill.name == "skill-beta"));
     assert!(!beta_skills.iter().any(|skill| skill.name == "skill-alpha"));
+    assert!(!beta_skills
+        .iter()
+        .any(|skill| skill.name == "skill-process"));
 }
