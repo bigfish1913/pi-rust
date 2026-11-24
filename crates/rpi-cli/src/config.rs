@@ -72,14 +72,13 @@ pub fn agent_dir() -> Result<PathBuf, ConfigError> {
     agent_dir_at(None)
 }
 
-/// Resolve the agent home for one harness: an explicit `--agent-dir` wins,
+/// Resolve the agent home for one harness: an explicit [`AgentHome`] wins,
 /// otherwise the historical `RPI_CODING_AGENT_DIR` / `~/.rpi/agent` path.
 /// Relative overrides are rejected (same rule as the env var).
 pub(crate) fn agent_dir_at(override_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {
     if let Some(dir) = override_dir {
         if !dir.is_absolute() {
-            return Err(ConfigError::RelativeOverride {
-                env: "--agent-dir",
+            return Err(ConfigError::InvalidAgentHome {
                 val: dir.to_string_lossy().into_owned(),
             });
         }
@@ -118,8 +117,21 @@ impl AgentHome {
         Self::default()
     }
 
-    pub fn from_option(explicit: Option<PathBuf>) -> Self {
-        Self { explicit }
+    /// Build an agent home from an optional explicit path.
+    ///
+    /// `Some(path)` is validated eagerly: the path must be absolute. Returning
+    /// an error here (instead of lazily on first use) keeps every later reader
+    /// infallible with respect to home shape and prevents a partially applied
+    /// home in embedders that tolerate per-call errors.
+    pub fn from_option(explicit: Option<PathBuf>) -> Result<Self, ConfigError> {
+        if let Some(path) = explicit.as_deref() {
+            if !path.is_absolute() {
+                return Err(ConfigError::InvalidAgentHome {
+                    val: path.to_string_lossy().into_owned(),
+                });
+            }
+        }
+        Ok(Self { explicit })
     }
 
     pub fn explicit_path(&self) -> Option<&Path> {
@@ -425,7 +437,7 @@ pub fn read_auth() -> Result<AuthStore, ConfigError> {
     read_auth_at(None)
 }
 
-/// [`read_auth`] against an explicit agent home (`--agent-dir`).
+/// [`read_auth`] against an explicit agent home.
 pub(crate) fn read_auth_at(agent_dir: Option<&Path>) -> Result<AuthStore, ConfigError> {
     let path = auth_path_at(agent_dir)?;
     match read_text_with_fallback(path, None)? {
@@ -451,7 +463,7 @@ pub fn write_auth(store: &AuthStore) -> Result<(), ConfigError> {
     write_auth_at(None, store)
 }
 
-/// [`write_auth`] against an explicit agent home (`--agent-dir`).
+/// [`write_auth`] against an explicit agent home.
 pub(crate) fn write_auth_at(
     agent_dir: Option<&Path>,
     store: &AuthStore,
@@ -471,7 +483,7 @@ pub fn upsert_credential(provider_id: &str, cred: Credential) -> Result<(), Conf
     upsert_credential_at(None, provider_id, cred)
 }
 
-/// [`upsert_credential`] against an explicit agent home (`--agent-dir`).
+/// [`upsert_credential`] against an explicit agent home.
 pub(crate) fn upsert_credential_at(
     agent_dir: Option<&Path>,
     provider_id: &str,
@@ -626,7 +638,7 @@ pub fn load_models_config() -> Result<ModelsConfig, ConfigError> {
     load_models_config_at(None)
 }
 
-/// [`load_models_config`] against an explicit agent home (`--agent-dir`).
+/// [`load_models_config`] against an explicit agent home.
 pub(crate) fn load_models_config_at(agent_dir: Option<&Path>) -> Result<ModelsConfig, ConfigError> {
     let path = models_path_at(agent_dir)?;
     match read_text_with_fallback(path, None)? {
@@ -648,7 +660,7 @@ pub fn save_models_config(cfg: &ModelsConfig) -> Result<(), ConfigError> {
     save_models_config_at(None, cfg)
 }
 
-/// [`save_models_config`] against an explicit agent home (`--agent-dir`).
+/// [`save_models_config`] against an explicit agent home.
 pub(crate) fn save_models_config_at(
     agent_dir: Option<&Path>,
     cfg: &ModelsConfig,
@@ -702,7 +714,7 @@ pub fn add_provider(
     )
 }
 
-/// [`add_provider`] against an explicit agent home (`--agent-dir`).
+/// [`add_provider`] against an explicit agent home.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn add_provider_at(
     agent_dir: Option<&Path>,
@@ -827,7 +839,7 @@ pub fn update_provider(
     )
 }
 
-/// [`update_provider`] against an explicit agent home (`--agent-dir`).
+/// [`update_provider`] against an explicit agent home.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_provider_at(
     agent_dir: Option<&Path>,
@@ -895,7 +907,7 @@ pub fn delete_provider(provider_id: &str) -> Result<(), String> {
     delete_provider_at(None, provider_id)
 }
 
-/// [`delete_provider`] against an explicit agent home (`--agent-dir`).
+/// [`delete_provider`] against an explicit agent home.
 pub(crate) fn delete_provider_at(
     agent_dir: Option<&Path>,
     provider_id: &str,
@@ -949,7 +961,7 @@ pub fn set_project_trust(cwd: &Path, trusted: Option<bool>) -> Result<(), Config
     set_project_trust_at(None, cwd, trusted)
 }
 
-/// [`set_project_trust`] against an explicit agent home (`--agent-dir`).
+/// [`set_project_trust`] against an explicit agent home.
 pub(crate) fn set_project_trust_at(
     agent_dir: Option<&Path>,
     cwd: &Path,
@@ -979,7 +991,7 @@ pub fn project_trust_decision(cwd: &Path) -> Result<Option<bool>, ConfigError> {
     project_trust_decision_at(None, cwd)
 }
 
-/// [`project_trust_decision`] under an explicit agent home (`--agent-dir`).
+/// [`project_trust_decision`] under an explicit agent home.
 pub(crate) fn project_trust_decision_at(
     agent_dir: Option<&Path>,
     cwd: &Path,

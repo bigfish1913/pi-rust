@@ -1,4 +1,4 @@
-//! `--agent-dir` isolation contract (PR 1).
+//! Explicit agent-home isolation contract (PR 1).
 //!
 //! One process, two explicit agent homes: settings / models / skills / SYSTEM.md
 //! / trust decisions must come from the selected home, never from the process
@@ -46,6 +46,14 @@ fn set_trust(home: &Path, cwd: &Path, trusted: bool) {
 }
 
 #[test]
+fn from_option_rejects_relative_homes_eagerly() {
+    let err = config::AgentHome::from_option(Some(PathBuf::from("relative/home")))
+        .expect_err("relative homes must fail at the API boundary");
+    assert!(matches!(err, config::ConfigError::InvalidAgentHome { .. }));
+    assert!(config::AgentHome::from_option(None).is_ok());
+}
+
+#[test]
 fn explicit_agent_dir_isolates_config_and_resources() {
     let alpha = tempfile::tempdir().unwrap();
     let beta = tempfile::tempdir().unwrap();
@@ -56,8 +64,8 @@ fn explicit_agent_dir_isolates_config_and_resources() {
     set_trust(alpha.path(), cwd.path(), true);
     set_trust(beta.path(), cwd.path(), false);
 
-    let alpha_home = config::AgentHome::from_option(Some(alpha.path().to_path_buf()));
-    let beta_home = config::AgentHome::from_option(Some(beta.path().to_path_buf()));
+    let alpha_home = config::AgentHome::from_option(Some(alpha.path().to_path_buf())).unwrap();
+    let beta_home = config::AgentHome::from_option(Some(beta.path().to_path_buf())).unwrap();
 
     // settings.json
     assert_eq!(
@@ -119,14 +127,14 @@ fn explicit_agent_dirs_are_safe_to_resolve_concurrently() {
     let beta_dir = beta.path().to_path_buf();
     std::thread::scope(|scope| {
         let a = scope.spawn(|| {
-            let home = config::AgentHome::from_option(Some(alpha_dir));
+            let home = config::AgentHome::from_option(Some(alpha_dir)).unwrap();
             for _ in 0..50 {
                 let resolved = provider::resolve(&home, None, None, None, None, None).unwrap();
                 assert_eq!(resolved.model.id, "alpha-model");
             }
         });
         let b = scope.spawn(|| {
-            let home = config::AgentHome::from_option(Some(beta_dir));
+            let home = config::AgentHome::from_option(Some(beta_dir)).unwrap();
             for _ in 0..50 {
                 let resolved = provider::resolve(&home, None, None, None, None, None).unwrap();
                 assert_eq!(resolved.model.id, "beta-model");
@@ -162,7 +170,7 @@ async fn build_uses_the_injected_home_over_the_process_env() {
     let _restore = RestoreEnv(std::env::var_os(config::CONFIG_DIR_ENV));
     std::env::set_var(config::CONFIG_DIR_ENV, env_home.path());
 
-    let home = config::AgentHome::from_option(Some(selected_home.path().to_path_buf()));
+    let home = config::AgentHome::from_option(Some(selected_home.path().to_path_buf())).unwrap();
     let resolved = provider::resolve(&home, None, None, None, None, None).unwrap();
     let args = rpi_cli::args::Args {
         no_session: true,
@@ -186,4 +194,78 @@ async fn build_uses_the_injected_home_over_the_process_env() {
         .unwrap_or_default();
     assert!(skills.iter().any(|skill| skill.name == "skill-beta"));
     assert!(!skills.iter().any(|skill| skill.name == "skill-alpha"));
+}
+
+/// The headline claim is "two sessions in one process". Build home A and home
+/// B in the same process (with a third process home in the env) and assert
+/// each ReloadContext and each harness's resources belong to its own home.
+#[tokio::test(flavor = "current_thread")]
+async fn builds_two_explicit_homes_in_one_process() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    struct RestoreEnv(Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(config::CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(config::CONFIG_DIR_ENV),
+            }
+        }
+    }
+
+    let process_home = tempfile::tempdir().unwrap();
+    let alpha = tempfile::tempdir().unwrap();
+    let beta = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    write_home(
+        process_home.path(),
+        "process",
+        "process-model",
+        "SYSTEM-PROCESS",
+    );
+    write_home(alpha.path(), "alpha", "alpha-model", "SYSTEM-ALPHA");
+    write_home(beta.path(), "beta", "beta-model", "SYSTEM-BETA");
+    let _restore = RestoreEnv(std::env::var_os(config::CONFIG_DIR_ENV));
+    std::env::set_var(config::CONFIG_DIR_ENV, process_home.path());
+
+    let alpha_home = config::AgentHome::from_option(Some(alpha.path().to_path_buf())).unwrap();
+    let beta_home = config::AgentHome::from_option(Some(beta.path().to_path_buf())).unwrap();
+    let args = rpi_cli::args::Args {
+        no_session: true,
+        no_extensions: true,
+        no_prompt_templates: true,
+        no_context_files: true,
+        system_prompt: Some("stable".into()),
+        ..Default::default()
+    };
+
+    let alpha_model = provider::resolve(&alpha_home, None, None, None, None, None).unwrap();
+    let (alpha_harness, _alpha_events, alpha_context) =
+        rpi_cli::session::build(&alpha_home, &alpha_model, &args, cwd.path(), false)
+            .await
+            .unwrap();
+    let beta_model = provider::resolve(&beta_home, None, None, None, None, None).unwrap();
+    let (beta_harness, _beta_events, beta_context) =
+        rpi_cli::session::build(&beta_home, &beta_model, &args, cwd.path(), false)
+            .await
+            .unwrap();
+
+    assert_eq!(alpha_context.home.root().unwrap(), alpha.path());
+    assert_eq!(beta_context.home.root().unwrap(), beta.path());
+
+    let alpha_skills = alpha_harness
+        .get_resources()
+        .await
+        .unwrap()
+        .skills
+        .unwrap_or_default();
+    let beta_skills = beta_harness
+        .get_resources()
+        .await
+        .unwrap()
+        .skills
+        .unwrap_or_default();
+    assert!(alpha_skills.iter().any(|skill| skill.name == "skill-alpha"));
+    assert!(!alpha_skills.iter().any(|skill| skill.name == "skill-beta"));
+    assert!(beta_skills.iter().any(|skill| skill.name == "skill-beta"));
+    assert!(!beta_skills.iter().any(|skill| skill.name == "skill-alpha"));
 }
