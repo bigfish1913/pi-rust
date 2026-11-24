@@ -140,19 +140,19 @@ fn entire_explicit_path_selection_is_validated_before_registration() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("must-not-register");
     let first = must_not_register("owned_preflight", &marker);
-    let mut cases = vec![
+    let cases = [
         vec![first.path.clone(), PathBuf::from("relative.dylib")],
         vec![first.path.clone(), directory.path().join("missing.dylib")],
         vec![first.path.clone(), directory.path().to_path_buf()],
         vec![first.path.clone(), first.path.clone()],
         vec![first.path.clone(); 33],
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("alias.dylib");
+            std::os::unix::fs::symlink(&first.path, &alias).unwrap();
+            vec![first.path.clone(), alias]
+        },
     ];
-    #[cfg(unix)]
-    {
-        let alias = directory.path().join("alias.dylib");
-        std::os::unix::fs::symlink(&first.path, &alias).unwrap();
-        cases.push(vec![first.path.clone(), alias]);
-    }
     for files in cases {
         let failure = load_explicit_session_owned(&files, Arc::new(NullDiagnostics), None)
             .err()
