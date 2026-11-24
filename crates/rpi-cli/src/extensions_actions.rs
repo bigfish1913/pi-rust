@@ -202,6 +202,23 @@ impl HarnessActionHost {
         )
     }
 
+    // Final retirement only, never a per-run/session-switch cancellation.
+    // This is the native auxiliary domain, NOT an OS process cleanup receipt.
+    #[allow(dead_code)] // Default CLI Host factory is not wired yet.
+    pub(crate) fn begin_auxiliary_shutdown(&self) {
+        self.children.begin_shutdown();
+        self.side_questions.begin_shutdown();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn wait_auxiliary_shutdown(&self) -> Result<(), String> {
+        let (children, questions) = tokio::join!(
+            self.children.wait_shutdown(),
+            self.side_questions.wait_shutdown(),
+        );
+        children.and(questions)
+    }
+
     pub fn set_catalog(&self, catalog: Vec<rpi_ai::Model>) {
         *self
             .catalog

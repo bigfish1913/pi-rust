@@ -285,11 +285,13 @@ fn file_arg(arg: &str) -> Option<PathBuf> {
 /// handles `--name=value` for *unknown* flags; we extend it to known flags for
 /// ergonomics). Short flags use a single leading `-`.
 pub fn parse_args(args: &[String]) -> Args {
-    let mut result = Args::default();
     // Native durable is the CLI default. Keep `Args::default()` unchanged for
     // embedded/test hosts that construct programmatic options explicitly.
-    result.native_durable = true;
-    result.offline = offline_env_enabled();
+    let mut result = Args {
+        native_durable: true,
+        offline: offline_env_enabled(),
+        ..Args::default()
+    };
     // `RPI_EXTENSIONS_DIR` env: an extra list of plugin dirs prepended to any
     // `--extensions-dir` flags. Semicolon-separated on Windows, colon-separated
     // on Unix (PATH-style). Empty entries skipped. `--no-extensions` still wins.
@@ -725,6 +727,10 @@ pub fn print_help() {
   --version, -v                  Show version
 
 {u}Subcommands:{r}
+  host <command>                 Shared Host control: foreground serve; status/list/
+                                inspect; submit/receipt; optional profiles and
+                                administrative-* (Unix; authenticated IPC;
+                                see `rpi host --help`)
   update                       Update the rpi CLI from crates.io
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)

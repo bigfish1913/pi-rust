@@ -122,20 +122,8 @@ pub struct DevExtension {
 impl DevExtension {
     pub fn detect(cwd: &Path, options: &DevOptions) -> Result<Arc<Self>, String> {
         let project = detect_project(cwd, options.package.as_deref())?;
-        let stage_root = project
-            .workspace_root
-            .join(".rpi/extensions/.dev")
-            .join(format!(
-                "{}-{}",
-                safe_name(&project.package),
-                std::process::id()
-            ));
-        std::fs::create_dir_all(&stage_root).map_err(|error| {
-            format!(
-                "could not create extension staging directory {}: {error}",
-                stage_root.display()
-            )
-        })?;
+        let stage_root =
+            crate::host::dev_staging::allocate(&project.workspace_root, &project.package)?;
         Ok(Arc::new(Self {
             project,
             release: options.release,
@@ -147,6 +135,36 @@ impl DevExtension {
             generation: AtomicU64::new(0),
             stop: AtomicBool::new(false),
         }))
+    }
+
+    /// Initial preparation only: no other strong/weak owner, watcher or staged
+    /// generation may exist yet. Failed builds can then discard this namespace
+    /// without touching loaded DLLs, another instance, or legacy directories.
+    pub(crate) fn prepare_initial(
+        mut self: Arc<Self>,
+        args: &mut Args,
+    ) -> Result<Arc<Self>, String> {
+        let dev = Arc::get_mut(&mut self)
+            .ok_or("initial dev preparation requires exclusive ownership")?;
+        if dev.generation.load(Ordering::SeqCst) != 0
+            || dev
+                .current_stage
+                .get_mut()
+                .map_err(|_| "dev stage state is poisoned")?
+                .is_some()
+        {
+            return Err("initial dev preparation requires an unbuilt instance".into());
+        }
+        if let Err(error) = dev.rebuild().and_then(|_| dev.apply_to_args(args)) {
+            if let Err(cleanup) = crate::host::dev_staging::discard_unloaded(&dev.stage_root) {
+                return Err(format!(
+                    "{error}\nInitial staging cleanup failed at {}: {cleanup}; directory may remain",
+                    dev.stage_root.display()
+                ));
+            }
+            return Err(error);
+        }
+        Ok(self)
     }
 
     pub fn package_name(&self) -> &str {
@@ -435,19 +453,6 @@ fn is_cdylib(path: &Path) -> bool {
     )
 }
 
-fn safe_name(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
 fn source_fingerprint(project: &ExtensionProject) -> u64 {
     let mut hasher = DefaultHasher::new();
     fingerprint_path(&project.package_root.join("src"), &mut hasher);
@@ -633,6 +638,194 @@ mod tests {
         assert_eq!(
             format_build_failure("exit code: 101", "\n"),
             "cargo build exited with exit code: 101"
+        );
+    }
+
+    #[test]
+    fn real_metadata_detects_get_separate_stages_and_cleanup_does_not_touch_other_owners() {
+        let temp = initial_project("pub fn fixture() {}\n");
+        let workspace = temp.path().canonicalize().unwrap();
+        // A prior PID-only namespace is not a directory this instance may adopt.
+        let legacy = workspace
+            .join(".rpi/extensions/.dev")
+            .join(format!("stage-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("keep-legacy"), b"prior owner").unwrap();
+        let first = DevExtension::detect(&workspace, &DevOptions::default()).unwrap();
+        let second = DevExtension::detect(&workspace, &DevOptions::default()).unwrap();
+        assert_ne!(first.stage_root, second.stage_root);
+        assert_ne!(first.stage_root, legacy);
+        assert_ne!(second.stage_root, legacy);
+        std::fs::write(second.stage_root.join("keep-second"), b"other instance").unwrap();
+        first.cleanup();
+        assert!(!first.stage_root.exists());
+        assert_eq!(
+            std::fs::read(second.stage_root.join("keep-second")).unwrap(),
+            b"other instance"
+        );
+        assert_eq!(
+            std::fs::read(legacy.join("keep-legacy")).unwrap(),
+            b"prior owner"
+        );
+        second.cleanup();
+        assert_eq!(
+            std::fs::read(legacy.join("keep-legacy")).unwrap(),
+            b"prior owner"
+        );
+    }
+
+    fn initial_project(source: &str) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), source).unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"stage-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"cdylib\"]\n[workspace]\n",
+        ).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            // cargoc may re-key the output root when this fixture adds a staging
+            // blocker. A legitimate rebuild must not change install_name/UUID
+            // and make the test confuse linker metadata with cleanup damage.
+            std::fs::create_dir(temp.path().join(".cargo")).unwrap();
+            std::fs::write(temp.path().join(".cargo/config.toml"),
+                "[build]\nrustflags = [\"-C\", \"link-arg=-Wl,-no_uuid\", \"-C\", \"link-arg=-Wl,-install_name,@rpath/libstage_fixture.dylib\"]\n",
+            ).unwrap();
+        }
+        temp
+    }
+
+    #[test]
+    fn initial_build_failure_discards_only_its_unloaded_namespace() {
+        let temp = initial_project("this is intentionally invalid Rust\n");
+        let dev = DevExtension::detect(temp.path(), &DevOptions::default()).unwrap();
+        let own = dev.stage_root.clone();
+        let other = DevExtension::detect(temp.path(), &DevOptions::default()).unwrap();
+        let old = own.parent().unwrap().join("stage-fixture-old-pid");
+        std::fs::create_dir(&old).unwrap();
+        for path in [&other.stage_root, &old] {
+            std::fs::write(path.join("keep"), b"not the failed preparation").unwrap();
+        }
+        let error = dev.prepare_initial(&mut Args::default()).err().unwrap();
+        assert!(error.contains("cargo build"), "{error}");
+        assert!(!own.exists());
+        for path in [&other.stage_root, &old] {
+            assert_eq!(
+                std::fs::read(path.join("keep")).unwrap(),
+                b"not the failed preparation"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_staging_failure_after_real_build_discards_partial_stage() {
+        let temp = initial_project("pub fn fixture() {}\n");
+        let dev = DevExtension::detect(temp.path(), &DevOptions::default()).unwrap();
+        let own = dev.stage_root.clone();
+        // Block the first generation directory after Cargo has actually built.
+        std::fs::write(own.join("1"), b"incomplete initial preparation").unwrap();
+        let error = dev.prepare_initial(&mut Args::default()).err().unwrap();
+        assert!(error.contains("could not create"), "{error}");
+        assert!(!own.exists());
+    }
+
+    #[test]
+    fn initial_copy_failure_after_real_build_preserves_other_owners() {
+        let temp = initial_project("pub fn fixture() {}\n");
+        let dev = DevExtension::detect(temp.path(), &DevOptions::default()).unwrap();
+        // Discover the actual Cargo DLL name; block only the copy destination,
+        // not creation of the generation directory or compilation of the DLL.
+        let artifact = build_cdylib(&dev.project, dev.release).unwrap();
+        let own = dev.stage_root.clone();
+        let blocked = own.join("1").join(artifact.file_name().unwrap());
+        std::fs::create_dir_all(&blocked).unwrap();
+        let other = DevExtension::detect(temp.path(), &DevOptions::default()).unwrap();
+        let legacy = own.parent().unwrap().join("stage-fixture-legacy-copy");
+        std::fs::create_dir(&legacy).unwrap();
+        for path in [&other.stage_root, &legacy] {
+            std::fs::write(path.join("keep"), b"not this preparation").unwrap();
+        }
+        let artifact_bytes = std::fs::read(&artifact).unwrap();
+        assert!(!artifact_bytes.is_empty());
+        let error = dev.prepare_initial(&mut Args::default()).err().unwrap();
+        assert!(error.contains("could not stage extension"), "{error}");
+        assert!(error.contains(blocked.to_str().unwrap()), "{error}");
+        assert!(!own.exists());
+        assert_eq!(std::fs::read(artifact).unwrap(), artifact_bytes);
+        for path in [&other.stage_root, &legacy] {
+            assert_eq!(
+                std::fs::read(path.join("keep")).unwrap(),
+                b"not this preparation"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_preparation_refuses_shared_ownership_without_deleting_files() {
+        let temp = initial_project("unused before ownership validation\n");
+        let dev = DevExtension::detect(temp.path(), &DevOptions::default()).unwrap();
+        let shared = dev.clone();
+        let sentinel = shared.stage_root.join("keep");
+        std::fs::write(&sentinel, b"shared namespace").unwrap();
+        let error = dev.prepare_initial(&mut Args::default()).err().unwrap();
+        assert!(error.contains("exclusive ownership"));
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"shared namespace");
+    }
+
+    #[test]
+    fn initial_preparation_refuses_weak_observers_without_deleting_files() {
+        let temp = initial_project("unused before ownership validation\n");
+        let dev = DevExtension::detect(temp.path(), &DevOptions::default()).unwrap();
+        let observer = Arc::downgrade(&dev);
+        let sentinel = dev.stage_root.join("keep");
+        std::fs::write(&sentinel, b"possibly observed by watcher").unwrap();
+        let error = dev.prepare_initial(&mut Args::default()).err().unwrap();
+        assert!(error.contains("exclusive ownership"));
+        assert_eq!(
+            std::fs::read(sentinel).unwrap(),
+            b"possibly observed by watcher"
+        );
+        drop(observer);
+    }
+
+    #[test]
+    fn initial_success_commits_same_owner_and_reprepare_keeps_built_artifact() {
+        let temp = initial_project("pub fn fixture() {}\n");
+        let dev = DevExtension::detect(temp.path(), &DevOptions::default()).unwrap();
+        let identity = Arc::as_ptr(&dev);
+        let mut args = Args::default();
+        let prepared = dev.prepare_initial(&mut args).unwrap();
+        assert_eq!(Arc::as_ptr(&prepared), identity);
+        let stage = prepared.current_stage.lock().unwrap().clone().unwrap();
+        assert_eq!(args.extensions_dir.last(), Some(&stage));
+        let artifact = std::fs::read_dir(&stage)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let bytes = std::fs::read(&artifact).unwrap();
+        assert!(!bytes.is_empty());
+        let error = prepared.prepare_initial(&mut args).err().unwrap();
+        assert!(error.contains("unbuilt instance"));
+        assert_eq!(std::fs::read(artifact).unwrap(), bytes);
+    }
+
+    #[test]
+    fn initial_cleanup_error_preserves_build_error_and_reports_remaining_path() {
+        let temp = initial_project("this is intentionally invalid Rust\n");
+        let dev = DevExtension::detect(temp.path(), &DevOptions::default()).unwrap();
+        let own = dev.stage_root.clone();
+        // A non-directory cannot be discarded as our original owner directory.
+        std::fs::remove_dir(&own).unwrap();
+        std::fs::write(&own, b"do not silently unlink a replacement").unwrap();
+        let error = dev.prepare_initial(&mut Args::default()).err().unwrap();
+        assert!(error.contains("cargo build"), "{error}");
+        assert!(error.contains("Initial staging cleanup failed"), "{error}");
+        assert!(error.contains(own.to_str().unwrap()), "{error}");
+        assert_eq!(
+            std::fs::read(&own).unwrap(),
+            b"do not silently unlink a replacement"
         );
     }
 

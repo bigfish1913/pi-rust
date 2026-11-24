@@ -4,11 +4,14 @@ use futures::FutureExt;
 use rpi_harness::{
     agent_harness::{AgentHarness, AgentLane},
     session::{
-        jsonl::JsonlSessionStorage, memory::SystemClock, session::DefaultIdGenerator,
+        jsonl::{JsonlSessionStorage, PreparedJsonlRestore},
+        memory::SystemClock,
+        session::DefaultIdGenerator,
         types::SessionStorage,
     },
     types::DrivingMode,
 };
+use rpi_tools::FileSystem;
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -23,6 +26,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 struct Active {
     id: RunId,
+    // Exact input identity, not this observer's volatile ticket. Duplicates
+    // never replace it; it lives until the original task fully settles.
+    submitted_request_id: Option<String>,
     cancel: CancellationToken,
     completion: watch::Receiver<Completion>,
 }
@@ -31,6 +37,9 @@ pub(super) struct Control {
     record: AgentRecord,
     active: Option<Active>,
     deferred: Option<String>,
+    // Volatile association carried only across explicit deferred polls in this
+    // owner lifetime. Restoring history never recreates cancellation authority.
+    deferred_request_id: Option<String>,
     closing: bool,
     cleaned: bool,
     uncertain: bool,
@@ -44,6 +53,7 @@ pub(super) struct Backend {
     catalog: HostCatalog,
     harness: AgentHarness,
     storage: JsonlSessionStorage,
+    extensions: Option<Arc<super::super::NativeExtensionCustody>>,
     limits: OrdinaryLimits,
     retiring: AtomicBool,
     closed: AtomicBool,
@@ -54,7 +64,7 @@ pub(super) async fn restore(
     id: AgentId,
     guard: CatalogGuard,
     limits: OrdinaryLimits,
-    binder: OrdinaryBinder,
+    binding: OrdinaryBinding,
 ) -> BackendResult<OrdinaryAgent> {
     let record = catalog.get(id).await?;
     if record.spec.mode != AgentMode::Persistent
@@ -70,8 +80,13 @@ pub(super) async fn restore(
         ));
     }
     let record = catalog.transition(id, guard, AgentState::Starting).await?;
-    match build(&catalog, &record, limits, binder).await {
+    match build(&catalog, &record, limits, binding).await {
         Ok(backend) => Ok(OrdinaryAgent { inner: backend }),
+        Err(error @ BackendError::ExtensionUnsettled(_)) => {
+            // No release proof: Service must retain Starting/residency and
+            // this error's concrete DLL/storage custody, never roll back Closed.
+            Err(error)
+        }
         Err(error) => {
             // build has drained/released any acquired writer before this rollback.
             // A failed rollback retains the reservation rather than claiming free capacity.
@@ -83,16 +98,57 @@ pub(super) async fn restore(
     }
 }
 
-async fn build(
-    catalog: &HostCatalog,
-    record: &AgentRecord,
-    limits: OrdinaryLimits,
-    binder: OrdinaryBinder,
-) -> BackendResult<Arc<Backend>> {
-    let cwd = tokio::fs::canonicalize(&record.spec.launch.cwd).await?;
-    let env = Arc::new(OsExecutionEnv::with_cwd(cwd.clone()));
-    let reference = record
-        .spec
+struct PreparedNativeBinding {
+    env: Arc<OsExecutionEnv>,
+    storage: PreparedJsonlRestore,
+    // Keep the immediate path inline: no extra heap allocation for existing
+    // native bindings. Exactly one slot is populated by prepare_binding.
+    options: Option<AgentHarnessOptions>,
+    assembly: Option<OrdinaryAssembly>,
+    instruction_resources: Option<Arc<super::super::NativeBindingResources>>,
+}
+
+/// Pure readonly preflight: neither Starting/resident metadata nor a Session
+/// writer is claimed. Actual restore repeats it to revalidate current facts.
+pub(super) async fn preflight(
+    spec: &crate::host::AgentSpec,
+    binding: OrdinaryBinding,
+) -> BackendResult<()> {
+    drop(prepare_binding(spec, binding).await?);
+    Ok(())
+}
+
+async fn prepare_binding(
+    spec: &crate::host::AgentSpec,
+    binding: OrdinaryBinding,
+) -> BackendResult<PreparedNativeBinding> {
+    let cwd = tokio::fs::canonicalize(&spec.launch.cwd).await?;
+    let OrdinaryBinding {
+        environment,
+        binder,
+        instruction_resources,
+        extensions: _,
+        #[cfg(test)]
+            filesystem: test_filesystem,
+    } = binding;
+    if let Some(resources) = &instruction_resources {
+        if spec.launch.resource_profile.as_deref() != Some(resources.identity()) {
+            return Err(BackendError::Binding(
+                "instruction resource identity mismatch",
+            ));
+        }
+        resources.validate_tools(&spec.launch.tools)?;
+    }
+    let env = match environment {
+        Some(env) if env.cwd() == cwd => env,
+        Some(_) => {
+            return Err(BackendError::Binding(
+                "execution workspace differs from registry",
+            ))
+        }
+        None => Arc::new(OsExecutionEnv::with_cwd(cwd.clone())),
+    };
+    let reference = spec
         .session
         .as_ref()
         .ok_or(BackendError::Binding("missing Session reference"))?;
@@ -100,8 +156,11 @@ async fn build(
     let path = path
         .to_str()
         .ok_or(BackendError::Binding("Session path must be UTF-8"))?;
+    let filesystem: Arc<dyn FileSystem> = env.clone();
+    #[cfg(test)]
+    let filesystem = test_filesystem.unwrap_or(filesystem);
     let prepared = JsonlSessionStorage::prepare_restore(
-        env.clone(),
+        filesystem,
         path,
         Arc::new(SystemClock),
         Arc::new(DefaultIdGenerator::new()),
@@ -114,19 +173,129 @@ async fn build(
     if tokio::fs::canonicalize(&facts.metadata.cwd).await? != cwd {
         return Err(BackendError::Binding("saved workspace identity mismatch"));
     }
-    // The mandatory resolver sees exact saved facts before any repair or lease.
-    let mut options = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        binder(&record.spec, env.clone(), &facts)
+    // Both resolver forms see exact saved facts before any repair or lease.
+    // A deferred resolver must only validate and construct an unpolled future.
+    let (options, assembly) = std::panic::catch_unwind(AssertUnwindSafe(|| -> BackendResult<_> {
+        match binder {
+            BindingResolver::Immediate(binder) => {
+                let options = binder(spec, env.clone(), &facts)?;
+                validate_bindings(spec, &options)?;
+                if let Some(resources) = &instruction_resources {
+                    resources.validate(&facts.values, &options.tools)?;
+                }
+                Ok((Some(options), None))
+            }
+            BindingResolver::Deferred(validator) => {
+                Ok((None, Some(validator(spec, env.clone(), &facts)?)))
+            }
+        }
     }))
     .map_err(|_| BackendError::TaskStopped)??;
-    validate_bindings(record, &options)?;
+    Ok(PreparedNativeBinding {
+        env,
+        storage: prepared,
+        options,
+        assembly,
+        instruction_resources,
+    })
+}
+
+async fn build(
+    catalog: &HostCatalog,
+    record: &AgentRecord,
+    limits: OrdinaryLimits,
+    binding: OrdinaryBinding,
+) -> BackendResult<Arc<Backend>> {
+    let extensions = binding.extensions.clone();
+    let Some(custody) = &extensions else {
+        return build_inner(catalog, record, limits, binding, None).await;
+    };
+    // Reject reuse before entering cleanup: a rejected second binding must
+    // never close the first Agent's still-live DLL owner or writer.
+    custody.claim(catalog.clone())?;
+    let result = AssertUnwindSafe(build_inner(
+        catalog,
+        record,
+        limits,
+        binding,
+        extensions.clone(),
+    ))
+    .catch_unwind()
+    .await
+    .unwrap_or(Err(BackendError::TaskStopped));
+    if result.is_err() {
+        custody.close().await?;
+        custody.release_storage().await;
+    }
+    result
+}
+
+async fn release_build_writer(
+    storage: &JsonlSessionStorage,
+    extensions: &Option<Arc<super::super::NativeExtensionCustody>>,
+) -> BackendResult<()> {
+    storage.drain().await;
+    if let Some(custody) = extensions {
+        custody.close().await?;
+    }
+    storage.release_writer_lease();
+    Ok(())
+}
+
+async fn build_inner(
+    catalog: &HostCatalog,
+    record: &AgentRecord,
+    limits: OrdinaryLimits,
+    binding: OrdinaryBinding,
+    extensions: Option<Arc<super::super::NativeExtensionCustody>>,
+) -> BackendResult<Arc<Backend>> {
+    let PreparedNativeBinding {
+        env,
+        storage: prepared,
+        options,
+        assembly,
+        instruction_resources,
+    } = prepare_binding(&record.spec, binding).await?;
+    // build runs only in the owned restore, never the readonly preflight.
+    // Do not detach/cancel assembly on waiter loss; final options still must
+    // pass the same model/provider/tool/drive validation before writer/repair.
+    let mut options = match (options, assembly) {
+        (Some(options), None) => options, // Already checked by the immediate resolver.
+        (None, Some(assembly)) => {
+            let options = AssertUnwindSafe(assembly)
+                .catch_unwind()
+                .await
+                .map_err(|_| BackendError::TaskStopped)??;
+            validate_bindings(&record.spec, &options)?;
+            if let Some(resources) = &instruction_resources {
+                resources.validate(&prepared.facts().await?.values, &options.tools)?;
+            }
+            options
+        }
+        _ => return Err(BackendError::Binding("invalid prepared assembly")),
+    };
     let storage = prepared.commit_strict().await?;
+    if let Some(custody) = &extensions {
+        custody.retain_storage(storage.clone());
+    }
     if !storage.writer_lease_held() {
         return Err(BackendError::Binding(
             "ordinary backend requires a real writer lease",
         ));
     }
     options.session = Session::new(Arc::new(storage.clone()), None);
+    if let Some(resources) = &instruction_resources {
+        // The exact writer also covers DLL cleanup when this binding owns
+        // executable resources; failed sync is not permission to unload early.
+        let persisted = AssertUnwindSafe(resources.persist(&options.session, &options.tools))
+            .catch_unwind()
+            .await
+            .unwrap_or(Err(BackendError::TaskStopped));
+        if let Err(error) = persisted {
+            release_build_writer(&storage, &extensions).await?;
+            return Err(error);
+        }
+    }
     options.require_native_durable = true;
     options.allow_existing_session = true;
     options.active_tool_names = record.spec.launch.tools.clone();
@@ -136,8 +305,7 @@ async fn build(
     let harness = match created {
         Ok(Ok(harness)) => harness,
         other => {
-            storage.drain().await;
-            storage.release_writer_lease();
+            release_build_writer(&storage, &extensions).await?;
             return Err(match other {
                 Ok(Err(error)) => error.into(),
                 _ => BackendError::TaskStopped,
@@ -149,7 +317,7 @@ async fn build(
         harness.wait_for_idle().await?;
         harness.drain_session().await;
         harness.close().await?;
-        storage.release_writer_lease();
+        release_build_writer(&storage, &extensions).await?;
         return Err(error.into());
     }
     let deferred = match harness.pending_deferred().await {
@@ -158,7 +326,7 @@ async fn build(
             harness.wait_for_idle().await?;
             harness.drain_session().await;
             harness.close().await?;
-            storage.release_writer_lease();
+            release_build_writer(&storage, &extensions).await?;
             return Err(error.into());
         }
     };
@@ -176,7 +344,7 @@ async fn build(
             harness.wait_for_idle().await?;
             harness.drain_session().await;
             harness.close().await?;
-            storage.release_writer_lease();
+            release_build_writer(&storage, &extensions).await?;
             return Err(error.into());
         }
     };
@@ -185,6 +353,7 @@ async fn build(
             record: idle,
             active: None,
             deferred,
+            deferred_request_id: None,
             closing: false,
             cleaned: false,
             uncertain: false,
@@ -195,15 +364,18 @@ async fn build(
         catalog: catalog.clone(),
         harness,
         storage,
+        extensions,
         limits,
         retiring: AtomicBool::new(false),
         closed: AtomicBool::new(false),
     }))
 }
 
-fn validate_bindings(record: &AgentRecord, options: &AgentHarnessOptions) -> BackendResult<()> {
-    let model = record
-        .spec
+fn validate_bindings(
+    spec: &crate::host::AgentSpec,
+    options: &AgentHarnessOptions,
+) -> BackendResult<()> {
+    let model = spec
         .launch
         .model
         .as_ref()
@@ -230,15 +402,9 @@ fn validate_bindings(record: &AgentRecord, options: &AgentHarnessOptions) -> Bac
         .iter()
         .map(|tool| tool.tool.schema().name.as_str())
         .collect();
-    let expected: BTreeSet<_> = record
-        .spec
-        .launch
-        .tools
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let expected: BTreeSet<_> = spec.launch.tools.iter().map(String::as_str).collect();
     if tools.len() != options.tools.len()
-        || expected.len() != record.spec.launch.tools.len()
+        || expected.len() != spec.launch.tools.len()
         || tools != expected
     {
         return Err(BackendError::Binding("tool bindings differ from registry"));
@@ -281,6 +447,52 @@ impl Backend {
         bounded_json(message, self.limits.max_input_bytes)
     }
 
+    pub fn validate_messages(&self, messages: &[AgentMessage]) -> BackendResult<()> {
+        bounded_json(&messages, self.limits.max_input_bytes)
+    }
+
+    /// Native admission observation for one request, independent of execution.
+    pub async fn admission(
+        &self,
+        request_id: &str,
+    ) -> BackendResult<Option<rpi_harness::agent_harness::HostAdmissionStatus>> {
+        self.harness
+            .host_admission(request_id)
+            .await
+            .map_err(super::admission_error)
+    }
+
+    pub async fn get_result(
+        &self,
+        run_id: &str,
+        history: HistoryIdentity,
+    ) -> BackendResult<Option<(RunResult, HistoryIdentity)>> {
+        let Some(result) = self.harness.get_result(run_id).await? else {
+            return Ok(None);
+        };
+        // This Backend owns a fixed Harness/Session. Cover the terminal record
+        // and all referenced entries, not only the earlier input admission.
+        let covered = self
+            .harness
+            .session()
+            .sync_history()
+            .await
+            .map_err(|_| BackendError::AdmissionUncertain)?;
+        if covered.generation != history.generation || covered.revision < history.revision {
+            return Err(BackendError::AdmissionUncertain);
+        }
+        Ok(Some((result, covered)))
+    }
+
+    pub async fn admissions(
+        &self,
+    ) -> BackendResult<Vec<rpi_harness::agent_harness::HostAdmissionStatus>> {
+        self.harness
+            .host_admissions()
+            .await
+            .map_err(super::admission_error)
+    }
+
     pub fn validate_operation(&self, operation: &OrdinaryOperation) -> BackendResult<()> {
         match operation {
             OrdinaryOperation::Prompt(messages) => {
@@ -294,11 +506,83 @@ impl Backend {
         }
     }
 
+    /// In-memory supervision only: a ticket is not proof that the input reached
+    /// the native journal. Use [`Self::submit_admitted`] for request-linked
+    /// admission.
     pub async fn submit(
         self: Arc<Self>,
-        mut control: OwnedMutexGuard<Control>,
+        control: OwnedMutexGuard<Control>,
         operation: OrdinaryOperation,
     ) -> BackendResult<RunTicket> {
+        let launched = self.launch(control, &operation, None).await?;
+        let ticket = RunTicket {
+            id: launched.id,
+            completion: launched.completion.clone(),
+        };
+        launched.spawn(operation, None);
+        Ok(ticket)
+    }
+
+    /// Admit the exact prompt in the native journal, then run it. The returned
+    /// ticket exposes the durable admission separately from execution outcome.
+    pub async fn submit_admitted(
+        self: Arc<Self>,
+        control: OwnedMutexGuard<Control>,
+        host_id: String,
+        request_id: String,
+        messages: Vec<AgentMessage>,
+    ) -> BackendResult<AdmittedRunTicket> {
+        if messages.is_empty() {
+            return Err(BackendError::Admission(
+                "at least one admitted message is required",
+            ));
+        }
+        let request = rpi_harness::agent_harness::HostAdmissionRequest {
+            request_id,
+            host_id,
+            agent_id: control.record.spec.id.to_string(),
+            kind: rpi_harness::agent_harness::HostAdmissionKind::Prompt {},
+            messages: messages.clone(),
+        };
+        rpi_harness::agent_harness::validate_host_admission(&request)
+            .map_err(super::admission_error)?;
+        // Full request comparison and a new strict sync are native Harness
+        // responsibilities. Entry visibility alone is never a durable retry ACK.
+        self.ready(&control)?;
+        if let Some(outcome) = self
+            .harness
+            .resync_host_admission(request.clone())
+            .await
+            .map_err(super::admission_error)?
+        {
+            return Ok(replayed_ticket(outcome.receipt));
+        }
+        let launched = self
+            .launch(
+                control,
+                &OrdinaryOperation::Prompt(messages.clone()),
+                Some(request.clone()),
+            )
+            .await?;
+        let admission = launched
+            .admission
+            .clone()
+            .ok_or(BackendError::TaskStopped)?;
+        let ticket = AdmittedRunTicket {
+            id: launched.id,
+            admission,
+            completion: launched.completion.clone(),
+        };
+        launched.spawn(OrdinaryOperation::Prompt(messages), Some(request));
+        Ok(ticket)
+    }
+
+    async fn launch(
+        self: &Arc<Self>,
+        mut control: OwnedMutexGuard<Control>,
+        operation: &OrdinaryOperation,
+        plan: Option<rpi_harness::agent_harness::HostAdmissionRequest>,
+    ) -> BackendResult<Launch> {
         self.ready(&control)?;
         if control.active.is_some()
             || (control.deferred.is_some()
@@ -320,30 +604,38 @@ impl Backend {
         let id = RunId::new();
         let cancel = CancellationToken::new();
         let (done, completion) = watch::channel(None);
+        let submitted_request_id = plan
+            .as_ref()
+            .map(|request| request.request_id.clone())
+            .or_else(|| match operation {
+                OrdinaryOperation::ResumeDeferred(_) => control.deferred_request_id.clone(),
+                _ => None,
+            });
         control.active = Some(Active {
             id,
+            submitted_request_id,
             cancel: cancel.clone(),
             completion: completion.clone(),
         });
         drop(control);
-        let inner = self.clone();
-        tokio::spawn(async move {
-            let result = AssertUnwindSafe(inner.run(id, cancel, operation))
-                .catch_unwind()
-                .await;
-            let result = match result {
-                Ok(report) => Ok(report),
-                Err(_) => {
-                    // Never publish Idle/release a slot after an unknown panic boundary.
-                    let mut control = inner.control.lock().await;
-                    control.fault = Some(BackendError::TaskStopped);
-                    control.uncertain = true;
-                    Err(BackendError::TaskStopped)
-                }
-            };
-            done.send_replace(Some(result));
-        });
-        Ok(RunTicket { id, completion })
+        // `Pending` is published before the task starts so a ticket waiting
+        // for admission can never observe `NotApplicable` for a plan.
+        let (admission_tx, admission) = match &plan {
+            Some(_) => {
+                let (tx, rx) = watch::channel(super::AdmissionState::Pending);
+                (Some(tx), Some(rx))
+            }
+            None => (None, None),
+        };
+        Ok(Launch {
+            inner: self.clone(),
+            id,
+            cancel,
+            completion,
+            admission,
+            admission_tx,
+            done,
+        })
     }
 
     async fn run(
@@ -351,9 +643,40 @@ impl Backend {
         id: RunId,
         cancel: CancellationToken,
         operation: OrdinaryOperation,
+        plan: Option<rpi_harness::agent_harness::HostAdmissionRequest>,
+        admission: Option<watch::Sender<AdmissionState>>,
     ) -> Arc<BackendReport> {
-        let outcome = if cancel.is_cancelled() {
-            Err(BackendError::CancelledBeforeAdmission)
+        // Admission precedes any provider/tool work. A rejection is a definite
+        // non-execution, never a durable input claim.
+        let mut replayed = false;
+        let admission_failure = if cancel.is_cancelled() {
+            let error = BackendError::CancelledBeforeAdmission;
+            publish_admission(&admission, AdmissionState::Rejected(error.clone()));
+            Some(error)
+        } else if let Some(request) = plan {
+            match self.harness.admit_host_request(request).await {
+                Ok(outcome) => {
+                    replayed = outcome.replayed;
+                    publish_admission(
+                        &admission,
+                        AdmissionState::Admitted(Arc::new(outcome.receipt)),
+                    );
+                    None
+                }
+                Err(error) => {
+                    let error = super::admission_error(error);
+                    publish_admission(&admission, AdmissionState::Rejected(error.clone()));
+                    Some(error)
+                }
+            }
+        } else {
+            None
+        };
+        let outcome = if let Some(error) = admission_failure {
+            Err(error)
+        } else if replayed {
+            // Exactly-once admission: the same request id never executes twice.
+            Ok(OrdinaryOutput::AlreadyAdmitted)
         } else {
             // Keep polling the real Harness future after signalling cancellation.
             // Do not abort/drop it, even while image preparation/recovery precedes RunStart.
@@ -363,21 +686,27 @@ impl Backend {
                         .harness
                         .prompt_messages(messages)
                         .await
+                        .map(Box::new)
                         .map(OrdinaryOutput::Run),
                     OrdinaryOperation::ResumePending => {
                         self.harness.resume_pending().await.map(|result| {
                             result
+                                .map(Box::new)
                                 .map(OrdinaryOutput::Run)
                                 .unwrap_or(OrdinaryOutput::NoPendingResume)
                         })
                     }
-                    OrdinaryOperation::ResumeDeferred(id) => {
-                        self.harness.resume(&id).await.map(OrdinaryOutput::Run)
-                    }
+                    OrdinaryOperation::ResumeDeferred(id) => self
+                        .harness
+                        .resume(&id)
+                        .await
+                        .map(Box::new)
+                        .map(OrdinaryOutput::Run),
                     OrdinaryOperation::Compact(instructions) => self
                         .harness
                         .compact(instructions.as_deref())
                         .await
+                        .map(Box::new)
                         .map(OrdinaryOutput::Compaction),
                 }
                 .map_err(BackendError::from)
@@ -444,6 +773,15 @@ impl Backend {
                     Some(deferred.id.clone())
                 }
                 _ => None,
+            };
+            control.deferred_request_id = if control.deferred.is_some() {
+                control
+                    .active
+                    .as_ref()
+                    .filter(|active| active.id == id)
+                    .and_then(|active| active.submitted_request_id.clone())
+            } else {
+                None
             };
         }
         if !control.closing
@@ -528,6 +866,54 @@ impl Backend {
         result
     }
 
+    fn validate_guard(&self, control: &Control, guard: CatalogGuard) -> BackendResult<()> {
+        let error = if guard.epoch != self.catalog.epoch() {
+            Some(CatalogError::EpochConflict)
+        } else if guard.revision != control.record.revision {
+            Some(CatalogError::RevisionConflict {
+                expected: guard.revision,
+                actual: control.record.revision,
+            })
+        } else {
+            None
+        };
+        match error {
+            Some(error) => Err(BackendError::GuardRejected(Arc::new(error))),
+            None => Ok(()),
+        }
+    }
+
+    pub fn cancel_guarded(&self, guard: CatalogGuard, ticket: RunId) -> BackendResult<bool> {
+        let control = self.control.try_lock().map_err(|_| BackendError::Busy)?;
+        self.validate_guard(&control, guard)?;
+        if let Some(active) = control.active.as_ref().filter(|active| active.id == ticket) {
+            active.cancel.cancel();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Exact submitted input, checked under the same gate as the signal. A
+    /// historical receipt, a duplicate observer and a parked deferred handle
+    /// never redirect this signal to another active operation.
+    pub fn cancel_submitted_guarded(
+        &self,
+        guard: CatalogGuard,
+        request_id: &str,
+    ) -> BackendResult<bool> {
+        let control = self.control.try_lock().map_err(|_| BackendError::Busy)?;
+        self.validate_guard(&control, guard)?;
+        if let Some(active) = control
+            .active
+            .as_ref()
+            .filter(|active| active.submitted_request_id.as_deref() == Some(request_id))
+        {
+            active.cancel.cancel();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn cancel(&self, ticket: RunId) -> BackendResult<bool> {
         let control = self.control.try_lock().map_err(|_| BackendError::Busy)?;
         if let Some(active) = control.active.as_ref().filter(|active| active.id == ticket) {
@@ -542,6 +928,15 @@ impl Backend {
         Ok(BackendSnapshot {
             record: control.record.clone(),
             ticket: control.active.as_ref().map(|active| active.id),
+            submitted_request_id: control
+                .active
+                .as_ref()
+                .and_then(|active| active.submitted_request_id.clone())
+                .or_else(|| control.deferred_request_id.clone()),
+            cancel_requested: control
+                .active
+                .as_ref()
+                .is_some_and(|active| active.cancel.is_cancelled()),
             active: self.harness.active_operation_snapshot(),
             pending_resume: self.harness.pending_resume().is_some(),
             deferred: control.deferred.clone(),
@@ -557,14 +952,57 @@ impl Backend {
     }
 
     pub async fn close(&self) -> BackendResult<()> {
+        self.close_inner(None).await
+    }
+
+    pub async fn close_guarded(&self, guard: CatalogGuard) -> BackendResult<()> {
+        self.close_inner(Some(guard)).await
+    }
+
+    async fn close_inner(&self, guard: Option<CatalogGuard>) -> BackendResult<()> {
         let _closing = self.close_gate.try_lock().map_err(|_| BackendError::Busy)?;
-        if self.is_closed() {
+        if self.is_closed() && guard.is_none() {
             return Ok(());
         }
-        self.retire();
         let mut control = self.control.lock().await;
+        if let Some(guard) = guard {
+            self.validate_guard(&control, guard)?;
+            if self.is_closed() || control.record.state == AgentState::Closing {
+                // No new Closing transition is needed on this retry, but an
+                // old retained handle must not acknowledge a reloaded owner.
+                let current = self.catalog.get(control.record.spec.id).await?;
+                if current.revision != guard.revision {
+                    return Err(BackendError::GuardRejected(Arc::new(
+                        CatalogError::RevisionConflict {
+                            expected: guard.revision,
+                            actual: current.revision,
+                        },
+                    )));
+                }
+                if self.is_closed() {
+                    return Ok(());
+                }
+            } else {
+                // Administrative admission must win the catalog CAS BEFORE any
+                // retire/cancel flag changes. An out-of-band catalog transition
+                // must not turn a stale request into unconditional shutdown.
+                let record = self
+                    .catalog
+                    .transition(control.record.spec.id, guard, AgentState::Closing)
+                    .await
+                    .map_err(|error| match error {
+                        CatalogError::EpochConflict | CatalogError::RevisionConflict { .. } => {
+                            BackendError::GuardRejected(Arc::new(error))
+                        }
+                        other => BackendError::from(other),
+                    })?;
+                control.record = record;
+            }
+        }
+        self.retire();
         control.closing = true;
-        // Signal cancellation regardless of a failed metadata Closing commit.
+        // Unconditional shutdown signals despite a failed Closing commit;
+        // guarded administration already won that commit before reaching here.
         let active = control.active.clone();
         if let Some(active) = &active {
             active.cancel.cancel();
@@ -615,8 +1053,14 @@ impl Backend {
         // already-closed Harness and only finish publishing the catalog fact.
         if !control.cleaned {
             self.harness.close().await?;
+            if let Some(custody) = &self.extensions {
+                custody.close().await?;
+            }
             self.storage.drain().await;
             self.storage.release_writer_lease();
+            if let Some(custody) = &self.extensions {
+                custody.release_storage().await;
+            }
             control.cleaned = true;
         }
         let closed = match self
@@ -637,6 +1081,7 @@ impl Backend {
         };
         control.record = closed;
         control.active = None;
+        control.deferred_request_id = None;
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
@@ -658,6 +1103,75 @@ impl Write for ByteCounter {
         Ok(())
     }
 }
+/// Ticket for an already-durable request id: admission is resolved, execution
+/// was settled as `AlreadyAdmitted` without launching anything.
+fn replayed_ticket(receipt: rpi_harness::agent_harness::HostAdmissionReceipt) -> AdmittedRunTicket {
+    let (_, admission) = watch::channel(AdmissionState::Admitted(Arc::new(receipt)));
+    let report = Arc::new(BackendReport {
+        outcome: Ok(OrdinaryOutput::AlreadyAdmitted),
+        write_failures: Vec::new(),
+        unsaved_messages: 0,
+        persistence_uncertain: false,
+        catalog_error: None,
+    });
+    let (_, completion) = watch::channel(Some(Ok(report)));
+    AdmittedRunTicket {
+        id: RunId::new(),
+        admission,
+        completion,
+    }
+}
+
+fn publish_admission(admission: &Option<watch::Sender<AdmissionState>>, state: AdmissionState) {
+    if let Some(sender) = admission {
+        sender.send_replace(state);
+    }
+}
+
+/// A launched supervisor task plus its admission/execution observers.
+struct Launch {
+    inner: Arc<Backend>,
+    id: RunId,
+    cancel: CancellationToken,
+    completion: watch::Receiver<Completion>,
+    admission: Option<watch::Receiver<AdmissionState>>,
+    admission_tx: Option<watch::Sender<AdmissionState>>,
+    done: watch::Sender<Completion>,
+}
+impl Launch {
+    fn spawn(
+        self,
+        operation: OrdinaryOperation,
+        plan: Option<rpi_harness::agent_harness::HostAdmissionRequest>,
+    ) {
+        let Launch {
+            inner,
+            id,
+            cancel,
+            completion: _,
+            admission: _,
+            admission_tx,
+            done,
+        } = self;
+        tokio::spawn(async move {
+            let result = AssertUnwindSafe(inner.run(id, cancel, operation, plan, admission_tx))
+                .catch_unwind()
+                .await;
+            let result = match result {
+                Ok(report) => Ok(report),
+                Err(_) => {
+                    // Never publish Idle/release a slot after an unknown panic boundary.
+                    let mut control = inner.control.lock().await;
+                    control.fault = Some(BackendError::TaskStopped);
+                    control.uncertain = true;
+                    Err(BackendError::TaskStopped)
+                }
+            };
+            done.send_replace(Some(result));
+        });
+    }
+}
+
 fn bounded_json(value: &impl Serialize, limit: usize) -> BackendResult<()> {
     let mut counter = ByteCounter { bytes: 0, limit };
     serde_json::to_writer(&mut counter, value).map_err(|_| BackendError::InputTooLarge)

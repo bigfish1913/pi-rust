@@ -388,7 +388,9 @@ async fn timeout_and_output_limits_are_terminal() {
         )
         .await
         .unwrap();
-    run(child, timed.clone(), "q".into(), Duration::ZERO).await;
+    run(child, timed.clone(), "q".into(), Duration::ZERO)
+        .await
+        .unwrap();
     assert_eq!(timed.snapshot()["status"], "failed");
     assert!(timed.snapshot()["error"]
         .as_str()
@@ -448,6 +450,8 @@ async fn failed_partial_responses_are_visible_but_not_replayed_as_successful_con
     assert_eq!(result["turns"][0]["status"], "failed");
     assert_eq!(result["turns"][1]["status"], "done");
 }
+
+mod retirement;
 
 #[test]
 fn history_limits_also_bound_failed_and_cancelled_turns() {

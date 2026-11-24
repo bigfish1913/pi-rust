@@ -30,10 +30,12 @@ pub(super) fn open_context_selector(
     list.on_cancel(close.clone());
     list.on_select(Arc::new(move |_| close()));
     open_searchable_selector(
-        state,
-        editor_container,
-        editor,
-        tui,
+        EditorUi {
+            state,
+            editor_container,
+            editor,
+            tui,
+        },
         Some("Context — loaded resources"),
         Some("Esc/Enter close · Type to filter · ↑/↓ browse · /usage for token totals"),
         list,
@@ -68,15 +70,18 @@ pub(super) fn open_selector(
 /// Returns the wrapper so callers can prefill the query (upstream's
 /// `initialSearchInput`). Mirrors `SelectSubmenu` with `searchable: true`.
 pub(super) fn open_searchable_selector(
-    state: &Arc<TuiState>,
-    editor_container: &Arc<Container>,
-    editor: &Arc<Editor>,
-    tui: &Arc<TuiAltScreen>,
+    ui: EditorUi<'_>,
     title: Option<&str>,
     description: Option<&str>,
     list: Arc<SelectList>,
     kind: SelectorKind,
 ) -> Arc<SearchableSelectList> {
+    let EditorUi {
+        state,
+        editor_container,
+        editor,
+        tui,
+    } = ui;
     let searchable = Arc::new(SearchableSelectList::new(title, description, list));
     open_selector_with_view(
         state,
@@ -154,15 +159,18 @@ pub(super) fn close_selector(
 /// the next user message — the in-flight run's config is already snapshotted),
 /// updates the footer, and notes the next-prompt effect.
 pub(super) fn open_model_selector(
-    state: &Arc<TuiState>,
-    editor_container: &Arc<Container>,
-    editor: &Arc<Editor>,
-    tui: &Arc<TuiAltScreen>,
+    ui: EditorUi<'_>,
     catalog: &[rpi_ai::Model],
     lane: &Arc<dyn AgentLane>,
     lane_model_id: &str,
     initial_search: Option<&str>,
 ) -> Option<Arc<SearchableSelectList>> {
+    let EditorUi {
+        state,
+        editor_container,
+        editor,
+        tui,
+    } = ui;
     let items = model_selector_items(catalog, lane_model_id);
     if items.is_empty() {
         add_note_message(
@@ -211,10 +219,7 @@ pub(super) fn open_model_selector(
     }));
 
     let searchable = open_searchable_selector(
-        state,
-        editor_container,
-        editor,
-        tui,
+        ui,
         Some("Select model"),
         Some("Type to filter by name, provider, or id"),
         list,
@@ -410,10 +415,12 @@ pub(super) fn open_session_selector(
     }));
 
     open_searchable_selector(
-        state,
-        editor_container,
-        editor,
-        tui,
+        EditorUi {
+            state,
+            editor_container,
+            editor,
+            tui,
+        },
         Some("Resume session"),
         Some(&description),
         list,
@@ -675,10 +682,12 @@ pub(super) async fn open_tree_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
     open_searchable_selector(
-        state,
-        editor_container,
-        editor,
-        tui,
+        EditorUi {
+            state,
+            editor_container,
+            editor,
+            tui,
+        },
         Some("Session tree"),
         Some("Type to filter by entry type, sequence, or id"),
         list,
@@ -830,10 +839,12 @@ pub(super) fn open_provider_selector(
     // Searchable like `/model` so the selector carries a title, a filter box,
     // and the Enter/Esc affordances instead of a bare list.
     open_searchable_selector(
-        state,
-        editor_container,
-        editor,
-        tui,
+        EditorUi {
+            state,
+            editor_container,
+            editor,
+            tui,
+        },
         Some("Select provider"),
         Some("Type to filter providers · Enter selects · Esc cancels"),
         list,
@@ -888,10 +899,12 @@ pub(super) fn open_login_provider_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
     open_searchable_selector(
-        state,
-        editor_container,
-        editor,
-        tui,
+        EditorUi {
+            state,
+            editor_container,
+            editor,
+            tui,
+        },
         Some("Log in to provider"),
         Some("Type to filter providers · Enter selects · Esc cancels"),
         list,
@@ -932,10 +945,12 @@ pub(super) fn open_logout_provider_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
     open_searchable_selector(
-        state,
-        editor_container,
-        editor,
-        tui,
+        EditorUi {
+            state,
+            editor_container,
+            editor,
+            tui,
+        },
         Some("Log out provider"),
         Some("Type to filter providers · Enter removes · Esc cancels"),
         list,
@@ -982,10 +997,12 @@ pub(super) fn open_provider_remove_selector(
     }));
 
     open_searchable_selector(
-        state,
-        editor_container,
-        editor,
-        tui,
+        EditorUi {
+            state,
+            editor_container,
+            editor,
+            tui,
+        },
         Some("Remove provider"),
         Some("Type to filter · Enter deletes · Esc cancels"),
         list,

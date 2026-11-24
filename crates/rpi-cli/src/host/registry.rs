@@ -1,3 +1,6 @@
+use super::lifecycle::{
+    self, LifecycleAdmission, LifecycleReceipt, LifecycleRequest, LifecycleState,
+};
 use super::{
     catalog::{is_mini, MAX_RECORD_BYTES},
     AgentId, AgentPage, AgentRecord, AgentSpec, AgentState, Capacity, CatalogError, CatalogGuard,
@@ -26,6 +29,33 @@ CREATE TABLE agents (
 );
 PRAGMA user_version = 1;";
 
+// Close-on-exec does not prevent fork's temporary descriptor inheritance. A
+// last-close-only flock release can outlive shutdown acknowledgement when a
+// concurrent child still references the open file description before exec.
+struct InstanceLock(Option<File>);
+impl InstanceLock {
+    fn release(&mut self) -> std::io::Result<()> {
+        if let Some(file) = &self.0 {
+            loop {
+                match fs2::FileExt::unlock(file) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => {
+                        result?;
+                        break;
+                    }
+                }
+            }
+        }
+        drop(self.0.take());
+        Ok(())
+    }
+}
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 pub(crate) struct Registry {
     // Field drop order: release SQLite and reservations before the instance lock.
     connection: Connection,
@@ -33,7 +63,7 @@ pub(crate) struct Registry {
     capacity: Capacity,
     config: HostConfig,
     epoch: HostEpoch,
-    _instance_lock: File,
+    _instance_lock: InstanceLock,
 }
 
 struct StoredRow {
@@ -88,7 +118,7 @@ impl StoredRow {
     }
 }
 
-fn find(connection: &Connection, id: AgentId) -> CatalogResult<Option<AgentRecord>> {
+pub(super) fn find(connection: &Connection, id: AgentId) -> CatalogResult<Option<AgentRecord>> {
     connection
         .query_row(
             &format!("SELECT {COLUMNS} FROM agents WHERE id = ?1"),
@@ -208,7 +238,7 @@ impl Registry {
         );
         connection.busy_timeout(std::time::Duration::from_secs(1))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if !matches!(version, 0 | 1) {
+        if !matches!(version, 0..=2) {
             return Err(CatalogError::UnsupportedVersion(version));
         }
         if version == 0 {
@@ -229,8 +259,12 @@ impl Registry {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if version == 0 {
             transaction.execute_batch(SCHEMA)?;
+            lifecycle::create_schema(&transaction)?;
             transaction.execute("INSERT INTO host_meta VALUES (1,?1)", [epoch.to_string()])?;
         } else {
+            if version == 1 {
+                lifecycle::create_schema(&transaction)?;
+            }
             let previous: String = transaction.query_row(
                 "SELECT epoch FROM host_meta WHERE singleton=1",
                 [],
@@ -256,6 +290,7 @@ impl Registry {
                     }
                 }
             }
+            lifecycle::recover(&transaction, previous)?;
             transaction.execute(
                 "UPDATE host_meta SET epoch=?1 WHERE singleton=1",
                 [epoch.to_string()],
@@ -270,6 +305,52 @@ impl Registry {
             epoch,
             _instance_lock: instance_lock,
         })
+    }
+
+    pub(crate) fn prepare_lifecycle(
+        &mut self,
+        request: LifecycleRequest,
+    ) -> CatalogResult<LifecycleAdmission> {
+        let admission = lifecycle::prepare(&mut self.connection, self.epoch, request)?;
+        lifecycle::checkpoint(&self.connection)?;
+        Ok(admission)
+    }
+
+    pub(crate) fn finish_lifecycle(
+        &mut self,
+        request: LifecycleRequest,
+        status: LifecycleState,
+    ) -> CatalogResult<LifecycleReceipt> {
+        let receipt = lifecycle::finish(&mut self.connection, self.epoch, request, status)?;
+        lifecycle::checkpoint(&self.connection)?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn lifecycle_receipt(
+        &self,
+        scope: super::ControlScopeId,
+        id: super::RequestId,
+    ) -> CatalogResult<Option<LifecycleReceipt>> {
+        let receipt = lifecycle::get(&self.connection, scope, id)?;
+        if receipt.is_some() {
+            lifecycle::checkpoint(&self.connection)?;
+        }
+        Ok(receipt)
+    }
+
+    pub(crate) fn shutdown(self) -> CatalogResult<()> {
+        let Self {
+            connection,
+            permits,
+            _instance_lock: mut lock,
+            ..
+        } = self;
+        drop(connection);
+        drop(permits);
+        // Explicit unlock affects inherited references to this same open file
+        // description too. Report unlock failure rather than falsely ACK cleanup.
+        lock.release()?;
+        Ok(())
     }
 
     pub(crate) fn epoch(&self) -> HostEpoch {
@@ -450,7 +531,7 @@ fn private_file(path: &Path) -> CatalogResult<File> {
 }
 
 #[cfg(unix)]
-fn own_directory(path: &Path) -> CatalogResult<File> {
+fn own_directory(path: &Path) -> CatalogResult<InstanceLock> {
     use std::os::unix::fs::DirBuilderExt;
     // Never chmod existing user paths. New directories are private from creation.
     std::fs::DirBuilder::new()
@@ -467,11 +548,11 @@ fn own_directory(path: &Path) -> CatalogResult<File> {
         }
     })?;
     // Keep the lock inode on disk: unlinking on shutdown admits split ownership.
-    Ok(lock)
+    Ok(InstanceLock(Some(lock)))
 }
 
 #[cfg(not(unix))]
-fn own_directory(_: &Path) -> CatalogResult<File> {
+fn own_directory(_: &Path) -> CatalogResult<InstanceLock> {
     Err(CatalogError::UnsupportedPlatform)
 }
 #[cfg(not(unix))]
@@ -481,4 +562,74 @@ fn private_file(_: &Path) -> CatalogResult<File> {
 #[cfg(not(unix))]
 fn check_private(_: &Path, _: bool) -> CatalogResult<()> {
     Err(CatalogError::UnsupportedPlatform)
+}
+
+#[cfg(all(test, unix))]
+mod ownership_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn shutdown_and_drop_unlock_shared_descriptions_without_releasing_a_later_owner() {
+        let root = tempfile::tempdir().unwrap();
+        // Deterministic reproduction of the fork/exec window: dup and fork
+        // references share the same flock-bearing open file description.
+        let path = root.path().join("last-close-only.lock");
+        let original = private_file(&path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&original).unwrap();
+        let inherited = original.try_clone().unwrap();
+        drop(original);
+        let contender = private_file(&path).unwrap();
+        assert_eq!(
+            fs2::FileExt::try_lock_exclusive(&contender)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs2::FileExt::unlock(&inherited).unwrap();
+        fs2::FileExt::try_lock_exclusive(&contender).unwrap();
+        drop(inherited);
+        drop(contender);
+
+        for explicit_shutdown in [false, true] {
+            let directory = root
+                .path()
+                .join(if explicit_shutdown { "ack" } else { "drop" });
+            let registry = Registry::open(&directory, HostConfig::default()).unwrap();
+            let inherited = registry
+                ._instance_lock
+                .0
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap();
+            let inode = inherited.metadata().unwrap().ino();
+            if explicit_shutdown {
+                registry.shutdown().unwrap();
+            } else {
+                drop(registry);
+            }
+            let next = Registry::open(&directory, HostConfig::default()).unwrap();
+            assert_eq!(
+                std::fs::metadata(directory.join("instance.lock"))
+                    .unwrap()
+                    .ino(),
+                inode,
+                "never unlink the singleton inode"
+            );
+            assert!(matches!(
+                Registry::open(&directory, HostConfig::default()),
+                Err(CatalogError::AlreadyRunning)
+            ));
+            drop(inherited);
+            assert!(
+                matches!(
+                    Registry::open(&directory, HostConfig::default()),
+                    Err(CatalogError::AlreadyRunning)
+                ),
+                "dropping an old inherited descriptor must not unlock a new owner"
+            );
+            next.shutdown().unwrap();
+        }
+    }
 }

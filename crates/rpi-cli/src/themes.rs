@@ -358,7 +358,7 @@ pub fn apply_and_persist(
         ThemeSpec::File(path) => {
             // Surface a load error before touching any state; the label is
             // the file stem (the discovery name), not the JSON `name` field.
-            LoadedTheme::load(path).map_err(|message| message)?;
+            LoadedTheme::load(path)?;
             path.file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or("theme")

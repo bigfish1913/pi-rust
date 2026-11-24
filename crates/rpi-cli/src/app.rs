@@ -85,6 +85,11 @@ async fn run_inner() -> i32 {
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // Shared Host control is an explicit independent entry point: never hydrate
+    // ambient durable/session/provider/extension state or interpret it as a prompt.
+    if argv.first().map(String::as_str) == Some("host") {
+        return crate::host::cli::run(&argv[1..]).await;
+    }
     if let Err(error) = crate::native_durable::experimental_epoch::early_check(&argv) {
         eprintln!("error: {error}");
         return EXIT_USAGE;
@@ -603,15 +608,17 @@ async fn run_inner() -> i32 {
                 Some(event_rx),
                 &parsed,
                 model_catalog,
-                initial.clone(),
-                &extra,
-                file_images.clone(),
-                if parsed.no_themes {
-                    None
-                } else {
-                    parsed.theme.as_deref().or(resolved.theme.as_deref())
+                crate::modes::InteractiveStartup {
+                    initial: initial.clone(),
+                    extra_messages: &extra,
+                    initial_images: file_images.clone(),
+                    theme: if parsed.no_themes {
+                        None
+                    } else {
+                        parsed.theme.as_deref().or(resolved.theme.as_deref())
+                    },
+                    no_themes: parsed.no_themes,
                 },
-                parsed.no_themes,
                 &reload_context,
             )
             .await
@@ -681,11 +688,13 @@ async fn run_inner() -> i32 {
                         &harness,
                         Some(event_rx),
                         model_catalog,
-                        reload_context.ui_dialog.clone(),
-                        oauth_snapshot,
-                        Some(reload_context.extension_session.clone()),
-                        parsed.rpc_message_updates,
-                        parsed.native_durable,
+                        crate::modes::RpcOptions {
+                            ui_dialog: reload_context.ui_dialog.clone(),
+                            oauth_snapshot,
+                            extension_session: Some(reload_context.extension_session.clone()),
+                            message_updates: parsed.rpc_message_updates,
+                            native_durable: parsed.native_durable,
+                        },
                     )
                     .await
                 };
@@ -787,17 +796,13 @@ fn prepare_dev_extension(
     };
 
     match crate::dev_extension::DevExtension::detect(cwd, options) {
-        Ok(extension) => {
-            if let Err(error) = extension.rebuild() {
-                eprintln!("error: initial extension build failed: {error}");
-                return Err(EXIT_RUNTIME);
+        Ok(extension) => match extension.prepare_initial(parsed) {
+            Ok(extension) => Ok(Some(extension)),
+            Err(error) => {
+                eprintln!("error: initial extension preparation failed: {error}");
+                Err(EXIT_RUNTIME)
             }
-            if let Err(error) = extension.apply_to_args(parsed) {
-                eprintln!("error: {error}");
-                return Err(EXIT_RUNTIME);
-            }
-            Ok(Some(extension))
-        }
+        },
         Err(error) => {
             // No Cargo cdylib found: degrade to skills-only mode.
             eprintln!("dev: {error}");
@@ -895,14 +900,14 @@ async fn list_models(search: &str, args: &Args, cwd: &Path) -> i32 {
 
     fn format_tokens(value: u64) -> String {
         if value >= 1_000_000 {
-            let whole = value % 1_000_000 == 0;
+            let whole = value.is_multiple_of(1_000_000);
             if whole {
                 format!("{}M", value / 1_000_000)
             } else {
                 format!("{:.1}M", value as f64 / 1_000_000.0)
             }
         } else if value >= 1_000 {
-            let whole = value % 1_000 == 0;
+            let whole = value.is_multiple_of(1_000);
             if whole {
                 format!("{}K", value / 1_000)
             } else {

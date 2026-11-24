@@ -360,34 +360,37 @@ pub async fn rpc(
         harness,
         agent_events.take(),
         model_catalog,
-        ui_dialog,
-        oauth_snapshot,
-        None,
-        message_updates,
-        false,
+        RpcOptions {
+            ui_dialog,
+            oauth_snapshot,
+            extension_session: None,
+            message_updates,
+            native_durable: false,
+        },
     )
     .await
+}
+
+/// Runtime integrations and policy shared by the stdio and test RPC loops.
+pub struct RpcOptions {
+    pub ui_dialog: rpi_extensions::UiDialogMailbox,
+    pub oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    pub extension_session: Option<crate::session::ExtensionSessionCell>,
+    pub message_updates: crate::args::RpcMessageUpdates,
+    pub native_durable: bool,
 }
 
 pub async fn rpc_with_durable(
     harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
-    ui_dialog: rpi_extensions::UiDialogMailbox,
-    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
-    extension_session: Option<crate::session::ExtensionSessionCell>,
-    message_updates: crate::args::RpcMessageUpdates,
-    native_durable: bool,
+    options: RpcOptions,
 ) -> i32 {
     rpc_with_native_durable_io(
         harness,
         agent_events.take(),
         model_catalog,
-        ui_dialog,
-        oauth_snapshot,
-        extension_session,
-        message_updates,
-        native_durable,
+        options,
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
     )
@@ -507,11 +510,13 @@ where
         harness,
         agent_events,
         model_catalog,
-        ui_dialog,
-        oauth_snapshot,
-        extension_session,
-        message_updates,
-        false,
+        RpcOptions {
+            ui_dialog,
+            oauth_snapshot,
+            extension_session,
+            message_updates,
+            native_durable: false,
+        },
         input,
         output,
     )
@@ -522,11 +527,7 @@ async fn rpc_with_native_durable_io<R, W>(
     harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
-    ui_dialog: rpi_extensions::UiDialogMailbox,
-    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
-    extension_session: Option<crate::session::ExtensionSessionCell>,
-    message_updates: crate::args::RpcMessageUpdates,
-    native_durable: bool,
+    options: RpcOptions,
     mut input: R,
     output: W,
 ) -> i32
@@ -534,6 +535,13 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
     W: Write + Send + 'static,
 {
+    let RpcOptions {
+        ui_dialog,
+        oauth_snapshot,
+        extension_session,
+        message_updates,
+        native_durable,
+    } = options;
     let phase_diagnostics =
         std::env::var_os("RPI_RPC_DIAGNOSTICS").is_some_and(|value| value != "0");
     let setup_timing = RpcPhaseTiming::start(phase_diagnostics, "setup_to_ready_enqueue");
@@ -2811,7 +2819,7 @@ async fn rpc_test_provider_config(msg: &serde_json::Value) -> Result<serde_json:
         required("apiKey")?,
     )
     .await?;
-    Ok(serde_json::to_value(result).map_err(|error| error.to_string())?)
+    serde_json::to_value(result).map_err(|error| error.to_string())
 }
 
 fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -2846,10 +2854,12 @@ fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value,
         api,
         base_url,
         api_key,
-        model_id,
-        model_name,
-        context_window,
-        max_tokens,
+        crate::config::ProviderModelConfig {
+            id: model_id,
+            name: model_name,
+            context_window,
+            max_tokens,
+        },
         supports_images,
     )?;
     Ok(serde_json::json!({
@@ -2885,10 +2895,12 @@ fn rpc_update_provider_config(msg: &serde_json::Value) -> Result<serde_json::Val
         api,
         base_url,
         msg.get("apiKey").and_then(serde_json::Value::as_str),
-        model_id,
-        msg.get("modelName").and_then(serde_json::Value::as_str),
-        positive_integer("contextWindow")?,
-        positive_integer("maxOutputTokens")?,
+        crate::config::ProviderModelConfig {
+            id: model_id,
+            name: msg.get("modelName").and_then(serde_json::Value::as_str),
+            context_window: positive_integer("contextWindow")?,
+            max_tokens: positive_integer("maxOutputTokens")?,
+        },
         msg.get("supportsImages")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
@@ -3070,7 +3082,7 @@ async fn rpc_set_model(
         .iter()
         .find(|m| {
             m.id.eq_ignore_ascii_case(id)
-                && provider.map_or(true, |provider| m.provider.eq_ignore_ascii_case(provider))
+                && provider.is_none_or(|provider| m.provider.eq_ignore_ascii_case(provider))
         })
         .cloned()
         .ok_or_else(|| format!("unknown model: {id}"))?;
@@ -3159,6 +3171,15 @@ fn run_end_outcome_str(o: RunEndOutcome) -> &'static str {
     }
 }
 
+/// Initial input and appearance for an interactive session.
+pub struct InteractiveStartup<'a> {
+    pub initial: Option<String>,
+    pub extra_messages: &'a [String],
+    pub initial_images: Vec<ImageContent>,
+    pub theme: Option<&'a str>,
+    pub no_themes: bool,
+}
+
 /// `interactive` mode: uses TUI if terminal supports it, falls back to minimal REPL.
 ///
 /// `event_rx` carries the live `AgentEvent` stream (drained by the TUI to
@@ -3172,11 +3193,7 @@ pub async fn interactive(
     event_rx: Option<tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>>,
     args: &Args,
     model_catalog: Vec<rpi_ai::Model>,
-    initial: Option<String>,
-    extra_messages: &[String],
-    initial_images: Vec<ImageContent>,
-    theme: Option<&str>,
-    no_themes: bool,
+    startup: InteractiveStartup<'_>,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     // ---- Session lifecycle (P1): BeforeTuiStart ----
@@ -3208,11 +3225,7 @@ pub async fn interactive(
             event_rx,
             args,
             model_catalog,
-            initial,
-            extra_messages,
-            initial_images,
-            theme,
-            no_themes,
+            startup,
             reload_context,
         ))
         .await
@@ -3222,7 +3235,14 @@ pub async fn interactive(
         for notice in &reload_context.startup_notices {
             eprintln!("note: {notice}");
         }
-        interactive_repl(harness, args, initial, extra_messages, initial_images).await
+        interactive_repl(
+            harness,
+            args,
+            startup.initial,
+            startup.extra_messages,
+            startup.initial_images,
+        )
+        .await
     };
 
     // `SessionShutdown`: the interactive session closed (TUI/REPL returned) —

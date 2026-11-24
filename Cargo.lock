@@ -2164,6 +2164,7 @@ dependencies = [
  "arboard",
  "async-trait",
  "base64",
+ "cc",
  "criterion",
  "crossterm",
  "dirs",

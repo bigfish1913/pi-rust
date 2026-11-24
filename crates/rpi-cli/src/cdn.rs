@@ -113,7 +113,7 @@ fn safe_archive_filename(value: &str) -> Result<String, String> {
     let filename = url
         .path_segments()
         .ok_or("archive URL has no path")?
-        .last()
+        .next_back()
         .ok_or("archive URL has no filename")?;
     safe_path_segment(filename, "archive filename")
 }
@@ -138,7 +138,7 @@ pub(crate) fn archive_url(
             .map_err(|_| "invalid CDN base URL")?;
         let already_scoped = base
             .path_segments()
-            .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+            .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
             == Some(prefix);
         if !already_scoped {
             path.push(prefix);

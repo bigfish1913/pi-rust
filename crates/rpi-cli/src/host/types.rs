@@ -48,6 +48,19 @@ identity!(AgentId);
 identity!(HostEpoch);
 identity!(RunId);
 identity!(RequestId);
+// Stable namespace for trusted administrative requests, distinct from epochs.
+identity!(ControlScopeId);
+// Opaque nonce for one frozen trusted profile, never a digest of private inputs.
+identity!(ProfileVersion);
+
+/// Public identity of immutable trusted inputs. Possessing/constructing this
+/// value grants nothing: the Host must resolve the exact pair in its allowlist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileRef {
+    pub agent_id: AgentId,
+    pub version: ProfileVersion,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

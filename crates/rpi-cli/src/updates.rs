@@ -796,7 +796,7 @@ fn staged_pending_version(update_root: &Path, channel: UpdateChannel) -> Option<
         {
             continue;
         }
-        if newest.as_ref().map_or(true, |newest| version > *newest) {
+        if newest.as_ref().is_none_or(|newest| version > *newest) {
             newest = Some(version);
         }
     }

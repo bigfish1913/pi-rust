@@ -28,9 +28,19 @@ fn now_ms() -> u64 {
 
 #[derive(Default)]
 pub(crate) struct ChildAgents {
-    jobs: Mutex<HashMap<String, Arc<Job>>>,
-    revoked: Mutex<HashSet<u64>>,
+    jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
+    revoked: Arc<Mutex<HashSet<u64>>>,
     active: Arc<AtomicUsize>,
+    tasks: crate::host::cli_tasks::CliTaskScope,
+}
+
+// The owned preparation shares only state, not the parent service's Drop owner.
+struct ChildPreparation {
+    jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
+    revoked: Arc<Mutex<HashSet<u64>>>,
+    active: Arc<AtomicUsize>,
+    admission: crate::host::cli_tasks::CliTaskAdmission,
+    signal: CancellationToken,
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -134,11 +144,21 @@ impl AgentEmitter for Emitter {
 
 impl Drop for ChildAgents {
     fn drop(&mut self) {
-        self.cancel_all();
+        self.begin_shutdown();
     }
 }
 
 impl ChildAgents {
+    pub(crate) fn begin_shutdown(&self) {
+        self.tasks.seal();
+        self.cancel_all();
+    }
+
+    #[allow(dead_code)] // Staged until the CLI's complete resource owner is wired.
+    pub(crate) async fn wait_shutdown(&self) -> Result<(), String> {
+        self.tasks.wait().await
+    }
+
     pub(crate) fn cancel_owner(&self, owner: u64) {
         self.revoked
             .lock()
@@ -231,7 +251,17 @@ impl ChildAgents {
             .and_then(Value::as_str)
             .ok_or("missing child op")?;
         if op == "start" {
-            return self.start(parent, owner, &args).await;
+            let preparation = ChildPreparation {
+                jobs: self.jobs.clone(),
+                revoked: self.revoked.clone(),
+                active: self.active.clone(),
+                admission: self.tasks.admit()?,
+                signal: self.tasks.signal(),
+            };
+            return self
+                .tasks
+                .call(Self::start(preparation, parent.clone(), owner, args))
+                .await?;
         }
         self.handle_existing(owner, args)
     }
@@ -297,11 +327,14 @@ impl ChildAgents {
     }
 
     async fn start(
-        &self,
-        parent: &AgentHarness,
+        preparation: ChildPreparation,
+        parent: AgentHarness,
         owner: u64,
-        args: &Value,
+        args: Value,
     ) -> Result<Value, String> {
+        if preparation.signal.is_cancelled() {
+            return Err("native auxiliary resources are retiring".into());
+        }
         let invocation_signal = rpi_agent::tool_execution_scope::invocation_signal();
         if invocation_signal
             .as_ref()
@@ -321,8 +354,8 @@ impl ChildAgents {
         if task.trim().is_empty() || task.len() > 20_000 || role.is_empty() || role.len() > 200 {
             return Err("child task must contain 1-20000 bytes and role 1-200 bytes".into());
         }
-        let turns = bounded_number(args, "maxTurns", 8, 1, 32)? as u32;
-        let timeout = bounded_number(args, "timeoutSeconds", 300, 10, 1800)?;
+        let turns = bounded_number(&args, "maxTurns", 8, 1, 32)? as u32;
+        let timeout = bounded_number(&args, "timeoutSeconds", 300, 10, 1800)?;
         let tools = args
             .get("tools")
             .map(|value| {
@@ -344,7 +377,7 @@ impl ChildAgents {
         let id = parent.session().id_generator().next();
         let job = Arc::new(Job {
             owner,
-            cancel: CancellationToken::new(),
+            cancel: preparation.signal.child_token(),
             invocation_signal,
             state: Mutex::new(State {
                 started_ms: now_ms(),
@@ -356,20 +389,23 @@ impl ChildAgents {
         // Reserve before awaiting construction so concurrent starts cannot exceed the cap.
         let permit;
         {
-            let revoked = self.revoked.lock().unwrap_or_else(|e| e.into_inner());
+            let revoked = preparation
+                .revoked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if revoked.contains(&owner) {
                 return Err("owning plugin unloaded".into());
             }
-            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut jobs = preparation.jobs.lock().unwrap_or_else(|e| e.into_inner());
             if jobs.len() >= MAX_JOBS {
                 return Err("child capacity reached; dispose finished children".into());
             }
-            let mut active = self.active.load(Ordering::Acquire);
+            let mut active = preparation.active.load(Ordering::Acquire);
             loop {
                 if active >= MAX_JOBS {
                     return Err("child cleanup still in progress; retry later".into());
                 }
-                match self.active.compare_exchange_weak(
+                match preparation.active.compare_exchange_weak(
                     active,
                     active + 1,
                     Ordering::AcqRel,
@@ -379,7 +415,7 @@ impl ChildAgents {
                     Err(current) => active = current,
                 }
             }
-            permit = Permit(self.active.clone());
+            permit = Permit(preparation.active.clone());
             jobs.insert(id.clone(), job.clone());
         }
         let session = Session::new(
@@ -400,7 +436,8 @@ impl ChildAgents {
         {
             Ok(child) => child,
             Err(error) => {
-                self.jobs
+                preparation
+                    .jobs
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&id);
@@ -411,26 +448,34 @@ impl ChildAgents {
         let worker = job.clone();
         let execution_scope = child.execution_scope.clone();
         let cleanup_harness = child.harness.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if std::panic::AssertUnwindSafe(run_child(
-                child,
-                worker.clone(),
-                prompt,
-                turns,
-                timeout,
-            ))
-            .catch_unwind()
-            .await
-            .is_err()
-            {
-                worker.fail("child runner panicked");
-                let _ = cleanup_harness.close().await;
-            }
-            // Also retain capacity when run_child unwinds after starting a
-            // background driver; catch_unwind is not a cleanup completion.
-            execution_scope.wait_idle().await;
-        });
+        let settlement = preparation.admission.clone();
+        preparation
+            .admission
+            .spawn(&tokio::runtime::Handle::current(), async move {
+                let _permit = permit;
+                match std::panic::AssertUnwindSafe(run_child(
+                    child,
+                    worker.clone(),
+                    prompt,
+                    turns,
+                    timeout,
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => settlement.mark_unknown(),
+                    Err(_) => {
+                        worker.fail("child runner panicked");
+                        if cleanup_harness.close().await.is_err() {
+                            settlement.mark_unknown();
+                        }
+                    }
+                }
+                // Also retain capacity when run_child unwinds after starting a
+                // background driver; catch_unwind is not a cleanup completion.
+                execution_scope.wait_idle().await;
+            });
         Ok(json!({"childId":id,"sessionId":id,"status":"running"}))
     }
 }
@@ -454,7 +499,13 @@ fn bounded_number(
     Ok(value)
 }
 
-async fn run_child(child: ChildHarness, job: Arc<Job>, prompt: String, turns: u32, timeout: u64) {
+async fn run_child(
+    child: ChildHarness,
+    job: Arc<Job>,
+    prompt: String,
+    turns: u32,
+    timeout: u64,
+) -> Result<(), String> {
     let lane = child.harness.lane("main");
     let run = lane.prompt_text(&prompt, Vec::new());
     tokio::pin!(run);
@@ -510,7 +561,11 @@ async fn run_child(child: ChildHarness, job: Arc<Job>, prompt: String, turns: u3
         let _ = child.harness.close().await;
         let _ = tokio::time::timeout(Duration::from_secs(2), &mut run).await;
     }
-    let _ = child.harness.close().await;
+    child
+        .harness
+        .close()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

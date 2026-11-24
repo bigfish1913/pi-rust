@@ -5,9 +5,10 @@
 //! use epoch/revision guards before retrying. This is not a prompt submission,
 //! durable input acknowledgement, or exactly-once tool execution API.
 
+use super::lifecycle::{LifecycleAdmission, LifecycleReceipt, LifecycleRequest, LifecycleState};
 use super::{
     registry::Registry, AgentId, AgentMode, AgentSpec, AgentState, CatalogError, CatalogResult,
-    HostConfig, HostEpoch,
+    ControlScopeId, HostConfig, HostEpoch, RequestId,
 };
 use serde::{Deserialize, Serialize};
 use std::{num::NonZeroUsize, path::PathBuf};
@@ -95,6 +96,19 @@ pub(crate) enum Command {
         limit: Option<NonZeroUsize>,
         reply: Reply<()>,
     },
+    PrepareLifecycle {
+        request: Box<LifecycleRequest>,
+        reply: Reply<LifecycleAdmission>,
+    },
+    FinishLifecycle {
+        result: Box<(LifecycleRequest, LifecycleState)>,
+        reply: Reply<LifecycleReceipt>,
+    },
+    LifecycleReceipt {
+        scope: ControlScopeId,
+        request_id: RequestId,
+        reply: Reply<Option<LifecycleReceipt>>,
+    },
     Shutdown {
         reply: Reply<()>,
     },
@@ -161,16 +175,31 @@ impl HostCatalog {
                         Command::Limit { limit, reply } => {
                             let _ = reply.send(registry.set_limit(limit));
                         }
+                        Command::PrepareLifecycle { request, reply } => {
+                            let _ = reply.send(registry.prepare_lifecycle(*request));
+                        }
+                        Command::FinishLifecycle { result, reply } => {
+                            let (request, status) = *result;
+                            let _ = reply.send(registry.finish_lifecycle(request, status));
+                        }
+                        Command::LifecycleReceipt {
+                            scope,
+                            request_id,
+                            reply,
+                        } => {
+                            let _ = reply.send(registry.lifecycle_receipt(scope, request_id));
+                        }
                         Command::Shutdown { reply } => {
                             shutdown = Some(reply);
                             break;
                         }
                     }
                 }
-                // Release SQLite and the instance lock before acknowledging shutdown.
-                drop(registry);
+                // Release SQLite, reservations and inherited lock references
+                // before acknowledging; unlock errors cannot become a success ACK.
+                let cleanup = registry.shutdown();
                 if let Some(reply) = shutdown {
-                    let _ = reply.send(Ok(()));
+                    let _ = reply.send(cleanup);
                 }
             })?;
         let epoch = started.await.map_err(|_| CatalogError::WorkerStopped)??;
@@ -252,6 +281,49 @@ impl HostCatalog {
         self.call(|reply| Command::Limit { limit, reply }).await
     }
 
+    /// Commit administrative custody only. The trusted coordinator must own
+    /// prepare+action+finish independently of a client waiter, and may act ONLY
+    /// when `fresh` is true. This API executes nothing and grants no permission.
+    pub async fn prepare_lifecycle(
+        &self,
+        request: LifecycleRequest,
+    ) -> CatalogResult<LifecycleAdmission> {
+        self.call(|reply| Command::PrepareLifecycle {
+            request: Box::new(request),
+            reply,
+        })
+        .await
+    }
+
+    /// Trusted coordinator publication, never a client-supplied result. A final
+    /// state is immutable; errors require reconciliation rather than replay.
+    pub async fn finish_lifecycle(
+        &self,
+        request: LifecycleRequest,
+        status: LifecycleState,
+    ) -> CatalogResult<LifecycleReceipt> {
+        self.call(|reply| Command::FinishLifecycle {
+            result: Box::new((request, status)),
+            reply,
+        })
+        .await
+    }
+
+    /// No Agent load, action replay, or ownership transfer. Found records pass
+    /// a strict SQLite checkpoint before they are returned as journal evidence.
+    pub async fn lifecycle_receipt(
+        &self,
+        scope: ControlScopeId,
+        request_id: RequestId,
+    ) -> CatalogResult<Option<LifecycleReceipt>> {
+        self.call(|reply| Command::LifecycleReceipt {
+            scope,
+            request_id,
+            reply,
+        })
+        .await
+    }
+
     /// Waits for storage/lock cleanup, not for Agent execution cleanup.
     pub async fn shutdown(&self) -> CatalogResult<()> {
         self.call(|reply| Command::Shutdown { reply }).await
@@ -265,6 +337,44 @@ pub(crate) fn is_mini(record: &AgentRecord) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn abandoned_lifecycle_reply_does_not_transfer_a_committed_fresh_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = HostCatalog::open(directory.path().join("host"), HostConfig::default())
+            .await
+            .unwrap();
+        let request = LifecycleRequest {
+            scope: ControlScopeId::new(),
+            request_id: RequestId::new(),
+            epoch: catalog.epoch(),
+            action: crate::host::lifecycle::LifecycleAction::Create {
+                agent_id: AgentId::new(),
+            },
+        };
+        let (reply, result) = oneshot::channel();
+        drop(result);
+        catalog
+            .sender
+            .send(Command::PrepareLifecycle {
+                request: Box::new(request.clone()),
+                reply,
+            })
+            .await
+            .unwrap();
+        // FIFO observation after the abandoned queued command, not a timing race.
+        let receipt = catalog
+            .lifecycle_receipt(request.scope, request.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.status, LifecycleState::Prepared {});
+        let duplicate = catalog.prepare_lifecycle(request).await.unwrap();
+        assert!(!duplicate.fresh);
+        assert_eq!(duplicate.receipt, receipt);
+        assert_eq!(catalog.status().await.unwrap().registered, 0);
+        catalog.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn abandoned_client_reply_does_not_undo_an_accepted_catalog_mutation() {

@@ -379,6 +379,14 @@ pub fn save_models_config(cfg: &ModelsConfig) -> Result<(), ConfigError> {
     atomic_write(&path, text.as_bytes())
 }
 
+/// Metadata for the first model in a user-configured provider.
+pub struct ProviderModelConfig<'a> {
+    pub id: &'a str,
+    pub name: Option<&'a str>,
+    pub context_window: Option<u64>,
+    pub max_tokens: Option<u64>,
+}
+
 /// Add one user-configured provider and its first model to `models.json`.
 ///
 /// This is shared by the interactive provider form and RPC clients so both
@@ -388,12 +396,15 @@ pub fn add_provider(
     api: &str,
     base_url: &str,
     api_key: &str,
-    model_id: &str,
-    model_name: Option<&str>,
-    context_window: Option<u64>,
-    max_tokens: Option<u64>,
+    model: ProviderModelConfig<'_>,
     supports_images: Option<bool>,
 ) -> Result<(), String> {
+    let ProviderModelConfig {
+        id: model_id,
+        name: model_name,
+        context_window,
+        max_tokens,
+    } = model;
     const MAX_FIELD: usize = 4096;
     let provider_id = provider_id.trim();
     let api = api.trim();
@@ -485,12 +496,15 @@ pub fn update_provider(
     api: &str,
     base_url: &str,
     api_key: Option<&str>,
-    model_id: &str,
-    model_name: Option<&str>,
-    context_window: Option<u64>,
-    max_tokens: Option<u64>,
+    model: ProviderModelConfig<'_>,
     supports_images: bool,
 ) -> Result<(), String> {
+    let ProviderModelConfig {
+        id: model_id,
+        name: model_name,
+        context_window,
+        max_tokens,
+    } = model;
     let provider_id = provider_id.trim();
     let api = api.trim();
     let base_url = base_url.trim();
@@ -813,9 +827,6 @@ fn native_provider_api_key_env_var(provider_id: &str) -> Option<&'static str> {
     }
 }
 
-/// Convert a `(provider_id, ProviderConfig)` pair into a list of library
-/// [`Model`]s. Provider-level `base_url`/`headers`/`auth_header` fold into each
-/// model. Returns `None` for protocols that do not have a runtime provider.
 // ---------------------------------------------------------------------------
 // Internals: dir ensure, atomic write, chmod
 // ---------------------------------------------------------------------------
@@ -1012,10 +1023,12 @@ mod tests {
             "openai-completions",
             "https://api.example.test/v1",
             "fixture-key",
-            "model-a",
-            Some("Model A"),
-            Some(128_000),
-            Some(4096),
+            ProviderModelConfig {
+                id: "model-a",
+                name: Some("Model A"),
+                context_window: Some(128_000),
+                max_tokens: Some(4096),
+            },
             Some(true),
         )
         .unwrap();
@@ -1045,10 +1058,12 @@ mod tests {
             "openai-responses",
             "https://api.example.test/v1",
             "fixture-key",
-            "model-a",
-            None,
-            None,
-            None,
+            ProviderModelConfig {
+                id: "model-a",
+                name: None,
+                context_window: None,
+                max_tokens: None,
+            },
             None,
         )
         .unwrap();
@@ -1057,10 +1072,12 @@ mod tests {
             "openai-completions",
             "https://api.example.test/v1",
             "fixture-key-2",
-            "model-b",
-            None,
-            None,
-            None,
+            ProviderModelConfig {
+                id: "model-b",
+                name: None,
+                context_window: None,
+                max_tokens: None,
+            },
             None,
         )
         .unwrap_err();
@@ -1070,10 +1087,12 @@ mod tests {
             "unsupported",
             "https://api.example.test/v1",
             "fixture-key",
-            "model-a",
-            None,
-            None,
-            None,
+            ProviderModelConfig {
+                id: "model-a",
+                name: None,
+                context_window: None,
+                max_tokens: None,
+            },
             None,
         )
         .unwrap_err();
@@ -1083,10 +1102,12 @@ mod tests {
             "openai-completions",
             "https://api.example.test/v1",
             "fixture-key",
-            "model-a",
-            None,
-            Some(0),
-            None,
+            ProviderModelConfig {
+                id: "model-a",
+                name: None,
+                context_window: Some(0),
+                max_tokens: None,
+            },
             None,
         )
         .unwrap_err();
@@ -1101,10 +1122,12 @@ mod tests {
             "openai-completions",
             "https://api.example.test/v1",
             "fixture-key",
-            "model-a",
-            Some("Model A"),
-            Some(128_000),
-            Some(4096),
+            ProviderModelConfig {
+                id: "model-a",
+                name: Some("Model A"),
+                context_window: Some(128_000),
+                max_tokens: Some(4096),
+            },
             Some(false),
         )
         .unwrap();
@@ -1113,10 +1136,12 @@ mod tests {
             "openai-responses",
             "https://new.example.test/v1",
             None,
-            "model-b",
-            Some("Model B"),
-            Some(256_000),
-            Some(8192),
+            ProviderModelConfig {
+                id: "model-b",
+                name: Some("Model B"),
+                context_window: Some(256_000),
+                max_tokens: Some(8192),
+            },
             true,
         )
         .unwrap();

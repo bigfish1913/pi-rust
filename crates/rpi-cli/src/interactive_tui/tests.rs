@@ -2423,10 +2423,12 @@ fn a_cancelled_provider_login_never_saves_a_late_credential() {
         };
         finish_provider_login(&state, &editor_container, &editor, &tui);
         handle_provider_oauth_result(
-            &state,
-            &editor_container,
-            &editor,
-            &tui,
+            EditorUi {
+                state: &state,
+                editor_container: &editor_container,
+                editor: &editor,
+                tui: &tui,
+            },
             &tx,
             "acme",
             "exchange",
@@ -2438,10 +2440,12 @@ fn a_cancelled_provider_login_never_saves_a_late_credential() {
 
         begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
         handle_provider_oauth_result(
-            &state,
-            &editor_container,
-            &editor,
-            &tui,
+            EditorUi {
+                state: &state,
+                editor_container: &editor_container,
+                editor: &editor,
+                tui: &tui,
+            },
             &tx,
             "acme",
             "exchange",
@@ -2510,10 +2514,12 @@ fn provider_oauth_escape_cancels_the_in_flight_call() {
         "display": {"title": "Authorize", "url": "https://example.test/auth"}
     });
     begin_provider_oauth_input(
-        &state,
-        &editor_container,
-        &editor,
-        &tui,
+        EditorUi {
+            state: &state,
+            editor_container: &editor_container,
+            editor: &editor,
+            tui: &tui,
+        },
         &tx,
         "acme",
         payload,
@@ -2631,10 +2637,12 @@ fn escape_during_logout_initialization_never_revokes_or_sticks() {
             "the queued revoke must observe the cancel"
         );
         handle_provider_oauth_result(
-            &state,
-            &editor_container,
-            &editor,
-            &tui,
+            EditorUi {
+                state: &state,
+                editor_container: &editor_container,
+                editor: &editor,
+                tui: &tui,
+            },
             &tx,
             "acme",
             "revoke",
@@ -2765,10 +2773,12 @@ fn an_interaction_form_for_an_ended_flow_restores_the_editor() {
         &tui
     ));
     begin_provider_oauth_input(
-        &state,
-        &editor_container,
-        &editor,
-        &tui,
+        EditorUi {
+            state: &state,
+            editor_container: &editor_container,
+            editor: &editor,
+            tui: &tui,
+        },
         &tx,
         "acme",
         serde_json::json!({"display": {"title": "Authorize"}}),
@@ -2821,10 +2831,12 @@ fn a_stale_failed_result_leaves_a_newer_flow_running() {
     });
     let messages_before = state.chat_container.child_count();
     handle_provider_oauth_result(
-        &state,
-        &editor_container,
-        &editor,
-        &tui,
+        EditorUi {
+            state: &state,
+            editor_container: &editor_container,
+            editor: &editor,
+            tui: &tui,
+        },
         &tx,
         "acme",
         "begin",
@@ -2891,10 +2903,12 @@ fn escape_between_the_flow_check_and_the_write_keeps_the_store_unchanged() {
         };
         let result = |flow_id, purpose, value| {
             handle_provider_oauth_result(
-                &state,
-                &editor_container,
-                &editor,
-                &tui,
+                EditorUi {
+                    state: &state,
+                    editor_container: &editor_container,
+                    editor: &editor,
+                    tui: &tui,
+                },
                 &tx,
                 "acme",
                 "exchange",
