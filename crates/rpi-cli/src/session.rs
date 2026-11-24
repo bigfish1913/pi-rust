@@ -58,10 +58,8 @@ use crate::args::Args;
 use crate::docs_tool::create_docs_tool;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
-    discover_append_system_prompt_file, discover_system_prompt_file, extension_dirs,
-    global_extension_dirs, global_prompt_template_dirs, global_skill_dirs,
     load_prompt_templates_with_precedence, load_skills_with_precedence, project_extension_dirs,
-    project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
+    project_prompt_template_dirs, project_skill_dirs,
 };
 use crate::startup_diagnostics::{Phase, StartupSpan};
 use rpi_extensions::{
@@ -315,19 +313,46 @@ pub enum SessionSelection {
 
 /// Decide the session selection from parsed args + the resolved cwd.
 pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
-    select_session_in_dir(args, configured_session_dir(args, cwd))
+    select_session_for(&crate::config::AgentHome::process(), args, cwd)
+}
+
+/// [`select_session`] for one agent home (library-embedded harnesses).
+pub fn select_session_for(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+) -> SessionSelection {
+    select_session_in_dir(args, configured_session_dir_for(home, args, cwd))
 }
 
 /// Resolve the root once at startup; runtime actions retain this selection.
 pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
+    configured_session_dir_for(&crate::config::AgentHome::process(), args, cwd)
+}
+
+pub(crate) fn configured_session_dir_for(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+) -> PathBuf {
     let dir = args
         .session_dir
         .clone()
         .or_else(|| {
-            crate::settings::load_settings()
+            home.settings()
                 .ok()
                 .and_then(|settings| settings.session_dir)
         })
+        // An explicitly provided home owns its transcripts; the process-wide
+        // env override only applies when the home is the process home (CLI).
+        // Otherwise a library host that passes home B while the environment
+        // still names A would silently write B's sessions into A.
+        .or_else(|| {
+            home.is_explicit()
+                .then(|| home.root().ok().map(|root| root.join("sessions")))
+                .flatten()
+        })
+        .or_else(|| std::env::var_os("RPI_CODING_AGENT_SESSION_DIR").map(PathBuf::from))
         .unwrap_or_else(|| default_session_dir(cwd));
     // Relative roots belong to the launch project, even if an extension later
     // changes the process working directory.
@@ -411,12 +436,28 @@ pub(crate) fn preflight_extension_startup(
     ),
     BuildError,
 > {
+    preflight_extension_startup_for(&crate::config::AgentHome::process(), args, cwd, trusted)
+}
+
+pub(crate) fn preflight_extension_startup_for(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    trusted: bool,
+) -> Result<
+    (
+        Option<crate::resource_selection::ResolvedSelection>,
+        SessionSelection,
+    ),
+    BuildError,
+> {
     let (resources, (selection, _)) =
-        preflight_extension_startup_with_restore(args, cwd, trusted, false)?;
+        preflight_extension_startup_with_restore(home, args, cwd, trusted, false)?;
     Ok((resources, selection))
 }
 
 fn preflight_extension_startup_with_restore(
+    home: &crate::config::AgentHome,
     args: &Args,
     cwd: &Path,
     trusted: bool,
@@ -432,9 +473,10 @@ fn preflight_extension_startup_with_restore(
     BuildError,
 > {
     let resource_selection_load = StartupSpan::start(Phase::ResourceSelectionLoad);
-    let mut resources = crate::resource_selection::ResolvedSelection::load(args, cwd, trusted)
-        .map_err(BuildError::HarnessCreate)?;
-    let selection = select_session(args, cwd);
+    let mut resources =
+        crate::resource_selection::ResolvedSelection::load_for(home, args, cwd, trusted)
+            .map_err(BuildError::HarnessCreate)?;
+    let selection = select_session_for(home, args, cwd);
     resource_selection_load.finish();
     let pinned = std::thread::scope(|scope| {
         scope
@@ -552,16 +594,17 @@ fn preflight_extension_startup_with_restore(
 }
 
 pub fn prepare_extensions(
+    home: &crate::config::AgentHome,
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
     crate::native_durable::experimental_epoch::policy(args).map_err(BuildError::HarnessCreate)?;
-    let resource_leases =
-        crate::resource_management::host_leases(cwd).map_err(BuildError::HarnessCreate)?;
+    let resource_leases = crate::resource_management::host_leases_for(home, cwd)
+        .map_err(BuildError::HarnessCreate)?;
     let preflight_prepare = StartupSpan::start(Phase::PreflightPrepare);
     let (resource_selection, (session_selection, prepared_restore)) =
-        preflight_extension_startup_with_restore(args, cwd, project_trusted, true)?;
+        preflight_extension_startup_with_restore(home, args, cwd, project_trusted, true)?;
     preflight_prepare.finish();
     // Transition hosts own the writer before any DLL registration. The strict
     // loader cannot repair history/progress or migrate metadata on rejection.
@@ -591,7 +634,7 @@ pub fn prepare_extensions(
         None
     };
     let session_dir = if matches!(session_selection, SessionSelection::Ephemeral) {
-        configured_session_dir(args, cwd)
+        configured_session_dir_for(home, args, cwd)
     } else {
         selection_dir(&session_selection)
     };
@@ -695,7 +738,13 @@ pub fn prepare_extensions(
     } else if args.no_extensions {
         ExtensionSession::none()
     } else {
-        load_extensions(args, cwd, project_trusted, Some(Arc::clone(&action_bridge)))
+        load_extensions(
+            home,
+            args,
+            cwd,
+            project_trusted,
+            Some(Arc::clone(&action_bridge)),
+        )
     };
     if args.verbose {
         if let Some(s) = extension_session.summary() {
@@ -747,7 +796,17 @@ pub fn prepare_extensions(
 /// [`ReloadContext`] the interactive TUI holds to drive `/reload` (and a
 /// plugin's `runtime_action(Reload)` via the mailbox). Non-interactive modes
 /// drop the context (no `/reload` surface in print/json mode).
+///
+/// `home` is the one agent-home value for this session: settings/auth/models/
+/// trust, skills/prompts/extensions/SYSTEM.md discovery, resource leases and
+/// the native-package artifacts used by extension loading all read from it.
+/// CLI callers pass [`AgentHome::process`](crate::config::AgentHome::process),
+/// which preserves the historical `RPI_CODING_AGENT_DIR`/`~/.rpi/agent`
+/// behavior; embedding hosts pass an explicit home and can run several
+/// sessions with different homes in one process without mutating the process
+/// environment.
 pub async fn build(
+    home: &crate::config::AgentHome,
     resolved: &ResolvedModel,
     args: &Args,
     cwd: &Path,
@@ -760,11 +819,67 @@ pub async fn build(
     ),
     BuildError,
 > {
-    let prepared = prepare_extensions(args, cwd, project_trusted)?;
-    build_prepared(resolved, args, cwd, project_trusted, prepared).await
+    let prepared = prepare_extensions(home, args, cwd, project_trusted)?;
+    build_prepared(home, resolved, args, cwd, project_trusted, prepared).await
+}
+
+/// The three resource families that share the same project/global/trust
+/// selection ladder. Keeping one implementation prevents a new family (themes,
+/// packages) from silently missing the explicit home on one of the three call
+/// sites.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResourceRootKind {
+    Extensions,
+    Skills,
+    PromptTemplates,
+}
+
+fn resource_root_dirs(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    kind: ResourceRootKind,
+) -> Vec<PathBuf> {
+    if (kind == ResourceRootKind::Extensions && args.no_extensions)
+        || (kind == ResourceRootKind::Skills && args.no_skills)
+        || (kind == ResourceRootKind::PromptTemplates && args.no_prompt_templates)
+    {
+        return Vec::new();
+    }
+    let mut dirs = if kind == ResourceRootKind::Extensions && args.dev_local_only {
+        // `dev-local` never imports unrelated global/project extension dirs;
+        // explicit `--extensions-dir` paths are appended below.
+        Vec::new()
+    } else if args.project_only {
+        match kind {
+            ResourceRootKind::Extensions => project_extension_dirs(cwd),
+            ResourceRootKind::Skills => project_skill_dirs(cwd),
+            ResourceRootKind::PromptTemplates => project_prompt_template_dirs(cwd),
+        }
+    } else if project_trusted {
+        match kind {
+            ResourceRootKind::Extensions => home.extension_dirs(cwd),
+            ResourceRootKind::Skills => home.skill_dirs(cwd),
+            ResourceRootKind::PromptTemplates => home.prompt_template_dirs(cwd),
+        }
+    } else {
+        match kind {
+            ResourceRootKind::Extensions => home.global_extension_dirs(),
+            ResourceRootKind::Skills => home.global_skill_dirs(),
+            ResourceRootKind::PromptTemplates => home.global_prompt_template_dirs(),
+        }
+    };
+    match kind {
+        ResourceRootKind::Extensions => dirs.extend(args.extensions_dir.iter().cloned()),
+        ResourceRootKind::Skills => dirs.extend(args.skill.iter().cloned()),
+        ResourceRootKind::PromptTemplates => dirs.extend(args.prompt_template.iter().cloned()),
+    }
+    dirs
 }
 
 pub async fn build_prepared(
+    home: &crate::config::AgentHome,
     resolved: &ResolvedModel,
     args: &Args,
     cwd: &Path,
@@ -821,7 +936,7 @@ pub async fn build_prepared(
 
     validate_durable_extensions(&extension_session).map_err(BuildError::HarnessCreate)?;
     let durable_binding = Arc::new(std::sync::OnceLock::new());
-    let mut tools = build_tools_bound(&ctx, args, durable_binding.clone());
+    let mut tools = build_tools_bound(home, &ctx, args, durable_binding.clone());
 
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools
@@ -920,7 +1035,7 @@ pub async fn build_prepared(
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted && resource_selection.is_none() => {
-            match discover_system_prompt_file(cwd) {
+            match home.discover_system_prompt_file(cwd, true) {
                 Some(path) => {
                     read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
                 }
@@ -951,7 +1066,7 @@ pub async fn build_prepared(
     }
     if args.append_system_prompt.is_empty() && resource_selection.is_none() {
         if let Some(path) = project_trusted
-            .then(|| discover_append_system_prompt_file(cwd))
+            .then(|| home.discover_append_system_prompt_file(cwd))
             .flatten()
         {
             if let Some(text) = read_prompt_source(&path, &mut context_paths) {
@@ -976,7 +1091,7 @@ pub async fn build_prepared(
     // `isProjectTrusted()` (global resources are unconditional). rpi v1 has no
     // trust prompt — project resources are discovered unconditionally (a copied
     // `.rpi/` dir drops in and works). Full trust gating is deferred.
-    let agent_dir = crate::config::agent_dir().ok();
+    let agent_dir = home.root().ok();
 
     // ---- B5b: extension resources_discover ----
     // If any plugin registered a `resources_discover` handler, fan the event out
@@ -1011,14 +1126,8 @@ pub async fn build_prepared(
             .skills
             .clone();
     } else if !args.no_skills {
-        let mut dirs = if args.dev_local_only || args.project_only {
-            project_skill_dirs(cwd)
-        } else if project_trusted {
-            skill_dirs(cwd)
-        } else {
-            global_skill_dirs()
-        };
-        dirs.extend(args.skill.iter().cloned());
+        let mut dirs =
+            resource_root_dirs(&home, args, cwd, project_trusted, ResourceRootKind::Skills);
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
@@ -1029,14 +1138,13 @@ pub async fn build_prepared(
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
     if !args.no_prompt_templates && resource_selection.is_none() {
-        let mut dirs = if args.dev_local_only || args.project_only {
-            project_prompt_template_dirs(cwd)
-        } else if project_trusted {
-            prompt_template_dirs(cwd)
-        } else {
-            global_prompt_template_dirs()
-        };
-        dirs.extend(args.prompt_template.iter().cloned());
+        let mut dirs = resource_root_dirs(
+            &home,
+            args,
+            cwd,
+            project_trusted,
+            ResourceRootKind::PromptTemplates,
+        );
         dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
@@ -1125,7 +1233,7 @@ pub async fn build_prepared(
         eprintln!("=== --debug-system-prompt ===");
         let base_src = if args.system_prompt.is_some() {
             "--system-prompt"
-        } else if discover_system_prompt_file(cwd).is_some() {
+        } else if home.discover_system_prompt_file(cwd, true).is_some() {
             "SYSTEM.md"
         } else {
             "default"
@@ -1216,7 +1324,7 @@ pub async fn build_prepared(
     // Saved user defaults. Best-effort: a missing or malformed file must not stop
     // a session from starting, and every accessor falls back to the harness
     // default when its key is absent.
-    let saved_settings = crate::settings::load_settings().unwrap_or_default();
+    let saved_settings = home.settings().unwrap_or_default();
 
     // `httpProxy` applies to rpi's own HTTP clients. Setting the environment is how
     // they are configured (`pi-ai/src/http.rs`), and upstream does the same thing
@@ -1580,6 +1688,7 @@ pub async fn build_prepared(
         project_trusted,
         discovered_theme_paths: Arc::new(std::sync::Mutex::new(discovered.theme_paths.clone())),
         args: reload_args,
+        home: home.clone(),
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
@@ -1914,6 +2023,9 @@ pub struct ReloadContext {
     /// `/reload` re-runs discovery with the same config). `session_dir` holds
     /// the resolved startup root, including saved settings/environment defaults.
     pub args: Args,
+    /// The session's agent home. `/reload` must re-read resources and settings
+    /// from this value, never from a startup snapshot or the process home.
+    pub home: crate::config::AgentHome,
     /// The resolved model + thinking level (the harness's active model stays
     /// unless `set_model` changed it; reload does not touch the model).
     pub resolved_model: rpi_ai::Model,
@@ -1954,7 +2066,7 @@ impl ReloadContext {
         self.args
             .session_dir
             .clone()
-            .unwrap_or_else(|| configured_session_dir(&self.args, &self.cwd))
+            .unwrap_or_else(|| configured_session_dir_for(&self.home, &self.args, &self.cwd))
     }
 }
 
@@ -2136,21 +2248,22 @@ where
         }
     }
     let cwd_str = ctx.cwd.to_string_lossy().to_string();
-    let project_trusted = resolve_project_trust(&effective_args, &ctx.cwd);
-    let prepared = match prepare_reload_inputs(&effective_args, &ctx.cwd, project_trusted) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            return ReloadOutcome {
-                summary: format!(
-                    "Settings reload failed: {error}. Keeping the currently loaded resources."
-                ),
-                had_warnings: true,
-                details: Vec::new(),
-                had_errors: true,
-                project_trusted: None,
-            };
-        }
-    };
+    let project_trusted = resolve_project_trust_for(&ctx.home, &effective_args, &ctx.cwd);
+    let prepared =
+        match prepare_reload_inputs_for(&ctx.home, &effective_args, &ctx.cwd, project_trusted) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return ReloadOutcome {
+                    summary: format!(
+                        "Settings reload failed: {error}. Keeping the currently loaded resources."
+                    ),
+                    had_warnings: true,
+                    details: Vec::new(),
+                    had_errors: true,
+                    project_trusted: None,
+                };
+            }
+        };
     after_prepare();
     let PreparedReloadInputs {
         extension_dirs,
@@ -2209,6 +2322,7 @@ where
         rpi_extensions::ExtensionSession::none()
     } else {
         load_extensions_from_dirs(
+            &ctx.home,
             &effective_args,
             &extension_dirs,
             Some(Arc::clone(&fresh_bridge)),
@@ -2283,6 +2397,7 @@ where
             }
         }
         match crate::provider::resolve_with_extensions(
+            &ctx.home,
             &args,
             &ctx.cwd,
             ctx.project_trusted,
@@ -2422,7 +2537,7 @@ where
     let context_files = if effective_args.no_context_files || !project_trusted {
         Vec::new()
     } else {
-        let agent_dir = crate::config::agent_dir().ok();
+        let agent_dir = ctx.home.root().ok();
         let agent_dir_path = agent_dir.unwrap_or_else(|| ctx.cwd.clone());
         load_project_context_files(&env_dyn, &ctx.cwd, &agent_dir_path).await
     };
@@ -2488,7 +2603,12 @@ where
     // Reuse the binding installed in the durable context hook at startup;
     // constructing a fresh OnceLock here would register a durable tool that
     // can never resolve its owning harness.
-    let mut tools = build_tools_bound(&tool_ctx, &effective_args, ctx.durable_binding.clone());
+    let mut tools = build_tools_bound(
+        &ctx.home,
+        &tool_ctx,
+        &effective_args,
+        ctx.durable_binding.clone(),
+    );
     merge_extension_tools(
         &mut tools,
         &extension_session,
@@ -2511,7 +2631,7 @@ where
     let mut context_paths = Vec::new();
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None if project_trusted => match discover_system_prompt_file(&ctx.cwd) {
+        None if project_trusted => match ctx.home.discover_system_prompt_file(&ctx.cwd, true) {
             Some(path) => {
                 read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
             }
@@ -2526,7 +2646,7 @@ where
     }
     if effective_args.append_system_prompt.is_empty() {
         if let Some(path) = project_trusted
-            .then(|| discover_append_system_prompt_file(&ctx.cwd))
+            .then(|| ctx.home.discover_append_system_prompt_file(&ctx.cwd))
             .flatten()
         {
             if let Some(text) = read_prompt_source(&path, &mut context_paths) {
@@ -2669,6 +2789,7 @@ fn reload_reads_settings(args: &Args) -> bool {
 /// snapshot intentionally excludes UI/model fields that `/reload` does not
 /// use, so an unrelated settings save does not invalidate the operation.
 fn load_reload_settings_snapshot(
+    home: &crate::config::AgentHome,
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
@@ -2676,7 +2797,8 @@ fn load_reload_settings_snapshot(
     if !reload_reads_settings(args) {
         return Ok(None);
     }
-    let global = crate::settings::load_settings()
+    let global = home
+        .settings()
         .map_err(|error| format!("could not load global settings: {error}"))?
         .into();
     let project = if project_trusted {
@@ -2697,17 +2819,25 @@ fn validate_settings_for_reload(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<(), String> {
-    load_reload_settings_snapshot(args, cwd, project_trusted).map(|_| ())
+    load_reload_settings_snapshot(
+        &crate::config::AgentHome::process(),
+        args,
+        cwd,
+        project_trusted,
+    )
+    .map(|_| ())
 }
 
-fn prepare_reload_inputs(
+fn prepare_reload_inputs_for(
+    home: &crate::config::AgentHome,
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedReloadInputs, String> {
-    prepare_reload_inputs_inner(args, cwd, project_trusted, || {})
+    prepare_reload_inputs_inner_for(home, args, cwd, project_trusted, || {})
 }
 
+#[cfg(test)]
 fn prepare_reload_inputs_inner<F>(
     args: &Args,
     cwd: &Path,
@@ -2717,43 +2847,46 @@ fn prepare_reload_inputs_inner<F>(
 where
     F: FnOnce(),
 {
-    let settings_before = load_reload_settings_snapshot(args, cwd, project_trusted)?;
+    prepare_reload_inputs_inner_for(
+        &crate::config::AgentHome::process(),
+        args,
+        cwd,
+        project_trusted,
+        before_verify,
+    )
+}
 
-    let mut extension_dirs = if args.no_extensions || args.dev_local_only {
-        Vec::new()
-    } else if args.project_only {
-        project_extension_dirs(cwd)
-    } else if project_trusted {
-        extension_dirs(cwd)
-    } else {
-        global_extension_dirs()
-    };
-    if !args.no_extensions {
-        extension_dirs.extend(args.extensions_dir.iter().cloned());
-    }
+fn prepare_reload_inputs_inner_for<F>(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    before_verify: F,
+) -> Result<PreparedReloadInputs, String>
+where
+    F: FnOnce(),
+{
+    let settings_before = load_reload_settings_snapshot(home, args, cwd, project_trusted)?;
 
-    let skill_base_dirs = if args.no_skills {
-        Vec::new()
-    } else if args.dev_local_only || args.project_only {
-        project_skill_dirs(cwd)
-    } else if project_trusted {
-        skill_dirs(cwd)
-    } else {
-        global_skill_dirs()
-    };
-
-    let prompt_base_dirs = if args.no_prompt_templates {
-        Vec::new()
-    } else if args.dev_local_only || args.project_only {
-        project_prompt_template_dirs(cwd)
-    } else if project_trusted {
-        prompt_template_dirs(cwd)
-    } else {
-        global_prompt_template_dirs()
-    };
+    let extension_dirs = resource_root_dirs(
+        home,
+        args,
+        cwd,
+        project_trusted,
+        ResourceRootKind::Extensions,
+    );
+    let skill_base_dirs =
+        resource_root_dirs(home, args, cwd, project_trusted, ResourceRootKind::Skills);
+    let prompt_base_dirs = resource_root_dirs(
+        home,
+        args,
+        cwd,
+        project_trusted,
+        ResourceRootKind::PromptTemplates,
+    );
 
     before_verify();
-    let settings_after = load_reload_settings_snapshot(args, cwd, project_trusted)?;
+    let settings_after = load_reload_settings_snapshot(home, args, cwd, project_trusted)?;
     if settings_before != settings_after {
         return Err(
             "settings changed while reload inputs were being prepared; retry /reload".to_string(),
@@ -2850,10 +2983,18 @@ fn build_models_with_extensions(
 /// Resolve project resource loading without prompting. Explicit CLI overrides
 /// win, then a stored decision; projects with no decision load by default.
 pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
+    resolve_project_trust_for(&crate::config::AgentHome::process(), args, cwd)
+}
+
+pub(crate) fn resolve_project_trust_for(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+) -> bool {
     if let Some(override_value) = args.trust_override {
         return override_value;
     }
-    crate::config::project_trust_decision(cwd)
+    home.project_trust_decision(cwd)
         .ok()
         .flatten()
         .unwrap_or(true)
@@ -2866,21 +3007,23 @@ pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
 /// `--extensions-dir` flags (scanned after the defaults — `args.rs`).
 /// Diagnostics are a no-op sink for now; load skips/ABI mismatches surface via
 /// the `--verbose` summary.
-fn startup_extension_dirs(args: &Args, cwd: &Path, project_trusted: bool) -> Vec<PathBuf> {
-    let mut dirs = if args.dev_local_only {
-        Vec::new()
-    } else if args.project_only {
-        project_extension_dirs(cwd)
-    } else if project_trusted {
-        extension_dirs(cwd)
-    } else {
-        global_extension_dirs()
-    };
-    dirs.extend(args.extensions_dir.iter().cloned());
-    dirs
+fn startup_extension_dirs(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Vec<PathBuf> {
+    resource_root_dirs(
+        home,
+        args,
+        cwd,
+        project_trusted,
+        ResourceRootKind::Extensions,
+    )
 }
 
 pub(crate) fn load_extensions(
+    home: &crate::config::AgentHome,
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
@@ -2889,15 +3032,15 @@ pub(crate) fn load_extensions(
     if args.no_extensions {
         return ExtensionSession::none();
     }
-    let dirs = startup_extension_dirs(args, cwd, project_trusted);
-    let leases = match crate::resource_management::host_leases(cwd) {
+    let dirs = startup_extension_dirs(home, args, cwd, project_trusted);
+    let leases = match crate::resource_management::host_leases_for(home, cwd) {
         Ok(leases) => leases,
         Err(error) => {
             eprintln!("warning: refusing extension loading: {error}");
             return ExtensionSession::none();
         }
     };
-    load_extensions_from_dirs(args, &dirs, action_bridge, Some(leases))
+    load_extensions_from_dirs(home, args, &dirs, action_bridge, Some(leases))
 }
 
 /// Replace the default global extension directory with the registry-selected
@@ -2911,10 +3054,13 @@ pub(crate) fn load_extensions(
 fn registry_aware_extension_inputs(
     dirs: &[PathBuf],
     explicit_files: &[PathBuf],
+    agent_dir_home: Option<&Path>,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     // `agent_dir` owns the registry file; `global_dir` is the directory the
     // loader would otherwise scan. Keep both: the helpers take the agent dir.
-    let agent_dir = crate::config::agent_dir().ok();
+    // `agent_dir_home` is already resolved from the session's `AgentHome`;
+    // never re-resolve it from the process environment here.
+    let agent_dir = agent_dir_home.map(Path::to_path_buf);
     let global_dir = agent_dir.as_ref().map(|dir| dir.join("extensions"));
     let mut filtered_dirs = Vec::with_capacity(dirs.len());
     let mut files = explicit_files.to_vec();
@@ -2961,13 +3107,16 @@ fn same_extension_dir(left: &Path, right: &Path) -> bool {
 }
 
 fn load_extensions_from_dirs(
+    home: &crate::config::AgentHome,
     args: &Args,
     dirs: &[PathBuf],
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
     host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> ExtensionSession {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
-    let (dirs, files) = registry_aware_extension_inputs(dirs, &args.extension);
+    let agent_dir = home.root().ok();
+    let (dirs, files) =
+        registry_aware_extension_inputs(dirs, &args.extension, agent_dir.as_deref());
     // B5a: the action bridge is cloned into every loaded plugin's vtable
     // `user_data` so post-register `runtime_action` calls recover the harness
     // host from any thread. The call site already gates `load_extensions` behind
@@ -3049,6 +3198,13 @@ fn merge_extension_tools(
 /// forgotten `timeout` from hanging the run forever — the "卡住" report).
 /// `RPI_BASH_TIMEOUT` overrides; a model-supplied timeout always wins.
 pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
+    bash_options_for(&crate::config::AgentHome::process())
+}
+
+/// [`bash_options`] for one agent home.
+pub fn bash_options_for(
+    home: &crate::config::AgentHome,
+) -> rpi_tools::tools::bash::BashToolOptions {
     use rpi_tools::tools::bash::BashToolOptions;
     let default = std::env::var("RPI_BASH_TIMEOUT")
         .ok()
@@ -3059,7 +3215,7 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     // alias/`shopt` setup). Native's `shellPath` is *not* wired: neither
     // `BashToolOptions` nor `ShellCaptureOptions` carries a shell binary today, so
     // honouring it means plumbing one through pi-tools first.
-    let settings = crate::settings::load_settings().unwrap_or_default();
+    let settings = home.settings().unwrap_or_default();
     BashToolOptions {
         command_prefix: settings.shell_command_prefix.clone(),
         default_timeout: Some(default),
@@ -3069,10 +3225,16 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
 
 #[cfg(test)]
 fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
-    build_tools_bound(ctx, args, Arc::new(std::sync::OnceLock::new()))
+    build_tools_bound(
+        &crate::config::AgentHome::process(),
+        ctx,
+        args,
+        Arc::new(std::sync::OnceLock::new()),
+    )
 }
 
 fn build_tools_bound(
+    home: &crate::config::AgentHome,
     ctx: &ExecutionToolContext,
     args: &Args,
     durable_binding: Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>,
@@ -3104,7 +3266,7 @@ fn build_tools_bound(
         ),
         (
             "bash",
-            HarnessTool::new(create_bash_tool(ctx, Some(bash_options()))),
+            HarnessTool::new(create_bash_tool(ctx, Some(bash_options_for(home)))),
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
@@ -3131,7 +3293,7 @@ fn build_tools_bound(
     // Apply default_tools from settings (if no CLI override)
     if args.tools.is_none() && args.resource_config.is_none() && args.resource_transition.is_none()
     {
-        if let Ok(settings) = crate::settings::load_settings() {
+        if let Ok(settings) = home.settings() {
             if let Some(default_tools) = &settings.default_tools {
                 all.retain(|(name, _)| default_tools.iter().any(|t| t == name));
             }
@@ -4557,6 +4719,7 @@ mod tests {
                     std::fs::write(path, content).unwrap();
                 }
                 let resolved = crate::provider::resolve(
+                    &crate::config::AgentHome::process(),
                     Some("anthropic"),
                     Some(crate::provider::DEFAULT_MODEL_ID),
                     None,
@@ -4572,8 +4735,15 @@ mod tests {
                     trust_override: Some(true),
                     ..Default::default()
                 };
-                let (harness, _events, mut context) =
-                    build(&resolved, &args, &cwd, true).await.unwrap();
+                let (harness, _events, mut context) = build(
+                    &crate::config::AgentHome::process(),
+                    &resolved,
+                    &args,
+                    &cwd,
+                    true,
+                )
+                .await
+                .unwrap();
                 let resources = harness.get_resources().await.unwrap();
                 let path = |p: PathBuf| p.to_string_lossy().into_owned();
                 assert_eq!(
@@ -5750,6 +5920,7 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
         let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
             Some("anthropic"),
             Some(crate::provider::DEFAULT_MODEL_ID),
             None,
@@ -5766,7 +5937,15 @@ mod tests {
             system_prompt: Some("stable system prompt".into()),
             ..Args::default()
         };
-        let (harness, _events, context) = build(&resolved, &args, &cwd, false).await.unwrap();
+        let (harness, _events, context) = build(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            false,
+        )
+        .await
+        .unwrap();
         let before_resources = harness.get_resources().await.unwrap();
         assert_eq!(before_resources.skills.as_ref().unwrap().len(), 1);
         assert_eq!(before_resources.skills.as_ref().unwrap()[0].name, "keep-me");
@@ -5841,6 +6020,7 @@ mod tests {
         // Startup snapshot: trusted.
         crate::config::set_project_trust(&cwd, Some(true)).unwrap();
         let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
             Some("anthropic"),
             Some(crate::provider::DEFAULT_MODEL_ID),
             None,
@@ -5856,7 +6036,15 @@ mod tests {
             system_prompt: Some("stable system prompt".into()),
             ..Args::default()
         };
-        let (harness, _events, context) = build(&resolved, &args, &cwd, true).await.unwrap();
+        let (harness, _events, context) = build(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            true,
+        )
+        .await
+        .unwrap();
         assert!(context.project_trusted, "startup snapshot is trusted");
 
         // /trust no, then /reload: the outcome must report the CURRENT
@@ -5871,6 +6059,111 @@ mod tests {
         let outcome = reload_extension_resources(&harness, &context).await;
         assert!(!outcome.had_errors, "{}", outcome.summary);
         assert_eq!(outcome.project_trusted, Some(true));
+    }
+
+    /// An explicit agent home owns its transcripts: the default session root
+    /// is `<home>/sessions`, while `--session-dir` still wins. The process
+    /// session-dir env override must not bleed into an explicit home.
+    #[test]
+    fn agent_home_defaults_the_session_root_under_the_home() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let env_dir = cwd.path().join("env-sessions");
+        let _env = crate::config::test_support::SessionDirEnv::new(Some(&env_dir));
+        let agent_home = crate::config::AgentHome::from_option(Some(home.path().to_path_buf()));
+        let args = Args::default();
+        assert_eq!(
+            configured_session_dir_for(&agent_home, &args, cwd.path()),
+            home.path().join("sessions")
+        );
+
+        let explicit = cwd.path().join("explicit-sessions");
+        let args = Args {
+            session_dir: Some(explicit.clone()),
+            ..Args::default()
+        };
+        assert_eq!(
+            configured_session_dir_for(&agent_home, &args, cwd.path()),
+            explicit
+        );
+    }
+
+    /// `/reload` must re-read resources from the `--agent-dir` home, not the
+    /// process default and not a startup snapshot.
+    #[test]
+    fn reload_inputs_reread_the_selected_agent_home() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let process_home = tempfile::tempdir().unwrap();
+        let selected_home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, process_home.path());
+        let process_skills = process_home.path().join("process-only-skills");
+        std::fs::create_dir_all(&process_skills).unwrap();
+        let selected_skills = selected_home.path().join("skills");
+        std::fs::create_dir_all(selected_skills.join("base")).unwrap();
+        std::fs::write(
+            selected_skills.join("base").join("SKILL.md"),
+            "---\nname: base\ndescription: base skill\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(selected_home.path().join("settings.json"), "{}").unwrap();
+
+        let selected_agent_home =
+            crate::config::AgentHome::from_option(Some(selected_home.path().to_path_buf()));
+        let args = Args {
+            no_session: true,
+            no_extensions: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            ..Args::default()
+        };
+
+        let first =
+            prepare_reload_inputs_for(&selected_agent_home, &args, cwd.path(), false).unwrap();
+        assert!(
+            first
+                .skill_base_dirs
+                .iter()
+                .any(|dir| dir == &selected_skills),
+            "{:?}",
+            first.skill_base_dirs
+        );
+        assert!(
+            first
+                .skill_base_dirs
+                .iter()
+                .all(|dir| !dir.starts_with(process_home.path())),
+            "{:?}",
+            first.skill_base_dirs
+        );
+
+        // A settings change in the selected home is observed by the next
+        // reload pass (the file is re-read, not cached at startup).
+        let extra = selected_home.path().join("extra-skills");
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(
+            selected_home.path().join("settings.json"),
+            serde_json::json!({"skillDirs": [extra]}).to_string(),
+        )
+        .unwrap();
+        let second =
+            prepare_reload_inputs_for(&selected_agent_home, &args, cwd.path(), false).unwrap();
+        assert!(
+            second.skill_base_dirs.iter().any(|dir| dir == &extra),
+            "{:?}",
+            second.skill_base_dirs
+        );
     }
 
     #[test]
@@ -5898,7 +6191,7 @@ mod tests {
         // An unreadable registry cannot tell us which artifacts are retired. Keep
         // the historical directory scan instead of silently loading nothing.
         let dirs = vec![extensions.clone()];
-        let (scan_dirs, files) = registry_aware_extension_inputs(&dirs, &[]);
+        let (scan_dirs, files) = registry_aware_extension_inputs(&dirs, &[], None);
         assert!(
             scan_dirs.contains(&extensions),
             "a corrupt registry must not disable every global extension"
@@ -5953,10 +6246,12 @@ mod tests {
             trust_override: Some(false),
             ..Args::default()
         };
-        let startup_dirs = startup_extension_dirs(&args, &cwd, false);
+        let home = crate::config::AgentHome::process();
+        let startup_dirs = startup_extension_dirs(&home, &args, &cwd, false);
+        let home_root = home.root().ok();
         assert!(startup_dirs.contains(&extensions));
         let (startup_scan_dirs, startup_files) =
-            registry_aware_extension_inputs(&startup_dirs, &args.extension);
+            registry_aware_extension_inputs(&startup_dirs, &args.extension, home_root.as_deref());
         assert!(!startup_scan_dirs.contains(&extensions));
         assert!(startup_files.contains(&active));
         assert!(startup_files.contains(&legacy));
@@ -5964,8 +6259,11 @@ mod tests {
         assert!(!startup_files.contains(&stale_rpi_web));
 
         let prepared = prepare_reload_inputs_inner(&args, &cwd, false, || {}).unwrap();
-        let (reload_scan_dirs, reload_files) =
-            registry_aware_extension_inputs(&prepared.extension_dirs, &args.extension);
+        let (reload_scan_dirs, reload_files) = registry_aware_extension_inputs(
+            &prepared.extension_dirs,
+            &args.extension,
+            home_root.as_deref(),
+        );
         assert!(!reload_scan_dirs.contains(&extensions));
         assert_eq!(reload_files, startup_files);
     }
@@ -5993,7 +6291,8 @@ mod tests {
         std::fs::write(&legacy, b"cdylib").unwrap();
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
-        let (dirs, files) = registry_aware_extension_inputs(&[extensions.clone()], &[]);
+        let (dirs, files) =
+            registry_aware_extension_inputs(&[extensions.clone()], &[], Some(agent.as_path()));
         assert!(dirs.is_empty());
         assert_eq!(files, vec![legacy]);
     }
@@ -6082,6 +6381,7 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
         let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
             Some("anthropic"),
             Some(crate::provider::DEFAULT_MODEL_ID),
             None,
@@ -6098,7 +6398,15 @@ mod tests {
             system_prompt: Some("stable system prompt".into()),
             ..Args::default()
         };
-        let (harness, _events, context) = build(&resolved, &args, &cwd, false).await.unwrap();
+        let (harness, _events, context) = build(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            false,
+        )
+        .await
+        .unwrap();
 
         let outcome = reload_extension_resources_inner(&harness, &context, || {
             std::fs::write(agent.join("settings.json"), "{ malformed").unwrap();
@@ -6244,6 +6552,7 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
         let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
             Some("anthropic"),
             Some(crate::provider::DEFAULT_MODEL_ID),
             None,
@@ -6263,7 +6572,15 @@ mod tests {
             ..Args::default()
         };
 
-        let (_, _, context) = build(&resolved, &args, &cwd, true).await.unwrap();
+        let (_, _, context) = build(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(context.cwd, cwd);
         assert!(context.project_trusted);
@@ -6292,6 +6609,7 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
         let resolved = crate::provider::resolve(
+            &crate::config::AgentHome::process(),
             Some("anthropic"),
             Some(crate::provider::DEFAULT_MODEL_ID),
             None,
@@ -6312,7 +6630,15 @@ mod tests {
             ..Args::default()
         };
 
-        let (harness, _, _) = build(&resolved, &args, &cwd, true).await.unwrap();
+        let (harness, _, _) = build(
+            &crate::config::AgentHome::process(),
+            &resolved,
+            &args,
+            &cwd,
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             harness.get_name().await.unwrap().as_deref(),
             Some("smoke name")

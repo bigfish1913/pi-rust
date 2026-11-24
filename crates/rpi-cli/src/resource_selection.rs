@@ -250,6 +250,15 @@ fn relative(path: &Path) -> Result<(), String> {
 
 impl ResolvedSelection {
     pub fn load(args: &Args, cwd: &Path, trusted: bool) -> Result<Option<Self>, String> {
+        Self::load_for(&crate::config::AgentHome::process(), args, cwd, trusted)
+    }
+
+    pub fn load_for(
+        home: &crate::config::AgentHome,
+        args: &Args,
+        cwd: &Path,
+        trusted: bool,
+    ) -> Result<Option<Self>, String> {
         let Some(config) = args
             .resource_transition
             .as_ref()
@@ -316,7 +325,7 @@ impl ResolvedSelection {
         let mut instructions = Vec::new();
         let mut resolved_package = None;
         if let Some(main) = &selection.main_package {
-            let native_root = main.scope.root(cwd)?;
+            let native_root = main.scope.root(home, cwd)?;
             let package = crate::packages::selected_package_at(&native_root, &main.name)?;
             let packages_root =
                 std::fs::canonicalize(native_root.join("packages")).map_err(|e| e.to_string())?;

@@ -57,7 +57,14 @@ pub fn project_dirs(cwd: &Path, sub: &str) -> Vec<PathBuf> {
 /// `~/.rpi/agent/skills`). Returns `None` if the agent dir can't be resolved
 /// (no home dir + no `RPI_CODING_AGENT_DIR`) — callers then proceed project-only.
 pub fn global_dir(sub: &str) -> Option<PathBuf> {
-    crate::config::agent_dir().ok().map(|d| d.join(sub))
+    global_dir_at(None, sub)
+}
+
+/// [`global_dir`] under an explicit agent home (`--agent-dir`).
+fn global_dir_at(agent_dir: Option<&Path>, sub: &str) -> Option<PathBuf> {
+    crate::config::agent_dir_at(agent_dir)
+        .ok()
+        .map(|d| d.join(sub))
 }
 
 /// The candidate context/SYSTEM/APPEND filenames live directly under
@@ -73,16 +80,24 @@ pub fn project_config_files(cwd: &Path, name: &str) -> Vec<PathBuf> {
 
 /// Global config file under `<agent_dir>/<name>` (`~/.rpi/agent/SYSTEM.md`).
 pub fn global_config_file(name: &str) -> Option<PathBuf> {
-    crate::config::agent_dir().ok().map(|d| d.join(name))
+    global_config_file_at(None, name)
+}
+
+/// [`global_config_file`] under an explicit agent home (`--agent-dir`).
+fn global_config_file_at(agent_dir: Option<&Path>, name: &str) -> Option<PathBuf> {
+    crate::config::agent_dir_at(agent_dir)
+        .ok()
+        .map(|d| d.join(name))
 }
 
 /// Discover `SYSTEM.md` from the project `.rpi/` directory or global agent dir.
 pub fn discover_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
-    discover_system_prompt_file_with_trust(cwd, true)
+    discover_system_prompt_file_at(None, cwd, true)
 }
 
-/// Discover `SYSTEM.md` with explicit project trust control.
-pub fn discover_system_prompt_file_with_trust(
+/// [`discover_system_prompt_file`] under an explicit agent home.
+fn discover_system_prompt_file_at(
+    agent_dir: Option<&Path>,
     cwd: &Path,
     project_trusted: bool,
 ) -> Option<PathBuf> {
@@ -93,17 +108,30 @@ pub fn discover_system_prompt_file_with_trust(
             }
         }
     }
-    global_config_file("SYSTEM.md").filter(|p| p.is_file())
+    global_config_file_at(agent_dir, "SYSTEM.md").filter(|p| p.is_file())
+}
+
+/// Discover `SYSTEM.md` with explicit project trust control.
+pub fn discover_system_prompt_file_with_trust(
+    cwd: &Path,
+    project_trusted: bool,
+) -> Option<PathBuf> {
+    discover_system_prompt_file_at(None, cwd, project_trusted)
 }
 
 /// Discover `APPEND_SYSTEM.md` using project-over-global precedence.
 pub fn discover_append_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
+    discover_append_system_prompt_file_at(None, cwd)
+}
+
+/// [`discover_append_system_prompt_file`] under an explicit agent home.
+fn discover_append_system_prompt_file_at(agent_dir: Option<&Path>, cwd: &Path) -> Option<PathBuf> {
     for project in project_config_files(cwd, "APPEND_SYSTEM.md") {
         if project.is_file() {
             return Some(project);
         }
     }
-    global_config_file("APPEND_SYSTEM.md").filter(|p| p.is_file())
+    global_config_file_at(agent_dir, "APPEND_SYSTEM.md").filter(|p| p.is_file())
 }
 
 // ---------------------------------------------------------------------------
@@ -273,9 +301,18 @@ pub async fn load_prompt_templates_with_precedence(
 /// configured and conventional global paths.
 /// The global dir is omitted when `agent_dir()` can't be resolved (no home dir).
 pub fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
+    skill_dirs_at(cwd, None)
+}
+
+/// [`skill_dirs`] under an explicit agent home (`--agent-dir`).
+fn skill_dirs_at(cwd: &Path, agent_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = project_skill_dirs(cwd);
-    if let Some(g) = global_dir("skills") {
-        dirs.extend(configured_global_dirs(g.clone(), ResourceKind::Skills));
+    if let Some(g) = global_dir_at(agent_dir, "skills") {
+        dirs.extend(configured_global_dirs(
+            g.clone(),
+            ResourceKind::Skills,
+            agent_dir,
+        ));
         dirs.push(g);
     }
     dirs
@@ -291,15 +328,29 @@ pub fn project_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
 /// Resource directories that do not depend on the current project. Used when
 /// the project trust gate denies local configuration/resources.
 pub fn global_skill_dirs() -> Vec<PathBuf> {
-    global_resource_dirs("skills", ResourceKind::Skills)
+    global_skill_dirs_at(None)
+}
+
+/// [`global_skill_dirs`] under an explicit agent home.
+fn global_skill_dirs_at(agent_dir: Option<&Path>) -> Vec<PathBuf> {
+    global_resource_dirs_at(agent_dir, "skills", ResourceKind::Skills)
 }
 
 /// The ordered prompt-template paths for a project: configured paths, then
 /// `[<cwd>/.rpi/prompts, <agent_dir>/prompts]`.
 pub fn prompt_template_dirs(cwd: &Path) -> Vec<PathBuf> {
+    prompt_template_dirs_at(cwd, None)
+}
+
+/// [`prompt_template_dirs`] under an explicit agent home.
+fn prompt_template_dirs_at(cwd: &Path, agent_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = project_prompt_template_dirs(cwd);
-    if let Some(g) = global_dir("prompts") {
-        dirs.extend(configured_global_dirs(g.clone(), ResourceKind::Prompts));
+    if let Some(g) = global_dir_at(agent_dir, "prompts") {
+        dirs.extend(configured_global_dirs(
+            g.clone(),
+            ResourceKind::Prompts,
+            agent_dir,
+        ));
         dirs.push(g);
     }
     dirs
@@ -311,16 +362,29 @@ pub fn project_prompt_template_dirs(cwd: &Path) -> Vec<PathBuf> {
 }
 
 pub fn global_prompt_template_dirs() -> Vec<PathBuf> {
-    global_resource_dirs("prompts", ResourceKind::Prompts)
+    global_prompt_template_dirs_at(None)
+}
+
+fn global_prompt_template_dirs_at(agent_dir: Option<&Path>) -> Vec<PathBuf> {
+    global_resource_dirs_at(agent_dir, "prompts", ResourceKind::Prompts)
 }
 
 /// The ordered Rust extension directories for a project. Configured paths are
 /// added before conventional directories so an explicit project path can be
 /// used for development while `.rpi` defaults stay lower precedence.
 pub fn extension_dirs(cwd: &Path) -> Vec<PathBuf> {
+    extension_dirs_at(cwd, None)
+}
+
+/// [`extension_dirs`] under an explicit agent home.
+fn extension_dirs_at(cwd: &Path, agent_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = project_resource_dirs(cwd, "extensions", ResourceKind::Extensions);
-    if let Some(g) = global_dir("extensions") {
-        dirs.extend(configured_global_dirs(g.clone(), ResourceKind::Extensions));
+    if let Some(g) = global_dir_at(agent_dir, "extensions") {
+        dirs.extend(configured_global_dirs(
+            g.clone(),
+            ResourceKind::Extensions,
+            agent_dir,
+        ));
         dirs.push(g);
     }
     dirs
@@ -331,7 +395,11 @@ pub fn project_extension_dirs(cwd: &Path) -> Vec<PathBuf> {
 }
 
 pub fn global_extension_dirs() -> Vec<PathBuf> {
-    global_resource_dirs("extensions", ResourceKind::Extensions)
+    global_extension_dirs_at(None)
+}
+
+fn global_extension_dirs_at(agent_dir: Option<&Path>) -> Vec<PathBuf> {
+    global_resource_dirs_at(agent_dir, "extensions", ResourceKind::Extensions)
 }
 
 #[derive(Clone, Copy)]
@@ -360,19 +428,27 @@ fn project_resource_dirs(cwd: &Path, sub: &str, kind: ResourceKind) -> Vec<PathB
     dirs
 }
 
-fn configured_global_dirs(agent_dir: PathBuf, kind: ResourceKind) -> Vec<PathBuf> {
-    crate::settings::load_settings()
+fn configured_global_dirs(
+    agent_dir: PathBuf,
+    kind: ResourceKind,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    crate::settings::load_settings_at(home)
         .ok()
         .into_iter()
         .flat_map(|settings| configured_paths(&settings, &agent_dir, kind))
         .collect()
 }
 
-fn global_resource_dirs(sub: &str, kind: ResourceKind) -> Vec<PathBuf> {
-    let Some(g) = global_dir(sub) else {
+fn global_resource_dirs_at(
+    agent_dir: Option<&Path>,
+    sub: &str,
+    kind: ResourceKind,
+) -> Vec<PathBuf> {
+    let Some(g) = global_dir_at(agent_dir, sub) else {
         return Vec::new();
     };
-    let mut dirs = configured_global_dirs(g.clone(), kind);
+    let mut dirs = configured_global_dirs(g.clone(), kind, agent_dir);
     dirs.push(g);
     dirs
 }
@@ -390,6 +466,56 @@ fn configured_paths(
     values
         .map(|paths| crate::settings::resolve_configured_paths(base, paths))
         .unwrap_or_default()
+}
+
+impl crate::config::AgentHome {
+    /// Global resource subdir `<home>/<sub>` (e.g. `<home>/skills`).
+    pub fn global_dir(&self, sub: &str) -> Option<PathBuf> {
+        global_dir_at(self.explicit_path(), sub)
+    }
+
+    /// Global config file under `<home>/<name>` (`<home>/SYSTEM.md`).
+    pub fn global_config_file(&self, name: &str) -> Option<PathBuf> {
+        global_config_file_at(self.explicit_path(), name)
+    }
+
+    pub fn discover_system_prompt_file(
+        &self,
+        cwd: &Path,
+        project_trusted: bool,
+    ) -> Option<PathBuf> {
+        discover_system_prompt_file_at(self.explicit_path(), cwd, project_trusted)
+    }
+
+    pub fn discover_append_system_prompt_file(&self, cwd: &Path) -> Option<PathBuf> {
+        discover_append_system_prompt_file_at(self.explicit_path(), cwd)
+    }
+
+    /// Ordered skill dirs for a project: project paths, then this home's
+    /// configured + conventional global paths.
+    pub fn skill_dirs(&self, cwd: &Path) -> Vec<PathBuf> {
+        skill_dirs_at(cwd, self.explicit_path())
+    }
+
+    pub fn global_skill_dirs(&self) -> Vec<PathBuf> {
+        global_skill_dirs_at(self.explicit_path())
+    }
+
+    pub fn prompt_template_dirs(&self, cwd: &Path) -> Vec<PathBuf> {
+        prompt_template_dirs_at(cwd, self.explicit_path())
+    }
+
+    pub fn global_prompt_template_dirs(&self) -> Vec<PathBuf> {
+        global_prompt_template_dirs_at(self.explicit_path())
+    }
+
+    pub fn extension_dirs(&self, cwd: &Path) -> Vec<PathBuf> {
+        extension_dirs_at(cwd, self.explicit_path())
+    }
+
+    pub fn global_extension_dirs(&self) -> Vec<PathBuf> {
+        global_extension_dirs_at(self.explicit_path())
+    }
 }
 
 #[cfg(test)]

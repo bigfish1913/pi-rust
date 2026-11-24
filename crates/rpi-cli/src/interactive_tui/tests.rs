@@ -3041,7 +3041,11 @@ fn switch_provider_for_test(
         .block_on(async {
             let harness = AgentHarness::create(Default::default()).await.unwrap();
             let lane = harness.lane("main");
-            let available = crate::provider::catalog_with_manifests(manifests).unwrap();
+            let available = crate::provider::catalog_with_manifests(
+                &crate::config::AgentHome::process(),
+                manifests,
+            )
+            .unwrap();
             let result = switch_provider(input, manifests, &available, &lane).await;
             if let Ok((model, _)) = &result {
                 assert_eq!(lane.get_model().await.unwrap(), *model);
@@ -3105,11 +3109,14 @@ fn provider_switch_applies_live_and_keeps_configured_protocol_for_duplicate_mode
         .unwrap();
         crate::config::save_models_config(&cfg).unwrap();
         let manifest = command_package_manifest("deepseek", "deepseek-flash", true);
-        let response_model = crate::provider::catalog_with_manifests(&[manifest.clone()])
-            .unwrap()
-            .into_iter()
-            .find(|model| model.provider == "deepseek" && model.api == rpi_ai::Api::OpenaiResponses)
-            .unwrap();
+        let response_model = crate::provider::catalog_with_manifests(
+            &crate::config::AgentHome::process(),
+            &[manifest.clone()],
+        )
+        .unwrap()
+        .into_iter()
+        .find(|model| model.provider == "deepseek" && model.api == rpi_ai::Api::OpenaiResponses)
+        .unwrap();
         let available = vec![manifest.models[0].clone(), response_model];
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3294,7 +3301,11 @@ fn provider_commands_respect_package_model_overrides_and_config_removal() {
             "baseUrl": "http://override.example/v1", "models": [{"id": "openrouter/auto", "name": "Override"}]
         }}})).unwrap();
         crate::config::save_models_config(&cfg).unwrap();
-        let catalog = crate::provider::catalog_with_manifests(&manifests).unwrap();
+        let catalog = crate::provider::catalog_with_manifests(
+            &crate::config::AgentHome::process(),
+            &manifests,
+        )
+        .unwrap();
         let models: Vec<_> = catalog
             .iter()
             .filter(|model| model.provider == "openrouter")
@@ -3320,7 +3331,11 @@ fn package_catalog_resolves_header_references_without_binding_credentials() {
             "apiKey":"secret-value", "headers":{"Authorization":"$RPI_TEST_MISSING_PACKAGE_HEADER"}, "models":[]
         }}})).unwrap();
         crate::config::save_models_config(&cfg).unwrap();
-        let catalog = crate::provider::catalog_with_manifests(&manifests).unwrap();
+        let catalog = crate::provider::catalog_with_manifests(
+            &crate::config::AgentHome::process(),
+            &manifests,
+        )
+        .unwrap();
         let model = catalog
             .iter()
             .find(|model| model.provider == "package-gateway")

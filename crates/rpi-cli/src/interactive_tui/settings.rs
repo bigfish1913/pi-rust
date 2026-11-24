@@ -622,9 +622,10 @@ pub(super) fn provider_selector_items(
     manifests: &[rpi_extensions::ProviderManifest],
     current_provider: Option<&str>,
 ) -> Vec<SelectItem> {
-    let catalog = crate::provider::catalog_with_manifests(manifests).unwrap_or_default();
-    let models_cfg = crate::config::load_models_config().unwrap_or_default();
-    let auth = crate::config::read_auth().unwrap_or_default();
+    let home = crate::config::AgentHome::process();
+    let catalog = crate::provider::catalog_with_manifests(&home, manifests).unwrap_or_default();
+    let models_cfg = home.models_config().unwrap_or_default();
+    let auth = home.read_auth().unwrap_or_default();
     let auth_states = crate::credentials::statuses(&models_cfg, &auth, manifests);
 
     let mut providers: Vec<(String, usize)> = Vec::new();
@@ -676,9 +677,10 @@ pub(super) fn login_provider_items_with_oauth(
     manifests: &[rpi_extensions::ProviderManifest],
     oauth_providers: &[rpi_extensions::OAuthProviderInfo],
 ) -> Vec<SelectItem> {
-    let catalog = crate::provider::catalog_with_manifests(manifests).unwrap_or_default();
-    let models_cfg = crate::config::load_models_config().unwrap_or_default();
-    let auth = crate::config::read_auth().unwrap_or_default();
+    let home = crate::config::AgentHome::process();
+    let catalog = crate::provider::catalog_with_manifests(&home, manifests).unwrap_or_default();
+    let models_cfg = home.models_config().unwrap_or_default();
+    let auth = home.read_auth().unwrap_or_default();
     let mut ids = Vec::new();
     for model in &catalog {
         if !ids.iter().any(|id: &String| id == &model.provider) {
@@ -1366,7 +1368,8 @@ pub(super) async fn switch_provider(
     lane: &Arc<dyn AgentLane>,
 ) -> Result<(rpi_ai::Model, String), String> {
     let catalog =
-        crate::provider::catalog_with_manifests(manifests).map_err(|error| error.to_string())?;
+        crate::provider::catalog_with_manifests(&crate::config::AgentHome::process(), manifests)
+            .map_err(|error| error.to_string())?;
     let provider_id = canonicalize_provider_input(input, &catalog)?;
     let candidates: Vec<_> = available
         .iter()
