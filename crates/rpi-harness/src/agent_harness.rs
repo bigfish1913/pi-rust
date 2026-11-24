@@ -921,7 +921,14 @@ pub use child::ChildHarness;
 mod durable_control;
 mod durable_execution;
 mod durable_ledger;
+mod host_admission;
 pub(crate) use durable_execution::NativeExecutionStorage;
+pub use host_admission::{
+    host_admission_digest, validate_host_admission, HostAdmissionExecution, HostAdmissionKind,
+    HostAdmissionOutcome, HostAdmissionReceipt, HostAdmissionRequest, HostAdmissionStatus,
+    HOST_ADMISSION_TYPE, MAX_HOST_ADMISSIONS, MAX_HOST_ADMISSION_BYTES,
+    MAX_HOST_ADMISSION_MESSAGES,
+};
 mod queue_writes;
 pub(crate) use queue_writes::QueueReservation;
 mod run_results;
@@ -2824,6 +2831,54 @@ impl AgentHarness {
         Ok(())
     }
 
+    /// Retire this closed, idle harness's executable bindings without releasing
+    /// its Session, writer, write diagnostics or unsaved recovery content.
+    ///
+    /// `close` alone deliberately retains these bindings. Hosts waiting for
+    /// plugin cleanup may explicitly relinquish them here, including from an
+    /// exact-resource harness: a closed harness can never run again. Destructors
+    /// run outside both harness locks so they may safely release callback state.
+    /// This is NOT proof of external-worker settlement or final library unload;
+    /// other owners/calls may still retain the bindings. Await their cleanup
+    /// evidence before releasing the durable writer. Retain cleanup capabilities
+    /// independently of the bindings being retired.
+    pub async fn retire_runtime_bindings(&self) -> HarnessResult<()> {
+        let retired = {
+            let _writes = self.message_writes.lock().await;
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.closed {
+                return Err(HarnessError::io(
+                    "runtime binding retirement requires close",
+                ));
+            }
+            if let Some(active) = &inner.active_run {
+                return Err(HarnessError::lane_busy(
+                    self.lane.clone(),
+                    active.run_id.clone(),
+                    active.kind,
+                    "Wait for the active operation before retiring bindings",
+                ));
+            }
+            inner.active_tool_names.clear();
+            (
+                std::mem::take(&mut inner.tools),
+                std::mem::take(&mut inner.models),
+                inner.to_provider_messages.take(),
+                std::mem::take(&mut inner.entry_projectors),
+                std::mem::take(&mut inner.entry_transforms),
+                inner.agent_emitter.take(),
+                inner.before_tool_call.take(),
+                inner.after_tool_call.take(),
+                inner.transform_context.take(),
+                inner.provider_hooks.take(),
+                inner.execution_scope.take(),
+                inner.skill_execution_env.take(),
+            )
+        };
+        drop(retired);
+        Ok(())
+    }
+
     /// Swap the harness's durable session facade (TUI `/session` hot-switch).
     /// `run_core` re-reads the session on every run (branch path, leaf id,
     /// context build), so replacing `inner.session` makes the next run
@@ -3925,7 +3980,9 @@ impl AgentHarness {
     /// `before_provider_request`/`before_provider_headers` `on()` handlers can
     /// patch the LIVE per-call options (not a run-once config-build — that
     /// would not be equivalent to pi's `beforeRequest`, which fires before
-    /// every provider call). `after_response` is invoked by the agent loop
+    /// every provider call). The request boundary is awaited, allowing a Host
+    /// to retain an owned blocking worker without parking this executor.
+    /// `after_response_async` is awaited by the agent loop
     /// after the stream resolves and before it emits `MessageEnd`, where the
     /// terminal assistant message is available without consuming the stream
     /// in this bridge.
@@ -3956,7 +4013,9 @@ impl AgentHarness {
                                     patch.apply(ctx.to_mut());
                                 }
                             }
-                            if let Some(patch) = hooks.before_request(model, &ctx, &opts) {
+                            if let Some(patch) =
+                                hooks.before_request_async(model, &ctx, &opts).await
+                            {
                                 patch.apply(&mut opts);
                             }
                         }
@@ -6703,6 +6762,10 @@ impl AgentLane for LaneHandle {
 }
 
 #[cfg(test)]
+#[path = "agent_harness/binding_retirement_tests.rs"]
+mod binding_retirement_tests;
+
+#[cfg(test)]
 #[path = "agent_harness/image_normalization_tests.rs"]
 mod image_normalization_tests;
 #[cfg(test)]
@@ -7732,6 +7795,10 @@ mod session_switch_tests {
         }));
     }
 }
+
+#[cfg(test)]
+#[path = "provider_hooks_async_tests.rs"]
+mod provider_hooks_async_tests;
 
 #[cfg(test)]
 mod borrowed_context_tests {

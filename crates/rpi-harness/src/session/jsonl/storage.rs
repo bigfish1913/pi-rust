@@ -55,6 +55,12 @@ use super::cold_frames::ResidentState;
 #[cfg(test)]
 #[path = "storage_compat_tests.rs"]
 mod compatibility_tests;
+#[cfg(all(test, unix))]
+#[path = "exclusive_create_tests.rs"]
+mod exclusive_create_tests;
+#[cfg(all(test, unix))]
+#[path = "history_sync_tests.rs"]
+mod history_sync_tests;
 #[path = "streaming.rs"]
 mod streaming;
 use std::collections::{HashMap, HashSet};
@@ -443,9 +449,40 @@ impl JsonlSessionStorage {
     pub async fn create(
         fs: Arc<dyn FileSystem>,
         path: &str,
+        header: JsonlV4Header,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<Self> {
+        Self::create_inner(fs, path, header, clock, ids, false).await
+    }
+
+    /// Exclusively create a new native history and progress companion. Existing
+    /// files (including symlinks/orphans) are never overwritten. Requires a real
+    /// writer lease, atomic create support and strict file/parent synchronization.
+    ///
+    /// Initialization remains owned if the caller drops its wait. A failure may
+    /// leave partial new files for explicit inspection; it never deletes files,
+    /// falls back to legacy truncating creation, or silently adopts an orphan.
+    pub async fn create_new(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        header: JsonlV4Header,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<Self> {
+        let path = path.to_owned();
+        tokio::spawn(async move { Self::create_inner(fs, &path, header, clock, ids, true).await })
+            .await
+            .map_err(|_| SessionError::storage("exclusive Session creation task stopped"))?
+    }
+
+    async fn create_inner(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
         mut header: JsonlV4Header,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
+        exclusive: bool,
     ) -> SessionResult<Self> {
         header.progress_format = Some(super::progress::FORMAT.into());
         // Claim ownership before creating either the history or its progress
@@ -455,27 +492,54 @@ impl JsonlSessionStorage {
             fs.try_acquire_writer_lease(path).await,
             &format!("Failed to acquire writer lease for {path}"),
         )?;
+        if exclusive && lease.is_none() {
+            return Err(SessionError::storage(
+                "exclusive Session creation requires a writer lease",
+            ));
+        }
         let progress =
             super::progress::JsonlProgressStore::new(fs.clone(), path, &header.id, clock.clone());
-        progress.initialize().await?;
-        file_result(
-            fs.write_file(path, FileContent::Text(encode_header(&header)), None)
-                .await,
-            &format!("Failed to initialize session {path}"),
-        )?;
-        file_result(
-            fs.sync_file(path, false, None).await,
-            &format!("Failed to sync initialized session {path}"),
-        )?;
-        let absolute = file_result(
-            fs.absolute_path(path, None).await,
-            &format!("Failed to resolve initialized session {path}"),
-        )?;
-        if let Some(parent) = absolute.parent() {
+        if exclusive {
+            // Claim an EMPTY primary path before touching the companion. Do
+            // not advertise a readable header until exclusive companion creation
+            // succeeds: even an orphan with the same Session ID must not become
+            // authoritative merely because a failed create left a new header.
             file_result(
-                fs.sync_directory(&parent.to_string_lossy(), None).await,
-                &format!("Failed to sync initialized session directory {path}"),
+                fs.write_new_file(path, FileContent::Bytes(Vec::new()), None)
+                    .await,
+                &format!("Failed to exclusively initialize session {path}"),
             )?;
+            progress.initialize_new().await?;
+            file_result(
+                fs.append_file(path, FileContent::Text(encode_header(&header)), None)
+                    .await,
+                &format!("Failed to publish new session header {path}"),
+            )?;
+            file_result(
+                fs.sync_file_and_parent(path, None).await,
+                &format!("Failed to strictly sync initialized session {path}"),
+            )?;
+        } else {
+            progress.initialize().await?;
+            file_result(
+                fs.write_file(path, FileContent::Text(encode_header(&header)), None)
+                    .await,
+                &format!("Failed to initialize session {path}"),
+            )?;
+            file_result(
+                fs.sync_file(path, false, None).await,
+                &format!("Failed to sync initialized session {path}"),
+            )?;
+            let absolute = file_result(
+                fs.absolute_path(path, None).await,
+                &format!("Failed to resolve initialized session {path}"),
+            )?;
+            if let Some(parent) = absolute.parent() {
+                file_result(
+                    fs.sync_directory(&parent.to_string_lossy(), None).await,
+                    &format!("Failed to sync initialized session directory {path}"),
+                )?;
+            }
         }
         let info = file_result(
             fs.file_info(path, None).await,
@@ -2423,6 +2487,36 @@ impl SessionStorage for JsonlSessionStorage {
     async fn get_stats(&self) -> SessionResult<SessionStats> {
         let state = self.state.lock().await;
         Ok(state.get_stats().clone())
+    }
+
+    /// An explicit, writer-ordered physical history barrier. `run_owned` keeps
+    /// the tail reservation through sync and identity sampling even if the
+    /// caller drops its wait; later writes/replacements cannot overtake it.
+    async fn sync_history(&self) -> SessionResult<HistoryIdentity> {
+        self.run_owned(|s| async move {
+            if !s.writer_lease_held() {
+                return Err(SessionError::storage(
+                    "physical history synchronization requires a writer lease",
+                ));
+            }
+            file_result(
+                s.fs.sync_file_and_parent(&s.metadata.path, None).await,
+                "Failed to synchronize session history",
+            )?;
+            // A concurrent explicit retirement or a replaced lease fence must
+            // never return an apparently valid durability observation.
+            s.ensure_writer_lease().await?;
+            if !s.writer_lease_held() {
+                return Err(SessionError::storage(
+                    "session writer lease was lost during history synchronization",
+                ));
+            }
+            Ok(HistoryIdentity {
+                revision: s.state.lock().await.sequence(),
+                generation: s.generation.load(Ordering::Acquire),
+            })
+        })
+        .await
     }
 
     /// Wait for the append that is in flight, if any, to settle.

@@ -24,12 +24,36 @@ use crate::registry::RegistrySnapshot;
 use crate::translate::dispatch_data_event;
 use crate::PluginKeepalive;
 
+#[cfg(test)]
+#[path = "provider_context_tests.rs"]
+mod context_tests;
+
+/// Explicit observer identity for a single Agent binding. `session_id: None`
+/// means genuinely sessionless (for example mini), not an environment fallback.
+/// This is metadata, never an authorization capability or credential container.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionProviderContext {
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+}
+impl ExtensionProviderContext {
+    fn decorate(&self, value: &mut serde_json::Value) {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("agentId".into(), serde_json::json!(self.agent_id));
+            object.insert("sessionId".into(), serde_json::json!(self.session_id));
+        }
+    }
+}
+
 /// A [`ProviderHooks`] that dispatches to the registered extension handlers.
 /// Keeps the cdylib mappings alive via the keepalive (the handler fn pointers
 /// live inside the plugins).
 pub struct ExtensionProviderHooks {
     snapshot: Arc<RegistrySnapshot>,
     _keepalive: Arc<PluginKeepalive>,
+    /// None preserves the single-session CLI's dynamic environment channel.
+    /// Shared Host bindings must always set Some, including sessionless Agents.
+    context: Option<ExtensionProviderContext>,
     /// Timestamp of the last user message we emitted `BeforeAgentStart` for.
     /// The hook fires once per provider call, but `before_agent_start` must
     /// fire once per prompt, so the prompt timestamp is the dedupe key.
@@ -81,9 +105,24 @@ impl ExtensionProviderHooks {
         Some(Self {
             snapshot,
             _keepalive: session.keepalive(),
+            context: None,
             last_before_agent_start: Mutex::new(None),
             last_forced_prompt: Mutex::new(None),
         })
+    }
+
+    /// Freeze per-Agent event identity without touching process globals. Bind
+    /// before installing this hook in an Agent; build another hook for another
+    /// Agent even when both share the same immutable registry snapshot.
+    pub fn with_context(mut self, context: ExtensionProviderContext) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    fn decorate(&self, value: &mut serde_json::Value) {
+        if let Some(context) = &self.context {
+            context.decorate(value);
+        }
     }
 }
 
@@ -108,7 +147,7 @@ impl ProviderHooks for ExtensionProviderHooks {
 
         let mut cache = self.last_forced_prompt.lock().unwrap();
         if cache.as_ref().map(|(ts, _)| *ts) != Some(timestamp) {
-            let event = before_agent_start_event(&prompt, image_count, ctx);
+            let event = before_agent_start_event(&prompt, image_count, ctx, self.context.as_ref());
             let forced = emit_before_agent_start(
                 ctx.system_prompt.as_deref().unwrap_or_default(),
                 &event.to_string(),
@@ -147,7 +186,8 @@ impl ProviderHooks for ExtensionProviderHooks {
             if *last != Some(timestamp) {
                 *last = Some(timestamp);
                 drop(last);
-                let event = before_agent_start_event(&prompt, image_count, ctx);
+                let event =
+                    before_agent_start_event(&prompt, image_count, ctx, self.context.as_ref());
                 // Synchronous, like the request dispatch below: a subscriber's
                 // `BeforeAgentStart` handler runs before any
                 // `BeforeProviderRequest` of this turn reaches it, so the turn is
@@ -161,7 +201,7 @@ impl ProviderHooks for ExtensionProviderHooks {
             }
         }
 
-        let request = serde_json::json!({
+        let mut request = serde_json::json!({
             "model": model.id,
             "provider": model.provider,
             "baseUrl": model.base_url,
@@ -180,12 +220,14 @@ impl ProviderHooks for ExtensionProviderHooks {
             // always null for plugins.
             "messages": ctx.messages,
         });
+        self.decorate(&mut request);
         dispatch_data_event(
             &self.snapshot,
             EventTag::BeforeProviderRequest,
             &request.to_string(),
         );
-        let headers = serde_json::json!({ "headers": opts.headers });
+        let mut headers = serde_json::json!({ "headers": opts.headers });
+        self.decorate(&mut headers);
         dispatch_data_event(
             &self.snapshot,
             EventTag::BeforeProviderHeaders,
@@ -197,7 +239,8 @@ impl ProviderHooks for ExtensionProviderHooks {
     /// Fan the terminal assistant message out to `AfterProviderResponse`
     /// subscribers.
     fn after_response(&self, _model: &Model, message: &AssistantMessage) {
-        let json = serde_json::to_value(message).unwrap_or(serde_json::json!({}));
+        let mut json = serde_json::to_value(message).unwrap_or(serde_json::json!({}));
+        self.decorate(&mut json);
         dispatch_data_event(
             &self.snapshot,
             EventTag::AfterProviderResponse,
@@ -220,24 +263,29 @@ impl ProviderHooks for ExtensionProviderHooks {
 /// `before_agent_start` fires earlier in the run and therefore carries the base
 /// prompt; a plugin that needs the pre-transform value should capture it from
 /// its own transformer's input instead of from this event.
-fn before_agent_start_event(prompt: &str, image_count: usize, ctx: &Context) -> serde_json::Value {
-    serde_json::json!({
+fn before_agent_start_event(
+    prompt: &str,
+    image_count: usize,
+    ctx: &Context,
+    identity: Option<&ExtensionProviderContext>,
+) -> serde_json::Value {
+    // Explicit None session identity must not leak a different Agent's global
+    // CLI identity. Only the legacy single-session path reads the environment.
+    let session_id = match identity {
+        Some(identity) => identity.session_id.clone(),
+        None => std::env::var(rpi_plugin_sdk::SESSION_ID_ENV).ok(),
+    };
+    let mut event = serde_json::json!({
         "prompt": prompt,
         "imageCount": image_count,
         "systemPrompt": ctx.system_prompt,
-        // The session this process serves. A plugin that traces the run reports
-        // it as the session id (nothing else tells an observer which session it
-        // is watching). Read from the environment per turn rather than captured
-        // at harness build, so an in-process session swap is reflected on the
-        // very next turn.
-        "sessionId": std::env::var(rpi_plugin_sdk::SESSION_ID_ENV).ok(),
-        // Who this extension is embedded in, so it can label its own output
-        // (trace name, tags, `service.name`) without hardcoding a brand that a
-        // rename would silently invalidate. Sent per turn, so it describes the
-        // process actually running rather than the SDK the plugin was built
-        // against.
+        "sessionId": session_id,
         "host": host_identity(),
-    })
+    });
+    if let Some(identity) = identity {
+        identity.decorate(&mut event);
+    }
+    event
 }
 
 /// The host's own identity, as handed to plugins.
@@ -352,6 +400,7 @@ mod tests {
         let hooks = ExtensionProviderHooks {
             snapshot: Arc::clone(&snapshot),
             _keepalive: Arc::new(crate::PluginKeepalive::new(Vec::new(), None)),
+            context: None,
             last_before_agent_start: Mutex::new(None),
             last_forced_prompt: Mutex::new(None),
         };
@@ -473,6 +522,7 @@ mod tests {
         let hooks = ExtensionProviderHooks {
             snapshot: Arc::clone(&snapshot),
             _keepalive: Arc::new(crate::PluginKeepalive::new(Vec::new(), None)),
+            context: None,
             last_before_agent_start: Mutex::new(None),
             last_forced_prompt: Mutex::new(None),
         };
@@ -559,6 +609,7 @@ mod tests {
         ExtensionProviderHooks {
             snapshot: Arc::new(registry.snapshot()),
             _keepalive: Arc::new(crate::PluginKeepalive::new(Vec::new(), None)),
+            context: None,
             last_before_agent_start: Mutex::new(None),
             last_forced_prompt: Mutex::new(None),
         }
@@ -717,6 +768,7 @@ mod tests {
         let hooks = ExtensionProviderHooks {
             snapshot: Arc::new(registry.snapshot()),
             _keepalive: Arc::new(crate::PluginKeepalive::new(Vec::new(), None)),
+            context: None,
             last_before_agent_start: Mutex::new(None),
             last_forced_prompt: Mutex::new(None),
         };

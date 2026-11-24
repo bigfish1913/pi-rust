@@ -61,6 +61,8 @@ use rpi_plugin_sdk::{ProviderRequestFn, ProviderStreamRequestFn, RenderFn};
 /// partial-callback path are both touched.
 struct EchoDrive {
     text: String,
+    // Opt-in fixture observation, not part of the ordinary echo result.
+    context: Option<serde_json::Value>,
     polls: usize,
 }
 
@@ -86,6 +88,9 @@ rpi_plugin_sdk::execute_handler! {
             .to_string();
         ECHO_DRIVES.insert(EchoDrive {
             text: value,
+            context: (parsed.get("probeContext").and_then(|v| v.as_bool()) == Some(true))
+                .then(|| parsed.get(rpi_plugin_sdk::HOST_CONTEXT_KEY).cloned())
+                .flatten(),
             polls: 0,
         })
     }
@@ -118,13 +123,13 @@ extern "C" fn echo_poll(
                 r#"{"error":"echo cancelled"}"#.into(),
             ));
         }
-        let text = {
+        let completed = {
             let mut drive = entry.lock();
             drive.polls += 1;
-            (drive.polls > 1).then(|| drive.text.clone())
+            (drive.polls > 1).then(|| (drive.text.clone(), drive.context.clone()))
         };
         // Do not hold the state lock while calling back into the host.
-        let Some(text) = text else {
+        let Some((text, context)) = completed else {
             // Emit a partial progress result through the callback path.
             if let Some(cb) = partial_cb {
                 let progress = StbString::from_string(
@@ -140,10 +145,17 @@ extern "C" fn echo_poll(
         };
 
         // Second poll: terminal Done with the echoed text.
-        let body = format!(
-            r#"{{"content":[{{"type":"text","text":"echo: {}"}}]}}"#,
-            escape_json_string(&text)
-        );
+        let body = match context {
+            Some(context) => serde_json::json!({
+                "content":[{"type":"text","text":format!("echo: {text}")}],
+                "details":{"context":context}
+            })
+            .to_string(),
+            None => format!(
+                r#"{{"content":[{{"type":"text","text":"echo: {}"}}]}}"#,
+                escape_json_string(&text)
+            ),
+        };
         StepResult::done(StbString::from_string(body))
     })
     .unwrap_or_else(|_| {
@@ -282,11 +294,18 @@ rpi_plugin_sdk::string_handler! {
     /// prompt) would fail.
     fn on_before_agent_start(event_json, out, _user_data) {
         PROMPT_TRANSFORM_HITS.fetch_add(1, Ordering::SeqCst);
-        let current = serde_json::from_str::<serde_json::Value>(event_json)
-            .ok()
-            .and_then(|v| v.get("systemPrompt")?.as_str().map(str::to_string))
-            .unwrap_or_default();
-        let json = serde_json::json!({ "systemPrompt": format!("{STUB_PROMPT_MARKER}{current}") });
+        let envelope = serde_json::from_str::<serde_json::Value>(event_json)
+            .unwrap_or(serde_json::Value::Null);
+        let current = envelope.get("systemPrompt").and_then(|v| v.as_str()).unwrap_or_default();
+        // Echo only the explicit Host identity into this test fixture's prompt.
+        // Legacy CLI prompts remain unchanged. The real-DLL concurrency test
+        // reads this marker to detect any cross-Agent envelope contamination.
+        let scope = if envelope.get("agentId").is_some() {
+            serde_json::json!({"agentId": envelope["agentId"], "sessionId": envelope["sessionId"]}).to_string()
+        } else {
+            String::new()
+        };
+        let json = serde_json::json!({ "systemPrompt": format!("{STUB_PROMPT_MARKER}{current}{scope}") });
         i32::from(!out.write(json.to_string()))
     }
 }

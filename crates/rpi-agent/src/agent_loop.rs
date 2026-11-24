@@ -854,7 +854,9 @@ async fn stream_assistant_response(
                         .await;
                 }
                 if let Some(hooks) = &config.provider_hooks {
-                    hooks.after_response(&config.model, &final_message);
+                    hooks
+                        .after_response_async(&config.model, &final_message)
+                        .await;
                 }
                 diagnostics
                     .emit_agent_event(
@@ -899,7 +901,9 @@ async fn stream_assistant_response(
             .await;
     }
     if let Some(hooks) = &config.provider_hooks {
-        hooks.after_response(&config.model, &final_message);
+        hooks
+            .after_response_async(&config.model, &final_message)
+            .await;
     }
     diagnostics
         .emit_agent_event(

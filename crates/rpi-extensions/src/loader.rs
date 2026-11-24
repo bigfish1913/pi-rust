@@ -17,8 +17,12 @@ use thiserror::Error;
 
 use rpi_plugin_sdk::{RpiPluginRegisterUnified, RPI_PLUGIN_ABI_VERSION_UNIFIED};
 
-use crate::registry::{ExtensionRegistry, RegistrySnapshot};
-use crate::{enter_current_api, ActionBridge, HostApi, NullDiagnostics, PluginDiagnostics};
+use crate::cleanup::PluginCleanupReporter;
+use crate::registry::{ExtensionRegistry, RegistrationInventory, RegistrySnapshot};
+use crate::{
+    enter_current_api, ActionBridge, HostApi, NullDiagnostics, PluginCleanupReceipt,
+    PluginDiagnostics,
+};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -47,6 +51,10 @@ pub enum PluginLoadError {
         plugin_version: u32,
         host_version: u32,
     },
+    #[error("invalid explicit plugin selection: {reason}")]
+    ExplicitSelection { reason: &'static str },
+    #[error("invalid explicit plugin path {path}: {reason}")]
+    ExplicitPath { path: PathBuf, reason: &'static str },
 }
 
 // ---------------------------------------------------------------------------
@@ -73,9 +81,15 @@ pub struct LoadedPlugin {
     diagnostics: Arc<dyn PluginDiagnostics>,
     /// Host-only resource ownership, never part of the plugin SDK/ABI.
     host_guard: Option<Arc<dyn Send + Sync>>,
+    cleanup: PluginCleanupReporter,
 }
 
 impl LoadedPlugin {
+    /// Observe final cleanup without keeping this library/context alive.
+    pub fn cleanup_receipt(&self) -> PluginCleanupReceipt {
+        self.cleanup.receipt()
+    }
+
     /// Reject new background work and cancel existing work without waiting.
     pub fn begin_shutdown(&self) {
         if let Some(api) = &self.host_api {
@@ -93,6 +107,7 @@ impl Drop for LoadedPlugin {
         let diagnostics = self.diagnostics.clone();
         let path = self.path.clone();
         let host_guard = self.host_guard.take();
+        let reporter = self.cleanup.clone();
         let cleanup = move || {
             // Drop can run under a caller's lock. Plugin callbacks run only on
             // this cleanup thread; reload begins shutdown explicitly earlier.
@@ -103,16 +118,27 @@ impl Drop for LoadedPlugin {
                 std::mem::forget(library);
                 std::mem::forget(api);
                 std::mem::forget(host_guard);
+                reporter.retained();
                 diagnostics.warn(&format!(
                     "plugin {} shutdown failed; retaining its library and callback context for process lifetime",
                     path.display()
                 ));
+            } else if let Err(error) = library.close() {
+                // An OS loader close error is not release evidence. Keep the
+                // callback context/guard even after SDK workers have settled.
+                std::mem::forget(api);
+                std::mem::forget(host_guard);
+                reporter.retained();
+                diagnostics.warn(&format!(
+                    "plugin {} library close failed: {error}; retaining callback context",
+                    path.display()
+                ));
             } else {
-                drop(library);
                 drop(api);
-                // Release exclusion only AFTER actual unmapping and callback
-                // destruction, not when the asynchronous cleanup was queued.
+                // Release exclusion only AFTER actual handle closure and
+                // callback destruction, not when async cleanup was queued.
                 drop(host_guard);
+                reporter.released();
             }
         };
         // If thread creation fails, dropping a captured Library would unload
@@ -128,6 +154,7 @@ impl Drop for LoadedPlugin {
             })
         {
             std::mem::forget(pending);
+            self.cleanup.retained();
             self.diagnostics.warn(&format!(
                 "could not start plugin cleanup: {error}; retaining library"
             ));
@@ -194,6 +221,40 @@ fn load_one_guarded(
     action_bridge: Option<Arc<ActionBridge>>,
     host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> Result<LoadedPlugin, PluginLoadError> {
+    // The legacy loader keeps its skip/drop semantics. The owned explicit
+    // loader below instead returns the failed registration's live custody.
+    load_one_owned(path, diagnostics, action_bridge, host_guard).map_err(|failure| failure.error)
+}
+
+struct OwnedLoadFailure {
+    error: PluginLoadError,
+    plugin: Option<Box<LoadedPlugin>>,
+}
+
+impl OwnedLoadFailure {
+    fn retaining(error: PluginLoadError, plugin: LoadedPlugin) -> Self {
+        Self {
+            error,
+            plugin: Some(Box::new(plugin)),
+        }
+    }
+}
+
+impl From<PluginLoadError> for OwnedLoadFailure {
+    fn from(error: PluginLoadError) -> Self {
+        Self {
+            error,
+            plugin: None,
+        }
+    }
+}
+
+fn load_one_owned(
+    path: &Path,
+    diagnostics: Arc<dyn PluginDiagnostics>,
+    action_bridge: Option<Arc<ActionBridge>>,
+    host_guard: Option<Arc<dyn Send + Sync>>,
+) -> Result<LoadedPlugin, OwnedLoadFailure> {
     let path = path.to_path_buf();
     // 1. Open the cdylib.
     let library = unsafe { Library::new(&path) }.map_err(|e| PluginLoadError::Open {
@@ -201,17 +262,41 @@ fn load_one_guarded(
         source: e,
     })?;
 
+    // Track ownership immediately after opening, INCLUDING symbol lookup
+    // failure. OS library close errors must not bypass cleanup evidence.
+    let abi_version = RPI_PLUGIN_ABI_VERSION_UNIFIED;
+    let mut loaded = LoadedPlugin {
+        action_bridge: None,
+        library: std::mem::ManuallyDrop::new(library),
+        path: path.clone(),
+        abi_version,
+        registry: ExtensionRegistry::new(),
+        host_api: None,
+        diagnostics: diagnostics.clone(),
+        host_guard,
+        cleanup: PluginCleanupReporter::new(),
+    };
+    // Publish non-owning evidence before any fallible symbol/registration work.
+    // Legacy skip/drop must not hide a partially loaded library from its host.
+    diagnostics.track_cleanup(loaded.cleanup_receipt());
     // 2. Look up the unified entrypoint.
-    let register: RpiPluginRegisterUnified = unsafe {
-        library
+    let register = match unsafe {
+        loaded
+            .library
             .get::<RpiPluginRegisterUnified>(rpi_plugin_sdk::REGISTER_SYMBOL_UNIFIED)
             .map(|symbol| *symbol)
-    }
-    .map_err(|e| PluginLoadError::Symbol {
-        path: path.clone(),
-        error: e.to_string(),
-    })?;
-    let abi_version = RPI_PLUGIN_ABI_VERSION_UNIFIED;
+    } {
+        Ok(register) => register,
+        Err(error) => {
+            return Err(OwnedLoadFailure::retaining(
+                PluginLoadError::Symbol {
+                    path,
+                    error: error.to_string(),
+                },
+                loaded,
+            ));
+        }
+    };
 
     // Plugin display name (file stem) — stamped onto every registration the
     // plugin makes so host diagnostics (e.g. lifecycle veto messages) can name
@@ -232,17 +317,9 @@ fn load_one_guarded(
         ),
         None => HostApi::new(plugin_name, registry, Arc::clone(&diagnostics)),
     };
-    // Install ownership before calling plugin code, including failed registrations.
-    let mut loaded = LoadedPlugin {
-        action_bridge: host_api.action_bridge.clone(),
-        library: std::mem::ManuallyDrop::new(library),
-        path: path.clone(),
-        abi_version,
-        registry: ExtensionRegistry::new(),
-        host_api: Some(host_api.clone()),
-        diagnostics: diagnostics.clone(),
-        host_guard,
-    };
+    // Install callback ownership before registration can start SDK workers.
+    loaded.action_bridge = host_api.action_bridge.clone();
+    loaded.host_api = Some(host_api.clone());
     // 4. Own the thread-local api during registration and restore the enclosing
     //    context afterward, even if registration fails or reenters the loader.
     let rc = {
@@ -273,18 +350,21 @@ fn load_one_guarded(
                 rc
             ));
         }
-        return Err(PluginLoadError::RegisterReturned { path, code: rc });
+        return Err(OwnedLoadFailure::retaining(
+            PluginLoadError::RegisterReturned { path, code: rc },
+            loaded,
+        ));
     }
 
     // 5. Take the registry out of the HostApi. The host keeps the Library alive
     //    (LoadedPlugin) so the plugin's code + static data remain mapped; the
     //    registry holds fn pointers into that code.
-    let registry = host_api
-        .take_registry()
-        .ok_or_else(|| PluginLoadError::RegisterReturned {
-            path: path.clone(),
-            code: -2,
-        })?;
+    let Some(registry) = host_api.take_registry() else {
+        return Err(OwnedLoadFailure::retaining(
+            PluginLoadError::RegisterReturned { path, code: -2 },
+            loaded,
+        ));
+    };
 
     tracing::debug!(path = %path.display(), abi_version, "loaded native plugin");
 
@@ -401,6 +481,15 @@ impl PluginKeepalive {
         }
     }
 
+    /// Observe each owned plugin's final cleanup without retaining its code.
+    /// Legacy raw `libraries` supplied to `new` have no cleanup receipts.
+    pub fn cleanup_receipts(&self) -> Vec<PluginCleanupReceipt> {
+        self.plugins
+            .iter()
+            .map(LoadedPlugin::cleanup_receipt)
+            .collect()
+    }
+
     /// Begin shutdown while outstanding adapters still retain the libraries.
     pub fn begin_shutdown(&self) {
         for plugin in &self.plugins {
@@ -487,6 +576,12 @@ impl ExtensionSession {
     /// `/reload` swaps in a fresh service with an empty cache.
     pub fn suggest_service(&self) -> Arc<crate::suggest_service::SuggestService> {
         Arc::clone(&self.suggest_service)
+    }
+
+    /// Read-only cleanup evidence; observers do not retain this session. The
+    /// owned explicit loader supplies one receipt for every loaded plugin.
+    pub fn cleanup_receipts(&self) -> Vec<PluginCleanupReceipt> {
+        self.keepalive.cleanup_receipts()
     }
 
     /// Cancel plugin background work. Call outside host/session locks.
@@ -650,11 +745,208 @@ pub fn load_session_mixed_guarded(
 }
 
 // ---------------------------------------------------------------------------
+// Explicit owned loading — no discovery, actions or partial publication
+// ---------------------------------------------------------------------------
+
+/// Non-executable custody of every DLL opened before an explicit load failed,
+/// INCLUDING the DLL whose registration returned an error. No registry or
+/// adapter can be recovered from this type. Dropping it only queues cleanup;
+/// retain its receipts and wait for `Released` before releasing host capacity.
+pub struct PluginLoadCustody {
+    keepalive: Arc<PluginKeepalive>,
+}
+
+impl PluginLoadCustody {
+    fn from_plugins(plugins: Vec<LoadedPlugin>) -> Self {
+        let mut keepalive = PluginKeepalive::new(Vec::new(), None);
+        keepalive.plugins = plugins;
+        Self {
+            keepalive: Arc::new(keepalive),
+        }
+    }
+
+    pub fn plugin_count(&self) -> usize {
+        self.keepalive.plugins.len()
+    }
+
+    /// Invoke outside host locks; does not await physical cleanup.
+    pub fn begin_shutdown(&self) {
+        self.keepalive.begin_shutdown();
+    }
+
+    pub fn cleanup_receipts(&self) -> Vec<PluginCleanupReceipt> {
+        self.keepalive.cleanup_receipts()
+    }
+}
+
+/// An explicit selection failed without publishing ANY executable registry.
+/// Its custody may still contain active SDK workers. Ignoring/dropping this
+/// error is not a settlement barrier.
+pub struct ExplicitPluginLoadFailure {
+    pub error: PluginLoadError,
+    pub custody: PluginLoadCustody,
+}
+
+impl std::fmt::Debug for ExplicitPluginLoadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExplicitPluginLoadFailure")
+            .field("error", &self.error)
+            .field("retained_plugins", &self.custody.plugin_count())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ExplicitPluginLoadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ExplicitPluginLoadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Load an explicit, bounded ordered set of absolute files, or retain the
+/// entire failed batch as non-executable custody. Unlike `load_session_mixed`,
+/// this never scans, skips bad files, deduplicates aliases, or wires an
+/// ActionBridge. All paths are checked before ANY entrypoint is invoked.
+///
+/// The caller must supply trusted, frozen artifacts and validate the returned
+/// registry/capabilities before exposing adapters. This function is not an
+/// artifact snapshot, sandbox, resource grant, or schema authorization. Registry
+/// merging retains the legacy first-wins rule; callers needing exact inventory
+/// must reject conflicting/unsupported registrations themselves.
+///
+/// Call only in owned assembly, never in readonly preflight. Registration may
+/// start SDK workers even when it fails. Keep the returned session OR failure
+/// custody until calls settle, begin shutdown, drop all keepalives, then await
+/// every cleanup receipt. Timeout/cancellation is not release evidence.
+pub fn load_explicit_session_owned(
+    files: &[PathBuf],
+    diagnostics: Arc<dyn PluginDiagnostics>,
+    host_guard: Option<Arc<dyn Send + Sync>>,
+) -> Result<ExtensionSession, ExplicitPluginLoadFailure> {
+    load_explicit_session_owned_checked(files, diagnostics, host_guard, |_, _| true)
+}
+
+/// Like `load_explicit_session_owned`, but each successful registration must
+/// pass the caller's exact data-only inventory check BEFORE loading the next
+/// plugin or merging registries. A rejection or validator panic returns the
+/// entire failed batch, including this plugin, as non-executable custody.
+///
+/// The index is the original explicit selection order. Inventory is not an
+/// artifact approval or a tool schema grant. Registration has already executed
+/// and may have started workers even when its inventory is rejected. Never
+/// discard the failure custody or treat this check as readonly preflight.
+pub fn load_explicit_session_owned_checked(
+    files: &[PathBuf],
+    diagnostics: Arc<dyn PluginDiagnostics>,
+    host_guard: Option<Arc<dyn Send + Sync>>,
+    mut validate: impl FnMut(usize, &RegistrationInventory) -> bool,
+) -> Result<ExtensionSession, ExplicitPluginLoadFailure> {
+    fn failed(error: PluginLoadError, plugins: Vec<LoadedPlugin>) -> ExplicitPluginLoadFailure {
+        ExplicitPluginLoadFailure {
+            error,
+            custody: PluginLoadCustody::from_plugins(plugins),
+        }
+    }
+
+    if files.len() > 32 {
+        return Err(failed(
+            PluginLoadError::ExplicitSelection {
+                reason: "at most 32 explicit libraries are supported",
+            },
+            Vec::new(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut canonical = Vec::with_capacity(files.len());
+    for path in files {
+        let identity = path
+            .is_absolute()
+            .then(|| std::fs::canonicalize(path).ok())
+            .flatten()
+            .filter(|path| path.is_file());
+        let Some(identity) = identity else {
+            return Err(failed(
+                PluginLoadError::ExplicitPath {
+                    path: path.clone(),
+                    reason: "an existing absolute regular file is required",
+                },
+                Vec::new(),
+            ));
+        };
+        if !seen.insert(identity.clone()) {
+            return Err(failed(
+                PluginLoadError::ExplicitPath {
+                    path: path.clone(),
+                    reason: "duplicate library or canonical path alias",
+                },
+                Vec::new(),
+            ));
+        }
+        canonical.push(identity);
+    }
+
+    let mut plugins = Vec::with_capacity(canonical.len());
+    for (index, path) in canonical.iter().enumerate() {
+        match load_one_owned(path, diagnostics.clone(), None, host_guard.clone()) {
+            Ok(plugin) => {
+                plugins.push(plugin);
+                let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    validate(
+                        index,
+                        &plugins
+                            .last()
+                            .expect("just pushed")
+                            .registry
+                            .registration_inventory(),
+                    )
+                }));
+                let reason = match checked {
+                    Ok(true) => continue,
+                    Ok(false) => "explicit registration inventory rejected",
+                    Err(_) => "explicit registration inventory validator panicked",
+                };
+                return Err(failed(
+                    PluginLoadError::ExplicitPath {
+                        path: path.clone(),
+                        reason,
+                    },
+                    plugins,
+                ));
+            }
+            Err(failure) => {
+                if let Some(plugin) = failure.plugin {
+                    plugins.push(*plugin);
+                }
+                return Err(failed(failure.error, plugins));
+            }
+        }
+    }
+    if plugins.is_empty() {
+        return Ok(ExtensionSession::none());
+    }
+    let registry = merge_registries(&mut plugins);
+    let custody = PluginLoadCustody::from_plugins(plugins);
+    Ok(ExtensionSession::from_parts(
+        Arc::new(registry.snapshot()),
+        custody.keepalive,
+        canonical,
+        None,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    mod owned_tests;
+
     use super::*;
     use crate::OAuthExtensionError;
     use std::fs;
