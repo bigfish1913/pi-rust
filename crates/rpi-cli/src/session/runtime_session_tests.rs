@@ -239,7 +239,7 @@ async fn fork_entry_cuts_the_new_branch_at_the_selected_message() {
         &cwd,
         None,
         Some(&first),
-        rpi_harness::session::types::ForkPosition::At,
+        Some(rpi_harness::session::types::ForkPosition::At),
     )
     .await
     .unwrap();
@@ -263,6 +263,102 @@ async fn fork_entry_cuts_the_new_branch_at_the_selected_message() {
     );
 }
 
+/// `before` drops the selected entry itself, so the branch ends at its parent.
+/// This is also the position the harness picks when `--fork-position` is
+/// omitted, which is why the CLI must not substitute its own default.
+#[tokio::test]
+async fn fork_entry_before_excludes_the_selected_message() {
+    use rpi_harness::session::types::{EntryOrder, EntryQuery, ForkPosition};
+
+    for position in [Some(ForkPosition::Before), None] {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = temporary.path().to_string_lossy();
+        let source_root = temporary.path().join("source");
+        let source = create_jsonl_session(&source_root, &cwd).await.unwrap();
+        let first = source
+            .append_message(rpi_agent::message::AgentMessage::User(
+                rpi_ai::types::UserMessage::new("first", 1),
+            ))
+            .await
+            .unwrap();
+        let second = source
+            .append_message(rpi_agent::message::AgentMessage::User(
+                rpi_ai::types::UserMessage::new("second", 2),
+            ))
+            .await
+            .unwrap();
+        let source_file = list_session_files_sync(&source_root).remove(0);
+        let root = temporary.path().join("sessions");
+        let forked = fork_session_at_launch(
+            &source_file.to_string_lossy(),
+            &root,
+            &cwd,
+            None,
+            Some(&second),
+            position,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<String> = forked
+            .find_entries(&EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id().to_owned())
+            .collect();
+        assert!(
+            ids.contains(&first),
+            "{position:?}: the parent must survive an exclusive cut"
+        );
+        assert!(
+            !ids.contains(&second),
+            "{position:?}: the selected entry must be dropped"
+        );
+    }
+}
+
+/// `--fork-entry` is an exact entry id, unlike `--fork`'s partial session id.
+/// An unknown id must fail the launch instead of silently forking at the leaf.
+#[tokio::test]
+async fn fork_entry_rejects_an_unknown_entry_id() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path().to_string_lossy();
+    let source_root = temporary.path().join("source");
+    let source = create_jsonl_session(&source_root, &cwd).await.unwrap();
+    let first = source
+        .append_message(rpi_agent::message::AgentMessage::User(
+            rpi_ai::types::UserMessage::new("first", 1),
+        ))
+        .await
+        .unwrap();
+    let source_file = list_session_files_sync(&source_root).remove(0);
+    let root = temporary.path().join("sessions");
+    // A prefix of a real id must not match.
+    let prefix = &first[..first.len() - 1];
+    for unknown in ["no-such-entry", prefix] {
+        let error = match fork_session_at_launch(
+            &source_file.to_string_lossy(),
+            &root,
+            &cwd,
+            None,
+            Some(unknown),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("an unknown --fork-entry must not fall back to the lane leaf"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(unknown),
+            "{unknown}: the error must name the entry it could not find, got {error}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn fork_takes_a_session_file_outside_the_session_directory() {
     let temporary = tempfile::tempdir().unwrap();
@@ -283,16 +379,9 @@ async fn fork_takes_a_session_file_outside_the_session_directory() {
     )
     .unwrap();
     let root = temporary.path().join("sessions");
-    let forked = fork_session_at_launch(
-        &copy.to_string_lossy(),
-        &root,
-        &cwd,
-        None,
-        None,
-        rpi_harness::session::types::ForkPosition::At,
-    )
-    .await
-    .unwrap_or_else(|error| panic!("fork from a file path failed: {error}"));
+    let forked = fork_session_at_launch(&copy.to_string_lossy(), &root, &cwd, None, None, None)
+        .await
+        .unwrap_or_else(|error| panic!("fork from a file path failed: {error}"));
     let forked_meta = forked.get_metadata().await.unwrap();
     assert_ne!(forked_meta.id, parent_id);
     assert_eq!(forked.get_name().await.unwrap().as_deref(), Some("parent"));

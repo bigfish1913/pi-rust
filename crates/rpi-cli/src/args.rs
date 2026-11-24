@@ -171,10 +171,16 @@ pub struct Args {
     /// `--fork <path|id>`: fork the given session into a new one and start in
     /// the fork (pi `--fork`).
     pub fork: Option<String>,
-    /// Optional branch cut for `--fork`: fork at this message entry.
+    /// `--fork-entry <entryId>`: cut the new branch at this message entry
+    /// instead of the lane leaf. The id must match exactly — unlike `--fork`'s
+    /// partial session id, no prefix or substring match is attempted.
+    /// Requires `--fork`.
     pub fork_entry: Option<String>,
-    /// Whether `--fork-entry` includes (`at`) or excludes (`before`) its message.
-    pub fork_position: rpi_harness::session::types::ForkPosition,
+    /// `--fork-position at|before`: whether `--fork-entry` includes (`at`) or
+    /// excludes (`before`) its message. `None` keeps the harness default for an
+    /// explicit entry, which is `before` (`ForkOptions::Branch`).
+    /// Requires `--fork`.
+    pub fork_position: Option<rpi_harness::session::types::ForkPosition>,
     /// `--models <patterns>`: comma-separated model patterns for the Ctrl+P
     /// cycle (globs/fuzzy in pi; v1 writes the matched ids to settings.json's
     /// scopedModels — the same set /scoped-models edits). Empty = all models.
@@ -478,16 +484,17 @@ pub fn parse_args(args: &[String]) -> Args {
             "--fork-entry" => result.fork_entry = take_value(&mut result, "--fork-entry"),
             "--fork-position" => {
                 if let Some(value) = take_value(&mut result, "--fork-position") {
-                    match value.as_str() {
-                        "at" | "At" => {
-                            result.fork_position = rpi_harness::session::types::ForkPosition::At
-                        }
-                        "before" | "Before" => {
-                            result.fork_position = rpi_harness::session::types::ForkPosition::Before
-                        }
-                        _ => result.errors.push(format!(
+                    // Mirror `ForkPosition`'s two variants; `AT`/`BEFORE` are
+                    // accepted so the flag is not case-sensitive by accident.
+                    if value.eq_ignore_ascii_case("at") {
+                        result.fork_position = Some(rpi_harness::session::types::ForkPosition::At);
+                    } else if value.eq_ignore_ascii_case("before") {
+                        result.fork_position =
+                            Some(rpi_harness::session::types::ForkPosition::Before);
+                    } else {
+                        result.errors.push(format!(
                             "Invalid --fork-position \"{value}\". Expected at or before"
-                        )),
+                        ));
                     }
                 }
             }
@@ -621,6 +628,22 @@ pub fn parse_args(args: &[String]) -> Args {
         i += 1;
     }
 
+    // `--fork-entry` / `--fork-position` only mean something for `--fork`
+    // (`SessionSelection::Fork` reads them; every other selection ignores
+    // them). Reject them instead of parsing cleanly and doing nothing.
+    if result.fork.is_none() {
+        if result.fork_entry.is_some() {
+            result
+                .errors
+                .push("--fork-entry requires --fork".to_string());
+        }
+        if result.fork_position.is_some() {
+            result
+                .errors
+                .push("--fork-position requires --fork".to_string());
+        }
+    }
+
     // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
     if result.resource_config.is_none() && result.resource_transition.is_none() {
         env_extension_dirs.append(&mut result.extensions_dir);
@@ -718,6 +741,13 @@ pub fn print_help() {
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
+  --session-id <id>              Use the exact session id, creating it if missing
+  --fork <id|path>               Fork a session into a new one and start in the fork
+                                 (partial UUID, file name fragment, or file path)
+  --fork-entry <entryId>         With --fork: cut the new branch at this message
+                                 entry. The entry id must match exactly
+  --fork-position <at|before>    With --fork-entry: keep the selected message in the
+                                 new branch (at) or drop it (before). Default: before
   --session-dir <dir>            Directory for session storage
   --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
@@ -1119,8 +1149,8 @@ mod tests {
         assert_eq!(a.fork.as_deref(), Some("xyz"));
         assert_eq!(a.fork_entry, None);
         assert_eq!(
-            a.fork_position,
-            rpi_harness::session::types::ForkPosition::At
+            a.fork_position, None,
+            "an explicit entry must keep the harness default (before), not force a position"
         );
         let a = parse_args(&s(&[
             "--fork",
@@ -1134,13 +1164,10 @@ mod tests {
         assert_eq!(a.fork_entry.as_deref(), Some("message-2"));
         assert_eq!(
             a.fork_position,
-            rpi_harness::session::types::ForkPosition::Before
+            Some(rpi_harness::session::types::ForkPosition::Before)
         );
         let a = parse_args(&s(&["--fork-position", "middle"]));
-        assert_eq!(
-            a.fork_position,
-            rpi_harness::session::types::ForkPosition::At
-        );
+        assert_eq!(a.fork_position, None);
         assert_eq!(
             a.errors,
             vec!["Invalid --fork-position \"middle\". Expected at or before".to_string()]
@@ -1156,6 +1183,59 @@ mod tests {
         assert_eq!(a.extension.len(), 1);
         assert_eq!(a.skill.len(), 1);
         assert_eq!(a.prompt_template.len(), 1);
+    }
+
+    #[test]
+    fn fork_position_is_case_insensitive() {
+        use rpi_harness::session::types::ForkPosition;
+        for (value, expected) in [
+            ("at", ForkPosition::At),
+            ("At", ForkPosition::At),
+            ("AT", ForkPosition::At),
+            ("before", ForkPosition::Before),
+            ("Before", ForkPosition::Before),
+            ("BEFORE", ForkPosition::Before),
+        ] {
+            let a = parse_args(&s(&["--fork", "xyz", "--fork-position", value]));
+            assert!(a.errors.is_empty(), "{value}: {:?}", a.errors);
+            assert_eq!(a.fork_position, Some(expected), "{value}");
+        }
+    }
+
+    /// `--fork-entry` / `--fork-position` are only read inside
+    /// `SessionSelection::Fork`; accepting them elsewhere would parse cleanly
+    /// and silently do nothing.
+    #[test]
+    fn fork_cut_flags_require_fork() {
+        let a = parse_args(&s(&["--fork-entry", "message-2", "--print", "hi"]));
+        assert_eq!(a.errors, vec!["--fork-entry requires --fork".to_string()]);
+
+        let a = parse_args(&s(&["--fork-position", "before"]));
+        assert_eq!(
+            a.errors,
+            vec!["--fork-position requires --fork".to_string()]
+        );
+
+        // Both flags together report once each, in flag order.
+        let a = parse_args(&s(&["--fork-position=at", "--fork-entry=message-2"]));
+        assert_eq!(
+            a.errors,
+            vec![
+                "--fork-entry requires --fork".to_string(),
+                "--fork-position requires --fork".to_string(),
+            ]
+        );
+
+        // With `--fork` they parse cleanly.
+        let a = parse_args(&s(&[
+            "--fork",
+            "xyz",
+            "--fork-entry",
+            "message-2",
+            "--fork-position",
+            "at",
+        ]));
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
     }
 
     #[test]
