@@ -221,7 +221,7 @@ rpi package link|list|unlink # 管理项目本地 Rust 扩展包
 ### CLI 自更新
 
 `rpi update` 默认从 GitHub Release 下载预编译的 CLI，不需要本地 Rust/Cargo。
-版本按 crates.io 的发布记录解析；`rpi-release.json` 提供各平台下载地址、大小和
+稳定版版本按 GitHub Releases 的发布记录解析；`rpi-release.json` 提供各平台下载地址、大小和
 压缩包/可执行文件的 SHA-256。校验目标平台、完整性和实际版本后，原子替换当前 CLI。
 Windows 会暂存更新，等待当前进程退出后完成替换。
 
@@ -229,6 +229,8 @@ Windows 会暂存更新，等待当前进程退出后完成替换。
 缺少 manifest、下载失败或校验不通过都会报错并保留原版本，不会自动转为编译。
 `--offline` 仅报告缓存的版本信息，不下载也不编译。旧 Release 没有 manifest 时，
 可等待协议资产补齐，或显式使用 `rpi update --build`。
+
+通过 Homebrew 安装时，使用 `brew upgrade rpi` 更新。启动时的更新提示也会显示这条命令。
 
 ### 启动资源清单
 
