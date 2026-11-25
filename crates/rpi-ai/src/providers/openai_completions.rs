@@ -501,7 +501,7 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
                             "function": {
                                 "name": tool.name,
                                 "description": tool.description,
-                                "parameters": tool.parameters.as_value(),
+                                "parameters": crate::strict_schema::portable_tool_parameters(tool.parameters.as_value()),
                             }
                         })
                     })
@@ -2056,5 +2056,54 @@ mod tests {
         assert_eq!(result.response_id.as_deref(), Some("accepted-id"));
         assert_eq!(result.usage.input, 42);
         assert_eq!(result.stop_reason, StopReason::Aborted);
+    }
+}
+
+#[cfg(test)]
+mod conditional_schema_tests {
+    use super::*;
+    use crate::types::{Context, Message, Schema, Tool, UserMessage};
+
+    fn model() -> Model {
+        Model::new(
+            "gpt-test",
+            "GPT Test",
+            Api::OpenaiCompletions,
+            "gateway",
+            "https://example.test/v1",
+        )
+    }
+
+    #[test]
+    fn conditional_tool_schemas_stay_off_the_completions_wire() {
+        let mut context = Context::new(vec![Message::User(UserMessage::new("hello", 0))]);
+        context.tools.push(Tool {
+            name: "goal".into(),
+            description: "Goal tool".into(),
+            parameters: Schema::new(json!({
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                    "action": {"type": "string", "enum": ["start", "show"]},
+                    "title": {"type": "string"}
+                },
+                "allOf": [{
+                    "if": {"properties": {"action": {"const": "start"}}, "required": ["action"]},
+                    "then": {"required": ["title"]}
+                }]
+            })),
+            constrained_sampling: None,
+        });
+        let body = build_request(&model(), &context, &SimpleStreamOptions::default());
+        let parameters = &body["tools"][0]["function"]["parameters"];
+        assert!(
+            !parameters.to_string().contains("\"if\""),
+            "gateways such as Routeryo reject if/then: {parameters}"
+        );
+        assert_eq!(
+            parameters["properties"]["action"]["enum"],
+            json!(["start", "show"])
+        );
+        assert!(parameters["allOf"].is_null());
     }
 }

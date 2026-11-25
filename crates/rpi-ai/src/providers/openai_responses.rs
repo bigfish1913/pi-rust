@@ -1886,7 +1886,7 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
                     },
                 })
             } else {
-                let mut tool = json!({"type":"function","name":t.name,"description":t.description,"parameters":t.parameters.as_value()});
+                let mut tool = json!({"type":"function","name":t.name,"description":t.description,"parameters":crate::strict_schema::portable_tool_parameters(t.parameters.as_value())});
                 // OpenAI rejects `strict: true` unless every object node carries
                 // `additionalProperties: false`, which `schemars` does not emit for
                 // the built-in tools. Transform first and only advertise strict
@@ -4148,5 +4148,72 @@ mod tests {
         assert_eq!(input[output_index]["call_id"], legacy_id);
 
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod conditional_schema_tests {
+    use super::*;
+    use crate::model::OpenaiResponsesCompat;
+    use crate::types::Schema;
+
+    fn strict_model() -> Model {
+        let mut model = Model::new(
+            "gpt-test",
+            "GPT Test",
+            Api::OpenaiResponses,
+            "gateway",
+            "https://example.test/v1",
+        );
+        model.compat = Some(StreamingProtocolCompat::OpenaiResponses(
+            OpenaiResponsesCompat {
+                supports_strict_mode: Some(true),
+                ..Default::default()
+            },
+        ));
+        model
+    }
+
+    #[test]
+    fn conditional_tool_schemas_stay_off_the_responses_wire() {
+        let context = Context {
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: vec![Tool {
+                name: "goal".into(),
+                description: "Goal tool".into(),
+                parameters: Schema::new(json!({
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "action": {"type": "string", "enum": ["start", "show"]},
+                        "title": {"type": "string"}
+                    },
+                    "allOf": [{
+                        "if": {"properties": {"action": {"const": "start"}}, "required": ["action"]},
+                        "then": {"required": ["title"]}
+                    }]
+                })),
+                constrained_sampling: Some(ConstrainedSamplingConfig::JsonSchema {
+                    strict: crate::types::ConstrainedStrictness::Prefer,
+                }),
+            }],
+        };
+        let body = build_request(&strict_model(), &context, &SimpleStreamOptions::default());
+        let tool = &body["tools"][0];
+        let parameters = &tool["parameters"];
+        assert!(
+            !parameters.to_string().contains("\"if\""),
+            "gateways such as Routeryo reject if/then: {parameters}"
+        );
+        assert_eq!(
+            parameters["properties"]["action"]["enum"],
+            json!(["start", "show"])
+        );
+        assert!(parameters["allOf"].is_null());
+        assert!(
+            tool.get("strict").is_none(),
+            "conditional schemas cannot satisfy strict mode"
+        );
     }
 }
