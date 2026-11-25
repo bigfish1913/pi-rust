@@ -717,6 +717,9 @@ where
     let run_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut run_task: Option<OwnedRpcRun> = None;
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
+    // Set by `stop_run`: the wrapper cancellation must not call `lane.abort()`,
+    // which would reclaim the queue the stop is required to preserve.
+    let preserve_queue_on_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut cancel_on_exit = false;
     let mut native_shutdown_reconciled = false;
 
@@ -1040,8 +1043,10 @@ where
                     let _ = task.await;
                 }
                 run_cancel = tokio_util::sync::CancellationToken::new();
+                preserve_queue_on_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
                 owner.run_cancel = run_cancel.clone();
                 let cancel_task = run_cancel.clone();
+                let preserve_queue_task = Arc::clone(&preserve_queue_on_cancel);
                 // Resuming spends the tokens the interrupted run never did, so it
                 // only proceeds when recovery actually left a pending run.
                 if resume && !lane.has_pending_resume().await {
@@ -1137,6 +1142,7 @@ where
                                     &lane_task,
                                     instructions,
                                     cancel_task,
+                                    Arc::clone(&preserve_queue_task),
                                 ))
                                 .await;
                             if result
@@ -1164,11 +1170,20 @@ where
                             result
                         } else if resume {
                             execution_request
-                                .scope(rpc_resume_cancellable(&lane_task, cancel_task))
+                                .scope(rpc_resume_cancellable(
+                                    &lane_task,
+                                    cancel_task,
+                                    Arc::clone(&preserve_queue_task),
+                                ))
                                 .await
                         } else {
                             execution_request
-                                .scope(rpc_prompt_cancellable(&lane_task, content, cancel_task))
+                                .scope(rpc_prompt_cancellable(
+                                    &lane_task,
+                                    content,
+                                    cancel_task,
+                                    preserve_queue_task,
+                                ))
                                 .await
                         };
                         execute_timing.finish();
@@ -1267,6 +1282,26 @@ where
                 let result = lane.abort().await;
                 external_tools.abort();
                 abort_result_reply(result)
+            }
+            "stop_run" => {
+                // rpi-web's Stop must end the in-flight run but leave steering
+                // and follow-up messages queued. `abort` intentionally reclaims
+                // them and would restore them into the composer, so use the
+                // explicit queue-preserving cancellation boundary instead.
+                preserve_queue_on_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                let stopped = match lane.active_operation().await {
+                    Ok(Some(active)) => lane
+                        .stop_preserving_queue(&active.run_id)
+                        .await
+                        .unwrap_or(false),
+                    Ok(None) => true,
+                    Err(_) => false,
+                };
+                // Cancel the wrapper too, so a stop that lands before the
+                // harness has admitted an active run still ends the prompt.
+                // The flag keeps that cancellation from reclaiming queues.
+                run_cancel.cancel();
+                Ok(serde_json::json!({"stopped": stopped}))
             }
             "configure_external_tools" => {
                 rpc_configure_external_tools(
@@ -1695,6 +1730,7 @@ async fn rpc_prompt_cancellable(
     lane: &Arc<dyn AgentLane>,
     content: crate::rpc::prompt_content::ParsedPrompt,
     cancel: tokio_util::sync::CancellationToken,
+    preserve_queue: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<serde_json::Value, String> {
     if cancel.is_cancelled() {
         return Err("Operation aborted".into());
@@ -1704,20 +1740,27 @@ async fn rpc_prompt_cancellable(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            // `abort()` reclaims the queue atomically. The entries are not
-            // dropped: they ride back on the settlement so the client can
-            // restore what the user staged while the run was in flight.
-            match lane.abort().await {
-                Ok(reclaimed) => prompt.await.map(|mut value| {
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert(
-                            "reclaimed".to_string(),
-                            reclaimed_payload(&reclaimed),
-                        );
-                    }
-                    value
-                }),
-                Err(_) => Err("Operation aborted".to_string()),
+            if preserve_queue.load(std::sync::atomic::Ordering::Acquire) {
+                // A queue-preserving stop only needs to join the prompt: its
+                // harness cancellation already ended the run, and calling
+                // `abort()` here would reclaim the queue we meant to keep.
+                prompt.await
+            } else {
+                // `abort()` reclaims the queue atomically. The entries are not
+                // dropped: they ride back on the settlement so the client can
+                // restore what the user staged while the run was in flight.
+                match lane.abort().await {
+                    Ok(reclaimed) => prompt.await.map(|mut value| {
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert(
+                                "reclaimed".to_string(),
+                                reclaimed_payload(&reclaimed),
+                            );
+                        }
+                        value
+                    }),
+                    Err(_) => Err("Operation aborted".to_string()),
+                }
             }
         }
         result = &mut prompt => result,
@@ -1741,6 +1784,7 @@ async fn rpc_compact_cancellable(
     lane: &Arc<dyn AgentLane>,
     instructions: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
+    preserve_queue: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<serde_json::Value, String> {
     let compact = async {
         match lane.compact(instructions.as_deref()).await {
@@ -1752,7 +1796,9 @@ async fn rpc_compact_cancellable(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            let _ = lane.abort().await;
+            if !preserve_queue.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = lane.abort().await;
+            }
             compact.await
         }
         result = &mut compact => result,
@@ -1809,6 +1855,7 @@ pub(crate) fn compaction_json(result: &CompactionResult) -> serde_json::Value {
 async fn rpc_resume_cancellable(
     lane: &Arc<dyn AgentLane>,
     cancel: tokio_util::sync::CancellationToken,
+    preserve_queue: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<serde_json::Value, String> {
     let resume = async {
         match lane.resume_pending().await {
@@ -1830,7 +1877,9 @@ async fn rpc_resume_cancellable(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            let _ = lane.abort().await;
+            if !preserve_queue.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = lane.abort().await;
+            }
             resume.await
         }
         result = &mut resume => result,

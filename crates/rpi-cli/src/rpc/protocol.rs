@@ -317,6 +317,7 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "resume_pending",
     "compact",
     "abort",
+    "stop_run",
     "get_available_models",
     "get_auth_status",
     "get_provider_models",
