@@ -52,6 +52,7 @@ pub mod install;
 pub mod interactive_tui;
 pub mod key_trace;
 pub mod message_agent;
+mod mini;
 pub mod model_registry;
 pub mod modes;
 mod native_durable;

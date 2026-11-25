@@ -134,6 +134,13 @@ async fn run_inner() -> i32 {
     // the client holds no local agent resources at all: it only connects to a
     // running `rpi --server` and renders the remote transcript.
     if let Some(addr) = take_flag_value(&argv, "--connect") {
+        if argv
+            .iter()
+            .any(|arg| arg == "--mini" || arg.starts_with("--mini="))
+        {
+            eprintln!("error: --mini cannot be combined with --connect");
+            return EXIT_USAGE;
+        }
         let token = resolve_connect_token(&argv);
         return crate::remote::tui::run(&addr, token.as_deref()).await;
     }
@@ -236,6 +243,10 @@ async fn run_inner() -> i32 {
         return code;
     }
 
+    if dev_options.is_some() && parsed.mini {
+        eprintln!("error: --mini cannot be combined with dev/dev-local");
+        return EXIT_USAGE;
+    }
     if dev_options.is_some()
         && (parsed.resource_config.is_some() || parsed.resource_transition.is_some())
     {
@@ -304,6 +315,27 @@ async fn run_inner() -> i32 {
             return EXIT_USAGE;
         }
     };
+
+    if parsed.mini {
+        drop(argv);
+        let mut messages = std::mem::take(&mut parsed.messages).into_iter();
+        let mut parts = read_piped_stdin()
+            .into_iter()
+            .chain((!file_text.is_empty()).then_some(file_text))
+            .chain(messages.next());
+        let initial = parts.next().map(|mut text| {
+            for part in parts {
+                text.push_str(&part);
+            }
+            text
+        });
+        let prompts = initial
+            .or_else(|| (!file_images.is_empty()).then(String::new))
+            .into_iter()
+            .chain(messages);
+        startup.finish();
+        return crate::mini::run(&parsed, &cwd, prompts, file_images).await;
+    }
 
     // ---- restored-session working directory (adopted before any resource load) ----
     // A session records the cwd it was created in; restoring one must return
@@ -1116,7 +1148,7 @@ fn build_initial_message(
 
 /// Print a model-resolution error with env-specific guidance. Mirrors the TS
 /// auth-guidance / model-resolver error formatting (condensed to stderr lines).
-fn print_resolve_error(e: &ResolveError) {
+pub(crate) fn print_resolve_error(e: &ResolveError) {
     match e {
         ResolveError::NoApiKey { hint } => {
             eprintln!("error: {e}");
