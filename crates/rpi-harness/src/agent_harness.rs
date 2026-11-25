@@ -611,6 +611,7 @@ struct ActiveRun {
     children: CancellationToken,
     idle: Arc<tokio::sync::Notify>,
     kind: OperationKind,
+    execution: Option<crate::execution::ExecutionLease>,
 }
 
 /// A queued user message keeps its public entry id until the agent loop drains
@@ -765,6 +766,7 @@ struct HarnessInner {
     // The final harness owner cancels children even if weak runtime bindings
     // still retain the public session/event facades.
     child_scope: Arc<Mutex<CancellationToken>>,
+    execution_observer: Option<crate::execution::ExecutionObserver>,
     execution_scope: Option<Arc<rpi_agent::tool_execution_scope::ToolExecutionScope>>,
     skill_execution_env: Option<Arc<dyn rpi_tools::ExecutionEnv>>,
     model: Model,
@@ -1205,6 +1207,7 @@ impl AgentHarness {
         let child_scope = Arc::new(Mutex::new(CancellationToken::new()));
         let inner = HarnessInner {
             child_scope: child_scope.clone(),
+            execution_observer: None,
             execution_scope: None,
             skill_execution_env: None,
             model: options.model,
@@ -2076,7 +2079,20 @@ impl AgentHarness {
     /// Context-only messages are already durable. Emit directly to the client
     /// emitter so they do not increment the loop's persistence indices.
     async fn emit_appended_messages(&self, messages: Vec<(String, AgentMessage)>) {
-        let emitter = self.inner.lock().unwrap().agent_emitter.clone();
+        let emitter = {
+            let inner = self.inner.lock().unwrap();
+            match &inner.execution_observer {
+                Some(observer) if self.lane == "main" => Some(
+                    observer.session_emitter(
+                        inner
+                            .agent_emitter
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(rpi_agent::CollectorEmitter::default())),
+                    ),
+                ),
+                _ => inner.agent_emitter.clone(),
+            }
+        };
         if let Some(emitter) = emitter {
             for (id, message) in messages {
                 emitter
@@ -2227,6 +2243,7 @@ impl AgentHarness {
                     continue;
                 }
             }
+            self.finalize_execution();
             self.release_run(run_id);
             drop(gate);
             return Ok(terminal_leaf);
@@ -2650,6 +2667,9 @@ impl AgentHarness {
         if let Some(active) = self.inner.lock().unwrap().active_run.as_mut() {
             active.run_id = run_id.clone();
             active.recovering = false;
+            if let Some(execution) = &mut active.execution {
+                execution.durable_intent = parked_run_id.is_some();
+            }
         }
         let _run_lease = ActiveRunLease {
             harness: self,
@@ -2709,14 +2729,13 @@ impl AgentHarness {
         // Still not ready: stay suspended. The operation stays open, so the next
         // start (or the next `drive`) polls the new handle in turn.
         if message.stop_reason == StopReason::Deferred {
-            return Ok(RunResult {
-                run_id,
-                outcome: HarnessRunOutcome::Suspended {
-                    leaf_id,
-                    final_entry_id: entry_id,
-                    deferred: message.deferred.clone().unwrap_or(deferred),
-                },
-            });
+            let mut outcome = HarnessRunOutcome::Suspended {
+                leaf_id,
+                final_entry_id: entry_id,
+                deferred: message.deferred.clone().unwrap_or(deferred),
+            };
+            self.finish_run_result(&run_id, &mut outcome).await?;
+            return Ok(RunResult { run_id, outcome });
         }
 
         // Anything left to do? A polled message that carries tool calls needs them
@@ -3104,6 +3123,64 @@ impl AgentHarness {
         Ok(())
     }
 
+    /// Install an optional loss-detecting execution observer before exposing a
+    /// transport. It is independent of reloadable UI/plugin emitters.
+    pub fn set_execution_observer(&self, observer: Option<crate::execution::ExecutionObserver>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let (Some(observer), Some(active)) = (&observer, inner.active_run.as_mut()) {
+            if self.lane == "main" && active.execution.is_none() {
+                let mut execution =
+                    crate::execution::ExecutionLease::new(observer.clone(), &self.lane);
+                // The operation may predate observer installation. Its eventual
+                // terminal result is authoritative; an early exit is uncertain.
+                execution.durable_intent = true;
+                active.execution = Some(execution);
+            }
+        }
+        inner.execution_observer = observer;
+    }
+
+    // Recovery can append durable repairs before this execution writes its
+    // own operation_started record. Failure in that window is not a no-op.
+    fn mark_execution_recovery(&self) {
+        if let Some(execution) = self
+            .inner
+            .lock()
+            .unwrap()
+            .active_run
+            .as_mut()
+            .and_then(|run| run.execution.as_mut())
+        {
+            execution.durable_intent = true;
+        }
+    }
+
+    fn stage_execution(&self, outcome: crate::execution::ExecutionOutcome) {
+        if let Some(execution) = self
+            .inner
+            .lock()
+            .unwrap()
+            .active_run
+            .as_mut()
+            .and_then(|run| run.execution.as_mut())
+        {
+            execution.outcome = Some(outcome);
+        }
+    }
+
+    fn finalize_execution(&self) {
+        if let Some(execution) = self
+            .inner
+            .lock()
+            .unwrap()
+            .active_run
+            .as_mut()
+            .and_then(|run| run.execution.as_mut())
+        {
+            execution.finalized = true;
+        }
+    }
+
     // -- private helpers ----------------------------------------------------
 
     /// Reject if closed or if a lane already has an active operation. On
@@ -3153,6 +3230,11 @@ impl AgentHarness {
         let run_id = self.session.id_generator().next();
         let signal = CancellationToken::new();
         let idle = Arc::new(tokio::sync::Notify::new());
+        let execution = inner
+            .execution_observer
+            .clone()
+            .filter(|_| self.lane == "main")
+            .map(|observer| crate::execution::ExecutionLease::new(observer, &self.lane));
         inner.active_run = Some(ActiveRun {
             finishing: false,
             recovering: true,
@@ -3162,6 +3244,7 @@ impl AgentHarness {
             children: self.child_scope.lock().unwrap().child_token(),
             idle: Arc::clone(&idle),
             kind,
+            execution,
         });
         Ok((run_id, signal, idle))
     }
@@ -3175,12 +3258,18 @@ impl AgentHarness {
                 .as_ref()
                 .is_some_and(|run| run.run_id == run_id)
             {
+                let pending_resume = inner.pending_resume.is_some();
                 inner.active_run.take().map(|a| {
                     // Every admitted run owns its tools, including a root whose
                     // caller drops the foreground future. The loop drops owned
                     // execute futures before this lease releases admission.
                     a.signal.cancel();
                     a.children.cancel();
+                    if let Some(execution) = a.execution {
+                        // Internal nonblocking enqueue under the admission lock
+                        // orders this release before a successor's admission.
+                        execution.release(a.run_id, pending_resume);
+                    }
                     a.idle
                 })
             } else {
@@ -4430,6 +4519,17 @@ impl AgentHarness {
         source_leaf_id: Option<String>,
         intent: OperationIntent,
     ) -> LaneRecord {
+        if let Some(execution) = self
+            .inner
+            .lock()
+            .unwrap()
+            .active_run
+            .as_mut()
+            .filter(|run| run.run_id == run_id)
+            .and_then(|run| run.execution.as_mut())
+        {
+            execution.durable_intent = true;
+        }
         LaneRecord::OperationStarted(OperationStartedRecord {
             base: RecordBase {
                 id: run_id.to_string(),
@@ -4683,6 +4783,8 @@ impl AgentHarness {
             let _gate = self.message_writes.lock().await;
             // Transfer admission atomically: another prompt must not get
             // between the polled assistant and its unanswered tool calls.
+            self.stage_execution(crate::execution::ExecutionOutcome::Skipped);
+            self.finalize_execution();
             self.release_run(parked_run_id);
             self.acquire_run_locked(OperationKind::Run)?
         };
@@ -4744,6 +4846,7 @@ impl AgentHarness {
         // Recovery runs before the source leaf is snapshotted, so the salvaged
         // messages are part of the base history this run builds on.
         let recovery_tools = self.recovery_tools();
+        self.mark_execution_recovery();
         // `true`: a run starting here retries through its own retry loop, so a
         // leftover failed attempt is settled the ordinary way.
         Self::finish_interrupted_operation(
@@ -5322,6 +5425,17 @@ impl AgentHarness {
             .agent_emitter
             .clone()
             .unwrap_or_else(|| Arc::new(rpi_agent::CollectorEmitter::default()));
+        let base_emitter = {
+            let inner = self.inner.lock().unwrap();
+            match inner
+                .active_run
+                .as_ref()
+                .and_then(|run| run.execution.as_ref())
+            {
+                Some(execution) => execution.emitter(base_emitter, &run_id),
+                None => base_emitter,
+            }
+        };
         // Durable progress: every streamed assistant frame is appended to the
         // session as it arrives, so a crash mid-run leaves a committed prefix
         // that `salvage_run_frames` can replay instead of losing the whole run.
@@ -5644,6 +5758,7 @@ impl AgentHarness {
         };
         self.validate_native_durable_current().await?;
         let recovery_tools = self.recovery_tools();
+        self.mark_execution_recovery();
         // `true`: a run starting here retries through its own retry loop, so a
         // leftover failed attempt is settled the ordinary way.
         Self::finish_interrupted_operation(
@@ -5706,14 +5821,15 @@ impl AgentHarness {
                                     Some(err.clone()),
                                 )
                                 .await?;
+                                let outcome = CompactionOutcome::Failed {
+                                    leaf_id: source_leaf.unwrap_or_default(),
+                                    error: err,
+                                };
+                                self.stage_execution(crate::execution::ExecutionOutcome::Compact(
+                                    outcome.clone(),
+                                ));
                                 self.finish_context_writes(&run_id, None).await?;
-                                return Ok(CompactionResult {
-                                    run_id,
-                                    outcome: CompactionOutcome::Failed {
-                                        leaf_id: source_leaf.unwrap_or_default(),
-                                        error: err,
-                                    },
-                                });
+                                return Ok(CompactionResult { run_id, outcome });
                             }
                         },
                     };
@@ -5800,6 +5916,7 @@ impl AgentHarness {
             self.write_operation_finished(&run_id, OperationOutcome::Declined, None)
                 .await?;
         }
+        self.stage_execution(crate::execution::ExecutionOutcome::Compact(outcome.clone()));
         self.finish_context_writes(&run_id, None).await?;
         Ok(CompactionResult { run_id, outcome })
     }

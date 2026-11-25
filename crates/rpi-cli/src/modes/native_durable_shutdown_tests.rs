@@ -163,7 +163,9 @@ impl Fixture {
                     extension_session: None,
                     message_updates: crate::args::RpcMessageUpdates::default(),
                     native_durable: enabled,
+                    home: crate::config::AgentHome::process(),
                 },
+                true,
                 input,
                 output,
             )

@@ -536,8 +536,14 @@ transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿�
   type 注册渲染器不会被调用。
 - `{"lines":[…]}` 会以 `\n` 拼成**一个**纯文本行，不是每行一个组件；需要多行时自己在
   `text` 里带换行。
+- entry renderer 可返回 `rc == 0` 与 `{"display":false}`，明确表示「已处理但隐藏」：
+  不添加组件或空行，不执行原始条目兜底，也不再询问后续 renderer。仅布尔值 `false`
+  生效，且优先于 `text`/`lines`；缺省、`true`、字符串 `"false"`、`null` 等保持旧行为。
+  非 0 返回码仍是「不处理」，不能用来隐藏。此字段仅适用于 entry renderer，不改变
+  message renderer、Markdown transformer、持久化或模型上下文。旧宿主可能忽略该字段
+  并显示兜底文本；插件未加载时也维持原有兜底。该能力不新增实时 entry 事件。
 - message renderer 的响应既没有 `text` 也没有 `lines` 时，TUI 降级显示 `[customType]`；
-  entry renderer 的响应缺这两个字段时不渲染，改由宿主自己的条目文案显示。
+  entry renderer 除显式 `display:false` 外，响应缺这两个字段时改由宿主自己的条目文案显示。
 - message renderer 除渲染自定义消息外，还会以
   `{"customType":"token-usage","usage":{...}}` 被调用一次以生成用量文本，因此要能容忍这个
   payload（没有匹配的 type 时返回非 0）。
@@ -787,7 +793,7 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 provider ID、目录与凭据继续独立。单 provider 教学样例才使用 `export_provider!`。
 
 完整规范：[Provider 接入规范](https://github.com/bigfish1913/pi-rust/blob/feature-stream-porider/docs/extensions/provider-integration.md)。创建推理扩展时优先复制
-正式 provider package 示例见 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
+正式 provider package 示例见 [rpi-providers](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)，通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
 
 ### 方式与目录
 
@@ -853,13 +859,13 @@ OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负�
 UTF-8 跨块、usage、唯一终态、响应未结束时取消与 HTTP 401；认证隔离、端点 / 请求头
 覆盖、公开目录无认证头、命令与重载也要验证。工具和 OAuth 只声明已完成验证的能力。
 真实 API 测试默认 ignored，显式运行时从环境注入 key 并限制超时、重试和用量。
-正式统一包位于独立的 [rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
+正式统一包位于独立的 [rpi-extension 项目](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)，
 保留 `deepseek` ID，声明 `DEEPSEEK_API_KEY`，并通过 `requiresReasoningContent` 支持工具续轮。
 
-在 rpi-package 仓库运行正式 package 的离线验证：
+在 rpi-extension 仓库运行正式 package 的离线验证：
 
 ```sh
-cd /path/to/rpi-package
+cd /path/to/rpi-extension
 cargo build -p rpi-providers
 cargo test -p rpi-providers --test streaming
 cargo test -p rpi-providers --test host

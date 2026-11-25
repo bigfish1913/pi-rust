@@ -205,7 +205,13 @@ async fn run_inner() -> i32 {
                     return EXIT_RUNTIME;
                 }
             };
-            let extension_session = crate::session::load_extensions(&args, &cwd, trusted, None);
+            let extension_session = crate::session::load_extensions(
+                &crate::config::AgentHome::process(),
+                &args,
+                &cwd,
+                trusted,
+                None,
+            );
             return crate::auth::run_with_extensions(&argv[1..], extension_session.snapshot_arc())
                 .await;
         }
@@ -400,7 +406,12 @@ async fn run_inner() -> i32 {
         Err(code) => return code,
     };
     let extension_prepare = StartupSpan::start(Phase::ExtensionPrepare);
-    let prepared = match prepare_extensions(&parsed, &cwd, project_trusted) {
+    let prepared = match prepare_extensions(
+        &crate::config::AgentHome::process(),
+        &parsed,
+        &cwd,
+        project_trusted,
+    ) {
         Ok(prepared) => prepared,
         Err(error) => {
             print_build_error(&error);
@@ -410,6 +421,7 @@ async fn run_inner() -> i32 {
     extension_prepare.finish();
     let model_resolve = StartupSpan::start(Phase::ModelResolve);
     let resolved = match resolve_with_extensions(
+        &crate::config::AgentHome::process(),
         &parsed,
         &cwd,
         project_trusted,
@@ -465,14 +477,22 @@ async fn run_inner() -> i32 {
 
     // ---- harness build ----
     let harness_build = StartupSpan::start(Phase::HarnessBuild);
-    let (harness, event_rx, mut reload_context) =
-        match build_prepared(&resolved, &parsed, &cwd, project_trusted, prepared).await {
-            Ok(triple) => triple,
-            Err(e) => {
-                print_build_error(&e);
-                return EXIT_RUNTIME;
-            }
-        };
+    let (harness, event_rx, mut reload_context) = match build_prepared(
+        &crate::config::AgentHome::process(),
+        &resolved,
+        &parsed,
+        &cwd,
+        project_trusted,
+        prepared,
+    )
+    .await
+    {
+        Ok(triple) => triple,
+        Err(e) => {
+            print_build_error(&e);
+            return EXIT_RUNTIME;
+        }
+    };
     harness_build.finish();
     startup.finish();
     reload_context.dev_extension = dev_extension;
@@ -505,7 +525,7 @@ async fn run_inner() -> i32 {
         })
         .unwrap_or(false);
     if web_requested && (!web_registered || !stdio_claimed) {
-        eprintln!("error: --web requires the rpi-web server extension; it is missing, disabled, or failed to load.\nInstall it with: rpi install rpi-web --github pi-rust/rpi-package\nThen restart with: rpi --web");
+        eprintln!("error: --web requires the rpi-web server extension; it is missing, disabled, or failed to load.\nInstall it with: rpi install rpi-web --github pi-rust/rpi-extension\nThen restart with: rpi --web");
         return EXIT_USAGE;
     }
     let stdio_lifecycle = reload_context
@@ -690,7 +710,7 @@ async fn run_inner() -> i32 {
                         let session = reload_context.extension_session.lock().unwrap();
                         session.snapshot_arc()
                     };
-                    crate::modes::rpc_with_durable(
+                    crate::modes::rpc_with_durable_home(
                         &harness,
                         Some(event_rx),
                         model_catalog,
@@ -700,6 +720,7 @@ async fn run_inner() -> i32 {
                             extension_session: Some(reload_context.extension_session.clone()),
                             message_updates: parsed.rpc_message_updates,
                             native_durable: parsed.native_durable,
+                            home: reload_context.home.clone(),
                         },
                     )
                     .await
@@ -865,15 +886,17 @@ fn emit_startup_warnings(parsed: &Args) {
 /// fuzzy-ish substring over provider, id, and display name.
 async fn list_models(search: &str, args: &Args, cwd: &Path) -> i32 {
     let trusted = crate::session::resolve_project_trust(args, cwd);
-    let prepared = match prepare_extensions(args, cwd, trusted) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            print_build_error(&error);
-            return EXIT_RUNTIME;
-        }
-    };
+    let prepared =
+        match prepare_extensions(&crate::config::AgentHome::process(), args, cwd, trusted) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                print_build_error(&error);
+                return EXIT_RUNTIME;
+            }
+        };
     let manifests = crate::provider::manifests_from_session(&prepared.extension_session);
-    let catalog = match crate::provider::catalog_with_diagnostics(&manifests) {
+    let home = crate::config::AgentHome::process();
+    let catalog = match crate::provider::catalog_with_diagnostics(&home, &manifests) {
         Ok((models, warnings)) => {
             for warning in warnings {
                 eprintln!("warning: models.json: {warning}");

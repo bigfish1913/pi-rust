@@ -25,7 +25,7 @@ by Mario Zechner. It now includes its own Rust-native plugin ABI and execution
 infrastructure. See [Acknowledgements](#acknowledgements) and [NOTICE](NOTICE)
 for upstream attribution.
 
-[Website](https://rpi.bigfisharc.cn/) · [Docs](https://rpi.bigfisharc.cn/docs.html) · [Extension catalog](https://rpi.bigfisharc.cn/packages.html) · [rpi-package](https://github.com/pi-rust/rpi-package)
+[Website](https://rpi.bigfisharc.cn/) · [Docs](https://rpi.bigfisharc.cn/docs.html) · [Extension catalog](https://rpi.bigfisharc.cn/packages.html) · [Submit an extension](https://rpi.bigfisharc.cn/submit.html) · [rpi-extension](https://github.com/pi-rust/rpi-extension)
 
 ## See it in action
 
@@ -396,11 +396,17 @@ and it does not replace `rpi-plugin-sdk`; a simple tool plugin should not add it
 unnecessarily.
 
 Ready-to-install extensions live in the companion
-[`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
+[`pi-rust/rpi-extension`](https://github.com/pi-rust/rpi-extension) repository, with
 an [online catalog](https://rpi.bigfisharc.cn/packages.html).
 
+The catalog moved from `pi-rust/rpi-package` to `pi-rust/rpi-extension`. Both
+spellings identify the same publisher: existing installs (including records that
+only stored a `prebuilt:<repository>` marker), `--github pi-rust/rpi-package`
+invocations, and the previous CDN prefix keep working, while version discovery
+and startup update checks follow the move and rewrite the recorded source.
+
 Browse the catalog for install commands, or open the
-[`packages/` source directory](https://github.com/pi-rust/rpi-package/tree/main/packages)
+[`packages/` source directory](https://github.com/pi-rust/rpi-extension/tree/main/packages)
 for extension READMEs and examples. Start with `rpi install rpi-todo` above,
 then use the [extension authoring guide](docs/extensions/authoring.md) to build your own.
 
@@ -490,7 +496,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.27.0](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
+| Current release | **[0.28.0](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.88 |
 | Platforms | Linux (GNU and musl), macOS, Windows (CI runs the suite on Linux) |
@@ -520,6 +526,9 @@ Issues and PRs are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for th
 build/test commands and the repository layout, and the
 [roadmap](ROADMAP.md) for what is already planned. Security problems should go
 through [SECURITY.md](SECURITY.md), not a public issue.
+
+Built an extension? [Submit it to the extension catalog](https://rpi.bigfisharc.cn/submit.html).
+欢迎[自主贡献扩展](https://rpi.bigfisharc.cn/submit.html)，与社区分享你的作品。
 
 The whole test suite runs offline: `cargo test --workspace --locked`.
 
@@ -571,7 +580,7 @@ Join us to ask questions, share ideas and try early builds.
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-21"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-21" width="230" alt="微信交流群二维码 / WeChat group QR code"></a><br>
+      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-25"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-25" width="230" alt="微信交流群二维码 / WeChat group QR code"></a><br>
       <sub><b>WeChat / 微信交流群</b> — 扫码加入 / Scan to join</sub>
     </td>
     <td align="center" width="50%">
@@ -588,7 +597,7 @@ open an issue. / 微信群图片链接每日更新日期参数以刷新缓存；
 
 ## Star history
 
-[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-package&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-package&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-extension&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-extension&Date)
 
 ## Contributors
 

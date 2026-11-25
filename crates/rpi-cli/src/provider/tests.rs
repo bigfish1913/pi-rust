@@ -84,11 +84,31 @@ fn trusted_project_defaults_override_global_defaults_for_resolution() {
     )
     .unwrap();
 
-    let trusted = resolve_for_cwd(None, None, None, None, None, project.path(), true).unwrap();
+    let trusted = resolve_for_cwd(
+        &crate::config::AgentHome::process(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        project.path(),
+        true,
+    )
+    .unwrap();
     assert_eq!(trusted.provider.id(), "project");
     assert_eq!(trusted.model.id, "project-model");
 
-    let untrusted = resolve_for_cwd(None, None, None, None, None, project.path(), false).unwrap();
+    let untrusted = resolve_for_cwd(
+        &crate::config::AgentHome::process(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        project.path(),
+        false,
+    )
+    .unwrap();
     assert_eq!(untrusted.provider.id(), "global");
     assert_eq!(untrusted.model.id, "global-model");
 }
@@ -228,7 +248,13 @@ mod package_oauth_refresh {
             ..Default::default()
         };
         let cwd = tempfile::tempdir().unwrap();
-        resolve_with_extensions(&args, cwd.path(), false, session)
+        resolve_with_extensions(
+            &crate::config::AgentHome::process(),
+            &args,
+            cwd.path(),
+            false,
+            session,
+        )
     }
 
     async fn ask(resolved: &ResolvedModel) -> rpi_ai::AssistantMessage {
@@ -523,7 +549,14 @@ mod package_oauth_refresh {
                 api_key: Some(key.into()),
                 ..Default::default()
             };
-            let resolved = resolve_with_extensions(&args, cwd.path(), false, &session).unwrap();
+            let resolved = resolve_with_extensions(
+                &crate::config::AgentHome::process(),
+                &args,
+                cwd.path(),
+                false,
+                &session,
+            )
+            .unwrap();
             ask(&resolved).await;
         }
         let resolved = resolve(&session).unwrap();

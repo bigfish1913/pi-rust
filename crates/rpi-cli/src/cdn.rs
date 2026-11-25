@@ -5,7 +5,13 @@ use std::path::Path;
 
 const CDN_ENV: &str = "RPI_CDN_BASE_URL";
 const CLI_REPOSITORY: &str = "https://github.com/bigfish1913/pi-rust";
-const PACKAGE_REPOSITORY: &str = "https://github.com/pi-rust/rpi-package";
+const EXTENSION_REPOSITORY: &str = "https://github.com/pi-rust/rpi-extension";
+/// Extension releases published before the catalog moved to
+/// `pi-rust/rpi-extension` still carry the old `repository` metadata, and their
+/// archives are already mirrored under the old CDN prefix. Both entries share
+/// the same handling; only the path prefixes differ. Keep this pair in sync with
+/// `prebuilt_extensions::MOVED_REPOSITORIES`.
+const LEGACY_EXTENSION_REPOSITORY: &str = "https://github.com/pi-rust/rpi-package";
 
 /// Resolve and validate the optional CDN base. The CDN is only a transport;
 /// manifests and all release identity fields still come from GitHub.
@@ -82,10 +88,17 @@ fn resolve_base_in(cli_value: Option<&str>, cwd: Option<&Path>) -> Result<Option
     Ok(Some(url))
 }
 
-fn repository_prefix(repository: &str) -> Option<&'static str> {
+/// CDN path prefixes to try for an official repository, in order.
+///
+/// A moved repository may have its archives mirrored under either prefix: the
+/// objects published before the move live under the previous name, and new
+/// releases can be mirrored under the new one. Both are attempted so a CDN
+/// mirror that has not caught up yet is a cache miss, not an install failure.
+fn repository_prefixes(repository: &str) -> Option<&'static [&'static str]> {
     match repository {
-        CLI_REPOSITORY => Some("rpi"),
-        PACKAGE_REPOSITORY => Some("rpi-package"),
+        CLI_REPOSITORY => Some(&["rpi"]),
+        EXTENSION_REPOSITORY => Some(&["rpi-extension", "rpi-package"]),
+        LEGACY_EXTENSION_REPOSITORY => Some(&["rpi-package", "rpi-extension"]),
         _ => None,
     }
 }
@@ -118,34 +131,46 @@ fn safe_archive_filename(value: &str) -> Result<String, String> {
     safe_path_segment(filename, "archive filename")
 }
 
-/// Construct the CDN URL only for the two official repositories and only from
-/// the already validated GitHub release tag and archive URL filename.
-pub(crate) fn archive_url(
+/// Construct the CDN candidate URLs for an official repository and only from
+/// the already validated GitHub release tag and archive URL filename. An empty
+/// list means the repository is not mirrored through this CDN.
+pub(crate) fn archive_urls(
     base: &Url,
     repository: &str,
     tag: &str,
     github_archive_url: &str,
-) -> Result<Option<Url>, String> {
-    let Some(prefix) = repository_prefix(repository) else {
-        return Ok(None);
+) -> Result<Vec<Url>, String> {
+    let Some(prefixes) = repository_prefixes(repository) else {
+        return Ok(Vec::new());
     };
     let tag = safe_path_segment(tag, "release tag")?;
     let filename = safe_archive_filename(github_archive_url)?;
-    let mut url = base.clone();
-    {
-        let mut path = url
-            .path_segments_mut()
-            .map_err(|_| "invalid CDN base URL")?;
-        let already_scoped = base
-            .path_segments()
-            .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
-            == Some(prefix);
-        if !already_scoped {
-            path.push(prefix);
+    let scoped = base
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+        .and_then(|segment| prefixes.iter().find(|prefix| **prefix == segment))
+        .copied();
+    // A base that already ends in a CDN namespace stays inside that one; the
+    // other candidates would point outside it.
+    let candidates: Vec<&'static str> = match scoped {
+        Some(prefix) => vec![prefix],
+        None => prefixes.to_vec(),
+    };
+    let mut urls = Vec::with_capacity(candidates.len());
+    for prefix in candidates {
+        let mut url = base.clone();
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|_| "invalid CDN base URL")?;
+            if scoped.is_none() {
+                path.push(prefix);
+            }
+            path.push("releases").push(&tag).push(&filename);
         }
-        path.push("releases").push(&tag).push(&filename);
+        urls.push(url);
     }
-    Ok(Some(url))
+    Ok(urls)
 }
 
 async fn download_one(
@@ -178,13 +203,13 @@ async fn download_one(
 /// release asset on any CDN transport, status, size, or hash failure.
 pub(crate) async fn download_with_fallback(
     client: &reqwest::Client,
-    cdn_url: Option<&Url>,
+    cdn_urls: &[Url],
     github_url: &str,
     limit: u64,
     expected_hash: &str,
     label: &str,
 ) -> Result<Vec<u8>, String> {
-    if let Some(cdn_url) = cdn_url {
+    for cdn_url in cdn_urls {
         match download_one(
             client,
             cdn_url.as_str(),
@@ -196,7 +221,7 @@ pub(crate) async fn download_with_fallback(
         {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
-                eprintln!("warning: CDN archive failed ({error}); falling back to GitHub")
+                eprintln!("warning: CDN archive failed ({error}); trying the next source")
             }
         }
     }
@@ -213,32 +238,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(base.as_str(), "https://assets.example.test/mirror");
-        let url = archive_url(
+        let urls = archive_urls(
             &base,
             CLI_REPOSITORY,
             "v1.2.3",
             "https://github.com/bigfish1913/pi-rust/releases/download/v1.2.3/rpi.zip",
         )
-        .unwrap()
         .unwrap();
         assert_eq!(
-            url.as_str(),
-            "https://assets.example.test/mirror/rpi/releases/v1.2.3/rpi.zip"
+            urls.iter().map(Url::as_str).collect::<Vec<_>>(),
+            ["https://assets.example.test/mirror/rpi/releases/v1.2.3/rpi.zip"]
         );
         let scoped = resolve_base(Some("https://assets.example.test/rpi"))
             .unwrap()
             .unwrap();
-        let scoped_url = archive_url(
+        let scoped_urls = archive_urls(
             &scoped,
             CLI_REPOSITORY,
             "v1.2.3",
             "https://github.com/bigfish1913/pi-rust/releases/download/v1.2.3/rpi.zip",
         )
-        .unwrap()
         .unwrap();
         assert_eq!(
-            scoped_url.as_str(),
-            "https://assets.example.test/rpi/releases/v1.2.3/rpi.zip"
+            scoped_urls.iter().map(Url::as_str).collect::<Vec<_>>(),
+            ["https://assets.example.test/rpi/releases/v1.2.3/rpi.zip"]
         );
     }
 
@@ -306,10 +329,16 @@ mod tests {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let cdn = Url::parse(&format!("http://{address}/cdn")).unwrap();
         let github = format!("http://{address}/github");
-        let result =
-            download_with_fallback(&client, Some(&cdn), &github, good_len, &expected, "archive")
-                .await
-                .unwrap();
+        let result = download_with_fallback(
+            &client,
+            std::slice::from_ref(&cdn),
+            &github,
+            good_len,
+            &expected,
+            "archive",
+        )
+        .await
+        .unwrap();
         assert_eq!(result, good);
         server.join().unwrap();
     }
@@ -327,20 +356,56 @@ mod tests {
         let base = resolve_base(Some("https://assets.example.test"))
             .unwrap()
             .unwrap();
-        assert!(archive_url(
+        assert!(archive_urls(
             &base,
             CLI_REPOSITORY,
             "v1",
             "https://github.com/a/b/releases/download/v1/a%2Fb.zip"
         )
         .is_err());
-        assert!(archive_url(
+        assert!(archive_urls(
             &base,
             "https://github.com/other/repo",
             "v1",
             "https://github.com/other/repo/releases/download/v1/a.zip"
         )
         .unwrap()
-        .is_none());
+        .is_empty());
+    }
+
+    #[test]
+    fn tries_both_cdn_prefixes_across_a_repository_move() {
+        let base = resolve_base(Some("https://assets.example.test"))
+            .unwrap()
+            .unwrap();
+        let archive =
+            "https://github.com/pi-rust/rpi-extension/releases/download/rpi-todo-v1/rpi-todo.zip";
+        let current = archive_urls(&base, EXTENSION_REPOSITORY, "rpi-todo-v1", archive).unwrap();
+        assert_eq!(
+            current.iter().map(Url::as_str).collect::<Vec<_>>(),
+            [
+                "https://assets.example.test/rpi-extension/releases/rpi-todo-v1/rpi-todo.zip",
+                "https://assets.example.test/rpi-package/releases/rpi-todo-v1/rpi-todo.zip",
+            ]
+        );
+        let legacy =
+            archive_urls(&base, LEGACY_EXTENSION_REPOSITORY, "rpi-todo-v1", archive).unwrap();
+        assert_eq!(
+            legacy.iter().map(Url::as_str).collect::<Vec<_>>(),
+            [
+                "https://assets.example.test/rpi-package/releases/rpi-todo-v1/rpi-todo.zip",
+                "https://assets.example.test/rpi-extension/releases/rpi-todo-v1/rpi-todo.zip",
+            ]
+        );
+        // A base already scoped to one namespace stays inside it.
+        let scoped = resolve_base(Some("https://assets.example.test/rpi-package"))
+            .unwrap()
+            .unwrap();
+        let scoped_urls =
+            archive_urls(&scoped, EXTENSION_REPOSITORY, "rpi-todo-v1", archive).unwrap();
+        assert_eq!(
+            scoped_urls.iter().map(Url::as_str).collect::<Vec<_>>(),
+            ["https://assets.example.test/rpi-package/releases/rpi-todo-v1/rpi-todo.zip"]
+        );
     }
 }

@@ -250,6 +250,15 @@ fn relative(path: &Path) -> Result<(), String> {
 
 impl ResolvedSelection {
     pub fn load(args: &Args, cwd: &Path, trusted: bool) -> Result<Option<Self>, String> {
+        Self::load_for(&crate::config::AgentHome::process(), args, cwd, trusted)
+    }
+
+    pub fn load_for(
+        home: &crate::config::AgentHome,
+        args: &Args,
+        cwd: &Path,
+        trusted: bool,
+    ) -> Result<Option<Self>, String> {
         let Some(config) = args
             .resource_transition
             .as_ref()
@@ -257,7 +266,9 @@ impl ResolvedSelection {
         else {
             return Ok(None);
         };
-        args.launch_fork_options()?;
+        if let Some(error) = args.fork_cut_errors().first() {
+            return Err((*error).to_owned());
+        }
         if (args.resource_config.is_some() && args.resource_transition.is_some())
             || (args.resource_transition.is_some()
                 && (args.name.is_some()
@@ -283,10 +294,7 @@ impl ResolvedSelection {
             || !args.prompt_template.is_empty()
             || !args.extension.is_empty()
             || !args.extensions_dir.is_empty()
-            || args
-                .unknown_flags
-                .keys()
-                .any(|name| !crate::args::is_fork_cut_flag(name))
+            || !args.unknown_flags.is_empty()
         {
             return Err("--resource-config requires trusted --mode rpc and conflicts with resource/tool/prompt/discovery/dev flags and unknown extension flags".into());
         }
@@ -320,7 +328,7 @@ impl ResolvedSelection {
         let mut instructions = Vec::new();
         let mut resolved_package = None;
         if let Some(main) = &selection.main_package {
-            let native_root = main.scope.root(cwd)?;
+            let native_root = main.scope.root(home, cwd)?;
             let package = crate::packages::selected_package_at(&native_root, &main.name)?;
             let packages_root =
                 std::fs::canonicalize(native_root.join("packages")).map_err(|e| e.to_string())?;

@@ -97,7 +97,7 @@ cargo run -p rpi-runtime --example embedded --locked
 真实 provider 集成需显式设置 `RPI_TEST_PROVIDER_LIBRARY`（已构建的
 `rpi-providers` 动态库）和 `RPI_TEST_PROVIDER_PACKAGE`（源码包目录），再运行
 `cargo test -p rpi-cli --test provider_packages --locked -- --nocapture`。
-本次在 Windows 加载相邻 rpi-package 的真实 DLL，7 项集成测试全部执行并通过，
+本次在 Windows 加载相邻 rpi-extension 的真实 DLL，7 项集成测试全部执行并通过，
 包含流式请求、provider 隔离、匿名策略、重载和项目包发现。
 
 第二阶段开放 provider/model/thinking 终端选择器。建议通过可选 `tui` feature

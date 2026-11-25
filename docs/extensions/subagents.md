@@ -122,7 +122,7 @@
 ## 跨仓库验证
 
 ```sh
-# D:/Projects/rpi-package
+# D:/Projects/rpi-extension
 cargo test -p rpi-subagents
 cargo build -p rpi-subagents
 

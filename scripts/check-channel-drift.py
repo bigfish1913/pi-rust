@@ -104,7 +104,11 @@ def collect(fetcher=fetch, token=None):
     github = {"Authorization": f"Bearer {token}"} if token else {}
     releases = fetcher(f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=20", github)
     if releases.status != 200:
-        raise RuntimeError(f"GitHub releases lookup failed: HTTP {releases.status}")
+        # An unauthenticated request from a shared runner address is routinely
+        # rate-limited with 403, which used to surface as a phantom drift.
+        hint = "" if token else (
+            " (no token was supplied; the monitor reads GITHUB_TOKEN)")
+        raise RuntimeError(f"GitHub releases lookup failed: HTTP {releases.status}{hint}")
     release_version = latest_stable_release(releases.json())
     if not release_version:
         raise RuntimeError("no published stable release found")

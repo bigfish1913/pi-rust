@@ -11,6 +11,36 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.28.0](https://github.com/bigfish1913/pi-rust/compare/v0.27.1...v0.28.0) - 2026-11-25
+
+### Added
+
+- *(cli)* inject AgentHome into session services ([#409](https://github.com/bigfish1913/pi-rust/pull/409))
+
+## [0.27.1](https://github.com/bigfish1913/pi-rust/compare/v0.27.0...v0.27.1) - 2026-11-21
+
+### Added
+
+- *(extensions)* follow the catalog move to pi-rust/rpi-extension ([#398](https://github.com/bigfish1913/pi-rust/pull/398))
+
+### Fixed
+
+- *(rpc)* correlate and settle every native execution lease ([#396](https://github.com/bigfish1913/pi-rust/pull/396))
+
+### Other
+
+- reduce history restore allocations and interrupted recovery hydration ([#394](https://github.com/bigfish1913/pi-rust/pull/394))
+
+### Fixed
+
+- *(rpc)* correlate RPC and autonomous execution leases without mistaking
+  per-attempt `agent_end` for completion. Correlated lifecycle framing requires
+  the parent to set `RPI_RPC_EXECUTION_LIFECYCLE=correlated-v1` on its child;
+  upgrade extcore to a launcher supporting this opt-in. Older clients retain
+  legacy framing and its limitations. Tool-partial congestion may drop partials
+  (the final tool result remains reliable), not the whole connection
+  ([#396](https://github.com/bigfish1913/pi-rust/pull/396)).
+
 ## [0.27.0](https://github.com/bigfish1913/pi-rust/compare/v0.26.1...v0.27.0) - 2026-11-20
 
 ### Added

@@ -171,6 +171,17 @@ pub struct Args {
     /// `--fork <path|id>`: fork the given session into a new one and start in
     /// the fork (pi `--fork`).
     pub fork: Option<String>,
+    /// `--fork-entry <entryId>`: cut the new branch at this message entry
+    /// instead of the lane leaf. The id must match exactly — unlike `--fork`'s
+    /// partial session id, no prefix or substring match is attempted.
+    /// Requires `--fork`.
+    pub fork_entry: Option<String>,
+    /// `--fork-position at|before`: whether `--fork-entry` includes (`at`) or
+    /// excludes (`before`) its message. `None` keeps the harness default for an
+    /// explicit entry, which is `before` (`ForkOptions::Branch`).
+    /// Requires `--fork` and `--fork-entry`; without an explicit entry the
+    /// harness applies the position to the implicit lane leaf and truncates it.
+    pub fork_position: Option<rpi_harness::session::types::ForkPosition>,
     /// `--models <patterns>`: comma-separated model patterns for the Ctrl+P
     /// cycle (globs/fuzzy in pi; v1 writes the matched ids to settings.json's
     /// scopedModels — the same set /scoped-models edits). Empty = all models.
@@ -248,8 +259,6 @@ pub struct Args {
     /// Extension-declared or otherwise unknown long flags. Values are either
     /// JSON booleans (a bare flag) or strings (a flag with a value), matching
     /// Pi's `unknownFlags` contract so an extension can claim its own options.
-    /// Also holds the reserved launch fork options, filtered before forwarding
-    /// flags to extensions.
     pub unknown_flags: BTreeMap<String, serde_json::Value>,
     /// Warnings about recognized-but-ignored flags (v1 scope cuts). Surfaced
     /// to the user on startup when `--verbose`.
@@ -259,52 +268,36 @@ pub struct Args {
     pub errors: Vec<String>,
 }
 
-pub(crate) fn is_fork_cut_flag(name: &str) -> bool {
-    matches!(name, "fork-entry" | "fork-position")
-}
-
 impl Args {
-    pub(crate) fn extension_flags(&self) -> BTreeMap<String, serde_json::Value> {
-        self.unknown_flags
-            .iter()
-            .filter(|(name, _)| !is_fork_cut_flag(name))
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect()
-    }
-
-    pub(crate) fn launch_fork_options(
-        &self,
-    ) -> Result<rpi_harness::session::types::ForkOptions, String> {
-        use rpi_harness::session::types::{ForkOptions, ForkPosition};
-
-        let entry = self.unknown_flags.get("fork-entry");
-        let position = self.unknown_flags.get("fork-position");
-        if entry.is_none() && position.is_none() {
-            return Ok(ForkOptions::default());
-        }
-        if self.fork.as_deref().is_none_or(str::is_empty)
-            || self.no_session
-            || self.continue_session
-            || self.resume
+    pub(crate) fn fork_cut_errors(&self) -> Vec<&'static str> {
+        let mut errors = Vec::new();
+        if self.fork.is_none() {
+            if self.fork_entry.is_some() {
+                errors.push("--fork-entry requires --fork");
+            }
+            if self.fork_position.is_some() {
+                errors.push("--fork-position requires --fork");
+            }
+        } else if (self.fork_entry.is_some() || self.fork_position.is_some())
+            && (self.fork.as_deref() == Some("")
+                || self.no_session
+                || self.continue_session
+                || self.resume)
         {
-            return Err("--fork-entry requires an active --fork selection".into());
+            errors.push("--fork cut flags require an active --fork selection");
         }
-        let entry = entry
-            .and_then(serde_json::Value::as_str)
-            .filter(|entry| !entry.trim().is_empty())
-            .ok_or("--fork-entry requires a nonempty entry ID")?;
-        let position = match position {
-            None => None,
-            Some(value) => Some(match value.as_str() {
-                Some("before") => ForkPosition::Before,
-                Some("at") => ForkPosition::At,
-                _ => return Err("--fork-position must be at or before".into()),
-            }),
-        };
-        Ok(ForkOptions::Branch {
-            entry_id: Some(entry.to_owned()),
-            position,
-        })
+        if self
+            .fork_entry
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            errors.push("--fork-entry requires a nonempty entry ID");
+        }
+        // An implicit leaf combined with `before` would drop that leaf.
+        if self.fork_entry.is_none() && self.fork_position.is_some() {
+            errors.push("--fork-position requires --fork-entry");
+        }
+        errors
     }
 }
 
@@ -524,14 +517,32 @@ pub fn parse_args(args: &[String]) -> Args {
             "--session" => result.session = take_value(&mut result, "--session"),
             "--session-id" => result.session_id = take_value(&mut result, "--session-id"),
             "--fork" => result.fork = take_value(&mut result, "--fork"),
-            "--fork-entry" | "--fork-position" => {
-                if let Some(value) = take_value(&mut result, &flag_key) {
-                    if result
-                        .unknown_flags
-                        .insert(flag_key[2..].to_owned(), serde_json::Value::String(value))
-                        .is_some()
-                    {
-                        result.errors.push(format!("duplicate {flag_key}"));
+            "--fork-entry" => {
+                if let Some(value) = take_value(&mut result, "--fork-entry") {
+                    if value.trim().is_empty() {
+                        result
+                            .errors
+                            .push("--fork-entry requires a nonempty entry ID".into());
+                    } else if result.fork_entry.replace(value).is_some() {
+                        result.errors.push("duplicate --fork-entry".into());
+                    }
+                }
+            }
+            "--fork-position" => {
+                if let Some(value) = take_value(&mut result, "--fork-position") {
+                    // Mirror `ForkPosition`'s two variants; `AT`/`BEFORE` are
+                    // accepted so the flag is not case-sensitive by accident.
+                    if result.fork_position.is_some() {
+                        result.errors.push("duplicate --fork-position".into());
+                    } else if value.eq_ignore_ascii_case("at") {
+                        result.fork_position = Some(rpi_harness::session::types::ForkPosition::At);
+                    } else if value.eq_ignore_ascii_case("before") {
+                        result.fork_position =
+                            Some(rpi_harness::session::types::ForkPosition::Before);
+                    } else {
+                        result.errors.push(format!(
+                            "Invalid --fork-position \"{value}\". Expected at or before"
+                        ));
                     }
                 }
             }
@@ -665,6 +676,11 @@ pub fn parse_args(args: &[String]) -> Args {
         i += 1;
     }
 
+    let fork_errors = result.fork_cut_errors();
+    result
+        .errors
+        .extend(fork_errors.into_iter().map(str::to_owned));
+
     // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
     if result.resource_config.is_none() && result.resource_transition.is_none() {
         env_extension_dirs.append(&mut result.extensions_dir);
@@ -674,9 +690,6 @@ pub fn parse_args(args: &[String]) -> Args {
     // `--mode json` selects the JSON event stream. The TS `resolveAppMode`
     // treats `mode === "json"` as its own non-interactive mode; we follow that.
     if let Err(error) = crate::native_durable::experimental_epoch::policy(&result) {
-        result.errors.push(error);
-    }
-    if let Err(error) = result.launch_fork_options() {
         result.errors.push(error);
     }
     result
@@ -766,9 +779,13 @@ pub fn print_help() {
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
-  --fork <id|path>               Start a new session from an existing branch
-  --fork-entry <id>              Cut the fork at a specific message entry
-  --fork-position <at|before>    Include or exclude the selected entry (default: before)
+  --session-id <id>              Use the exact session id, creating it if missing
+  --fork <id|path>               Fork a session into a new one and start in the fork
+                                 (partial UUID, file name fragment, or file path)
+  --fork-entry <entryId>         With --fork: cut the new branch at this message
+                                 entry. The entry id must match exactly
+  --fork-position <at|before>    With --fork-entry: keep the selected message in the
+                                 new branch (at) or drop it (before). Default: before
   --session-dir <dir>            Directory for session storage
   --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
@@ -848,7 +865,7 @@ pub fn print_help() {
   ANTHROPIC_BASE_URL             Override the Anthropic endpoint (e.g. a compatible proxy)
   OPENAI_API_KEY                 Bearer token for openai-completions/responses
   RPI_OFFLINE                     Disable startup network operations when set to 1/true/yes
-  RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
+  RPI_CODING_AGENT_DIR           Override the ~/.rpi agent home (auth/models/settings/trust)
   RPI_SESSION_ID                 Session id served by a plugin (set by the host; also honored as an override)
 
 {u}Notes:{r}
@@ -1172,6 +1189,31 @@ mod tests {
         assert!(a.errors.is_empty());
         assert_eq!(a.session_id.as_deref(), Some("01abc"));
         assert_eq!(a.fork.as_deref(), Some("xyz"));
+        assert_eq!(a.fork_entry, None);
+        assert_eq!(
+            a.fork_position, None,
+            "an explicit entry must keep the harness default (before), not force a position"
+        );
+        let a = parse_args(&s(&[
+            "--fork",
+            "xyz",
+            "--fork-entry",
+            "message-2",
+            "--fork-position",
+            "before",
+        ]));
+        assert!(a.errors.is_empty());
+        assert_eq!(a.fork_entry.as_deref(), Some("message-2"));
+        assert_eq!(
+            a.fork_position,
+            Some(rpi_harness::session::types::ForkPosition::Before)
+        );
+        let a = parse_args(&s(&["--fork-position", "middle"]));
+        assert_eq!(a.fork_position, None);
+        assert_eq!(
+            a.errors,
+            vec!["Invalid --fork-position \"middle\". Expected at or before".to_string()]
+        );
         let a = parse_args(&s(&[
             "-e",
             "plugin.dll",
@@ -1197,7 +1239,7 @@ mod tests {
         ]));
         assert!(args.errors.is_empty(), "{:?}", args.errors);
         assert_eq!(
-            args.extension_flags(),
+            args.unknown_flags,
             BTreeMap::from([("extension-option".into(), serde_json::json!("keep"))])
         );
         for argv in [
@@ -1228,6 +1270,113 @@ mod tests {
         ] {
             assert!(!parse_args(&s(argv)).errors.is_empty(), "{argv:?}");
         }
+    }
+
+    #[test]
+    fn fork_position_is_case_insensitive() {
+        use rpi_harness::session::types::ForkPosition;
+        for (value, expected) in [
+            ("at", ForkPosition::At),
+            ("At", ForkPosition::At),
+            ("AT", ForkPosition::At),
+            ("before", ForkPosition::Before),
+            ("Before", ForkPosition::Before),
+            ("BEFORE", ForkPosition::Before),
+        ] {
+            let a = parse_args(&s(&[
+                "--fork",
+                "xyz",
+                "--fork-entry",
+                "message-2",
+                "--fork-position",
+                value,
+            ]));
+            assert!(a.errors.is_empty(), "{value}: {:?}", a.errors);
+            assert_eq!(a.fork_position, Some(expected), "{value}");
+        }
+    }
+
+    /// `--fork-entry` is only read inside `SessionSelection::Fork`, and
+    /// `--fork-position` only makes sense alongside an explicit entry: without
+    /// one it reaches the harness as `entry_id: None, position: Some(Before)`
+    /// and truncates the current leaf from the child.
+    #[test]
+    fn fork_cut_flags_require_fork() {
+        let a = parse_args(&s(&["--fork-entry", "message-2", "--print", "hi"]));
+        assert_eq!(a.errors, vec!["--fork-entry requires --fork".to_string()]);
+
+        // `--fork-position` alone is missing both prerequisites; the existing
+        // rule stays, and the new entry rule is reported alongside it.
+        let a = parse_args(&s(&["--fork-position", "before"]));
+        assert_eq!(
+            a.errors,
+            vec![
+                "--fork-position requires --fork".to_string(),
+                "--fork-position requires --fork-entry".to_string(),
+            ]
+        );
+
+        // Both flags together report once each, in flag order.
+        let a = parse_args(&s(&["--fork-position=at", "--fork-entry=message-2"]));
+        assert_eq!(
+            a.errors,
+            vec![
+                "--fork-entry requires --fork".to_string(),
+                "--fork-position requires --fork".to_string(),
+            ]
+        );
+
+        // With `--fork` they parse cleanly.
+        let a = parse_args(&s(&[
+            "--fork",
+            "xyz",
+            "--fork-entry",
+            "message-2",
+            "--fork-position",
+            "at",
+        ]));
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+    }
+
+    /// The reviewer's P2: `--fork-position` without `--fork-entry` is not
+    /// inert — the harness takes the current leaf as the implicit target and
+    /// then applies `Before`, dropping it from the child. Cover both position
+    /// values, both argv spellings, and the no-`--fork` combination.
+    #[test]
+    fn fork_position_requires_fork_entry() {
+        for value in ["at", "before", "AT", "BEFORE"] {
+            // Separate-value form.
+            let a = parse_args(&s(&["--fork", "xyz", "--fork-position", value]));
+            assert_eq!(
+                a.errors,
+                vec!["--fork-position requires --fork-entry".to_string()],
+                "{value}: the flag is not inert"
+            );
+            assert!(a.fork_position.is_some(), "{value}");
+
+            // Inline `--flag=value` form.
+            let flag = format!("--fork-position={value}");
+            let a = parse_args(&s(&["--fork", "xyz", &flag]));
+            assert_eq!(
+                a.errors,
+                vec!["--fork-position requires --fork-entry".to_string()],
+                "{flag}: the flag is not inert"
+            );
+        }
+
+        // With --fork-entry present, both forms are accepted.
+        let a = parse_args(&s(&[
+            "--fork",
+            "xyz",
+            "--fork-entry",
+            "message-2",
+            "--fork-position=before",
+        ]));
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(
+            a.fork_position,
+            Some(rpi_harness::session::types::ForkPosition::Before)
+        );
     }
 
     #[test]

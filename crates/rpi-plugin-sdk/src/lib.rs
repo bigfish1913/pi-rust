@@ -1512,9 +1512,14 @@ pub type CommandArgumentCompletionFn =
 /// payload (for example `{"customType":"token-usage","usage":{...}}`);
 /// entry renderers receive `{"customType":"...","data":...}`. Message and
 /// entry renderers return `{"text":"...","markdown":true|false}` or
-/// `{"lines":["..."]}` for terminal UI. Markdown transformers return
-/// `{"markdown":"..."}`. The rendered value is one transcript row/component,
-/// not an arbitrary component tree.
+/// `{"lines":["..."]}` for terminal UI. Entry renderers may instead return
+/// `{"display":false}` with status `0` to claim an entry without displaying it:
+/// no component, spacer or raw-text fallback is added. Only the boolean `false`
+/// hides; it takes precedence over `text` and `lines`. This is entry-only and
+/// requires a host implementing explicit visibility (older hosts may fall back
+/// to raw text). Non-zero status still means unhandled, not hidden.
+/// Markdown transformers return `{"markdown":"..."}`. The rendered value is
+/// one transcript row/component, not an arbitrary component tree.
 pub type RenderFn =
     extern "C" fn(input_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
@@ -1878,8 +1883,11 @@ pub struct PluginApi {
     /// Register a renderer for session custom entries. The host invokes it with
     /// `{"customType":"...","data":...}` and accepts the same single-row
     /// output as [`RenderFn`]: `{"text":"...","markdown":true|false}` or
-    /// `{"lines":["..."]}`. A renderer is tried in registration order; the
-    /// first valid JSON response wins.
+    /// `{"lines":["..."]}`, or `{"display":false}` for an explicitly hidden
+    /// entry (no component, spacer or fallback text). A renderer is tried in
+    /// registration order; the first valid JSON response with status `0` wins,
+    /// including a hidden response. Non-zero means unhandled. No ABI change is
+    /// needed; hosts predating explicit visibility may still render raw text.
     pub register_entry_renderer: Option<
         extern "C" fn(
             name: StbStringRef,

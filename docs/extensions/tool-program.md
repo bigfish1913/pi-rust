@@ -688,7 +688,7 @@ on `dev/web-hmr` remains untouched, and no UI changes are part of this increment
 
 ## Real native smoke
 
-Build this host and the companion `rpi-package` checkout's `rpi-codemode` and
+Build this host and the companion `rpi-extension` checkout's `rpi-codemode` and
 `rpi-permission-gate` libraries. Optionally build the
 [test-only parity fixture](../../scripts/fixtures/codemode-parity/README.md)
 for trusted accounting and native partial-callback coverage:

@@ -8,6 +8,7 @@ impl AgentHarness {
         run_id: &str,
         outcome: &mut HarnessRunOutcome,
     ) -> HarnessResult<()> {
+        self.stage_execution(crate::execution::ExecutionOutcome::Run(outcome.clone()));
         let (operation, end, error, final_id, message) = match &*outcome {
             HarnessRunOutcome::Completed {
                 final_entry_id,
@@ -43,7 +44,10 @@ impl AgentHarness {
                 final_entry_id.clone(),
                 final_message.as_ref(),
             ),
-            HarnessRunOutcome::Suspended { .. } => return Ok(()),
+            HarnessRunOutcome::Suspended { .. } => {
+                self.finalize_execution();
+                return Ok(());
+            }
         };
         // Usually the final entry is the assistant itself. If a result follows
         // it, walk only that committed suffix, not all session history.

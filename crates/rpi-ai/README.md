@@ -47,7 +47,7 @@ it is the default.
 - `providers` — concrete implementations: `faux` (always), `anthropic`,
   `openai_completions`, `openai_responses` (behind `providers`).
   DeepSeek, OpenRouter, llama.cpp and Proxy live together in the optional
-  [rpi-providers package](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers);
+  [rpi-providers package](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers);
   see the [migration guide](../../docs/architecture/provider-packages.md).
 
 ## The `Provider` trait

@@ -69,6 +69,22 @@ pub use rpi_runtime::config::DEFAULT_PROVIDER_ID;
 /// is `join(homedir(), CONFIG_DIR_NAME, "agent")`. The env override points at
 /// the agent dir itself.
 pub fn agent_dir() -> Result<PathBuf, ConfigError> {
+    agent_dir_at(None)
+}
+
+/// Resolve the agent home for one harness: an explicit `--agent-dir` wins,
+/// otherwise the historical `RPI_CODING_AGENT_DIR` / `~/.rpi/agent` path.
+/// Relative overrides are rejected (same rule as the env var).
+pub(crate) fn agent_dir_at(override_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    if let Some(dir) = override_dir {
+        if !dir.is_absolute() {
+            return Err(ConfigError::RelativeOverride {
+                env: "--agent-dir",
+                val: dir.to_string_lossy().into_owned(),
+            });
+        }
+        return Ok(dir.to_path_buf());
+    }
     if let Some(val) = std::env::var_os(CONFIG_DIR_ENV) {
         let p = PathBuf::from(&val);
         if !p.is_absolute() {
@@ -83,6 +99,172 @@ pub fn agent_dir() -> Result<PathBuf, ConfigError> {
         env: CONFIG_DIR_ENV,
     })?;
     Ok(home.join(CONFIG_DIR_NAME).join("agent"))
+}
+
+/// One session's agent home.
+///
+/// `explicit = Some(path)` is the library-embedding mode: every reader and
+/// writer is addressed through this value, so several harnesses can live in one
+/// process with different homes. CLI sessions use [`AgentHome::process`], which
+/// preserves the historical `RPI_CODING_AGENT_DIR` / `~/.rpi/agent` behavior.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentHome {
+    explicit: Option<PathBuf>,
+}
+
+impl AgentHome {
+    /// The historical process home (`RPI_CODING_AGENT_DIR` / `~/.rpi/agent`).
+    pub fn process() -> Self {
+        Self::default()
+    }
+
+    pub fn from_option(explicit: Option<PathBuf>) -> Self {
+        Self { explicit }
+    }
+
+    pub fn explicit_path(&self) -> Option<&Path> {
+        self.explicit.as_deref()
+    }
+
+    pub fn is_explicit(&self) -> bool {
+        self.explicit.is_some()
+    }
+
+    pub fn root(&self) -> Result<PathBuf, ConfigError> {
+        agent_dir_at(self.explicit_path())
+    }
+
+    pub fn auth_path(&self) -> Result<PathBuf, ConfigError> {
+        Ok(self.root()?.join("auth.json"))
+    }
+
+    pub fn models_path(&self) -> Result<PathBuf, ConfigError> {
+        Ok(self.root()?.join("models.json"))
+    }
+
+    pub fn settings_path(&self) -> Result<PathBuf, ConfigError> {
+        Ok(self.root()?.join("settings.json"))
+    }
+
+    pub fn trust_path(&self) -> Result<PathBuf, ConfigError> {
+        Ok(self.root()?.join("trust.json"))
+    }
+
+    pub fn read_auth(&self) -> Result<AuthStore, ConfigError> {
+        read_auth_at(self.explicit_path())
+    }
+
+    pub fn write_auth(&self, store: &AuthStore) -> Result<(), ConfigError> {
+        write_auth_at(self.explicit_path(), store)
+    }
+
+    pub fn upsert_credential(
+        &self,
+        provider_id: &str,
+        cred: Credential,
+    ) -> Result<(), ConfigError> {
+        upsert_credential_at(self.explicit_path(), provider_id, cred)
+    }
+
+    pub fn upsert_oauth_token(
+        &self,
+        provider_id: &str,
+        access: String,
+        refresh: String,
+        expires: i64,
+    ) -> Result<(), ConfigError> {
+        upsert_oauth_token_at(self.explicit_path(), provider_id, access, refresh, expires)
+    }
+
+    pub fn replace_oauth_token_if_unchanged(
+        &self,
+        provider_id: &str,
+        expected: (&str, &str, i64),
+        access: String,
+        refresh: String,
+        expires: i64,
+    ) -> Result<bool, ConfigError> {
+        replace_oauth_token_if_unchanged_at(
+            self.explicit_path(),
+            provider_id,
+            expected,
+            access,
+            refresh,
+            expires,
+        )
+    }
+
+    pub fn read_oauth_token(&self, provider_id: &str) -> Result<Option<Credential>, ConfigError> {
+        read_oauth_token_at(self.explicit_path(), provider_id)
+    }
+
+    pub fn delete_credential(&self, provider_id: &str) -> Result<bool, ConfigError> {
+        delete_credential_at(self.explicit_path(), provider_id)
+    }
+
+    pub fn models_config(&self) -> Result<ModelsConfig, ConfigError> {
+        load_models_config_at(self.explicit_path())
+    }
+
+    pub fn save_models_config(&self, cfg: &ModelsConfig) -> Result<(), ConfigError> {
+        save_models_config_at(self.explicit_path(), cfg)
+    }
+
+    pub fn add_provider(
+        &self,
+        provider_id: &str,
+        api: &str,
+        base_url: &str,
+        api_key: &str,
+        model: ProviderModelConfig<'_>,
+        supports_images: Option<bool>,
+    ) -> Result<(), String> {
+        add_provider_at(
+            self.explicit_path(),
+            provider_id,
+            api,
+            base_url,
+            api_key,
+            model,
+            supports_images,
+        )
+    }
+
+    pub fn update_provider(
+        &self,
+        provider_id: &str,
+        api: &str,
+        base_url: &str,
+        api_key: Option<&str>,
+        model: ProviderModelConfig<'_>,
+        supports_images: bool,
+    ) -> Result<(), String> {
+        update_provider_at(
+            self.explicit_path(),
+            provider_id,
+            api,
+            base_url,
+            api_key,
+            model,
+            supports_images,
+        )
+    }
+
+    pub fn delete_provider(&self, provider_id: &str) -> Result<(), String> {
+        delete_provider_at(self.explicit_path(), provider_id)
+    }
+
+    pub fn read_trust(&self) -> Result<TrustStore, ConfigError> {
+        read_trust_at(self.explicit_path())
+    }
+
+    pub fn project_trust_decision(&self, cwd: &Path) -> Result<Option<bool>, ConfigError> {
+        project_trust_decision_at(self.explicit_path(), cwd)
+    }
+
+    pub fn set_project_trust(&self, cwd: &Path, trusted: Option<bool>) -> Result<(), ConfigError> {
+        set_project_trust_at(self.explicit_path(), cwd, trusted)
+    }
 }
 
 /// The config dir one level above the agent dir (`~/.rpi`, or the parent of an
@@ -100,22 +282,38 @@ fn config_root_dir() -> Result<PathBuf, ConfigError> {
 
 /// `~/.rpi/agent/auth.json`.
 pub fn auth_path() -> Result<PathBuf, ConfigError> {
-    Ok(agent_dir()?.join("auth.json"))
+    auth_path_at(None)
+}
+
+pub(crate) fn auth_path_at(agent_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    Ok(agent_dir_at(agent_dir)?.join("auth.json"))
 }
 
 /// `~/.rpi/agent/models.json`.
 pub fn models_path() -> Result<PathBuf, ConfigError> {
-    Ok(agent_dir()?.join("models.json"))
+    models_path_at(None)
+}
+
+pub(crate) fn models_path_at(agent_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    Ok(agent_dir_at(agent_dir)?.join("models.json"))
 }
 
 /// `~/.rpi/agent/settings.json` (saved default provider/model/thinking + theme).
 pub fn settings_path() -> Result<PathBuf, ConfigError> {
-    Ok(agent_dir()?.join("settings.json"))
+    settings_path_at(None)
+}
+
+pub(crate) fn settings_path_at(agent_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    Ok(agent_dir_at(agent_dir)?.join("settings.json"))
 }
 
 /// `~/.rpi/agent/trust.json` (per-cwd project trust decisions).
 pub fn trust_path() -> Result<PathBuf, ConfigError> {
-    Ok(agent_dir()?.join("trust.json"))
+    trust_path_at(None)
+}
+
+pub(crate) fn trust_path_at(agent_dir: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    Ok(agent_dir_at(agent_dir)?.join("trust.json"))
 }
 
 fn read_text_with_fallback(
@@ -210,7 +408,12 @@ fn migrate_legacy_layout_in(root: &Path, agent: &Path) -> Result<usize, ConfigEr
 /// Read the auth store. Missing file ⇒ empty store (not an error). Malformed
 /// JSON ⇒ `ConfigError::Json` (we do not silently swallow a corrupt auth file).
 pub fn read_auth() -> Result<AuthStore, ConfigError> {
-    let path = auth_path()?;
+    read_auth_at(None)
+}
+
+/// [`read_auth`] against an explicit agent home (`--agent-dir`).
+pub(crate) fn read_auth_at(agent_dir: Option<&Path>) -> Result<AuthStore, ConfigError> {
+    let path = auth_path_at(agent_dir)?;
     match read_text_with_fallback(path, None)? {
         Some((path, text)) => {
             serde_json::from_str(&text).map_err(|source| ConfigError::Json { path, source })
@@ -231,8 +434,16 @@ fn auth_store_lock() -> &'static std::sync::Mutex<()> {
 /// temp sibling, `rename`s over the target, then `chmod 0o600` on Unix).
 /// Callers that read-modify-write must hold the internal store lock.
 pub fn write_auth(store: &AuthStore) -> Result<(), ConfigError> {
-    let path = auth_path()?;
-    let dir = agent_dir()?;
+    write_auth_at(None, store)
+}
+
+/// [`write_auth`] against an explicit agent home (`--agent-dir`).
+pub(crate) fn write_auth_at(
+    agent_dir: Option<&Path>,
+    store: &AuthStore,
+) -> Result<(), ConfigError> {
+    let path = auth_path_at(agent_dir)?;
+    let dir = agent_dir_at(agent_dir)?;
     ensure_dir(&dir)?;
     let json = serde_json::to_string_pretty(store).unwrap();
     atomic_write(&path, json.as_bytes())?;
@@ -243,12 +454,21 @@ pub fn write_auth(store: &AuthStore) -> Result<(), ConfigError> {
 /// Read-modify-write: upsert a credential for `provider_id`. Re-reads the
 /// latest store under the lock, so other providers' entries are preserved.
 pub fn upsert_credential(provider_id: &str, cred: Credential) -> Result<(), ConfigError> {
+    upsert_credential_at(None, provider_id, cred)
+}
+
+/// [`upsert_credential`] against an explicit agent home (`--agent-dir`).
+pub(crate) fn upsert_credential_at(
+    agent_dir: Option<&Path>,
+    provider_id: &str,
+    cred: Credential,
+) -> Result<(), ConfigError> {
     let _store_guard = auth_store_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut store = read_auth()?;
+    let mut store = read_auth_at(agent_dir)?;
     store.insert(provider_id.to_string(), cred);
-    write_auth(&store)
+    write_auth_at(agent_dir, &store)
 }
 
 /// Store an OAuth token under exactly one provider id using the atomic auth
@@ -269,6 +489,25 @@ pub fn upsert_oauth_token(
     )
 }
 
+/// [`upsert_oauth_token`] against an explicit agent home.
+pub(crate) fn upsert_oauth_token_at(
+    agent_dir: Option<&Path>,
+    provider_id: &str,
+    access: String,
+    refresh: String,
+    expires: i64,
+) -> Result<(), ConfigError> {
+    upsert_credential_at(
+        agent_dir,
+        provider_id,
+        Credential::Oauth {
+            access,
+            refresh,
+            expires,
+        },
+    )
+}
+
 /// Replace `provider_id`'s OAuth token only if the stored one still has the
 /// `expected` access, refresh and expiry. Returns `false`, writing nothing, when
 /// a login or logout replaced or removed it meanwhile, so a late refresh result
@@ -280,10 +519,22 @@ pub fn replace_oauth_token_if_unchanged(
     refresh: String,
     expires: i64,
 ) -> Result<bool, ConfigError> {
+    replace_oauth_token_if_unchanged_at(None, provider_id, expected, access, refresh, expires)
+}
+
+/// [`replace_oauth_token_if_unchanged`] against an explicit agent home.
+pub(crate) fn replace_oauth_token_if_unchanged_at(
+    agent_dir: Option<&Path>,
+    provider_id: &str,
+    expected: (&str, &str, i64),
+    access: String,
+    refresh: String,
+    expires: i64,
+) -> Result<bool, ConfigError> {
     let _store_guard = auth_store_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut store = read_auth()?;
+    let mut store = read_auth_at(agent_dir)?;
     let unchanged = matches!(
         store.get(provider_id),
         Some(Credential::Oauth { access, refresh, expires })
@@ -298,14 +549,22 @@ pub fn replace_oauth_token_if_unchanged(
                 expires,
             },
         );
-        write_auth(&store)?;
+        write_auth_at(agent_dir, &store)?;
     }
     Ok(unchanged)
 }
 
 /// Read only the OAuth credential for one provider.
 pub fn read_oauth_token(provider_id: &str) -> Result<Option<Credential>, ConfigError> {
-    Ok(match read_auth()?.get(provider_id) {
+    read_oauth_token_at(None, provider_id)
+}
+
+/// [`read_oauth_token`] against an explicit agent home.
+pub(crate) fn read_oauth_token_at(
+    agent_dir: Option<&Path>,
+    provider_id: &str,
+) -> Result<Option<Credential>, ConfigError> {
+    Ok(match read_auth_at(agent_dir)?.get(provider_id) {
         Some(Credential::Oauth {
             access,
             refresh,
@@ -324,12 +583,20 @@ pub fn read_oauth_token(provider_id: &str) -> Result<Option<Credential>, ConfigE
 /// the file when the provider existed (so `auth logout` reflects the new state
 /// on disk even if the map isn't empty).
 pub fn delete_credential(provider_id: &str) -> Result<bool, ConfigError> {
+    delete_credential_at(None, provider_id)
+}
+
+/// [`delete_credential`] against an explicit agent home.
+pub(crate) fn delete_credential_at(
+    agent_dir: Option<&Path>,
+    provider_id: &str,
+) -> Result<bool, ConfigError> {
     let _store_guard = auth_store_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut store = read_auth()?;
+    let mut store = read_auth_at(agent_dir)?;
     if store.remove(provider_id).is_some() {
-        write_auth(&store)?;
+        write_auth_at(agent_dir, &store)?;
         Ok(true)
     } else {
         Ok(false)
@@ -342,7 +609,12 @@ pub fn delete_credential(provider_id: &str) -> Result<bool, ConfigError> {
 
 /// Load `~/.rpi/models.json`. Missing file ⇒ empty config (no error).
 pub fn load_models_config() -> Result<ModelsConfig, ConfigError> {
-    let path = models_path()?;
+    load_models_config_at(None)
+}
+
+/// [`load_models_config`] against an explicit agent home (`--agent-dir`).
+pub(crate) fn load_models_config_at(agent_dir: Option<&Path>) -> Result<ModelsConfig, ConfigError> {
+    let path = models_path_at(agent_dir)?;
     match read_text_with_fallback(path, None)? {
         Some((path, text)) => {
             parse_models_json(&text).map_err(|source| ConfigError::Json { path, source })
@@ -359,8 +631,16 @@ pub fn load_models_config() -> Result<ModelsConfig, ConfigError> {
 /// fields in `models.json` are not preserved on rewrite. A timestamped
 /// `models.json.bak-*` snapshot is written first so a mistake can be reverted.
 pub fn save_models_config(cfg: &ModelsConfig) -> Result<(), ConfigError> {
-    let path = models_path()?;
-    let dir = agent_dir()?;
+    save_models_config_at(None, cfg)
+}
+
+/// [`save_models_config`] against an explicit agent home (`--agent-dir`).
+pub(crate) fn save_models_config_at(
+    agent_dir: Option<&Path>,
+    cfg: &ModelsConfig,
+) -> Result<(), ConfigError> {
+    let path = models_path_at(agent_dir)?;
+    let dir = agent_dir_at(agent_dir)?;
     ensure_dir(&dir)?;
     // Back up the existing file before rewriting it (best-effort; a missing
     // file is normal on first save).
@@ -392,6 +672,27 @@ pub struct ProviderModelConfig<'a> {
 /// This is shared by the interactive provider form and RPC clients so both
 /// surfaces enforce the same protocol, URL, duplicate, and size checks.
 pub fn add_provider(
+    provider_id: &str,
+    api: &str,
+    base_url: &str,
+    api_key: &str,
+    model: ProviderModelConfig<'_>,
+    supports_images: Option<bool>,
+) -> Result<(), String> {
+    add_provider_at(
+        None,
+        provider_id,
+        api,
+        base_url,
+        api_key,
+        model,
+        supports_images,
+    )
+}
+
+/// [`add_provider`] against an explicit agent home (`--agent-dir`).
+pub(crate) fn add_provider_at(
+    agent_dir: Option<&Path>,
     provider_id: &str,
     api: &str,
     base_url: &str,
@@ -449,7 +750,7 @@ pub fn add_provider(
     if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
         return Err("base URL must start with http:// or https://".into());
     }
-    let mut config = load_models_config().map_err(|error| error.to_string())?;
+    let mut config = load_models_config_at(agent_dir).map_err(|error| error.to_string())?;
     if config.providers.contains_key(provider_id) {
         return Err(format!(
             "provider {provider_id:?} already has a models.json configuration"
@@ -485,13 +786,34 @@ pub fn add_provider(
             }],
         },
     );
-    save_models_config(&config).map_err(|error| error.to_string())
+    save_models_config_at(agent_dir, &config).map_err(|error| error.to_string())
 }
 
 /// Update an existing models.json provider and its first model. An omitted API
 /// key preserves the existing key, so editing metadata does not require
 /// exposing or re-entering a secret.
 pub fn update_provider(
+    provider_id: &str,
+    api: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+    model: ProviderModelConfig<'_>,
+    supports_images: bool,
+) -> Result<(), String> {
+    update_provider_at(
+        None,
+        provider_id,
+        api,
+        base_url,
+        api_key,
+        model,
+        supports_images,
+    )
+}
+
+/// [`update_provider`] against an explicit agent home (`--agent-dir`).
+pub(crate) fn update_provider_at(
+    agent_dir: Option<&Path>,
     provider_id: &str,
     api: &str,
     base_url: &str,
@@ -528,7 +850,7 @@ pub fn update_provider(
     if max_tokens == Some(0) {
         return Err("max output tokens must be greater than zero".into());
     }
-    let mut config = load_models_config().map_err(|error| error.to_string())?;
+    let mut config = load_models_config_at(agent_dir).map_err(|error| error.to_string())?;
     let provider = config
         .providers
         .get_mut(provider_id)
@@ -551,22 +873,30 @@ pub fn update_provider(
     } else {
         vec!["text".to_string()]
     });
-    save_models_config(&config).map_err(|error| error.to_string())
+    save_models_config_at(agent_dir, &config).map_err(|error| error.to_string())
 }
 
 /// Delete a user-configured provider from models.json.
 pub fn delete_provider(provider_id: &str) -> Result<(), String> {
+    delete_provider_at(None, provider_id)
+}
+
+/// [`delete_provider`] against an explicit agent home (`--agent-dir`).
+pub(crate) fn delete_provider_at(
+    agent_dir: Option<&Path>,
+    provider_id: &str,
+) -> Result<(), String> {
     let provider_id = provider_id.trim();
     if provider_id.is_empty() {
         return Err("provider is required".into());
     }
-    let mut config = load_models_config().map_err(|error| error.to_string())?;
+    let mut config = load_models_config_at(agent_dir).map_err(|error| error.to_string())?;
     if config.providers.shift_remove(provider_id).is_none() {
         return Err(format!(
             "provider {provider_id:?} has no models.json configuration"
         ));
     }
-    save_models_config(&config).map_err(|error| error.to_string())
+    save_models_config_at(agent_dir, &config).map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -584,7 +914,11 @@ pub type TrustStore = BTreeMap<String, Option<bool>>;
 /// Malformed JSON ⇒ `ConfigError::Json`. `null` decisions deserialize as
 /// `None`; absent entries are simply not present.
 pub fn read_trust() -> Result<TrustStore, ConfigError> {
-    let path = trust_path()?;
+    read_trust_at(None)
+}
+
+pub(crate) fn read_trust_at(agent_dir: Option<&Path>) -> Result<TrustStore, ConfigError> {
+    let path = trust_path_at(agent_dir)?;
     match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text).map_err(|e| ConfigError::Json {
             path: path.clone(),
@@ -598,18 +932,27 @@ pub fn read_trust() -> Result<TrustStore, ConfigError> {
 /// Persist the trust decision for a project directory. The path is canonical
 /// when it exists, with an absolute fallback for a project being created.
 pub fn set_project_trust(cwd: &Path, trusted: Option<bool>) -> Result<(), ConfigError> {
+    set_project_trust_at(None, cwd, trusted)
+}
+
+/// [`set_project_trust`] against an explicit agent home (`--agent-dir`).
+pub(crate) fn set_project_trust_at(
+    agent_dir: Option<&Path>,
+    cwd: &Path,
+    trusted: Option<bool>,
+) -> Result<(), ConfigError> {
     let key = std::fs::canonicalize(cwd)
         .unwrap_or_else(|_| cwd.to_path_buf())
         .to_string_lossy()
         .into_owned();
-    let mut store = read_trust()?;
+    let mut store = read_trust_at(agent_dir)?;
     if let Some(decision) = trusted {
         store.insert(key, Some(decision));
     } else {
         store.remove(&key);
     }
-    let path = trust_path()?;
-    ensure_dir(&agent_dir()?)?;
+    let path = trust_path_at(agent_dir)?;
+    ensure_dir(&agent_dir_at(agent_dir)?)?;
     let json = serde_json::to_string_pretty(&store).unwrap();
     atomic_write(&path, json.as_bytes())?;
     set_owner_only(&path);
@@ -619,11 +962,19 @@ pub fn set_project_trust(cwd: &Path, trusted: Option<bool>) -> Result<(), Config
 /// Return the stored trust decision for `cwd`. A missing entry (or an entry
 /// explicitly set to `null`) returns `None`; callers choose their safe default.
 pub fn project_trust_decision(cwd: &Path) -> Result<Option<bool>, ConfigError> {
+    project_trust_decision_at(None, cwd)
+}
+
+/// [`project_trust_decision`] under an explicit agent home (`--agent-dir`).
+pub(crate) fn project_trust_decision_at(
+    agent_dir: Option<&Path>,
+    cwd: &Path,
+) -> Result<Option<bool>, ConfigError> {
     let key = std::fs::canonicalize(cwd)
         .unwrap_or_else(|_| cwd.to_path_buf())
         .to_string_lossy()
         .into_owned();
-    Ok(read_trust()?.get(&key).copied().flatten())
+    Ok(read_trust_at(agent_dir)?.get(&key).copied().flatten())
 }
 
 /// Parse the models JSON, tolerating `//` line comments (a minimal subset of

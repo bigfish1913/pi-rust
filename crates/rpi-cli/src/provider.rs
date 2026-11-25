@@ -42,7 +42,11 @@ pub(crate) fn runtime_settings(settings: settings::Settings) -> rpi_runtime::Run
         http_idle_timeout_ms: timeout,
     }
 }
+/// Resolve with an explicit agent home: models.json, auth.json and settings
+/// are read from that home, never the process home.
+#[allow(clippy::too_many_arguments)]
 fn resolve_with_factories(
+    home: &config::AgentHome,
     provider: Option<&str>,
     model: Option<&str>,
     thinking: Option<ThinkingLevel>,
@@ -52,8 +56,8 @@ fn resolve_with_factories(
     factories: &RuntimeFactories,
 ) -> Result<ResolvedModel, ResolveError> {
     rpi_runtime::RuntimeConfig {
-        models: config::load_models_config()?,
-        credentials: config::read_auth()?,
+        models: home.models_config()?,
+        credentials: home.read_auth()?,
         settings: runtime_settings(settings),
     }
     .resolve(
@@ -69,15 +73,19 @@ fn resolve_with_factories(
         &CliValues,
     )
 }
+
+/// Resolve against `home` without project settings.
 pub fn resolve(
+    home: &config::AgentHome,
     cli_provider: Option<&str>,
     cli_model: Option<&str>,
     cli_thinking: Option<ThinkingLevel>,
     cli_api_key: Option<&str>,
     cli_base_url: Option<&str>,
 ) -> Result<ResolvedModel, ResolveError> {
-    let settings = settings::load_settings().unwrap_or_default();
+    let settings = home.settings()?;
     resolve_with_settings(
+        home,
         cli_provider,
         cli_model,
         cli_thinking,
@@ -88,7 +96,9 @@ pub fn resolve(
 }
 
 /// Resolve using upstream's global -> trusted-project settings precedence.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_for_cwd(
+    home: &config::AgentHome,
     cli_provider: Option<&str>,
     cli_model: Option<&str>,
     cli_thinking: Option<ThinkingLevel>,
@@ -97,8 +107,9 @@ pub fn resolve_for_cwd(
     cwd: &std::path::Path,
     project_trusted: bool,
 ) -> Result<ResolvedModel, ResolveError> {
-    let settings = settings::load_effective_model_settings(cwd, project_trusted)?;
+    let settings = home.effective_model_settings(cwd, project_trusted)?;
     resolve_with_settings(
+        home,
         cli_provider,
         cli_model,
         cli_thinking,
@@ -108,7 +119,9 @@ pub fn resolve_for_cwd(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_with_settings(
+    home: &config::AgentHome,
     cli_provider: Option<&str>,
     cli_model: Option<&str>,
     cli_thinking: Option<ThinkingLevel>,
@@ -117,6 +130,7 @@ fn resolve_with_settings(
     settings: settings::Settings,
 ) -> Result<ResolvedModel, ResolveError> {
     resolve_with_factories(
+        home,
         cli_provider,
         cli_model,
         cli_thinking,
@@ -128,13 +142,15 @@ fn resolve_with_settings(
 }
 
 pub fn resolve_with_extensions(
+    home: &config::AgentHome,
     args: &crate::args::Args,
     cwd: &std::path::Path,
     trusted: bool,
     session: &rpi_extensions::ExtensionSession,
 ) -> Result<ResolvedModel, ResolveError> {
-    let settings = settings::load_effective_model_settings(cwd, trusted)?;
+    let settings = home.effective_model_settings(cwd, trusted)?;
     resolve_with_factories(
+        home,
         args.provider.as_deref(),
         args.model.as_deref(),
         args.thinking,
@@ -172,8 +188,8 @@ fn factories_from_session(session: &rpi_extensions::ExtensionSession) -> Runtime
     }
     factories
 }
-pub fn catalog_all() -> Result<Vec<Model>, config::ConfigError> {
-    catalog_with_manifests(&[])
+pub fn catalog_all(home: &config::AgentHome) -> Result<Vec<Model>, config::ConfigError> {
+    catalog_with_manifests(home, &[])
 }
 pub fn manifests_from_session(
     session: &rpi_extensions::ExtensionSession,
@@ -188,16 +204,18 @@ pub fn manifests_from_session(
 }
 
 pub fn catalog_with_manifests(
+    home: &config::AgentHome,
     manifests: &[rpi_extensions::ProviderManifest],
 ) -> Result<Vec<Model>, config::ConfigError> {
-    catalog_with_diagnostics(manifests).map(|(models, _)| models)
+    catalog_with_diagnostics(home, manifests).map(|(models, _)| models)
 }
 pub(crate) fn catalog_with_diagnostics(
+    home: &config::AgentHome,
     manifests: &[rpi_extensions::ProviderManifest],
 ) -> Result<(Vec<Model>, Vec<String>), config::ConfigError> {
     let declarations: Vec<_> = manifests.iter().map(declaration).collect();
     Ok(rpi_runtime::provider::catalog_with_diagnostics(
-        config::load_models_config()?,
+        home.models_config()?,
         &declarations,
         &CliValues,
     ))

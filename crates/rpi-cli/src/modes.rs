@@ -356,7 +356,7 @@ pub async fn rpc(
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
     message_updates: crate::args::RpcMessageUpdates,
 ) -> i32 {
-    rpc_with_durable(
+    rpc_with_durable_home(
         harness,
         agent_events.take(),
         model_catalog,
@@ -366,6 +366,7 @@ pub async fn rpc(
             extension_session: None,
             message_updates,
             native_durable: false,
+            home: crate::config::AgentHome::process(),
         },
     )
     .await
@@ -378,9 +379,11 @@ pub struct RpcOptions {
     pub extension_session: Option<crate::session::ExtensionSessionCell>,
     pub message_updates: crate::args::RpcMessageUpdates,
     pub native_durable: bool,
+    pub home: crate::config::AgentHome,
 }
 
-pub async fn rpc_with_durable(
+/// Use the session agent home for RPC configuration and resource commands.
+pub async fn rpc_with_durable_home(
     harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
@@ -391,6 +394,9 @@ pub async fn rpc_with_durable(
         agent_events.take(),
         model_catalog,
         options,
+        crate::rpc::execution::lifecycle_enabled(
+            std::env::var_os(crate::rpc::execution::LIFECYCLE_ENV).as_deref(),
+        ),
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
     )
@@ -516,7 +522,9 @@ where
             extension_session,
             message_updates,
             native_durable: false,
+            home: crate::config::AgentHome::process(),
         },
+        true,
         input,
         output,
     )
@@ -528,6 +536,7 @@ async fn rpc_with_native_durable_io<R, W>(
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
     options: RpcOptions,
+    correlated_execution: bool,
     mut input: R,
     output: W,
 ) -> i32
@@ -541,6 +550,7 @@ where
         extension_session,
         message_updates,
         native_durable,
+        home,
     } = options;
     let phase_diagnostics =
         std::env::var_os("RPI_RPC_DIAGNOSTICS").is_some_and(|value| value != "0");
@@ -590,39 +600,48 @@ where
 
     let commit_task = RetainedRpcTask::new(commit_task, pump_stop.clone());
 
-    // A completion response is queued only after its final events, so a
-    // subsequent prompt cannot overtake the previous run's agent_end.
-    let (event_flush_tx, mut event_flush_rx) =
-        tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
-    // Stream fine-grained AgentEvents as JSONL until the receiver closes.
-    let event_task = agent_events.take().map(|mut rx| {
+    // Preserve only the pre-observation backlog for existing callers. All live
+    // RPC events below come from the identity-bearing execution stream.
+    let mut startup_events = Vec::new();
+    if let Some(mut events) = agent_events.take() {
+        loop {
+            match events.try_recv() {
+                Ok(event) => startup_events.push(event),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    }
+    let (execution_observer, mut execution_events) =
+        rpi_harness::execution::ExecutionObserver::channel(256, writer_failed.clone());
+    let execution_observation =
+        crate::rpc::execution::Observation::new(harness, execution_observer.clone());
+    let events_ready = tokio_util::sync::CancellationToken::new();
+    let event_task = {
         let out = stdout.clone();
         let stop = pump_stop.clone();
+        let ready = events_ready.clone();
         tokio::spawn(async move {
+            tokio::select! {
+                _ = ready.cancelled() => {},
+                _ = stop.cancelled() => return,
+            }
             loop {
                 let received = tokio::select! {
                     _ = stop.cancelled() => {
-                        drain_rpc_events(&out, &mut rx).await;
+                        while let Ok(event) = execution_events.try_recv() {
+                            crate::rpc::execution::forward(&out, event, correlated_execution).await;
+                        }
                         break;
                     }
-                    Some(done) = event_flush_rx.recv() => {
-                        drain_rpc_events(&out, &mut rx).await;
-                        let _ = done.send(());
-                        continue;
-                    }
-                    event = rx.recv() => event,
+                    event = execution_events.recv() => event,
                 };
-                match received {
-                    Ok(event) => write_agent_event(&out, &event).await,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
+                let Some(event) = received else { break };
+                crate::rpc::execution::forward(&out, event, correlated_execution).await;
             }
         })
-    });
-
-    let event_task = event_task.map(|task| RetainedRpcTask::new(task, pump_stop.clone()));
-    let event_flush = event_task.as_ref().map(|_| event_flush_tx);
+    };
+    let event_task = RetainedRpcTask::new(event_task, pump_stop.clone());
 
     // Bridge the extension `UiDialog` mailbox over the rpc channel so a
     // permission-gate extension can ask the client a question mid-run: we emit
@@ -691,6 +710,14 @@ where
         }
     };
     let mut ready = rpc_protocol::ready(message_updates);
+    // Advertise active semantics, not merely support. Legacy clients must not
+    // receive autonomous settlements that can clear another request's admission.
+    if !correlated_execution {
+        ready["semantics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("executionLifecycle");
+    }
     ready["durable"] =
         crate::native_durable::experimental_epoch::capabilities_for(harness, native_durable);
     ready["resourceState"] = serde_json::json!({
@@ -720,6 +747,10 @@ where
         }
     }
     write_line(&stdout, &ready).await;
+    for event in startup_events {
+        write_agent_event(&stdout, &event).await;
+    }
+    events_ready.cancel();
     setup_timing.finish();
 
     loop {
@@ -1012,8 +1043,7 @@ where
                 let harness_task = harness.clone();
                 let out_task = stdout.clone();
                 let active_task = Arc::clone(&run_active);
-                let mailbox_task = ui_dialog.clone();
-                let flush_events = event_flush.clone();
+                let flush_events = execution_observer.clone();
                 let lifecycle_session = extension_session.clone();
                 let instructions = msg
                     .get("customInstructions")
@@ -1055,10 +1085,14 @@ where
                                 return;
                             }
                         };
+                        let execution_request =
+                            rpi_harness::execution::ExecutionRequest::new(id.clone());
+                        let pending_settlement =
+                            crate::rpc::execution::PendingSettlement::new(out_task.failure());
                         write_line(
                             &out_task,
                             &rpc_protocol::response(
-                                Some(id),
+                                Some(id.clone()),
                                 &kind,
                                 Ok(Some(serde_json::json!({"accepted": true}))),
                             ),
@@ -1081,13 +1115,14 @@ where
                                     );
                                 }
                             }
-                            let result = rpc_compact_cancellable(
-                                &harness_task,
-                                &lane_task,
-                                instructions,
-                                cancel_task,
-                            )
-                            .await;
+                            let result = execution_request
+                                .scope(rpc_compact_cancellable(
+                                    &harness_task,
+                                    &lane_task,
+                                    instructions,
+                                    cancel_task,
+                                ))
+                                .await;
                             if result
                                 .as_ref()
                                 .ok()
@@ -1112,19 +1147,26 @@ where
                             }
                             result
                         } else if resume {
-                            rpc_resume_cancellable(&harness_task, &lane_task, cancel_task).await
+                            execution_request
+                                .scope(rpc_resume_cancellable(
+                                    &harness_task,
+                                    &lane_task,
+                                    cancel_task,
+                                ))
+                                .await
                         } else {
-                            rpc_prompt_cancellable(&harness_task, &lane_task, content, cancel_task)
+                            execution_request
+                                .scope(rpc_prompt_cancellable(
+                                    &harness_task,
+                                    &lane_task,
+                                    content,
+                                    cancel_task,
+                                ))
                                 .await
                         };
                         execute_timing.finish();
                         let flush_timing = RpcPhaseTiming::start(phase_diagnostics, "event_flush");
-                        if let Some(flush) = flush_events {
-                            let (done, drained) = tokio::sync::oneshot::channel();
-                            if flush.send(done).is_ok() {
-                                let _ = drained.await;
-                            }
-                        }
+                        flush_events.flush().await;
                         flush_timing.finish();
                         let (outcome, aborted, error) = match &result {
                             Ok(value) => {
@@ -1157,6 +1199,10 @@ where
                             .cloned();
                         let settled = serde_json::json!({
                             "type": "agent_settled",
+                            "requestId": id,
+                            "executionId": execution_request.last_execution().map(|e| e.execution_id),
+                            "lane": "main",
+                            "finalText": result.as_ref().ok().and_then(|value| value.get("finalText")),
                             "runId": result.as_ref().ok().and_then(|value| value.get("runId")),
                             "outcome": outcome,
                             "aborted": aborted,
@@ -1177,7 +1223,9 @@ where
                         // it: the independent writer can expose an enqueued event
                         // immediately. The dispatcher still joins this retained task
                         // before starting its successor, preserving output ordering.
-                        mailbox_task.cancel_all();
+                        // Tool/dialog owners close their own requests. A global
+                        // cancel_all here could cancel an autonomous successor's
+                        // question after this operation released its lease.
                         active_task.store(false, std::sync::atomic::Ordering::Release);
                         #[cfg(test)]
                         if let Some(finished) = &_finished {
@@ -1187,6 +1235,7 @@ where
                             RpcPhaseTiming::start(phase_diagnostics, "settled_enqueue");
                         write_line(&out_task, &settled).await;
                         enqueue_timing.finish();
+                        pending_settlement.complete();
                     }),
                     run_cancel.clone(),
                 ));
@@ -1295,14 +1344,18 @@ where
             "clear_queue" => rpc_clear_queue(&lane).await,
             "navigate" => rpc_navigate(&lane, &msg, extension_session.as_ref()).await,
             "get_available_models" => Ok(rpc_get_available_models(&model_catalog)),
-            "get_auth_status" => Ok(rpc_get_auth_status(&model_catalog, oauth_snapshot.as_ref())),
+            "get_auth_status" => Ok(rpc_get_auth_status(
+                &model_catalog,
+                oauth_snapshot.as_ref(),
+                &home,
+            )),
             "get_provider_models" => rpc_get_provider_models(&msg).await,
             "test_provider_config" => rpc_test_provider_config(&msg).await,
-            "oauth" => rpc_oauth(&oauth_snapshot, &msg),
-            "set_api_key" => rpc_set_api_key(&msg).await,
-            "set_provider_config" => rpc_set_provider_config(&msg),
-            "update_provider_config" => rpc_update_provider_config(&msg),
-            "delete_provider_config" => rpc_delete_provider_config(&msg),
+            "oauth" => rpc_oauth(&oauth_snapshot, &msg, &home),
+            "set_api_key" => rpc_set_api_key(&msg, &home).await,
+            "set_provider_config" => rpc_set_provider_config(&msg, &home),
+            "update_provider_config" => rpc_update_provider_config(&msg, &home),
+            "delete_provider_config" => rpc_delete_provider_config(&msg, &home),
             "set_model" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
                 Err("cannot set model while a run or prompt validation is active".into())
             }
@@ -1371,9 +1424,9 @@ where
         exit_code = 1;
     }
     let _ = dialog_task.await;
-    if let Some(task) = event_task {
-        let _ = task.await;
-    }
+    drop(execution_observation);
+    drop(execution_observer);
+    let _ = event_task.await;
     // All producers have joined; close the queue and flush every queued line.
     drop(stdout);
     match writer_task.await {
@@ -1522,6 +1575,7 @@ fn rpc_execute_command(
     .unwrap_or_else(|_| Err(format!("command panicked: {name}")))
 }
 
+#[cfg(test)]
 async fn drain_rpc_events(
     out: &RpcWriter,
     events: &mut tokio::sync::broadcast::Receiver<AgentEvent>,
@@ -1707,7 +1761,7 @@ async fn rpc_compact_cancellable(
 
 /// Reduce a compaction result to what a client needs: the verdict, and a line
 /// a transcript can print.
-fn compaction_json(result: &CompactionResult) -> serde_json::Value {
+pub(crate) fn compaction_json(result: &CompactionResult) -> serde_json::Value {
     let mut value = match &result.outcome {
         CompactionOutcome::Completed { leaf_id, entry } => {
             let (tokens_before, retained) = match entry {
@@ -1778,7 +1832,9 @@ async fn rpc_resume_cancellable(
         .map(|(value, _)| value)
 }
 
-fn rpc_outcome_str(outcome: &HarnessRunOutcome) -> (&'static str, Option<String>, Option<String>) {
+pub(crate) fn rpc_outcome_str(
+    outcome: &HarnessRunOutcome,
+) -> (&'static str, Option<String>, Option<String>) {
     match outcome {
         HarnessRunOutcome::Completed { final_message, .. } => {
             ("completed", Some(assistant_text(final_message)), None)
@@ -2668,11 +2724,14 @@ fn rpc_project_transcript(
     Ok(items)
 }
 
-fn rpc_auth_provider_ids(model_catalog: &[rpi_ai::Model]) -> std::collections::BTreeSet<String> {
+fn rpc_auth_provider_ids(
+    model_catalog: &[rpi_ai::Model],
+    home: &crate::config::AgentHome,
+) -> std::collections::BTreeSet<String> {
     let mut providers =
         std::collections::BTreeSet::from(["anthropic".to_string(), "openai".to_string()]);
     providers.extend(model_catalog.iter().map(|model| model.provider.clone()));
-    if let Ok(models) = crate::config::load_models_config() {
+    if let Ok(models) = home.models_config() {
         providers.extend(models.providers.keys().cloned());
     }
     providers
@@ -2681,9 +2740,10 @@ fn rpc_auth_provider_ids(model_catalog: &[rpi_ai::Model]) -> std::collections::B
 fn rpc_get_auth_status(
     model_catalog: &[rpi_ai::Model],
     oauth_snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
+    home: &crate::config::AgentHome,
 ) -> serde_json::Value {
-    let store = crate::config::read_auth().unwrap_or_default();
-    let models = crate::config::load_models_config().unwrap_or_default();
+    let store = home.read_auth().unwrap_or_default();
+    let models = home.models_config().unwrap_or_default();
     let manifests = oauth_snapshot.map_or_else(Vec::new, |snapshot| {
         snapshot
             .providers()
@@ -2692,7 +2752,7 @@ fn rpc_get_auth_status(
             .collect()
     });
     let auth_states = crate::credentials::statuses(&models, &store, &manifests);
-    let providers = rpc_auth_provider_ids(model_catalog)
+    let providers = rpc_auth_provider_ids(model_catalog, home)
         .into_iter()
         .map(|provider| {
             let credential = store.get(&provider);
@@ -2721,6 +2781,7 @@ fn rpc_get_auth_status(
 fn rpc_oauth(
     snapshot: &Option<Arc<rpi_extensions::RegistrySnapshot>>,
     msg: &serde_json::Value,
+    home: &crate::config::AgentHome,
 ) -> Result<serde_json::Value, String> {
     let snapshot = snapshot
         .as_ref()
@@ -2751,7 +2812,7 @@ fn rpc_oauth(
                 .credential()
                 .map_err(|_| "OAuth provider returned an invalid credential".to_string())?
                 .ok_or_else(|| "OAuth provider returned no credential".to_string())?;
-            crate::config::upsert_oauth_token(
+            home.upsert_oauth_token(
                 provider,
                 credential.access,
                 credential.refresh,
@@ -2833,7 +2894,10 @@ async fn rpc_test_provider_config(msg: &serde_json::Value) -> Result<serde_json:
     serde_json::to_value(result).map_err(|error| error.to_string())
 }
 
-fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+fn rpc_set_provider_config(
+    msg: &serde_json::Value,
+    home: &crate::config::AgentHome,
+) -> Result<serde_json::Value, String> {
     let required = |name: &str| {
         msg.get(name)
             .and_then(serde_json::Value::as_str)
@@ -2860,7 +2924,7 @@ fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value,
     let supports_images = msg
         .get("supportsImages")
         .and_then(serde_json::Value::as_bool);
-    crate::config::add_provider(
+    home.add_provider(
         provider,
         api,
         base_url,
@@ -2881,7 +2945,10 @@ fn rpc_set_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value,
     }))
 }
 
-fn rpc_update_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+fn rpc_update_provider_config(
+    msg: &serde_json::Value,
+    home: &crate::config::AgentHome,
+) -> Result<serde_json::Value, String> {
     let required = |name: &str| {
         msg.get(name)
             .and_then(serde_json::Value::as_str)
@@ -2901,7 +2968,7 @@ fn rpc_update_provider_config(msg: &serde_json::Value) -> Result<serde_json::Val
     let api = required("api")?;
     let base_url = required("baseUrl")?;
     let model_id = required("modelId")?;
-    crate::config::update_provider(
+    home.update_provider(
         provider,
         api,
         base_url,
@@ -2923,21 +2990,27 @@ fn rpc_update_provider_config(msg: &serde_json::Value) -> Result<serde_json::Val
     }))
 }
 
-fn rpc_delete_provider_config(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+fn rpc_delete_provider_config(
+    msg: &serde_json::Value,
+    home: &crate::config::AgentHome,
+) -> Result<serde_json::Value, String> {
     let provider = msg
         .get("provider")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "delete_provider_config requires provider".to_string())?;
-    crate::config::delete_provider(provider)?;
+    home.delete_provider(provider)?;
     Ok(serde_json::json!({
         "provider": provider,
         "requiresRestart": true,
     }))
 }
 
-async fn rpc_set_api_key(msg: &serde_json::Value) -> Result<serde_json::Value, String> {
+async fn rpc_set_api_key(
+    msg: &serde_json::Value,
+    home: &crate::config::AgentHome,
+) -> Result<serde_json::Value, String> {
     let provider = msg
         .get("provider")
         .and_then(serde_json::Value::as_str)
@@ -2950,7 +3023,7 @@ async fn rpc_set_api_key(msg: &serde_json::Value) -> Result<serde_json::Value, S
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "set_api_key requires a non-empty apiKey".to_string())?;
-    crate::config::upsert_credential(
+    home.upsert_credential(
         provider,
         crate::config::Credential::ApiKey {
             key: Some(api_key.to_string()),
@@ -4032,7 +4105,7 @@ mod tests {
         std::fs::write(directory.path().join("auth.json"), serde_json::json!({
             "expired-account": {"type":"oauth", "access":"expired-secret", "refresh":"refresh-secret", "expires":1}
         }).to_string()).unwrap();
-        let status = rpc_get_auth_status(&[], None);
+        let status = rpc_get_auth_status(&[], None, &crate::config::AgentHome::process());
         let providers = status["providers"].as_array().unwrap();
         let header = providers
             .iter()
@@ -4048,6 +4121,70 @@ mod tests {
         assert_eq!(expired["ready"], false);
         assert_eq!(expired["status"], "expired");
         assert!(!status.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn rpc_auth_writes_and_status_read_the_explicit_agent_home() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        struct RestoreConfig(Option<std::ffi::OsString>);
+        impl Drop for RestoreConfig {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+        let _restore = RestoreConfig(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let process_home = tempfile::tempdir().unwrap();
+        let session_home = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, process_home.path());
+        std::fs::write(process_home.path().join("models.json"), serde_json::json!({
+            "providers": {
+                "alpha": {"api":"anthropic-messages","apiKey":"key-alpha","models":[{"id":"alpha-model"}]}
+            }
+        }).to_string()).unwrap();
+
+        let session_home_value =
+            crate::config::AgentHome::from_option(Some(session_home.path().to_path_buf()));
+        let reply = rpc_set_api_key(
+            &serde_json::json!({"provider": "beta", "apiKey": "TENANT-B-SECRET"}),
+            &session_home_value,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["ready"], true);
+
+        // The secret lands in the selected home, never in the process home
+        // inherited from RPI_CODING_AGENT_DIR.
+        let session_auth = std::fs::read_to_string(session_home.path().join("auth.json")).unwrap();
+        assert!(session_auth.contains("TENANT-B-SECRET"));
+        assert!(!process_home.path().join("auth.json").exists());
+
+        // A provider catalog that lives only in the selected home is visible;
+        // the process home's catalog is not.
+        std::fs::write(
+            session_home.path().join("models.json"),
+            serde_json::json!({
+                "providers": {
+                    "beta": {"api":"anthropic-messages","models":[{"id":"beta-model"}]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let status = rpc_get_auth_status(&[], None, &session_home_value);
+        let providers = status["providers"].as_array().unwrap();
+        let beta = providers
+            .iter()
+            .find(|row| row["provider"] == "beta")
+            .unwrap();
+        assert_eq!(beta["ready"], true);
+        assert_eq!(beta["source"], "auth.json");
+        // A provider that exists only in the process home must not leak into
+        // the session home's status.
+        assert!(providers.iter().all(|row| row["provider"] != "alpha"));
+        assert!(!status.to_string().contains("TENANT-B-SECRET"));
     }
 
     #[test]
@@ -4154,18 +4291,36 @@ mod tests {
         RpcOutput,
         tokio::task::JoinHandle<i32>,
     ) {
+        start_test_rpc_with_execution(harness, ui, extension_session, true)
+    }
+
+    pub(super) fn start_test_rpc_with_execution(
+        harness: AgentHarness,
+        ui: rpi_extensions::UiDialogMailbox,
+        extension_session: Option<crate::session::ExtensionSessionCell>,
+        correlated_execution: bool,
+    ) -> (
+        tokio::io::DuplexStream,
+        RpcOutput,
+        tokio::task::JoinHandle<i32>,
+    ) {
         let (client, input) = tokio::io::duplex(4096);
         let output = RpcOutput::default();
         let captured = output.clone();
         let task = tokio::spawn(async move {
-            rpc_with_io_and_lifecycle(
+            rpc_with_native_durable_io(
                 &harness,
                 None,
                 vec![],
-                ui,
-                None,
-                extension_session,
-                crate::args::RpcMessageUpdates::default(),
+                RpcOptions {
+                    ui_dialog: ui,
+                    oauth_snapshot: None,
+                    extension_session,
+                    message_updates: crate::args::RpcMessageUpdates::default(),
+                    native_durable: false,
+                    home: crate::config::AgentHome::process(),
+                },
+                correlated_execution,
                 tokio::io::BufReader::new(input),
                 captured,
             )
