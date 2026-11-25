@@ -307,8 +307,16 @@ pub enum SessionSelection {
     /// `--session-id <id>`: use the EXACT session id, creating it if missing.
     ByExactId { id: String, dir: PathBuf },
     /// `--fork <path|id>`: fork the given session into a new one and start in
-    /// the fork.
-    Fork { source: String, dir: PathBuf },
+    /// the fork. `entry_id` optionally cuts the new branch at a message;
+    /// `position` says whether that message stays (`at`) or is dropped
+    /// (`before`). `None` keeps the harness default for an explicit entry
+    /// (`before`).
+    Fork {
+        source: String,
+        dir: PathBuf,
+        entry_id: Option<String>,
+        position: Option<rpi_harness::session::types::ForkPosition>,
+    },
 }
 
 /// Decide the session selection from parsed args + the resolved cwd.
@@ -377,6 +385,8 @@ pub(crate) fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelecti
         return SessionSelection::Fork {
             source: s.clone(),
             dir,
+            entry_id: args.fork_entry.clone(),
+            position: args.fork_position,
         };
     }
     if let Some(s) = &args.session_id {
@@ -499,7 +509,7 @@ fn preflight_extension_startup_with_restore(
                         let restore_target = StartupSpan::start(Phase::RestoreTarget);
                         let cwd_str = cwd.to_string_lossy();
                         let target = match &selection {
-                            SessionSelection::Fork { source, dir } => {
+                            SessionSelection::Fork { source, dir, .. } => {
                                 match session_metadata_at(Path::new(source)) {
                                     Some(meta) => Some(meta),
                                     None => find_session_metadata(source, &cwd_str, dir).await?,
@@ -577,9 +587,15 @@ fn preflight_extension_startup_with_restore(
                         binding_validate.finish();
                         Ok((
                             match selection {
-                                SessionSelection::Fork { .. } => SessionSelection::Fork {
+                                SessionSelection::Fork {
+                                    entry_id,
+                                    position,
+                                    ..
+                                } => SessionSelection::Fork {
                                     source: meta.path,
                                     dir,
+                                    entry_id: entry_id.clone(),
+                                    position,
                                 },
                                 _ => SessionSelection::ByExactId { id: meta.id, dir },
                             },
@@ -3400,8 +3416,13 @@ async fn build_session(
         | SessionSelection::ByExactId { .. } => {
             restore_session(selection, cwd, prepared_restore).await
         }
-        SessionSelection::Fork { source, dir } => {
-            fork_session_at_launch(source, dir, cwd, selected).await
+        SessionSelection::Fork {
+            source,
+            dir,
+            entry_id,
+            position,
+        } => {
+            fork_session_at_launch(source, dir, cwd, selected, entry_id.as_deref(), *position).await
         }
     }
 }
@@ -3579,6 +3600,8 @@ async fn fork_session_at_launch(
     dir: &Path,
     cwd: &str,
     selected: Option<&crate::resource_selection::ResolvedSelection>,
+    entry_id: Option<&str>,
+    position: Option<rpi_harness::session::types::ForkPosition>,
 ) -> Result<Session, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
@@ -3625,7 +3648,10 @@ async fn fork_session_at_launch(
                 cwd: cwd.to_string(),
                 metadata: None,
             },
-            &ForkOptions::default(),
+            &ForkOptions::Branch {
+                entry_id: entry_id.map(str::to_owned),
+                position,
+            },
             |values| crate::resource_selection::fork_initial_values_for_selection(values, selected),
         )
         .await
@@ -6682,6 +6708,58 @@ mod tests {
             select_session(&args, cwd),
             SessionSelection::ById { id, .. } if id == "01a02ece"
         ));
+    }
+
+    /// The cut flags have to survive selection: `select_session_in_dir` is the
+    /// only place that copies them off `Args`, so a dropped field here would
+    /// make `--fork-entry` silently fork at the lane leaf again.
+    #[test]
+    fn select_fork_carries_the_cut_flags() {
+        use rpi_harness::session::types::ForkPosition;
+
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
+        let cwd = Path::new("/tmp");
+
+        // No cut: both stay absent so the build uses the harness defaults.
+        let args = Args {
+            fork: Some("parent".into()),
+            ..Args::default()
+        };
+        match select_session(&args, cwd) {
+            SessionSelection::Fork {
+                source,
+                entry_id,
+                position,
+                ..
+            } => {
+                assert_eq!(source, "parent");
+                assert_eq!(entry_id, None);
+                assert_eq!(position, None);
+            }
+            other => panic!("expected Fork, got {other:?}"),
+        }
+
+        for (flag, expected) in [
+            (None, None),
+            (Some(ForkPosition::At), Some(ForkPosition::At)),
+            (Some(ForkPosition::Before), Some(ForkPosition::Before)),
+        ] {
+            let args = Args {
+                fork: Some("parent".into()),
+                fork_entry: Some("message-2".into()),
+                fork_position: flag,
+                ..Args::default()
+            };
+            match select_session(&args, cwd) {
+                SessionSelection::Fork {
+                    entry_id, position, ..
+                } => {
+                    assert_eq!(entry_id.as_deref(), Some("message-2"));
+                    assert_eq!(position, expected, "{flag:?}");
+                }
+                other => panic!("expected Fork, got {other:?}"),
+            }
+        }
     }
 
     #[test]
