@@ -479,12 +479,23 @@ rules, which are load-bearing rather than stylistic.
 rpi --host          # Start or join the configured default area
 rpi --host default  # Explicitly select the area named default
 rpi --host work     # Start or join the area named work
+rpi --host --mini "explain this error"       # Run Mini in the configured default area
+rpi --mini --host=work "explain this error"  # Run Mini in the named area
 ```
 
 Each area has one local Host process per agent home. Each terminal opens its
 own AgentLoop and session with its own history, working directory and run
 controls. The TUI shows the area, Host PID, Session ID and Agent ID. The Host
 stays available after TUI exit.
+
+`--mini` runs once in the selected Host and prints the final response on the
+client's stdout. It accepts piped input and `@file` attachments, uses one
+`maxAgents` slot until the run settles, and creates no session journal. Explicit
+provider and model flags take precedence over area defaults. Use `--tools` to
+enable built-in tools in Mini. The local request and reply frames each have a
+4 MiB limit, including JSON encoding.
+If the area's running Host predates Mini support, restart it with the updated
+binary before using the combined flags.
 
 The area named `default` uses the ordinary session store. Other areas keep
 session files under `<agent-home>/local-host-v1/area-<name>/sessions`. Areas

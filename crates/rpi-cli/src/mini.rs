@@ -14,7 +14,7 @@ use rpi_ai::types::{Content, ImageContent, StopReason, UserContent, UserMessage}
 use rpi_tools::{ExecutionToolContext, OsExecutionEnv};
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{print_resolve_error, EXIT_RUNTIME, EXIT_USAGE};
+use crate::app::{resolve_error_message, EXIT_RUNTIME, EXIT_USAGE};
 use crate::args::Args;
 use crate::config::AgentHome;
 use crate::provider::ResolveError;
@@ -27,40 +27,76 @@ impl AgentEmitter for DiscardEvents {
     }
 }
 
-pub(crate) async fn run(
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Input {
+    pub prompts: Vec<String>,
+    pub images: Vec<ImageContent>,
+}
+
+pub(crate) fn print_text(text: String) {
+    if text.ends_with('\n') {
+        print!("{text}");
+    } else {
+        println!("{text}");
+    }
+}
+
+pub(crate) async fn run(args: &Args, cwd: &Path, input: Input) -> i32 {
+    match execute(
+        &AgentHome::process(),
+        args,
+        cwd,
+        input,
+        CancellationToken::new(),
+        |message| eprintln!("{message}"),
+    )
+    .await
+    {
+        Ok(Some(text)) => {
+            print_text(text);
+            0
+        }
+        Ok(None) => 0,
+        Err(code) => code,
+    }
+}
+
+pub(crate) async fn execute(
+    home: &AgentHome,
     args: &Args,
     cwd: &Path,
-    prompts: impl Iterator<Item = String>,
-    images: Vec<ImageContent>,
-) -> i32 {
-    let mut prompts = prompts.peekable();
+    input: Input,
+    signal: CancellationToken,
+    mut report: impl FnMut(String),
+) -> Result<Option<String>, i32> {
+    let mut prompts = input.prompts.into_iter().peekable();
     if prompts.peek().is_none() {
-        return 0;
+        return Ok(None);
     }
 
-    let home = AgentHome::process();
     let (provider, model, thinking_level) = {
         let resolved = match crate::provider::resolve_for_cwd(
-            &home,
+            home,
             args.provider.as_deref(),
             args.model.as_deref(),
             args.thinking,
             args.api_key.as_deref(),
             args.base_url.as_deref(),
             cwd,
-            crate::session::resolve_project_trust_for(&home, args, cwd),
+            crate::session::resolve_project_trust_for(home, args, cwd),
         ) {
             Ok(resolved) => resolved,
             Err(error) => {
-                print_resolve_error(&error);
-                return match error {
+                report(resolve_error_message(&error));
+                return Err(match error {
                     ResolveError::NoApiKey { .. } | ResolveError::Config(_) => EXIT_USAGE,
                     _ => EXIT_RUNTIME,
-                };
+                });
             }
         };
         for warning in &resolved.compat_warnings {
-            eprintln!("warning: models.json: {warning}");
+            report(format!("warning: models.json: {warning}"));
         }
         (resolved.provider, resolved.model, resolved.thinking_level)
     };
@@ -71,7 +107,7 @@ pub(crate) async fn run(
     {
         let env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
         let context = ExecutionToolContext::new(env.clone(), Some(env));
-        crate::session::build_tools_bound(&home, &context, args, None)
+        crate::session::build_tools_bound(home, &context, args, None)
             .into_iter()
             .map(|tool| tool.tool)
             .collect::<Vec<_>>()
@@ -99,7 +135,7 @@ pub(crate) async fn run(
         system_prompt.push_str(file_text.as_deref().unwrap_or(extra));
     }
     if args.debug_system_prompt {
-        eprintln!("{system_prompt}");
+        report(system_prompt.clone());
     }
 
     let settings = home.settings().unwrap_or_default();
@@ -131,7 +167,7 @@ pub(crate) async fn run(
         max_retry_delay: None,
         cache_retention: Default::default(),
         session_id: None,
-        signal: CancellationToken::new(),
+        signal,
     };
     let stream = rpi_agent::stream_fn(move |model, context, options| {
         let mut options = options.clone();
@@ -147,7 +183,7 @@ pub(crate) async fn run(
         tools,
         messages: Vec::new(),
     };
-    let mut images = images;
+    let mut images = input.images;
     while let Some(prompt) = prompts.next() {
         let content = if images.is_empty() {
             UserContent::Text(prompt)
@@ -180,8 +216,8 @@ pub(crate) async fn run(
         {
             Ok(messages) => messages,
             Err(error) => {
-                eprintln!("run failed: {error}");
-                return EXIT_RUNTIME;
+                report(format!("run failed: {error}"));
+                return Err(EXIT_RUNTIME);
             }
         };
         let Some(reply) = new_messages
@@ -189,36 +225,29 @@ pub(crate) async fn run(
             .rev()
             .find_map(AgentMessage::as_assistant)
         else {
-            eprintln!("run finished without an assistant message");
-            return EXIT_RUNTIME;
+            report("run finished without an assistant message".into());
+            return Err(EXIT_RUNTIME);
         };
         match reply.stop_reason {
             StopReason::Error | StopReason::Aborted => {
-                eprintln!(
-                    "{}",
+                report(
                     reply
                         .error_message
-                        .as_deref()
-                        .unwrap_or(reply.stop_reason.as_str())
+                        .clone()
+                        .unwrap_or_else(|| reply.stop_reason.as_str().into()),
                 );
-                return EXIT_RUNTIME;
+                return Err(EXIT_RUNTIME);
             }
             StopReason::Deferred => {
-                eprintln!("deferred responses require a session");
-                return EXIT_RUNTIME;
+                report("deferred responses require a session".into());
+                return Err(EXIT_RUNTIME);
             }
             _ => {}
         }
         if is_last {
-            let text = crate::modes::assistant_text(reply);
-            if text.ends_with('\n') {
-                print!("{text}");
-            } else {
-                println!("{text}");
-            }
-            return 0;
+            return Ok(Some(crate::modes::assistant_text(reply)));
         }
         context.messages.extend(new_messages);
     }
-    0
+    Ok(None)
 }

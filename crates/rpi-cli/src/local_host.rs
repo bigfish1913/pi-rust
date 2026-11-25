@@ -1,4 +1,4 @@
-//! One local process per area serves a new native AgentHarness on each TUI connection.
+//! One local process per area serves TUI sessions and one-shot Mini runs.
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
@@ -11,19 +11,21 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{sleep, timeout, Instant};
+use tokio_util::sync::CancellationToken;
 
+use crate::app::{EXIT_RUNTIME, EXIT_USAGE};
 use crate::args::{Args, Mode};
 use crate::config::AgentHome;
 use crate::remote::protocol::RemoteCommand;
 use crate::session_driver::{DriverCommand, DriverEvent, RemoteEventMapper, SessionDriver};
 
-const DAEMON_COMMAND: &str = "__rpi_local_host";
+pub(crate) const DAEMON_COMMAND: &str = "__rpi_local_host";
 const DEFAULT_AREA: &str = "default";
 const VERSION: u32 = 1;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -33,7 +35,6 @@ const DEFAULT_MAX_AGENTS: usize = 32;
 // Leave at least half of the default 512-worker pool for other work.
 const MAX_CONFIGURED_AGENTS: usize = 256;
 const MAX_CAPACITY_REJECTIONS: usize = 8;
-const HELP: &str = "Usage: rpi --host [area]\n\nOpen a new TUI session in the area's local rpi process, starting it if needed.\nSet defaultArea in the agent home's host.json to override 'default'.";
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -119,6 +120,77 @@ impl HostConfig {
 struct OpenSession {
     version: u32,
     workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mini: Option<Box<MiniRequest>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MiniRequest {
+    input: crate::mini::Input,
+    provider: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    thinking: Option<rpi_ai::ThinkingLevel>,
+    timeout: Option<Duration>,
+    stream_idle_timeout: Option<Duration>,
+    trust_override: Option<bool>,
+    tools: Option<Vec<String>>,
+    exclude_tools: Option<Vec<String>>,
+    no_tools: bool,
+    no_builtin_tools: bool,
+    system_prompt: Option<String>,
+    append_system_prompt: Vec<String>,
+    debug_system_prompt: bool,
+}
+
+impl MiniRequest {
+    fn new(args: Args, input: crate::mini::Input) -> Self {
+        Self {
+            input,
+            provider: args.provider,
+            model: args.model,
+            api_key: args.api_key,
+            base_url: args.base_url,
+            thinking: args.thinking,
+            timeout: args.timeout,
+            stream_idle_timeout: args.stream_idle_timeout,
+            trust_override: args.trust_override,
+            tools: args.tools,
+            exclude_tools: args.exclude_tools,
+            no_tools: args.no_tools,
+            no_builtin_tools: args.no_builtin_tools,
+            system_prompt: args.system_prompt,
+            append_system_prompt: args.append_system_prompt,
+            debug_system_prompt: args.debug_system_prompt,
+        }
+    }
+
+    fn into_run(self, area: Args) -> (Args, crate::mini::Input) {
+        let args = Args {
+            mini: true,
+            no_session: true,
+            no_extensions: true,
+            provider: self.provider.or(area.provider),
+            model: self.model.or(area.model),
+            api_key: self.api_key,
+            base_url: self.base_url,
+            thinking: self.thinking,
+            timeout: self.timeout,
+            stream_idle_timeout: self.stream_idle_timeout,
+            trust_override: self.trust_override,
+            tools: self.tools,
+            exclude_tools: self.exclude_tools,
+            no_tools: self.no_tools,
+            no_builtin_tools: self.no_builtin_tools,
+            system_prompt: self.system_prompt,
+            append_system_prompt: self.append_system_prompt,
+            debug_system_prompt: self.debug_system_prompt,
+            ..Args::default()
+        };
+        (args, self.input)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,52 +201,77 @@ enum OpenReply {
         agent_id: String,
         session_id: String,
     },
+    MiniFinished {
+        exit_code: i32,
+        text: Option<String>,
+        diagnostics: Vec<String>,
+    },
     Error {
         message: String,
     },
 }
 
-pub(crate) async fn run(args: &[String]) -> i32 {
-    let result = match args {
-        [command, flag] if command == "--host" && matches!(flag.as_str(), "--help" | "-h") => {
-            println!("{HELP}");
-            return 0;
-        }
-        [command, rest @ ..]
-            if matches!(command.as_str(), "--host" | DAEMON_COMMAND) && rest.len() <= 1 =>
-        {
-            let requested = rest.first().map(String::as_str);
-            if requested.is_some_and(|area| !valid_area(area)) {
-                eprintln!("error: Host area must start with a lowercase ASCII letter or digit and contain 1–32 lowercase ASCII letters, digits, hyphens or underscores");
-                return crate::app::EXIT_USAGE;
-            }
-            enter(command == DAEMON_COMMAND, requested).await
-        }
-        _ => {
-            eprintln!("{HELP}");
-            return crate::app::EXIT_USAGE;
-        }
+pub(crate) async fn run(mut args: Args) -> i32 {
+    let requested = args.host.take().filter(|area| !area.is_empty());
+    if !check_area(requested.as_deref()) {
+        return EXIT_USAGE;
+    }
+    let home = AgentHome::process();
+    let config = match HostConfig::load(&home) {
+        Ok(config) => config,
+        Err(message) => return exit_code(Err(message)),
     };
+    let area = resolve_area(requested.as_deref(), &config);
+    if args.mini {
+        exit_code(run_mini_client(&home, area, args).await)
+    } else {
+        exit_code(run_client(&home, area).await.map(|()| 0))
+    }
+}
+
+pub(crate) async fn run_daemon_command(args: &[String]) -> i32 {
+    if args.len() > 1 {
+        return EXIT_USAGE;
+    }
+    let requested = args.first().map(String::as_str);
+    if !check_area(requested) {
+        return EXIT_USAGE;
+    }
+    let home = AgentHome::process();
+    let config = match HostConfig::load(&home) {
+        Ok(config) => config,
+        Err(message) => return exit_code(Err(message)),
+    };
+    let area = resolve_area(requested, &config);
+    exit_code(
+        run_daemon(&home, area, config.areas.get(area))
+            .await
+            .map(|()| 0),
+    )
+}
+
+fn exit_code(result: Result<i32, String>) -> i32 {
     match result {
-        Ok(()) => 0,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error}");
-            crate::app::EXIT_RUNTIME
+            EXIT_RUNTIME
         }
     }
 }
 
-async fn enter(daemon: bool, requested: Option<&str>) -> Result<(), String> {
-    let home = AgentHome::process();
-    let config = HostConfig::load(&home)?;
-    let area = requested
-        .or(config.default_area.as_deref())
-        .unwrap_or(DEFAULT_AREA);
-    if daemon {
-        run_daemon(&home, area, config.areas.get(area)).await
-    } else {
-        run_client(&home, area).await
+fn check_area(area: Option<&str>) -> bool {
+    if area.is_some_and(|area| !valid_area(area)) {
+        eprintln!("error: Host area must start with a lowercase ASCII letter or digit and contain 1–32 lowercase ASCII letters, digits, hyphens or underscores");
+        return false;
     }
+    true
+}
+
+fn resolve_area<'a>(requested: Option<&'a str>, config: &'a HostConfig) -> &'a str {
+    requested
+        .or(config.default_area.as_deref())
+        .unwrap_or(DEFAULT_AREA)
 }
 
 fn valid_area(area: &str) -> bool {
@@ -407,14 +504,45 @@ async fn serve_session(
         )
         .await;
     }
+    let workspace = validate_workspace(&open.workspace);
+    let cwd = match workspace {
+        Ok(cwd) => cwd,
+        Err(message) => return write_json(&mut output, &OpenReply::Error { message }).await,
+    };
+    if let Some(request) = open.mini {
+        let (args, request) = request.into_run(args);
+        let signal = CancellationToken::new();
+        let mut diagnostics = Vec::new();
+        let result = {
+            let run =
+                crate::mini::execute(&home, &args, &cwd, request, signal.clone(), |message| {
+                    diagnostics.push(message);
+                });
+            tokio::pin!(run);
+            tokio::select! {
+                _ = input.fill_buf() => {
+                    signal.cancel();
+                    let _ = run.await;
+                    return Ok(());
+                }
+                result = &mut run => result,
+            }
+        };
+        let (exit_code, text) = match result {
+            Ok(text) => (0, text),
+            Err(exit_code) => (exit_code, None),
+        };
+        return write_json(
+            &mut output,
+            &OpenReply::MiniFinished {
+                exit_code,
+                text,
+                diagnostics,
+            },
+        )
+        .await;
+    }
     let built = async {
-        let cwd = open
-            .workspace
-            .canonicalize()
-            .map_err(|error| error.to_string())?;
-        if !open.workspace.is_absolute() || !cwd.is_dir() {
-            return Err("local Host workspace must be an absolute directory".into());
-        }
         let trusted = crate::session::resolve_project_trust_for(&home, &args, &cwd);
         let resolved = crate::provider::resolve_for_cwd(
             &home,
@@ -460,6 +588,16 @@ async fn serve_session(
     Ok(())
 }
 
+fn validate_workspace(workspace: &Path) -> Result<PathBuf, String> {
+    let cwd = workspace
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !workspace.is_absolute() || !cwd.is_dir() {
+        return Err("local Host workspace must be an absolute directory".into());
+    }
+    Ok(cwd)
+}
+
 // The existing RPC writer calls this only on its blocking worker. The timeout
 // lets it fail the transport if a disconnected or stalled client cannot drain it.
 struct SocketWriter(OwnedWriteHalf);
@@ -500,6 +638,48 @@ async fn write_json(
         .map_err(|error| error.to_string())
 }
 
+async fn run_mini_client(home: &AgentHome, area: &str, mut args: Args) -> Result<i32, String> {
+    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    crate::app::emit_startup_warnings(&args);
+    let (file_text, images) = match crate::app::process_file_args(&args.file_args, &workspace) {
+        Ok(files) => files,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return Ok(EXIT_USAGE);
+        }
+    };
+    let input = crate::app::mini_input(&mut args, file_text, images);
+    if input.prompts.is_empty() {
+        return Ok(0);
+    }
+    let directory = host_directory(home, area)?;
+    let (input_stream, mut output) = connect(area, &directory).await?.into_split();
+    let mut input_stream = BufReader::new(input_stream);
+    write_json(
+        &mut output,
+        &OpenSession {
+            version: VERSION,
+            workspace,
+            mini: Some(Box::new(MiniRequest::new(args, input))),
+        },
+    )
+    .await?;
+    match read_json::<OpenReply>(&mut input_stream).await? {
+        Some(OpenReply::MiniFinished { exit_code, text, diagnostics }) => {
+            for message in diagnostics {
+                eprintln!("{message}");
+            }
+            if let Some(text) = text {
+                crate::mini::print_text(text);
+            }
+            Ok(exit_code)
+        }
+        Some(OpenReply::Error { message }) => Err(message),
+        Some(OpenReply::Opened { .. }) => Err("local Host returned a session for a Mini run".into()),
+        None => Err("local Host closed before returning a Mini result. Check that the area's running Host supports --mini".into()),
+    }
+}
+
 async fn run_client(home: &AgentHome, area: &str) -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("rpi --host requires a terminal".into());
@@ -513,6 +693,7 @@ async fn run_client(home: &AgentHome, area: &str) -> Result<(), String> {
         &OpenSession {
             version: VERSION,
             workspace,
+            mini: None,
         },
     )
     .await?;
@@ -526,6 +707,9 @@ async fn run_client(home: &AgentHome, area: &str) -> Result<(), String> {
             session_id,
         }) => (host_pid, agent_id, session_id),
         Some(OpenReply::Error { message }) => return Err(message),
+        Some(OpenReply::MiniFinished { .. }) => {
+            return Err("local Host returned a Mini result for a session".into())
+        }
         None => return Err("local Host closed before opening a session".into()),
     };
     let (tx, rx) = mpsc::unbounded_channel();

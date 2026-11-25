@@ -259,6 +259,87 @@ async fn complete(socket: &mut TcpStream) {
     socket.write_all(b"0\r\n\r\n").await.unwrap();
 }
 
+#[tokio::test]
+async fn mini_flags_run_in_the_same_host_and_use_its_capacity() {
+    timeout(Duration::from_secs(30), async {
+        let root = tempfile::Builder::new().prefix("rh-mini-").tempdir_in("/tmp").unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("project");
+        let sessions = root.path().join("sessions");
+        for dir in [&agent, &workspace, &sessions] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(workspace.join("context.txt"), "attached context").unwrap();
+        let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        write_fixture(&agent, provider.local_addr().unwrap());
+        std::fs::write(
+            agent.join("host.json"),
+            json!({"defaultArea":"work", "areas":{"work":{
+                "provider":"fixture", "model":"fixture", "tools":["read"], "maxAgents":2
+            }}}).to_string(),
+        ).unwrap();
+        // Mini must resolve through the running area's provider and model.
+        std::fs::write(agent.join("settings.json"), "{}").unwrap();
+        let mut daemon = spawn_daemon(root.path(), &agent, Some("work"), &sessions);
+        let socket = agent.join("local-host-v1/area-work/rpc.sock");
+        let spawn = |args: &[&str]| {
+            Command::new(env!("CARGO_BIN_EXE_rpi"))
+                .args(args)
+                .current_dir(&workspace)
+                .env("HOME", root.path())
+                .env("RPI_CODING_AGENT_DIR", &agent)
+                .env("RPI_OFFLINE", "1")
+                .env("NO_PROXY", "127.0.0.1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
+        let mut a = spawn(&["--host", "--mini", "@context.txt", "prompt-alpha"]);
+        a.stdin.take().unwrap().write_all(b"piped alpha ").await.unwrap();
+        let mut b = spawn(&["--mini", "--host=work", "--tools", "read", "prompt-beta"]);
+        drop(b.stdin.take());
+        let (mut first, _) = provider.accept().await.unwrap();
+        let (mut second, _) = provider.accept().await.unwrap();
+        let (first_body, second_body) = tokio::join!(provider_request(&mut first), provider_request(&mut second));
+        let (alpha, beta) = if first_body.contains("prompt-alpha") {
+            (first_body, second_body)
+        } else {
+            (second_body, first_body)
+        };
+        assert!(alpha.contains("prompt-alpha") && alpha.contains("piped alpha") && alpha.contains("attached context"), "{alpha}");
+        assert!(beta.contains("prompt-beta") && !beta.contains("prompt-alpha"), "{beta}");
+        let alpha = serde_json::from_str::<Value>(&alpha).unwrap();
+        let beta = serde_json::from_str::<Value>(&beta).unwrap();
+        assert!(alpha["tools"].is_null(), "{alpha}");
+        assert_eq!(beta["tools"][0]["function"]["name"], "read", "{beta}");
+        let (_, reply) = Client::handshake(&socket, &workspace).await;
+        assert_eq!(reply["type"], "error", "{reply}");
+        assert!(reply["message"].as_str().unwrap().contains("maxAgents: 2"), "{reply}");
+        let ((), ()) = tokio::join!(complete(&mut first), complete(&mut second));
+        let (a, b) = tokio::join!(a.wait_with_output(), b.wait_with_output());
+        for finished in [a.unwrap(), b.unwrap()] {
+            assert!(finished.status.success(), "{}", String::from_utf8_lossy(&finished.stderr));
+            assert_eq!(finished.stdout, format!("{}\n", "area response ".repeat(8)).into_bytes());
+        }
+        let mut cancelled = spawn(&["--host", "work", "--mini", "prompt-cancel"]);
+        drop(cancelled.stdin.take());
+        let (mut request, _) = provider.accept().await.unwrap();
+        assert!(provider_request(&mut request).await.contains("prompt-cancel"));
+        request.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        cancelled.kill().await.unwrap();
+        assert_eq!(request.read(&mut [0]).await.unwrap(), 0, "provider stream should close on cancellation");
+        assert!(journals(&sessions).is_empty());
+        assert!(!agent.join("local-host-v1/area-work/sessions").exists());
+        let (session, opened) = Client::open(&socket, &workspace).await;
+        assert_eq!(opened["host_pid"].as_u64(), daemon.id().map(u64::from));
+        drop(session);
+        daemon.kill().await.unwrap();
+    }).await.expect("Host Mini probe timed out");
+}
+
 async fn area_probe() {
     let root = tempfile::Builder::new()
         .prefix("rh-areas-")
