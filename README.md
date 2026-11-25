@@ -140,7 +140,13 @@ export ANTHROPIC_API_KEY=...          # or OPENAI_API_KEY, or ~/.rpi/agent/model
 rpi                                   # interactive TUI
 rpi -p "summarize the README"         # one-shot
 rpi --mode json -p "list the crates"  # machine-readable event stream
+rpi --mini "explain this error"       # low-memory text run
 ```
+
+`--mini` accepts prompts from arguments or piped input and prints the final
+reply. It keeps conversation context only for the current invocation and skips
+session storage, durable workflows, extension loading, and prompt resource
+discovery. Add `--tools read` to enable the built-in `read` tool.
 
 Sessions persist as JSONL and survive a crash mid-run; `rpi` resumes from the
 last committed frame rather than replaying the turn. Custom Anthropic or

@@ -54,6 +54,7 @@ pub mod key_trace;
 #[cfg(unix)]
 mod local_host;
 pub mod message_agent;
+mod mini;
 pub mod model_registry;
 pub mod modes;
 mod native_durable;

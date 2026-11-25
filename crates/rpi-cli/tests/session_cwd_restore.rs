@@ -150,6 +150,70 @@ async fn run_rpi(
     (status, stdout, stderr)
 }
 
+#[tokio::test]
+async fn mini_uses_in_process_context_without_opening_a_session() {
+    let fixture = start_fixture().await;
+    let cwd = fixture.root.path().join("session-cwd-project");
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let listener = fixture.listener.clone();
+    let collector = bodies.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            serve_one_request(listener.clone(), collector.clone()).await;
+        }
+    });
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rpi"))
+            .current_dir(&cwd)
+            .env("RPI_CODING_AGENT_DIR", &fixture.agent)
+            .env("RPI_CODING_AGENT_SESSION_DIR", &fixture.sessions)
+            .env("NO_PROXY", "127.0.0.1")
+            .args([
+                "--mini",
+                "--offline",
+                "--provider",
+                "fixture",
+                "--model",
+                "reasoner",
+                "--system-prompt",
+                "mini system",
+                "--tools",
+                "read,durable",
+                "first",
+                "second",
+                "third",
+            ])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("mini should finish all prompts")
+    .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(output.stdout, b"ok.\n");
+    server.await.unwrap();
+
+    let bodies = bodies.lock().unwrap();
+    let request = &bodies[2];
+    let messages = request["messages"].as_array().unwrap();
+    let content: Vec<_> = messages
+        .iter()
+        .map(|message| message["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        content,
+        ["mini system", "first", "ok.", "second", "ok.", "third"]
+    );
+    let tools = request["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "read");
+    assert!(fixture.sessions.read_dir().unwrap().next().is_none());
+    assert!(!cwd.join(".rpi/sessions").exists());
+}
+
 /// A session created in `project-a` and resumed (`-c`) from a different
 /// directory must run in `project-a`: the provider request's system prompt
 /// names the recorded directory, not the launch directory. Before the adoption
