@@ -11,6 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.28.0](https://github.com/bigfish1913/pi-rust/compare/v0.27.1...v0.28.0) - 2026-11-25
+
+### Added
+
+- *(cli)* inject AgentHome into session services ([#409](https://github.com/bigfish1913/pi-rust/pull/409))
+
 ## [0.27.1](https://github.com/bigfish1913/pi-rust/compare/v0.27.0...v0.27.1) - 2026-11-21
 
 ### Added
