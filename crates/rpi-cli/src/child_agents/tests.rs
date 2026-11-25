@@ -421,7 +421,7 @@ fn observation_query(parent: &str, command: &str) -> Value {
     json!({"type":command,"version":1,"parentSessionId":parent})
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_observations_survive_disposal_and_are_parent_scoped() {
     let parent = parent(FauxScript::new().with_text("native child final")).await;
     let manager = ChildAgents::default();
@@ -498,7 +498,7 @@ fn observation_tails_are_bounded_and_report_eviction_and_oversized_events() {
     assert!(manager.query("parent", request).is_err());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_child_cancel_reaches_the_owned_runner() {
     let parent = parent(
         FauxScript::new()
