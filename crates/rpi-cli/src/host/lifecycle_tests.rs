@@ -526,8 +526,10 @@ async fn legacy_v1_catalog_migrates_in_place_preserving_registered_agents() {
         .unwrap();
     fixture.catalog.shutdown().await.unwrap();
     let db = fixture.db();
-    db.execute_batch("DROP TABLE lifecycle_requests; PRAGMA user_version=1;")
-        .unwrap();
+    db.execute_batch(
+        "DROP TABLE recovery_members; DROP TABLE lifecycle_requests; PRAGMA user_version=1;",
+    )
+    .unwrap();
     drop(db);
     fixture.catalog = HostCatalog::open(fixture.root.path().join("host"), HostConfig::default())
         .await
@@ -540,7 +542,7 @@ async fn legacy_v1_catalog_migrates_in_place_preserving_registered_agents() {
         .db()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     assert!(
         fixture
             .catalog

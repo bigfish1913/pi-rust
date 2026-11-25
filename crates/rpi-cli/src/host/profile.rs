@@ -9,7 +9,8 @@
 //! This module only parses and validates. Persistent profiles selected for
 //! startup create/reopen a Session; explicit Mini profiles cannot reference one.
 //! Dynamically available profiles are frozen configuration, not implicit startup
-//! or execution. Parsing Mini does not enable an unwired daemon engine.
+//! or execution. Mini daemon execution additionally requires separate private
+//! authority; parsing a profile alone never enables it.
 
 use super::{
     bindings::{NativeBindingProfile, NativeToolPolicy},
@@ -161,7 +162,10 @@ impl AgentProfileFile {
             ));
         }
         let max_input_bytes = self.max_input_bytes.unwrap_or(DEFAULT_MAX_INPUT_BYTES);
-        if max_input_bytes == 0 || max_input_bytes > MAX_INPUT_BYTES {
+        if max_input_bytes == 0
+            || max_input_bytes > MAX_INPUT_BYTES
+            || (self.agent.mode == AgentMode::Mini && max_input_bytes > DEFAULT_MAX_INPUT_BYTES)
+        {
             return Err(BackendError::Binding("profile input budget is invalid"));
         }
         let timeout = match self.timeout_ms {

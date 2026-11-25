@@ -570,7 +570,7 @@ async fn unknown_schema_fails_without_retaining_instance_ownership() {
         HostCatalog::open(path.clone(), HostConfig::default()).await,
         Err(CatalogError::UnsupportedVersion(99))
     ));
-    database.execute_batch("PRAGMA user_version=2").unwrap();
+    database.execute_batch("PRAGMA user_version=3").unwrap();
     drop(database);
     HostCatalog::open(path, HostConfig::default())
         .await
@@ -754,4 +754,79 @@ async fn oversized_queued_metadata_is_rejected_before_persistence() {
     ));
     assert_eq!(catalog.status().await.unwrap().registered, 0);
     catalog.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_preserves_members_on_rejected_close_and_removes_interrupted_close_intent() {
+    use super::lifecycle::{LifecycleAction, LifecycleFailure, LifecycleRequest, LifecycleState};
+    let (_root, path) = directory();
+    let spec = make_spec(AgentMode::Persistent);
+    let id = spec.id;
+    let binding = [42; 32];
+    let catalog = HostCatalog::open_with_recovery(
+        path.clone(),
+        HostConfig::default(),
+        [(id, binding)].into(),
+    )
+    .await
+    .unwrap();
+    let record = catalog.register(spec).await.unwrap();
+    catalog.remember_members(vec![id]).await.unwrap();
+    let request = |request_id| LifecycleRequest {
+        scope: ControlScopeId::new(),
+        request_id,
+        epoch: catalog.epoch(),
+        action: LifecycleAction::Close {
+            agent_id: id,
+            revision: record.revision,
+        },
+    };
+    let rejected = request(RequestId::new());
+    assert!(
+        catalog
+            .prepare_lifecycle(rejected.clone())
+            .await
+            .unwrap()
+            .fresh
+    );
+    catalog
+        .finish_lifecycle(
+            rejected,
+            LifecycleState::Rejected {
+                code: LifecycleFailure::Busy,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.recovery_members(vec![id]).await.unwrap()[&id],
+        Some(binding)
+    );
+
+    let interrupted = request(RequestId::new());
+    assert!(
+        catalog
+            .prepare_lifecycle(interrupted.clone())
+            .await
+            .unwrap()
+            .fresh
+    );
+    catalog.shutdown().await.unwrap();
+    let reopened = HostCatalog::open(path, HostConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.recovery_members(vec![id]).await.unwrap()[&id],
+        None
+    );
+    assert_eq!(
+        reopened
+            .lifecycle_receipt(interrupted.scope, interrupted.request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        LifecycleState::Interrupted {}
+    );
+    reopened.shutdown().await.unwrap();
 }

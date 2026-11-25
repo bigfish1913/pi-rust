@@ -156,6 +156,10 @@ include!("host_control/stopping.rs");
 include!("host_control/closing_failure.rs");
 include!("host_control/instruction_resources.rs");
 include!("host_control/launch_policy.rs");
+include!("host_control/recovery.rs");
+#[cfg(target_os = "macos")]
+#[path = "host_control/daemon.rs"]
+mod daemon;
 #[path = "host_control/native_hooks.rs"]
 mod native_hooks;
 

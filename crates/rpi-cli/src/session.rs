@@ -628,7 +628,7 @@ pub fn prepare_extensions(
         catalog.clone(),
         cwd.to_path_buf(),
         runtime.clone(),
-        args.unknown_flags.clone(),
+        args.extension_flags(),
         tool_context.clone(),
     );
     let action_host = Arc::new(
@@ -866,6 +866,7 @@ pub async fn build_prepared(
         None => {
             build_session(
                 &selection,
+                args,
                 &cwd_str,
                 resource_selection.as_ref(),
                 prepared_restore,
@@ -2211,7 +2212,7 @@ where
                     .clone(),
                 ctx.cwd.clone(),
                 ctx.runtime.clone(),
-                ctx.args.unknown_flags.clone(),
+                ctx.args.extension_flags(),
                 ctx.tool_context.clone(),
             );
             crate::extensions_actions::HarnessActionHost::set_harness(
@@ -3267,6 +3268,7 @@ where
 /// Build the `Session` facade for the chosen selection.
 async fn build_session(
     selection: &SessionSelection,
+    args: &Args,
     cwd: &str,
     selected: Option<&crate::resource_selection::ResolvedSelection>,
     prepared_restore: Option<rpi_harness::session::jsonl::PreparedJsonlRestore>,
@@ -3289,7 +3291,10 @@ async fn build_session(
             restore_session(selection, cwd, prepared_restore).await
         }
         SessionSelection::Fork { source, dir } => {
-            fork_session_at_launch(source, dir, cwd, selected).await
+            let fork = args
+                .launch_fork_options()
+                .map_err(BuildError::SessionOpen)?;
+            fork_session_at_launch(source, dir, cwd, &fork, selected).await
         }
     }
 }
@@ -3466,12 +3471,13 @@ async fn fork_session_at_launch(
     source: &str,
     dir: &Path,
     cwd: &str,
+    fork: &rpi_harness::session::types::ForkOptions,
     selected: Option<&crate::resource_selection::ResolvedSelection>,
 ) -> Result<Session, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
     };
-    use rpi_harness::session::types::{ForkOptions, SessionStorage};
+    use rpi_harness::session::types::SessionStorage;
     use rpi_tools::FileSystem;
 
     let dir = dir.to_path_buf();
@@ -3513,7 +3519,7 @@ async fn fork_session_at_launch(
                 cwd: cwd.to_string(),
                 metadata: None,
             },
-            &ForkOptions::default(),
+            fork,
             |values| crate::resource_selection::fork_initial_values_for_selection(values, selected),
         )
         .await

@@ -133,10 +133,13 @@ impl Job {
     }
     fn observe(&self, event: AgentEvent) {
         if let AgentEvent::MessageUpdate {
-            assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
+            assistant_message_event,
             ..
         } = event
         {
+            let AssistantMessageEvent::TextDelta { delta, .. } = *assistant_message_event else {
+                return;
+            };
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.status != "running" {
                 return;

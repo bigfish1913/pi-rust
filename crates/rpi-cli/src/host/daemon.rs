@@ -1,12 +1,13 @@
-//! Foreground daemon ownership. No background spawn, implicit discovery,
-//! catalog-wide Agent restore, ambient secret hydration or management-extension loading.
+//! Working Host ownership for foreground and supervised execution.
 pub use super::daemon_administration::{DaemonAdministration, DaemonAdministrationConfig};
 use super::{
     ordinary::{OrdinaryBinding, OrdinaryLimits},
     profile::HostStartupAgent,
+    recovery::Bindings,
     server::{ControlConfig, ControlServer, ServerError},
     service::{HostService, ServiceError},
-    AgentRecord, AgentSpec, CatalogError, HostCatalog, HostConfig, ProfileRef, TrustedProfileSet,
+    AgentId, AgentRecord, AgentSpec, CatalogError, HostCatalog, HostConfig, ProfileRef,
+    TrustedProfileSet,
 };
 use rpi_harness::session::{
     jsonl::{JsonlSessionStorage, JsonlV4Header},
@@ -14,6 +15,7 @@ use rpi_harness::session::{
 };
 use rpi_tools::OsExecutionEnv;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -41,6 +43,8 @@ pub struct HostDaemon {
     service: HostService,
     control: ControlServer,
     administration: Option<DaemonAdministration>,
+    #[cfg(target_os = "macos")]
+    launch_lock: Option<super::registry::InstanceLock>,
 }
 impl HostDaemon {
     pub async fn open(
@@ -72,6 +76,41 @@ impl HostDaemon {
         agents: Vec<HostStartupAgent>,
         administration: Option<DaemonAdministrationConfig>,
     ) -> Result<Self, DaemonError> {
+        Self::open_with_mini(directory, host, control, agents, administration, None).await
+    }
+
+    /// Mini is opt-in via separate private authority. It never inherits the
+    /// Persistent administrative grant or durable lifecycle journal.
+    pub async fn open_with_mini(
+        directory: PathBuf,
+        host: HostConfig,
+        control: ControlConfig,
+        agents: Vec<HostStartupAgent>,
+        administration: Option<DaemonAdministrationConfig>,
+        mini_control: Option<super::mini_control::MiniControlConfig>,
+    ) -> Result<Self, DaemonError> {
+        Self::open_with_recovery(
+            directory,
+            host,
+            control,
+            agents,
+            administration,
+            mini_control,
+            (None, None),
+        )
+        .await
+    }
+
+    pub(super) async fn open_with_recovery(
+        directory: PathBuf,
+        host: HostConfig,
+        control: ControlConfig,
+        agents: Vec<HostStartupAgent>,
+        administration: Option<DaemonAdministrationConfig>,
+        mini_control: Option<super::mini_control::MiniControlConfig>,
+        startup: (Option<Bindings>, Option<std::os::unix::net::UnixListener>),
+    ) -> Result<Self, DaemonError> {
+        let (recovery, listener) = startup;
         // Reject invalid options before opening SQLite or creating directories.
         control.validate()?;
         if host.host_idle_timeout_ms.is_some()
@@ -83,27 +122,89 @@ impl HostDaemon {
         host.validate()
             .map_err(CatalogError::from)
             .map_err(DaemonError::Catalog)?;
-        // Raw Mini assembly is Session-free, but startup is not yet connected
-        // to its owner/volatile execution engine. Fail closed before SQLite or
-        // any earlier persistent profile can create a Session.
-        if agents
-            .iter()
-            .any(|agent| agent.spec.mode != super::AgentMode::Persistent)
-        {
-            return Err(DaemonError::StartupAgent);
+        match &mini_control {
+            Some(policy) => policy.preflight(&agents).await?,
+            None if agents
+                .iter()
+                .any(|agent| agent.spec.mode == super::AgentMode::Mini) =>
+            {
+                return Err(DaemonError::StartupAgent);
+            }
+            None => {}
         }
-        let (agents, prepared) = match administration {
-            Some(policy) => (Vec::new(), Some(policy.prepare(agents).await?)),
-            None => (agents, None),
+        let (minis, agents): (Vec<_>, Vec<_>) = agents
+            .into_iter()
+            .partition(|agent| agent.spec.mode == super::AgentMode::Mini);
+        if administration.as_ref().is_some_and(|policy| {
+            policy
+                .profiles
+                .iter()
+                .any(|profile| minis.iter().any(|mini| mini.spec.id == profile.spec.id))
+        }) {
+            return Err(DaemonError::Administration);
+        }
+        let (agents, prepared, recovery_profiles) = match administration {
+            Some(policy) => (Vec::new(), Some(policy.prepare(agents).await?), None),
+            None if recovery.is_some() => {
+                let profiles = TrustedProfileSet::freeze(agents)
+                    .await
+                    .map_err(|_| DaemonError::StartupAgent)?;
+                (Vec::new(), None, Some(profiles))
+            }
+            None => (agents, None, None),
         };
-        let catalog = HostCatalog::open(directory, host)
-            .await
-            .map_err(DaemonError::Catalog)?;
+        #[cfg(target_os = "macos")]
+        let launch_lock = if listener.is_none() {
+            Some(
+                super::registry::own_directory_lock(&directory, "supervisor.lock")
+                    .map_err(DaemonError::Catalog)?,
+            )
+        } else {
+            None
+        };
+        let catalog =
+            HostCatalog::open_with_recovery(directory, host, recovery.clone().unwrap_or_default())
+                .await
+                .map_err(DaemonError::Catalog)?;
         let service = HostService::new(catalog);
-        let startup = match &prepared {
-            Some(prepared) => prepared.start(&service).await,
-            None => start_agents(&service, agents).await,
-        };
+        let startup = async {
+            if let Some(bindings) = &recovery {
+                let loaded = match &prepared {
+                    Some(policy) => {
+                        policy
+                            .start_recovery(&service, bindings, minis.len())
+                            .await?
+                    }
+                    None => {
+                        let profiles = recovery_profiles
+                            .as_ref()
+                            .ok_or(DaemonError::StartupAgent)?;
+                        let startup: Vec<_> = profiles.references().collect();
+                        start_recovery(
+                            &service,
+                            profiles,
+                            &startup,
+                            &BTreeSet::new(),
+                            bindings,
+                            minis.len(),
+                        )
+                        .await?
+                    }
+                };
+                super::mini_control::start_minis(&service, minis).await?;
+                return service
+                    .catalog()
+                    .remember_members(loaded)
+                    .await
+                    .map_err(DaemonError::Catalog);
+            }
+            super::mini_control::start_minis(&service, minis).await?;
+            match &prepared {
+                Some(prepared) => prepared.start(&service).await,
+                None => start_agents(&service, agents).await,
+            }
+        }
+        .await;
         if let Err(error) = startup {
             // A failed startup must not leave owners or catalog ownership behind.
             return match service.shutdown().await {
@@ -123,10 +224,14 @@ impl HostDaemon {
                 };
             }
         };
-        let server = match ControlServer::bind_with_administration(
+        let mini = mini_control
+            .map(|policy| super::mini_control::MiniControl::new(service.clone(), policy));
+        let server = match ControlServer::bind_with_controls(
             control,
             service.clone(),
             administration.clone(),
+            mini,
+            listener,
         )
         .await
         {
@@ -140,6 +245,8 @@ impl HostDaemon {
             service,
             control: server,
             administration,
+            #[cfg(target_os = "macos")]
+            launch_lock,
         })
     }
     /// Trusted native integrations can install explicit bindings. This handle
@@ -170,6 +277,8 @@ impl HostDaemon {
             .await
             .map_err(DaemonError::Settlement)?;
         self.control.stop().await?;
+        #[cfg(target_os = "macos")]
+        drop(self.launch_lock.take());
         Ok(())
     }
 }
@@ -213,6 +322,85 @@ pub(super) async fn start_frozen_agents(
         load_startup(service, fresh.spec, fresh.limits, fresh.binding, existing).await?;
     }
     Ok(())
+}
+
+pub(super) async fn start_recovery(
+    service: &HostService,
+    profiles: &TrustedProfileSet,
+    startup: &[ProfileRef],
+    restorable: &BTreeSet<AgentId>,
+    bindings: &Bindings,
+    mini_count: usize,
+) -> Result<Vec<AgentId>, DaemonError> {
+    let catalog = service.catalog();
+    let previous = catalog
+        .recovery_members(startup.iter().map(|reference| reference.agent_id).collect())
+        .await
+        .map_err(DaemonError::Catalog)?;
+    let mut selected: BTreeMap<_, _> = startup
+        .iter()
+        .map(|reference| (reference.agent_id, *reference))
+        .collect();
+    let configured: BTreeMap<_, _> = profiles
+        .references()
+        .map(|reference| (reference.agent_id, reference))
+        .collect();
+    for (&id, version) in &previous {
+        match version {
+            None => {
+                selected.remove(&id);
+            }
+            Some(version) => {
+                if bindings.get(&id) != Some(version)
+                    || !(selected.contains_key(&id) || restorable.contains(&id))
+                {
+                    return Err(DaemonError::StartupAgent);
+                }
+                selected.insert(id, *configured.get(&id).ok_or(DaemonError::StartupAgent)?);
+            }
+        }
+    }
+    let capacity = catalog
+        .status()
+        .await
+        .map_err(DaemonError::Catalog)?
+        .max_agents;
+    if capacity.is_some_and(|limit| selected.len().saturating_add(mini_count) > limit) {
+        return Err(DaemonError::StartupAgent);
+    }
+    // Check every existing history before creating any new Session or taking a
+    // writer. A recorded member missing its history is a permanent failure.
+    for (&id, &reference) in &selected {
+        let prepared = profiles
+            .prepare(reference)
+            .await
+            .map_err(|_| DaemonError::StartupAgent)?;
+        let session = prepared
+            .spec
+            .session
+            .as_ref()
+            .ok_or(DaemonError::StartupAgent)?;
+        match catalog.get(id).await {
+            Ok(record) if record.spec != prepared.spec => return Err(DaemonError::StartupAgent),
+            Ok(_) => {}
+            Err(CatalogError::UnknownAgent) if !previous.contains_key(&id) => {
+                match tokio::fs::symlink_metadata(&session.path).await {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    _ => {}
+                }
+            }
+            Err(CatalogError::UnknownAgent) => return Err(DaemonError::StartupAgent),
+            Err(error) => return Err(DaemonError::Catalog(error)),
+        }
+        prepared
+            .binding
+            .preflight_session(&prepared.spec)
+            .await
+            .map_err(|_| DaemonError::StartupAgent)?;
+    }
+    let references: Vec<_> = selected.values().copied().collect();
+    start_frozen_agents(service, profiles, &references).await?;
+    Ok(selected.into_keys().collect())
 }
 
 async fn preflight_startup(

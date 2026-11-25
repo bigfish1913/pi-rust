@@ -17,6 +17,8 @@ use std::{num::NonZeroUsize, path::Path, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const DEADLINE: Duration = Duration::from_secs(15);
+#[path = "mini_owner_tests.rs"]
+mod mini_owner_tests;
 struct Fixture {
     root: tempfile::TempDir,
     catalog: HostCatalog,

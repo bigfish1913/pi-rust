@@ -47,10 +47,30 @@ pub enum ServiceError {
     TaskStopped,
 }
 
-type Entry = OwnerEntry<OrdinaryAgent, super::NativeExtensionCustody>;
+enum NativeOwner {
+    Ordinary(OrdinaryAgent),
+    Mini(super::mini::MiniAgent),
+}
+impl NativeOwner {
+    fn ordinary(&self) -> std::result::Result<&OrdinaryAgent, BackendError> {
+        match self {
+            Self::Ordinary(owner) => Ok(owner),
+            Self::Mini(_) => Err(BackendError::Binding(
+                "Mini has no persistent admission authority",
+            )),
+        }
+    }
+    async fn close(&self) -> std::result::Result<(), BackendError> {
+        match self {
+            Self::Ordinary(owner) => owner.close().await,
+            Self::Mini(owner) => owner.close().await,
+        }
+    }
+}
+type Entry = OwnerEntry<NativeOwner, super::NativeExtensionCustody>;
 struct Inner {
     catalog: HostCatalog,
-    runtime: HostRuntime<OrdinaryAgent, super::NativeExtensionCustody>,
+    runtime: HostRuntime<NativeOwner, super::NativeExtensionCustody>,
     #[cfg(unix)]
     administration_claimed: AtomicBool,
 }
@@ -114,6 +134,25 @@ impl ServiceReservation<'_> {
             .cancel_submitted_guarded(guard, &submitted_request_id.to_string())
             .await
             .map_err(ServiceError::Backend)
+    }
+    #[cfg(unix)]
+    pub(crate) fn mini_client(&self, id: AgentId) -> Result<super::mini::MiniClient> {
+        self.service.mini_client(id)
+    }
+    #[cfg(unix)]
+    pub(crate) async fn close_mini(&self, id: AgentId) -> Result<()> {
+        // Mode proof before entering the mode-independent native close path.
+        // A CloseFailed Mini retains the same entry for explicit reconciliation.
+        {
+            let entries = self.service.inner.entries();
+            let entry = entries.get(&id).ok_or(ServiceError::NotLoaded)?;
+            if !matches!(entry.owner.as_deref(), Some(NativeOwner::Mini(_))) {
+                return Err(
+                    BackendError::Binding("Mini control cannot close a Persistent owner").into(),
+                );
+            }
+        }
+        self.service.close_inner(id, None).await
     }
     pub(crate) async fn close_guarded(&self, id: AgentId, guard: CatalogGuard) -> Result<()> {
         self.service.close_inner(id, Some(guard)).await
@@ -337,7 +376,7 @@ impl HostService {
                     id,
                     Entry {
                         phase: OwnerPhase::Live,
-                        owner: Some(Arc::new(owner)),
+                        owner: Some(Arc::new(NativeOwner::Ordinary(owner))),
                         failed_start: None,
                     },
                 );
@@ -366,6 +405,128 @@ impl HostService {
         }
     }
 
+    /// Start one Session-free owner through the same reservation/table and
+    /// stop barrier as persistent owners. Trusted Rust API only; daemon/wire
+    /// Mini admission remains closed until its separate capability is complete.
+    pub async fn start_mini(
+        &self,
+        id: AgentId,
+        guard: CatalogGuard,
+        profile: super::bindings::NativeBindingProfile,
+        limits: super::mini::MiniLimits,
+    ) -> Result<super::mini::MiniClient> {
+        self.with_administration(move |reservation| {
+            Box::pin(async move {
+                reservation
+                    .service
+                    .start_mini_inner(id, guard, profile, limits)
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn start_mini_inner(
+        &self,
+        id: AgentId,
+        guard: CatalogGuard,
+        profile: super::bindings::NativeBindingProfile,
+        limits: super::mini::MiniLimits,
+    ) -> Result<super::mini::MiniClient> {
+        let record = self
+            .inner
+            .catalog
+            .get(id)
+            .await
+            .map_err(|error| ServiceError::Catalog(Arc::new(error)))?;
+        if record.spec.mode != super::AgentMode::Mini {
+            return Err(
+                BackendError::Binding("Mini requires explicit Session-free metadata").into(),
+            );
+        }
+        let custody = super::NativeExtensionCustody::new();
+        {
+            let mut entries = self.inner.entries();
+            if entries.contains_key(&id) {
+                return Err(ServiceError::AlreadyOwned);
+            }
+            entries.insert(
+                id,
+                Entry {
+                    phase: OwnerPhase::Starting,
+                    owner: None,
+                    failed_start: Some(custody.clone()),
+                },
+            );
+        }
+        let result = AssertUnwindSafe(super::mini::MiniAgent::start(
+            self.inner.catalog.clone(),
+            id,
+            guard,
+            profile,
+            limits,
+            custody.clone(),
+            self.inner.runtime.stopping_signal(),
+        ))
+        .catch_unwind()
+        .await;
+        // A panic cannot prove that staging/registration released its custody.
+        let safe_failure = matches!(result, Ok(Err(_))) && self.failed_start_is_inactive(id).await;
+        let mut entries = self.inner.entries();
+        match result {
+            Ok(Ok(owner)) => {
+                let client = owner.client();
+                entries.insert(
+                    id,
+                    Entry {
+                        phase: OwnerPhase::Live,
+                        owner: Some(Arc::new(NativeOwner::Mini(owner))),
+                        failed_start: None,
+                    },
+                );
+                Ok(client)
+            }
+            failure => {
+                if safe_failure {
+                    entries.remove(&id);
+                } else {
+                    entries.insert(
+                        id,
+                        Entry {
+                            phase: OwnerPhase::StartFailed,
+                            owner: None,
+                            failed_start: Some(custody),
+                        },
+                    );
+                }
+                match failure {
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(_) => Err(ServiceError::TaskStopped),
+                    Ok(Ok(_)) => unreachable!(),
+                }
+            }
+        }
+    }
+
+    /// Attach to this exact Mini incarnation; no latest-owner lookup occurs in
+    /// the returned weak client, so an old client cannot retarget a later load.
+    pub fn mini_client(&self, id: AgentId) -> Result<super::mini::MiniClient> {
+        if self.is_stopping() {
+            return Err(ServiceError::Stopping);
+        }
+        let entries = self.inner.entries();
+        let entry = entries.get(&id).ok_or(ServiceError::NotLoaded)?;
+        if entry.phase != OwnerPhase::Live {
+            return Err(ServiceError::Busy);
+        }
+        match entry.owner.as_deref().ok_or(ServiceError::TaskStopped)? {
+            NativeOwner::Mini(owner) => Ok(owner.client()),
+            NativeOwner::Ordinary(_) => {
+                Err(BackendError::Binding("persistent owner has no Mini authority").into())
+            }
+        }
+    }
+
     /// Attach/detach only changes this weak observer, never native lifetime.
     /// This does not authorize arbitrary callers; the IPC authority layer must
     /// check the invocation's scope before exposing it.
@@ -383,6 +544,7 @@ impl HostService {
                 .owner
                 .as_ref()
                 .ok_or(ServiceError::TaskStopped)?
+                .ordinary()?
                 .client()),
             OwnerPhase::Starting | OwnerPhase::Closing => Err(ServiceError::Busy),
             OwnerPhase::StartFailed | OwnerPhase::CloseFailed => {
@@ -469,6 +631,12 @@ impl HostService {
     /// Explicit close can be retried after a failed shutdown. A dropped waiter
     /// cannot cancel settlement or release an unsettled owner/capacity slot.
     pub async fn close_ordinary(&self, id: AgentId) -> Result<()> {
+        self.close_agent(id).await
+    }
+
+    /// Mode-independent close on the sole native owner table. Mini reaches Lost
+    /// only after its prompt and actual DLL custody settle, never on cancellation.
+    pub async fn close_agent(&self, id: AgentId) -> Result<()> {
         let service = self.clone();
         supervised(async move {
             let _reservation = service.inner.runtime.lifecycle.read().await;
@@ -513,7 +681,11 @@ impl HostService {
                             .transition(
                                 id,
                                 self.inner.catalog.guard(&record),
-                                super::AgentState::Closed,
+                                if record.spec.mode == super::AgentMode::Mini {
+                                    super::AgentState::Lost
+                                } else {
+                                    super::AgentState::Closed
+                                },
                             )
                             .await
                             .map_err(BackendError::from)?;
@@ -555,6 +727,11 @@ impl HostService {
                 return Err(ServiceError::Busy);
             }
             let owner = entry.owner.clone().ok_or(ServiceError::TaskStopped)?;
+            if guard.is_some() {
+                // The persistent administrative guard is not Mini authority.
+                // Reject before changing phase or signalling any native run.
+                owner.ordinary()?;
+            }
             let previous_phase = entry.phase;
             entry.phase = OwnerPhase::Closing;
             (owner, previous_phase)
@@ -563,7 +740,7 @@ impl HostService {
         // if native close cannot return, and a retry is never a fresh restore.
         let result = AssertUnwindSafe(async {
             match guard {
-                Some(guard) => owner.close_guarded(guard).await,
+                Some(guard) => owner.ordinary()?.close_guarded(guard).await,
                 None => owner.close().await,
             }
         })

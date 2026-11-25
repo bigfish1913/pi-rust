@@ -7,6 +7,7 @@ use super::{
     },
     daemon::DaemonError,
     lifecycle::{LifecycleReceipt, LifecycleRequest},
+    recovery::Bindings,
     service::HostService,
     AgentId, ControlScopeId, HostStartupAgent, ProfileRef, TrustedProfileSet, MAX_TRUSTED_PROFILES,
 };
@@ -68,6 +69,7 @@ pub(crate) struct PreparedDaemonAdministration {
     startup: Vec<ProfileRef>,
     grant: AdministrativeGrant,
     visible: Vec<ProfileRef>,
+    restorable: BTreeSet<AgentId>,
     max_jobs: NonZeroUsize,
 }
 impl DaemonAdministrationConfig {
@@ -115,11 +117,17 @@ impl DaemonAdministrationConfig {
                     .ok_or(DaemonError::Administration)
             })
             .collect::<Result<_, _>>()?;
+        let restorable = if self.permissions.restore {
+            self.allowed_agents
+        } else {
+            BTreeSet::new()
+        };
         Ok(PreparedDaemonAdministration {
             profiles,
             startup,
             grant,
             visible,
+            restorable,
             max_jobs: self.max_jobs,
         })
     }
@@ -127,6 +135,22 @@ impl DaemonAdministrationConfig {
 impl PreparedDaemonAdministration {
     pub(crate) async fn start(&self, service: &HostService) -> Result<(), DaemonError> {
         super::daemon::start_frozen_agents(service, &self.profiles, &self.startup).await
+    }
+    pub(super) async fn start_recovery(
+        &self,
+        service: &HostService,
+        bindings: &Bindings,
+        mini_count: usize,
+    ) -> Result<Vec<AgentId>, DaemonError> {
+        super::daemon::start_recovery(
+            service,
+            &self.profiles,
+            &self.startup,
+            &self.restorable,
+            bindings,
+            mini_count,
+        )
+        .await
     }
     pub(crate) fn assemble(
         self,

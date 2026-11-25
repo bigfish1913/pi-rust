@@ -257,6 +257,7 @@ impl ResolvedSelection {
         else {
             return Ok(None);
         };
+        args.launch_fork_options()?;
         if (args.resource_config.is_some() && args.resource_transition.is_some())
             || (args.resource_transition.is_some()
                 && (args.name.is_some()
@@ -282,7 +283,10 @@ impl ResolvedSelection {
             || !args.prompt_template.is_empty()
             || !args.extension.is_empty()
             || !args.extensions_dir.is_empty()
-            || !args.unknown_flags.is_empty()
+            || args
+                .unknown_flags
+                .keys()
+                .any(|name| !crate::args::is_fork_cut_flag(name))
         {
             return Err("--resource-config requires trusted --mode rpc and conflicts with resource/tool/prompt/discovery/dev flags and unknown extension flags".into());
         }

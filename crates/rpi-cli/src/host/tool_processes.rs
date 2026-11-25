@@ -33,6 +33,19 @@ extern "C" {
         capacity: usize,
         written: *mut usize,
     ) -> i32;
+    fn rpi_host_session_census(
+        session: i32,
+        members: *mut NativeMember,
+        capacity: usize,
+        written: *mut usize,
+    ) -> i32;
+    fn rpi_host_signal_session_member(
+        session: i32,
+        pid: i32,
+        start_sec: u64,
+        start_usec: u64,
+        signal: i32,
+    ) -> i32;
 }
 
 const MAX_PINS: usize = 64;
@@ -223,13 +236,17 @@ impl PinnedProcessGroup {
     }
 }
 fn group_members(group: i32) -> io::Result<Vec<Member>> {
+    members(group, rpi_host_process_census)
+}
+
+fn members(
+    id: i32,
+    census: unsafe extern "C" fn(i32, *mut NativeMember, usize, *mut usize) -> i32,
+) -> io::Result<Vec<Member>> {
     let mut rows = vec![NativeMember::default(); MAX_MEMBERS];
     let mut count = 0;
-    // SAFETY: repr(C) matches the small private SDK-compiled shim record (not
-    // kinfo_proc). The initialized array holds exactly capacity writable rows;
-    // the shim bounds every write and returns a positive errno on failure.
-    let error =
-        unsafe { rpi_host_process_census(group, rows.as_mut_ptr(), rows.len(), &mut count) };
+    // SAFETY: both census shims bound their writes to the initialized C records.
+    let error = unsafe { census(id, rows.as_mut_ptr(), rows.len(), &mut count) };
     if error != 0 {
         return Err(io::Error::from_raw_os_error(error));
     }
@@ -253,6 +270,64 @@ fn group_members(group: i32) -> io::Result<Vec<Member>> {
         return Err(io::Error::other("duplicate process group census identity"));
     }
     Ok(members)
+}
+
+/// Drain the private session while the caller keeps it alive. The worker must
+/// already be stopped or exited. Verify a stable stopped cohort before killing
+/// it so a background child cannot leave an unobserved foreground successor.
+pub(super) fn drain_session(session: i32, timeout: Duration) -> io::Result<()> {
+    use nix::unistd::{getpid, getsid};
+    let caller = getpid().as_raw();
+    if getsid(None)?.as_raw() != session {
+        return Err(io::Error::other("lost owned session"));
+    }
+    let snapshot = || {
+        let mut members = match members(session, rpi_host_session_census) {
+            Ok(members) => members,
+            Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(index) = members.iter().position(|entry| entry.pid == caller) else {
+            return Err(io::Error::other("owner absent from session census"));
+        };
+        members.remove(index);
+        Ok(Some(members))
+    };
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(cohort) = snapshot()? {
+            let frozen = cohort.iter().all(|member| member.status == 4); // Darwin SSTOP
+            let signal = if frozen && snapshot()?.as_ref() == Some(&cohort) {
+                if cohort.is_empty() {
+                    return Ok(());
+                }
+                Signal::SIGKILL
+            } else {
+                Signal::SIGSTOP
+            };
+            for member in cohort {
+                // SAFETY: all arguments are scalar identities from the checked census.
+                let error = unsafe {
+                    rpi_host_signal_session_member(
+                        session,
+                        member.pid,
+                        member.start.0,
+                        member.start.1,
+                        signal as i32,
+                    )
+                };
+                match error {
+                    0 | libc::ESRCH | libc::EAGAIN => (),
+                    code => return Err(io::Error::from_raw_os_error(code)),
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "owned session exit not proved",
+    ))
 }
 
 #[cfg(test)]

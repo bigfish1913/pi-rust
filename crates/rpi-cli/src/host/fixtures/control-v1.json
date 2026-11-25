@@ -7,10 +7,10 @@
   },
   "welcome": {
     "protocol": "rpi-shared-host",
-    "version": { "major": 1, "minor": 5 },
+    "version": { "major": 1, "minor": 6 },
     "host_id": "11111111-1111-4111-8111-111111111111",
     "epoch": "22222222-2222-4222-8222-222222222222",
-    "capabilities": ["status", "list", "inspect", "receipts", "results", "profiles", "administrative_receipts", "administrative_create", "administrative_restore", "administrative_close", "administrative_cancel", "administrative_stop", "cancel", "close"],
+    "capabilities": ["mini", "status", "list", "inspect", "receipts", "results", "profiles", "administrative_receipts", "administrative_create", "administrative_restore", "administrative_close", "administrative_cancel", "administrative_stop", "cancel", "close"],
     "limits": { "max_frame_bytes": 1048576, "max_in_flight": 64, "max_page_size": 128 }
   },
   "requests": [
@@ -136,6 +136,88 @@
             "revision": 7
           }
         }
+      }
+    },
+    {
+      "call_id": "81818181-8181-4181-8181-000000000001",
+      "epoch": "22222222-2222-4222-8222-222222222222",
+      "command": {
+        "op": "mini_execute",
+        "request": {
+          "scope": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          "epoch": "22222222-2222-4222-8222-222222222222",
+          "request_id": "71717171-7171-4171-8171-717171717171",
+          "action": {
+            "op": "submit",
+            "agent_id": "66666666-6666-4666-8666-666666666666",
+            "prompt": "literal {{mini}}"
+          }
+        }
+      }
+    },
+    {
+      "call_id": "81818181-8181-4181-8181-000000000002",
+      "epoch": "22222222-2222-4222-8222-222222222222",
+      "command": {
+        "op": "mini_receipt",
+        "request": {
+          "scope": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          "epoch": "22222222-2222-4222-8222-222222222222",
+          "request_id": "71717171-7171-4171-8171-717171717171",
+          "action": {
+            "op": "submit",
+            "agent_id": "66666666-6666-4666-8666-666666666666",
+            "prompt": "literal {{mini}}"
+          }
+        }
+      }
+    },
+    {
+      "call_id": "81818181-8181-4181-8181-000000000003",
+      "epoch": "22222222-2222-4222-8222-222222222222",
+      "command": {
+        "op": "mini_execute",
+        "request": {
+          "scope": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          "epoch": "22222222-2222-4222-8222-222222222222",
+          "request_id": "72727272-7272-4272-8272-727272727272",
+          "action": {
+            "op": "cancel",
+            "agent_id": "66666666-6666-4666-8666-666666666666",
+            "submitted_request_id": "71717171-7171-4171-8171-717171717171",
+            "run_id": "73737373-7373-4373-8373-737373737373"
+          }
+        }
+      }
+    },
+    {
+      "call_id": "81818181-8181-4181-8181-000000000004",
+      "epoch": "22222222-2222-4222-8222-222222222222",
+      "command": {
+        "op": "mini_execute",
+        "request": {
+          "scope": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          "epoch": "22222222-2222-4222-8222-222222222222",
+          "request_id": "74747474-7474-4474-8474-747474747474",
+          "action": {
+            "op": "close",
+            "agent_id": "66666666-6666-4666-8666-666666666666"
+          }
+        }
+      }
+    },
+    {
+      "call_id": "81818181-8181-4181-8181-000000000005",
+      "epoch": "22222222-2222-4222-8222-222222222222",
+      "command": {
+        "op": "mini_result",
+        "scope": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        "epoch": "22222222-2222-4222-8222-222222222222",
+        "agent_id": "66666666-6666-4666-8666-666666666666",
+        "request_id": "71717171-7171-4171-8171-717171717171",
+        "run_id": null,
+        "offset": 0,
+        "max_bytes": 4096
       }
     }
   ],

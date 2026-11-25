@@ -6,6 +6,9 @@
 //! durable input acknowledgement, or exactly-once tool execution API.
 
 use super::lifecycle::{LifecycleAdmission, LifecycleReceipt, LifecycleRequest, LifecycleState};
+use super::recovery::Bindings;
+#[cfg(unix)]
+use super::recovery::Membership;
 use super::{
     registry::Registry, AgentId, AgentMode, AgentSpec, AgentState, CatalogError, CatalogResult,
     ControlScopeId, HostConfig, HostEpoch, RequestId,
@@ -109,6 +112,16 @@ pub(crate) enum Command {
         request_id: RequestId,
         reply: Reply<Option<LifecycleReceipt>>,
     },
+    #[cfg(unix)]
+    RecoveryMembers {
+        configured: Vec<AgentId>,
+        reply: Reply<Membership>,
+    },
+    #[cfg(unix)]
+    RememberMembers {
+        loaded: Vec<AgentId>,
+        reply: Reply<()>,
+    },
     Shutdown {
         reply: Reply<()>,
     },
@@ -124,6 +137,14 @@ pub struct HostCatalog {
 
 impl HostCatalog {
     pub async fn open(directory: PathBuf, config: HostConfig) -> CatalogResult<Self> {
+        Self::open_with_recovery(directory, config, Bindings::new()).await
+    }
+
+    pub(super) async fn open_with_recovery(
+        directory: PathBuf,
+        config: HostConfig,
+        bindings: Bindings,
+    ) -> CatalogResult<Self> {
         config.validate()?;
         if !directory.is_absolute() {
             return Err(
@@ -135,7 +156,7 @@ impl HostCatalog {
         std::thread::Builder::new()
             .name("rpi-host-registry".into())
             .spawn(move || {
-                let mut registry = match Registry::open(&directory, config) {
+                let mut registry = match Registry::open(&directory, config, bindings) {
                     Ok(registry) => registry,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -188,6 +209,14 @@ impl HostCatalog {
                             reply,
                         } => {
                             let _ = reply.send(registry.lifecycle_receipt(scope, request_id));
+                        }
+                        #[cfg(unix)]
+                        Command::RecoveryMembers { configured, reply } => {
+                            let _ = reply.send(registry.recovery_members(&configured));
+                        }
+                        #[cfg(unix)]
+                        Command::RememberMembers { loaded, reply } => {
+                            let _ = reply.send(registry.remember_members(&loaded));
                         }
                         Command::Shutdown { reply } => {
                             shutdown = Some(reply);
@@ -322,6 +351,21 @@ impl HostCatalog {
             reply,
         })
         .await
+    }
+
+    #[cfg(unix)]
+    pub(super) async fn recovery_members(
+        &self,
+        configured: Vec<AgentId>,
+    ) -> CatalogResult<Membership> {
+        self.call(|reply| Command::RecoveryMembers { configured, reply })
+            .await
+    }
+
+    #[cfg(unix)]
+    pub(super) async fn remember_members(&self, loaded: Vec<AgentId>) -> CatalogResult<()> {
+        self.call(|reply| Command::RememberMembers { loaded, reply })
+            .await
     }
 
     /// Waits for storage/lock cleanup, not for Agent execution cleanup.

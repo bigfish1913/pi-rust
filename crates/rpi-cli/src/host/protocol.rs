@@ -8,7 +8,7 @@ use std::fmt;
 
 pub const PROTOCOL: &str = "rpi-shared-host";
 pub const MAJOR: u16 = 1;
-pub const MINOR: u16 = 5;
+pub const MINOR: u16 = 6;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Text-result page budget in UTF-8 bytes, independent of catalog page counts.
 pub const MAX_RESULT_TEXT_BYTES: usize = 16 * 1024;
@@ -62,6 +62,55 @@ identity!(CallId);
 identity!(TicketId);
 identity!(ControlScopeId);
 identity!(ProfileVersion);
+identity!(RunId);
+
+/// Entire epoch-scoped volatile intent. This never names a durable admission
+/// or grants permission; only the daemon's private Mini policy can do that.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiniRequest {
+    pub scope: ControlScopeId,
+    pub epoch: Epoch,
+    pub request_id: RequestId,
+    pub action: MiniAction,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MiniAction {
+    Submit {
+        agent_id: AgentId,
+        prompt: String,
+    },
+    Cancel {
+        agent_id: AgentId,
+        submitted_request_id: RequestId,
+        run_id: RunId,
+    },
+    /// Mini identity cannot be reloaded in an epoch. Close never means restore,
+    /// force-abort, or permission to close a Persistent owner.
+    Close {
+        agent_id: AgentId,
+    },
+}
+impl MiniAction {
+    pub fn agent(&self) -> AgentId {
+        match self {
+            Self::Submit { agent_id, .. }
+            | Self::Cancel { agent_id, .. }
+            | Self::Close { agent_id } => *agent_id,
+        }
+    }
+}
+impl MiniRequest {
+    pub fn valid(&self) -> bool {
+        match &self.action {
+            MiniAction::Submit { prompt, .. } => {
+                !prompt.trim().is_empty() && prompt.len() <= MAX_SUBMIT_PROMPT_BYTES
+            }
+            _ => true,
+        }
+    }
+}
 
 /// Opaque immutable input identity, never configuration or authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,7 +321,9 @@ impl Welcome {
             && self.capabilities.len() <= 64
     }
     pub fn supports(&self, capability: Capability) -> bool {
-        capability != Capability::Unknown && self.capabilities.contains(&capability)
+        capability != Capability::Unknown
+            && self.capabilities.contains(&capability)
+            && (capability != Capability::Mini || self.version.minor >= 6)
     }
 }
 
@@ -291,6 +342,25 @@ pub enum Command {
     // An empty struct variant is intentional: serde's internally tagged unit
     // variant otherwise ignores unknown fields even with deny_unknown_fields.
     Status {},
+    /// Start an owned, bounded volatile control operation. Admission/result is
+    /// lost at epoch end. Never rewrite/replay the original intent on restart.
+    MiniExecute {
+        request: MiniRequest,
+    },
+    /// Reconcile exactly the original intent, including its historical epoch.
+    MiniReceipt {
+        request: MiniRequest,
+    },
+    /// Epoch/Agent/input scoped output. Nonzero offsets pin the original run.
+    MiniResult {
+        scope: ControlScopeId,
+        epoch: Epoch,
+        agent_id: AgentId,
+        request_id: RequestId,
+        run_id: Option<RunId>,
+        offset: usize,
+        max_bytes: usize,
+    },
     List {
         after: Option<AgentId>,
         limit: usize,
@@ -379,6 +449,9 @@ impl Command {
     pub fn capability(&self) -> Capability {
         match self {
             Self::Status {} => Capability::Status,
+            Self::MiniExecute { .. } | Self::MiniReceipt { .. } | Self::MiniResult { .. } => {
+                Capability::Mini
+            }
             Self::List { .. } => Capability::List,
             Self::Inspect { .. } => Capability::Inspect,
             Self::Profiles { .. } => Capability::Profiles,
@@ -399,6 +472,7 @@ impl Command {
     }
     pub fn request_id(&self) -> Option<RequestId> {
         match self {
+            Self::MiniExecute { request } => Some(request.request_id),
             Self::AdministrativeCreate { request }
             | Self::AdministrativeRestore { request }
             | Self::AdministrativeClose { request }
@@ -414,6 +488,16 @@ impl Command {
     }
     pub fn valid(&self, limits: Limits) -> bool {
         match self {
+            Self::MiniExecute { request } | Self::MiniReceipt { request } => request.valid(),
+            Self::MiniResult {
+                offset,
+                max_bytes,
+                run_id,
+                ..
+            } => {
+                (4..=MAX_RESULT_TEXT_BYTES).contains(max_bytes)
+                    && (*offset == 0 || run_id.is_some())
+            }
             Self::List { limit, .. } | Self::Profiles { limit, .. } => {
                 (1..=limits.max_page_size).contains(limit)
             }
@@ -501,6 +585,56 @@ pub struct Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mini_intents_are_closed_volatile_and_never_durable_admissions() {
+        let request = MiniRequest {
+            scope: ControlScopeId::new(),
+            epoch: Epoch::new(),
+            request_id: RequestId::new(),
+            action: MiniAction::Submit {
+                agent_id: AgentId::new(),
+                prompt: "literal {{mini}}".into(),
+            },
+        };
+        let execute = Command::MiniExecute {
+            request: request.clone(),
+        };
+        let query = Command::MiniReceipt {
+            request: request.clone(),
+        };
+        assert_eq!(execute.request_id(), Some(request.request_id));
+        assert_eq!(query.request_id(), None);
+        assert_eq!(execute.capability(), Capability::Mini);
+        assert!(execute.valid(Limits::default()));
+        for key in ["grant", "session", "durable", "revision"] {
+            let mut value = serde_json::to_value(&execute).unwrap();
+            value["request"][key] = Value::Bool(true);
+            assert!(serde_json::from_value::<Command>(value).is_err());
+        }
+        let mut empty = request;
+        empty.action = MiniAction::Submit {
+            agent_id: AgentId::new(),
+            prompt: " ".into(),
+        };
+        assert!(!empty.valid());
+        let mut value = serde_json::to_value(Command::MiniResult {
+            scope: ControlScopeId::new(),
+            epoch: Epoch::new(),
+            agent_id: AgentId::new(),
+            request_id: RequestId::new(),
+            run_id: None,
+            offset: 1,
+            max_bytes: 4096,
+        })
+        .unwrap();
+        assert!(!serde_json::from_value::<Command>(value.clone())
+            .unwrap()
+            .valid(Limits::default()));
+        value["run_id"] = serde_json::json!(RunId::new());
+        assert!(serde_json::from_value::<Command>(value)
+            .unwrap()
+            .valid(Limits::default()));
+    }
     #[test]
     fn golden_frames_roundtrip_and_reject_ambiguous_mutations() {
         let frames: Value = serde_json::from_str(include_str!("fixtures/control-v1.json")).unwrap();
@@ -707,8 +841,9 @@ mod tests {
             frames["requests"]
                 .as_array()
                 .unwrap()
-                .last()
-                .unwrap()
+                .iter()
+                .find(|value| value["command"]["op"] == "administrative_receipt")
+                .expect("golden fixture carries the original historical query")
                 .clone(),
         )
         .unwrap();

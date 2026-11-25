@@ -7462,23 +7462,25 @@ mod session_switch_tests {
                         .emit(AgentEvent::MessageUpdate {
                             message_id: None,
                             message: partial.clone(),
-                            assistant_message_event:
+                            assistant_message_event: Box::new(
                                 rpi_ai::types::AssistantMessageEvent::TextStart {
                                     content_index: 0,
                                     partial: partial.clone(),
                                 },
+                            ),
                         })
                         .await;
                     recorder
                         .emit(AgentEvent::MessageUpdate {
                             message_id: None,
                             message: partial.clone(),
-                            assistant_message_event:
+                            assistant_message_event: Box::new(
                                 rpi_ai::types::AssistantMessageEvent::TextDelta {
                                     content_index: 0,
                                     delta: "kept prefix".into(),
                                     partial,
                                 },
+                            ),
                         })
                         .await;
                 }

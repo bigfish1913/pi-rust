@@ -34,29 +34,28 @@ No automatic retry. Administrative exit codes: 0 recorded success, 1 definite fa
 3 unresolved (missing/prepared/interrupted/uncertain, lost reply or mutation output).
 A historical success is not proof of current residency or process exit.
 
-Unix only. serve runs in the foreground; SIGINT/SIGTERM request native settlement.
+Unix only. serve defaults to the foreground. SIGINT/SIGTERM request settlement.
 IPC: status/list/inspect, Agent-scoped receipt queries and text submit to loaded
 Agents. Optional administration adds allowed-profile discovery, full-intent
 receipts, profile create/restore, guarded close, stable-input cancellation and Stop.
 Legacy ticket Cancel and bare Stop remain unavailable.
-Startup Agents come only from explicit `agents` profiles; there is no ambient
-settings/credential discovery, Session auto-restore or background spawn.
+Agent assembly uses only explicit private profiles and settings.
 Config (0600 file, private owned parent; no token CLI flag or env fallback):
   directory, socket_path, host_id (UUID), token (32..128 URL-safe ASCII),
   host (optional HostConfig; max_agents supported, timeout policies rejected),
   mode (foreground|daemon, default foreground),
   recovery (optional object; restore_on_start/restart_on_crash, both default false).
-    restart_on_crash requires daemon mode. Daemon and whole-Host recovery are
-    recognized but NOT IMPLEMENTED: serve rejects them before profile/catalog
-    setup; queries can still use a valid config without starting a Host.
+    On macOS, daemon starts a detached supervisor and waits for the Host to be ready.
+    restart_on_crash requires daemon mode. Accepted Stop suppresses restart.
+    restore_on_start loads the saved Persistent member set and explicit Agents.
   agents (optional list of absolute private Agent profile paths, serve only),
   administration (optional private policy; fixed native authority, journaled IPC):
     scope (fixed UUID namespace), allowed_agents (UUID list, default empty),
     permissions (create/restore/cancel/close/stop list, default empty),
     profiles (dynamic-only private profile paths, default empty), max_jobs (1..64, default 8).
   Startup and dynamic profiles share one immutable set, with no duplicate identities
-  or Session aliases; every allowed Agent must be in that set. Dynamic profiles
-  never create, register or load automatically. The scope is not an auth credential.
+  or Session aliases. Every allowed Agent must be in that set. Recovery also
+  requires a matching private profile and restore authority for dynamic members.
   max_connections (default 8),
   handshake_timeout_ms (default 5000), request_timeout_ms (default 30000),
   client_timeout_ms (default 5000). All paths must be absolute.
@@ -99,12 +98,15 @@ mod submission_cli;
 #[cfg(unix)]
 mod unix {
     use super::{administration_cli, submission_cli, HELP};
+    #[cfg(target_os = "macos")]
+    use crate::host::supervisor;
     use crate::host::{
         administration::AdministrativePermissions,
         client::{ConnectionConfig, HostClient},
         daemon::{DaemonAdministrationConfig, HostDaemon},
         launch_policy::{HostRunMode, LaunchPolicy, RecoveryPolicy},
         protocol::{AgentId, AuthToken, Command, HostId, MAX_PAGE_SIZE},
+        recovery::{self, Bindings},
         server::ControlConfig,
         AgentId as NativeAgentId, ControlScopeId, HostConfig,
     };
@@ -225,6 +227,9 @@ mod unix {
         /// Owner policy only; never populated from a control request.
         #[serde(default)]
         administration: Option<FileAdministration>,
+        /// Separate volatile Mini grant; absent means no Mini engine/capability.
+        #[serde(default)]
+        mini_control: Option<crate::host::mini_control::MiniControlConfig>,
     }
     impl FileConfig {
         fn launch_policy(&self) -> LaunchPolicy {
@@ -253,6 +258,10 @@ mod unix {
                     .administration
                     .as_ref()
                     .is_none_or(|policy| policy.valid(self.agents.len()))
+                && self
+                    .mini_control
+                    .as_ref()
+                    .is_none_or(|policy| policy.valid())
         }
         fn connection(&self) -> ConnectionConfig {
             ConnectionConfig {
@@ -307,10 +316,9 @@ mod unix {
         }
         Ok(bytes)
     }
-    fn read_config(path: PathBuf) -> Result<FileConfig, &'static str> {
-        let bytes = read_private_bytes(&path, MAX_CONFIG_BYTES)?;
+    fn parse_config(bytes: &[u8]) -> Result<FileConfig, &'static str> {
         let config: FileConfig =
-            serde_json::from_slice(&bytes).map_err(|_| "invalid Host config")?;
+            serde_json::from_slice(bytes).map_err(|_| "invalid Host config")?;
         if !config.valid() {
             return Err("invalid Host config");
         }
@@ -318,17 +326,31 @@ mod unix {
     }
     fn read_profiles(
         paths: &[PathBuf],
+        config: &FileConfig,
+        recovery: &mut Option<Bindings>,
     ) -> Result<Vec<crate::host::HostStartupAgent>, &'static str> {
         let mut agents = Vec::with_capacity(paths.len());
         for path in paths {
             let bytes = read_private_bytes(path, crate::host::MAX_PROFILE_BYTES)?;
             let profile: crate::host::AgentProfileFile =
                 serde_json::from_slice(&bytes).map_err(|_| "invalid Agent profile")?;
-            agents.push(
-                profile
-                    .into_startup()
-                    .map_err(|_| "invalid Agent profile")?,
-            );
+            let agent = profile
+                .into_startup()
+                .map_err(|_| "invalid Agent profile")?;
+            if let Some(bindings) = recovery.as_mut() {
+                if agent.spec.mode == crate::host::AgentMode::Persistent {
+                    let version = recovery::profile_version(
+                        config.host_id,
+                        &config.token,
+                        &bytes,
+                        &agent.profile,
+                    );
+                    if bindings.insert(agent.spec.id, version).is_some() {
+                        return Err("duplicate Agent identity in recovery configuration");
+                    }
+                }
+            }
+            agents.push(agent);
         }
         Ok(agents)
     }
@@ -469,6 +491,18 @@ mod unix {
     }
 
     pub(super) async fn run(argv: &[String]) -> i32 {
+        #[cfg(target_os = "macos")]
+        match argv.first().map(String::as_str) {
+            Some(supervisor::SUPERVISOR) => {
+                return internal_supervisor(&argv[1..])
+                    .await
+                    .unwrap_or_else(report_io);
+            }
+            Some(supervisor::WORKER) => {
+                return internal_worker(&argv[1..]).await.unwrap_or_else(report_io);
+            }
+            _ => (),
+        }
         let invocation = match parse(argv) {
             Ok(value) => value,
             Err(_) => {
@@ -476,7 +510,11 @@ mod unix {
                 return 2;
             }
         };
-        let config = match tokio::task::spawn_blocking(move || read_config(invocation.config)).await
+        let path = invocation.config.clone();
+        let config = match tokio::task::spawn_blocking(move || {
+            parse_config(&read_private_bytes(&path, MAX_CONFIG_BYTES)?)
+        })
+        .await
         {
             Ok(Ok(config)) => config,
             Ok(Err(error)) => {
@@ -556,7 +594,89 @@ mod unix {
             eprintln!("error: {error}");
             return 1;
         }
-        let agents = match read_profiles(&config.agents) {
+        #[cfg(target_os = "macos")]
+        if config.mode == HostRunMode::Daemon {
+            return match supervisor::launch(&invocation.config).await {
+                Ok(ready) => write_json(&ready.json())
+                    .map(|()| 0)
+                    .unwrap_or_else(report_io),
+                Err(error) => report_io(error),
+            };
+        }
+        start(
+            config,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(target_os = "macos")]
+    fn report_io(error: std::io::Error) -> i32 {
+        eprintln!("error: {error}");
+        1
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn internal_supervisor(argv: &[String]) -> std::io::Result<i32> {
+        let [flag, path] = argv else {
+            return Err(std::io::Error::other("invalid detached Host invocation"));
+        };
+        if flag != "--config" {
+            return Err(std::io::Error::other("invalid detached Host invocation"));
+        }
+        let channel = supervisor::adopt_channel()?;
+        let bytes = read_private_bytes(std::path::Path::new(path), MAX_CONFIG_BYTES)
+            .map_err(std::io::Error::other)?;
+        let config = parse_config(&bytes).map_err(std::io::Error::other)?;
+        if config.mode != HostRunMode::Daemon {
+            return Err(std::io::Error::other("detached Host configuration changed"));
+        }
+        supervisor::detached(
+            channel,
+            config.directory,
+            config.socket_path,
+            bytes,
+            config.recovery.restart_on_crash,
+        )
+        .await?;
+        Ok(0)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn internal_worker(argv: &[String]) -> std::io::Result<i32> {
+        let [listener, lock] = argv else {
+            return Err(std::io::Error::other(
+                "invalid detached Host worker invocation",
+            ));
+        };
+        let listener = listener.parse::<i32>().map_err(std::io::Error::other)?;
+        let lock = lock.parse::<i32>().map_err(std::io::Error::other)?;
+        let mut channel = supervisor::adopt_channel()?;
+        let (identity, bytes) =
+            supervisor::read_config(&mut channel, MAX_CONFIG_BYTES as usize).await?;
+        let config = parse_config(&bytes).map_err(std::io::Error::other)?;
+        if config.mode != HostRunMode::Daemon {
+            return Err(std::io::Error::other(
+                "invalid detached Host worker configuration",
+            ));
+        }
+        let worker = supervisor::Worker::adopt(
+            config.socket_path.clone(),
+            identity,
+            channel,
+            listener,
+            lock,
+        )?;
+        Ok(start(config, Some(worker)).await)
+    }
+
+    async fn start(
+        config: FileConfig,
+        #[cfg(target_os = "macos")] worker: Option<supervisor::Worker>,
+    ) -> i32 {
+        let mut recovery = config.recovery.restore_on_start.then(Bindings::new);
+        let agents = match read_profiles(&config.agents, &config, &mut recovery) {
             Ok(agents) => agents,
             Err(error) => {
                 eprintln!("error: {error}");
@@ -567,7 +687,8 @@ mod unix {
             .administration
             .as_ref()
             .map(|policy| {
-                read_profiles(&policy.profiles).and_then(|profiles| policy.native(profiles))
+                read_profiles(&policy.profiles, &config, &mut recovery)
+                    .and_then(|profiles| policy.native(profiles))
             })
             .transpose()
         {
@@ -577,14 +698,31 @@ mod unix {
                 return 1;
             }
         };
-        serve(config, agents, administration).await
+        serve(
+            config,
+            agents,
+            administration,
+            recovery,
+            #[cfg(target_os = "macos")]
+            worker,
+        )
+        .await
     }
     async fn serve(
         config: FileConfig,
         agents: Vec<crate::host::HostStartupAgent>,
         administration: Option<DaemonAdministrationConfig>,
+        recovery: Option<Bindings>,
+        #[cfg(target_os = "macos")] worker: Option<supervisor::Worker>,
     ) -> i32 {
         use tokio::signal::unix::{signal, SignalKind};
+        #[cfg(target_os = "macos")]
+        let (listener, mut supervisor) = match worker {
+            Some(worker) => (Some(worker.listener), Some(worker.monitor)),
+            None => (None, None),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let listener = None;
         // Diagnostics must not panic away a native owner when stderr is closed.
         fn diagnostic(message: impl std::fmt::Display) {
             use std::io::Write;
@@ -599,12 +737,14 @@ mod unix {
             return 1;
         };
         let control = config.control();
-        let mut daemon = match HostDaemon::open_configured(
+        let mut daemon = match HostDaemon::open_with_recovery(
             config.directory,
             config.host,
             control,
             agents,
             administration,
+            config.mini_control,
+            (recovery, listener),
         )
         .await
         {
@@ -614,7 +754,27 @@ mod unix {
                 return 1;
             }
         };
-        let output_failed = write_json(&serde_json::json!({"event":"host_ready", "pid":std::process::id(), "control":daemon.welcome()})).is_err();
+        let ready = serde_json::json!({"event":"host_ready", "pid":std::process::id(), "control":daemon.welcome()});
+        #[cfg(target_os = "macos")]
+        let mut parent_lost = false;
+        #[cfg(target_os = "macos")]
+        let output_failed = match supervisor.as_mut() {
+            Some(monitor) => {
+                parent_lost = supervisor::publish(
+                    &mut monitor.socket,
+                    &supervisor::Ready {
+                        pid: std::process::id(),
+                        control: daemon.welcome().clone(),
+                    },
+                )
+                .await
+                .is_err();
+                parent_lost
+            }
+            None => write_json(&ready).is_err(),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let output_failed = write_json(&ready).is_err();
         if output_failed {
             diagnostic("Host readiness output failed");
         }
@@ -622,23 +782,64 @@ mod unix {
         let mut shutdown_now = output_failed;
         loop {
             if !shutdown_now {
-                tokio::select! {
-                    _ = interrupt.recv() => {},
-                    _ = terminate.recv() => {},
+                let parent_exit = async {
+                    #[cfg(target_os = "macos")]
+                    if let Some(monitor) = supervisor.as_mut() {
+                        use tokio::io::AsyncReadExt;
+                        if !parent_lost {
+                            let _ = monitor.socket.read(&mut [0]).await;
+                            return;
+                        }
+                    }
+                    std::future::pending::<()>().await;
+                };
+                let stopping = tokio::select! {
+                    _ = interrupt.recv() => true,
+                    _ = terminate.recv() => true,
+                    _ = parent_exit => {
+                        #[cfg(target_os = "macos")]
+                        { parent_lost = true; }
+                        false
+                    },
                     result = daemon.wait_control(), if !listener_failed => {
                         listener_failed = result.is_err() || !daemon.control_stopped_by_administration();
                         if listener_failed { diagnostic("Host control listener stopped"); }
+                        false
                     },
+                };
+                #[cfg(target_os = "macos")]
+                if let Some(monitor) = supervisor.as_mut() {
+                    if stopping && !parent_lost {
+                        use tokio::io::AsyncWriteExt;
+                        parent_lost = monitor.socket.write_all(&[1]).await.is_err();
+                    }
                 }
+                #[cfg(not(target_os = "macos"))]
+                let _ = stopping;
             }
             shutdown_now = false;
             match daemon.shutdown().await {
                 Ok(()) => {
+                    #[cfg(target_os = "macos")]
+                    if let Some(monitor) = supervisor.take() {
+                        if nix::unistd::getppid().as_raw() != monitor.session {
+                            loop {
+                                match supervisor::settle(monitor.session).await {
+                                    Ok(()) => break,
+                                    Err(error) => {
+                                        diagnostic(error);
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                }
+                            }
+                            monitor.lease.remove();
+                        }
+                    }
                     return if listener_failed || output_failed {
                         1
                     } else {
                         0
-                    }
+                    };
                 }
                 Err(error) => {
                     diagnostic(error);
@@ -744,7 +945,8 @@ mod unix {
                         assert_eq!(config.valid(), !restart || mode == "daemon");
                         assert_eq!(
                             config.launch_policy().require_implemented().is_ok(),
-                            mode == "foreground" && !restore && !restart
+                            (!restart || mode == "daemon")
+                                && (mode == "foreground" || cfg!(target_os = "macos"))
                         );
                     }
                 }

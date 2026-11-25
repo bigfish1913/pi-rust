@@ -41,7 +41,7 @@ pub(super) struct HostRuntime<Owner, StartupResidue = ()> {
     // A transaction holds a reader; whole-Host stop holds the fair writer.
     // Admission checks stopping both before and after acquiring its reader.
     pub lifecycle: RwLock<()>,
-    stopping: AtomicBool,
+    stopping: Arc<AtomicBool>,
     closed: AtomicBool,
 }
 
@@ -50,7 +50,7 @@ impl<Owner, StartupResidue> HostRuntime<Owner, StartupResidue> {
         Self {
             entries: Mutex::new(BTreeMap::new()),
             lifecycle: RwLock::new(()),
-            stopping: AtomicBool::new(false),
+            stopping: Arc::new(AtomicBool::new(false)),
             closed: AtomicBool::new(false),
         }
     }
@@ -72,6 +72,12 @@ impl<Owner, StartupResidue> HostRuntime<Owner, StartupResidue> {
 
     pub fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)
+    }
+
+    /// Existing Mini observers share this exact admission seal, not a copied
+    /// stopping flag or a parallel owner table.
+    pub fn stopping_signal(&self) -> Arc<AtomicBool> {
+        self.stopping.clone()
     }
 
     pub fn is_closed(&self) -> bool {

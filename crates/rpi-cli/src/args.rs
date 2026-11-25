@@ -248,6 +248,8 @@ pub struct Args {
     /// Extension-declared or otherwise unknown long flags. Values are either
     /// JSON booleans (a bare flag) or strings (a flag with a value), matching
     /// Pi's `unknownFlags` contract so an extension can claim its own options.
+    /// Also holds the reserved launch fork options, filtered before forwarding
+    /// flags to extensions.
     pub unknown_flags: BTreeMap<String, serde_json::Value>,
     /// Warnings about recognized-but-ignored flags (v1 scope cuts). Surfaced
     /// to the user on startup when `--verbose`.
@@ -255,6 +257,55 @@ pub struct Args {
     /// Hard parse errors (unknown short flags, missing values). Non-empty ⇒
     /// `main` prints them + help and exits non-zero.
     pub errors: Vec<String>,
+}
+
+pub(crate) fn is_fork_cut_flag(name: &str) -> bool {
+    matches!(name, "fork-entry" | "fork-position")
+}
+
+impl Args {
+    pub(crate) fn extension_flags(&self) -> BTreeMap<String, serde_json::Value> {
+        self.unknown_flags
+            .iter()
+            .filter(|(name, _)| !is_fork_cut_flag(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+
+    pub(crate) fn launch_fork_options(
+        &self,
+    ) -> Result<rpi_harness::session::types::ForkOptions, String> {
+        use rpi_harness::session::types::{ForkOptions, ForkPosition};
+
+        let entry = self.unknown_flags.get("fork-entry");
+        let position = self.unknown_flags.get("fork-position");
+        if entry.is_none() && position.is_none() {
+            return Ok(ForkOptions::default());
+        }
+        if self.fork.as_deref().is_none_or(str::is_empty)
+            || self.no_session
+            || self.continue_session
+            || self.resume
+        {
+            return Err("--fork-entry requires an active --fork selection".into());
+        }
+        let entry = entry
+            .and_then(serde_json::Value::as_str)
+            .filter(|entry| !entry.trim().is_empty())
+            .ok_or("--fork-entry requires a nonempty entry ID")?;
+        let position = match position {
+            None => None,
+            Some(value) => Some(match value.as_str() {
+                Some("before") => ForkPosition::Before,
+                Some("at") => ForkPosition::At,
+                _ => return Err("--fork-position must be at or before".into()),
+            }),
+        };
+        Ok(ForkOptions::Branch {
+            entry_id: Some(entry.to_owned()),
+            position,
+        })
+    }
 }
 
 /// The canonical valid `--thinking` level strings, in level order. Mirrors TS
@@ -473,6 +524,17 @@ pub fn parse_args(args: &[String]) -> Args {
             "--session" => result.session = take_value(&mut result, "--session"),
             "--session-id" => result.session_id = take_value(&mut result, "--session-id"),
             "--fork" => result.fork = take_value(&mut result, "--fork"),
+            "--fork-entry" | "--fork-position" => {
+                if let Some(value) = take_value(&mut result, &flag_key) {
+                    if result
+                        .unknown_flags
+                        .insert(flag_key[2..].to_owned(), serde_json::Value::String(value))
+                        .is_some()
+                    {
+                        result.errors.push(format!("duplicate {flag_key}"));
+                    }
+                }
+            }
             "--models" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.models = Some(split_csv(&v));
@@ -614,6 +676,9 @@ pub fn parse_args(args: &[String]) -> Args {
     if let Err(error) = crate::native_durable::experimental_epoch::policy(&result) {
         result.errors.push(error);
     }
+    if let Err(error) = result.launch_fork_options() {
+        result.errors.push(error);
+    }
     result
 }
 
@@ -700,6 +765,9 @@ pub fn print_help() {
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
+  --fork <id|path>               Start a new session from an existing branch
+  --fork-entry <id>              Cut the fork at a specific message entry
+  --fork-position <at|before>    Include or exclude the selected entry (default: before)
   --session-dir <dir>            Directory for session storage
   --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
@@ -1114,6 +1182,51 @@ mod tests {
         assert_eq!(a.extension.len(), 1);
         assert_eq!(a.skill.len(), 1);
         assert_eq!(a.prompt_template.len(), 1);
+    }
+
+    #[test]
+    fn fork_cut_flags_are_reserved_and_require_an_active_fork() {
+        let args = parse_args(&s(&[
+            "--fork-entry=entry-1",
+            "--fork",
+            "source",
+            "--fork-position",
+            "at",
+            "--extension-option=keep",
+        ]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(
+            args.extension_flags(),
+            BTreeMap::from([("extension-option".into(), serde_json::json!("keep"))])
+        );
+        for argv in [
+            &["--fork-entry", "entry-1"][..],
+            &["--fork", "source", "--fork-position", "at"],
+            &[
+                "--fork",
+                "source",
+                "--fork-entry",
+                "entry-1",
+                "--no-session",
+            ],
+            &["--fork", "source", "--fork-entry", "entry-1", "--resume"],
+            &[
+                "--fork",
+                "source",
+                "--fork-entry",
+                "entry-1",
+                "--fork-position=after",
+            ],
+            &[
+                "--fork",
+                "source",
+                "--fork-entry=entry-1",
+                "--fork-entry=entry-2",
+            ],
+            &["--fork", "source", "--fork-entry="],
+        ] {
+            assert!(!parse_args(&s(argv)).errors.is_empty(), "{argv:?}");
+        }
     }
 
     #[test]
