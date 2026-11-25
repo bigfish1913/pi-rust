@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 struct ControlAuthority {
     administration: Option<DaemonAdministration>,
     mini: Option<super::mini_control::MiniControl>,
+    session_rpc: Option<super::area_rpc::Session>,
 }
 
 #[derive(Clone)]
@@ -162,7 +163,7 @@ impl ControlServer {
         service: HostService,
         administration: Option<DaemonAdministration>,
     ) -> Result<Self, ServerError> {
-        Self::bind_with_controls(config, service, administration, None, None).await
+        Self::bind_with_controls(config, service, administration, None, None, None).await
     }
     pub(crate) async fn bind_with_controls(
         config: ControlConfig,
@@ -170,11 +171,21 @@ impl ControlServer {
         administration: Option<DaemonAdministration>,
         mini: Option<super::mini_control::MiniControl>,
         inherited: Option<std::os::unix::net::UnixListener>,
+        session_rpc_agent: Option<super::AgentId>,
     ) -> Result<Self, ServerError> {
         config.validate()?;
+        let session_rpc = match session_rpc_agent {
+            Some(id) => Some(
+                super::area_rpc::Session::open(&service, id, config.host_id)
+                    .await
+                    .map_err(|_| ServerError::InvalidConfiguration)?,
+            ),
+            None => None,
+        };
         let authority = ControlAuthority {
             administration,
             mini,
+            session_rpc,
         };
         let (listener, lease) = match inherited {
             Some(listener) => (listener, None),
@@ -327,8 +338,17 @@ async fn connection(
     {
         return;
     }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Handshake {
+        Control(Hello),
+        Session(super::area_rpc::SessionHello),
+    }
     let handshake = async {
-        let hello: Hello = read_frame(&mut stream, MAX_FRAME_BYTES).await?;
+        let (hello, session) = match read_frame(&mut stream, MAX_FRAME_BYTES).await? {
+            Handshake::Control(hello) => (hello, None),
+            Handshake::Session(request) => (request.session_rpc, Some(request.agent_id)),
+        };
         if !config.token.matches(&hello.token)
             || hello.host_id != config.host_id
             || hello.protocol != PROTOCOL
@@ -336,15 +356,29 @@ async fn connection(
         {
             return Err(super::client::Failure::IncompatiblePeer);
         }
-        write_frame(&mut stream, &encode_frame(&welcome, MAX_FRAME_BYTES)?).await
+        if session.is_none() {
+            write_frame(&mut stream, &encode_frame(&welcome, MAX_FRAME_BYTES)?).await?;
+        }
+        Ok(session)
     };
     let handshake_result = tokio::select! {
         biased;
         _ = native_stop.cancelled() => return,
         result = tokio::time::timeout(config.handshake_timeout, handshake) => result,
     };
-    if !matches!(handshake_result, Ok(Ok(()))) {
-        return;
+    match handshake_result {
+        Ok(Ok(Some(agent))) => {
+            if let Some(session) = authority
+                .session_rpc
+                .as_ref()
+                .filter(|s| s.agent_id == agent)
+            {
+                session.serve(stream, native_stop).await;
+            }
+            return;
+        }
+        Ok(Ok(None)) => (),
+        _ => return,
     }
     loop {
         let exchange = async {

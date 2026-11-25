@@ -96,7 +96,7 @@ mod administration_cli;
 mod submission_cli;
 
 #[cfg(unix)]
-mod unix {
+pub(super) mod unix {
     use super::{administration_cli, submission_cli, HELP};
     #[cfg(target_os = "macos")]
     use crate::host::supervisor;
@@ -118,7 +118,7 @@ mod unix {
         time::Duration,
     };
 
-    const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+    pub(in crate::host) const MAX_CONFIG_BYTES: u64 = 64 * 1024;
     fn connections() -> usize {
         8
     }
@@ -202,9 +202,9 @@ mod unix {
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct FileConfig {
+    pub(in crate::host) struct FileConfig {
         directory: PathBuf,
-        socket_path: PathBuf,
+        pub(in crate::host) socket_path: PathBuf,
         host_id: HostId,
         token: AuthToken,
         #[serde(default)]
@@ -224,6 +224,8 @@ mod unix {
         /// Startup Agent profiles for `serve`, absolute private files.
         #[serde(default)]
         agents: Vec<PathBuf>,
+        #[serde(default)]
+        session_rpc_agent: Option<NativeAgentId>,
         /// Owner policy only; never populated from a control request.
         #[serde(default)]
         administration: Option<FileAdministration>,
@@ -263,7 +265,7 @@ mod unix {
                     .as_ref()
                     .is_none_or(|policy| policy.valid())
         }
-        fn connection(&self) -> ConnectionConfig {
+        pub(in crate::host) fn connection(&self) -> ConnectionConfig {
             ConnectionConfig {
                 socket_path: self.socket_path.clone(),
                 host_id: self.host_id,
@@ -274,9 +276,24 @@ mod unix {
     }
     /// Read one explicitly named private Host input (daemon config or Agent
     /// profile). No fallback path, environment lookup or symlink following.
-    pub(super) fn read_private_bytes(
+    pub(in crate::host) fn read_private_bytes(
         path: &std::path::Path,
         max: u64,
+    ) -> Result<Vec<u8>, &'static str> {
+        read_file_bytes(path, max, 0o077)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::host) fn read_area_settings(
+        path: &std::path::Path,
+    ) -> Result<Vec<u8>, &'static str> {
+        read_file_bytes(path, MAX_CONFIG_BYTES, 0o022)
+    }
+
+    fn read_file_bytes(
+        path: &std::path::Path,
+        max: u64,
+        forbidden_mode: u32,
     ) -> Result<Vec<u8>, &'static str> {
         use std::{
             io::Read,
@@ -290,7 +307,7 @@ mod unix {
         let parent = path.parent().ok_or(unsafe_file)?;
         let directory = std::fs::symlink_metadata(parent).map_err(|_| unsafe_file)?;
         let uid = nix::unistd::Uid::effective().as_raw();
-        if !directory.is_dir() || directory.uid() != uid || directory.mode() & 0o077 != 0 {
+        if !directory.is_dir() || directory.uid() != uid || directory.mode() & forbidden_mode != 0 {
             return Err(unsafe_file);
         }
         let file = std::fs::OpenOptions::new()
@@ -301,7 +318,7 @@ mod unix {
         let metadata = file.metadata().map_err(|_| unsafe_file)?;
         if !metadata.is_file()
             || metadata.uid() != uid
-            || metadata.mode() & 0o077 != 0
+            || metadata.mode() & forbidden_mode != 0
             || metadata.nlink() != 1
             || metadata.len() > max
         {
@@ -316,7 +333,7 @@ mod unix {
         }
         Ok(bytes)
     }
-    fn parse_config(bytes: &[u8]) -> Result<FileConfig, &'static str> {
+    pub(in crate::host) fn parse_config(bytes: &[u8]) -> Result<FileConfig, &'static str> {
         let config: FileConfig =
             serde_json::from_slice(bytes).map_err(|_| "invalid Host config")?;
         if !config.valid() {
@@ -744,7 +761,7 @@ mod unix {
             agents,
             administration,
             config.mini_control,
-            (recovery, listener),
+            (recovery, listener, config.session_rpc_agent),
         )
         .await
         {

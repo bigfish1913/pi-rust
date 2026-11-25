@@ -461,6 +461,20 @@ with the full `execute`→`poll`→`cancel`→`destroy` lifecycle — and read
 [`docs/extensions/authoring.md`](docs/extensions/authoring.md) for the safety
 rules, which are load-bearing rather than stylistic.
 
+## Shared Host areas on macOS
+
+```bash
+rpi --host                 # Open the default area's Session in the terminal
+rpi --host work            # Open a separate area and Session
+rpi --host --mode json     # Inspect the selected area, Host and Session IDs
+```
+
+First entry creates `$RPI_CODING_AGENT_DIR/host.json` (normally `~/.rpi/agent/host.json`) and starts a detached Host with one Persistent Agent. Concurrent entries share that Host and Session. Start the clients from the same workspace. Choose a different area for another workspace.
+
+The settings file starts with `{"defaultArea":"default","areas":{"default":{}}}`. Each area can set `provider`, `model`, and `tools`. The initial profile uses global model settings and available non-OAuth credentials. Its tool list defaults to `read`. The generated private profile and Host configuration live under `hosts/<area>/` and are reused on restart. `--mode json` prints the configuration path for [the Host control commands](crates/rpi-cli/src/host/cli.rs), including `status` and `administrative-stop`.
+
+The terminal supports shared text prompts, live responses, saved history, and cancellation. Closing a terminal disconnects its view. In Web, use `rpi-web --host-area` or `rpi --webserver --host-area` from the same workspace to open the shared Session.
+
 ## Remote mode
 
 ```bash

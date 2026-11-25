@@ -1823,7 +1823,10 @@ async fn rpc_prompt_content(
     )
 }
 
-async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> serde_json::Value {
+pub(crate) async fn rpc_get_state(
+    lane: &Arc<dyn AgentLane>,
+    harness: &AgentHarness,
+) -> serde_json::Value {
     let model = lane.get_model().await.ok();
     let thinking = lane
         .get_thinking_level()
@@ -1881,7 +1884,7 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
     })
 }
 
-fn rpc_now_ms() -> i64 {
+pub(crate) fn rpc_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -1904,7 +1907,7 @@ fn rpc_message_text(value: &serde_json::Value) -> String {
         .join("\n")
 }
 
-async fn rpc_get_history(
+pub(crate) async fn rpc_get_history(
     lane: &Arc<dyn AgentLane>,
     harness: &AgentHarness,
     msg: &serde_json::Value,
@@ -2545,7 +2548,7 @@ fn page_window(
 /// Read-only snapshot of the current branch, oldest first. Messages are
 /// projected with the same `AgentMessage` encoding the event stream uses, so a
 /// client can render a transcript without understanding session entries.
-async fn rpc_get_messages(
+pub(crate) async fn rpc_get_messages(
     lane: &Arc<dyn AgentLane>,
     harness: &AgentHarness,
     msg: &serde_json::Value,
@@ -2963,7 +2966,7 @@ async fn rpc_set_api_key(msg: &serde_json::Value) -> Result<serde_json::Value, S
     }))
 }
 
-fn rpc_get_available_models(catalog: &[rpi_ai::Model]) -> serde_json::Value {
+pub(crate) fn rpc_get_available_models(catalog: &[rpi_ai::Model]) -> serde_json::Value {
     let models = catalog
         .iter()
         .map(crate::rpc::protocol::model_descriptor)
@@ -2971,7 +2974,9 @@ fn rpc_get_available_models(catalog: &[rpi_ai::Model]) -> serde_json::Value {
     serde_json::json!({"models": models})
 }
 
-async fn rpc_get_available_thinking_levels(lane: &Arc<dyn AgentLane>) -> serde_json::Value {
+pub(crate) async fn rpc_get_available_thinking_levels(
+    lane: &Arc<dyn AgentLane>,
+) -> serde_json::Value {
     let levels = lane
         .get_model()
         .await

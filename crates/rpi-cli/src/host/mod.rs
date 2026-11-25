@@ -11,6 +11,13 @@
 
 #[cfg(unix)]
 pub mod administration;
+#[cfg(target_os = "macos")]
+mod area;
+pub(crate) mod area_entry;
+#[cfg(unix)]
+mod area_rpc;
+#[cfg(target_os = "macos")]
+mod area_terminal;
 pub mod bindings;
 mod capacity;
 mod catalog;

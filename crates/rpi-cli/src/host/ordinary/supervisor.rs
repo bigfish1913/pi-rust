@@ -52,6 +52,8 @@ pub(super) struct Backend {
     close_gate: Arc<Mutex<()>>,
     catalog: HostCatalog,
     harness: AgentHarness,
+    #[cfg(unix)]
+    area_events: std::sync::OnceLock<super::super::area_rpc::Events>,
     storage: JsonlSessionStorage,
     extensions: Option<Arc<super::super::NativeExtensionCustody>>,
     limits: OrdinaryLimits,
@@ -364,6 +366,8 @@ async fn build_inner(
         close_gate: Arc::new(Mutex::new(())),
         catalog: catalog.clone(),
         harness,
+        #[cfg(unix)]
+        area_events: std::sync::OnceLock::new(),
         storage,
         extensions,
         limits,
@@ -658,6 +662,14 @@ impl Backend {
             match self.harness.admit_host_request(request).await {
                 Ok(outcome) => {
                     replayed = outcome.replayed;
+                    #[cfg(unix)]
+                    if !replayed {
+                        if let (Some(events), OrdinaryOperation::Prompt(messages)) =
+                            (self.area_events.get(), &operation)
+                        {
+                            events.admitted(messages, &outcome.receipt.entry_id);
+                        }
+                    }
                     publish_admission(
                         &admission,
                         AdmissionState::Admitted(Arc::new(outcome.receipt)),
@@ -822,6 +834,10 @@ impl Backend {
             catalog_error,
         });
         control.last_report = Some(report.clone());
+        #[cfg(unix)]
+        if let Some(events) = self.area_events.get() {
+            events.settled(&report, self.harness.pending_resume().is_some());
+        }
         report
     }
 
@@ -946,6 +962,58 @@ impl Backend {
             fault: control.fault.clone(),
             last_report: control.last_report.clone(),
         })
+    }
+
+    #[cfg(unix)]
+    pub async fn install_area_events(
+        &self,
+        events: super::super::area_rpc::Events,
+    ) -> BackendResult<()> {
+        if self.extensions.is_some() {
+            return Err(BackendError::Binding(
+                "Host area RPC requires a native Agent without extension hooks",
+            ));
+        }
+        self.area_events
+            .set(events.clone())
+            .map_err(|_| BackendError::Binding("Host area event stream already installed"))?;
+        self.harness
+            .set_agent_emitter(Some(Arc::new(events)))
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub async fn area_query(
+        &self,
+        kind: &str,
+        msg: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let harness = &self.harness;
+        let lane = harness.lane("main");
+        match kind {
+            "get_state" => Ok(crate::modes::rpc_get_state(&lane, harness).await),
+            "get_messages" => {
+                let mut query = msg.clone();
+                query["limit"] =
+                    serde_json::json!(msg["limit"].as_u64().unwrap_or(100).clamp(1, 400));
+                crate::modes::rpc_get_messages(&lane, harness, &query).await
+            }
+            "get_message_summaries" => crate::rpc::message_queries::summaries(harness, msg).await,
+            "get_message_window" => crate::rpc::message_queries::window(harness, msg).await,
+            "get_history" => crate::modes::rpc_get_history(&lane, harness, msg).await,
+            "get_available_models" => {
+                let model = lane
+                    .get_model()
+                    .await
+                    .map_err(|_| "Host model unavailable")?;
+                Ok(crate::modes::rpc_get_available_models(&[model]))
+            }
+            "get_available_thinking_levels" => {
+                Ok(crate::modes::rpc_get_available_thinking_levels(&lane).await)
+            }
+            _ => Err("command is unavailable for this Host area".into()),
+        }
     }
 
     pub fn unsaved_messages(&self) -> Vec<UnsavedMessage> {

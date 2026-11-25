@@ -558,6 +558,26 @@ impl OrdinaryClient {
         self.upgrade()?.cancel_submitted_guarded(guard, request_id)
     }
 
+    #[cfg(unix)]
+    pub(in crate::host) async fn install_area_events(
+        &self,
+        events: super::area_rpc::Events,
+    ) -> BackendResult<()> {
+        self.upgrade()?.install_area_events(events).await
+    }
+
+    #[cfg(unix)]
+    pub(in crate::host) async fn area_query(
+        &self,
+        kind: &str,
+        msg: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.upgrade()
+            .map_err(|error| error.to_string())?
+            .area_query(kind, msg)
+            .await
+    }
+
     /// Cheap volatile observation; does not scan transcripts or prove settlement.
     pub async fn snapshot(&self) -> BackendResult<BackendSnapshot> {
         self.upgrade()?.snapshot()
