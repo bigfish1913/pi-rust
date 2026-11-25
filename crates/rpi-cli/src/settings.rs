@@ -379,7 +379,7 @@ pub fn load_settings() -> Result<Settings, ConfigError> {
     load_settings_at(None)
 }
 
-/// [`load_settings`] against an explicit agent home (`--agent-dir`).
+/// [`load_settings`] against an explicit agent home.
 pub(crate) fn load_settings_at(agent_dir: Option<&Path>) -> Result<Settings, ConfigError> {
     let path = config::settings_path_at(agent_dir)?;
     match std::fs::read_to_string(&path) {
@@ -533,7 +533,7 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
     save_settings_at(None, settings)
 }
 
-/// [`save_settings`] against an explicit agent home (`--agent-dir`).
+/// [`save_settings`] against an explicit agent home.
 pub(crate) fn save_settings_at(
     agent_dir: Option<&Path>,
     settings: &Settings,
