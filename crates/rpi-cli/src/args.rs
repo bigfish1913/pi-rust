@@ -783,7 +783,8 @@ pub fn print_help() {
   --version, -v                  Show version
 
 {u}Subcommands:{r}
-  update                       Update the rpi CLI from crates.io
+  update                       Update the rpi CLI from GitHub releases
+                                (Homebrew installs use `brew upgrade rpi`)
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
   events path|tail               Inspect the extension event journal (needs
