@@ -90,6 +90,12 @@ async fn run_inner() -> i32 {
     if argv.first().map(String::as_str) == Some("host") {
         return crate::host::cli::run(&argv[1..]).await;
     }
+    if argv
+        .first()
+        .is_some_and(|arg| arg == "--host" || arg.starts_with("--host="))
+    {
+        return crate::host::area_entry::run(&argv).await;
+    }
     if let Err(error) = crate::native_durable::experimental_epoch::early_check(&argv) {
         eprintln!("error: {error}");
         return EXIT_USAGE;

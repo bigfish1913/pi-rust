@@ -751,6 +751,7 @@ pub fn print_help() {
   --rpc-message-updates <mode>   RPC updates: compact-deltas (default) or snapshot (legacy)
   --server [--port <n>] [--bind <ip>]
                                  Headless server: serve a remote-connectable agent (no TUI)
+  --host [area]                 Join or start a persistent local Host area (macOS)
   --connect <host:port>          Remote client: connect to a `--server` instance and run the TUI
                                  (no local provider/tools/session; all agent work is remote)
   --token <token>                Auth token for `--connect` (printed by `--server`; may also

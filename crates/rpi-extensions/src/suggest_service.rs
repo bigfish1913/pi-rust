@@ -770,6 +770,8 @@ mod tests {
         static CALLS: AtomicU64 = AtomicU64::new(0);
         let mut suggester = suggester_for(hung_handler);
         suggester.user_data = &CALLS as *const _ as *mut c_void;
+        // The last callback can finish after this test releases COUNT_LOCK.
+        suggester.plugin_free_string = rpi_plugin_sdk::callbacks::free_string;
 
         // TTL shorter than the handler's sleep: every loop tick would refresh
         // if the timeout freed the slot.

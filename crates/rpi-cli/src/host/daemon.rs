@@ -96,7 +96,7 @@ impl HostDaemon {
             agents,
             administration,
             mini_control,
-            (None, None),
+            (None, None, None),
         )
         .await
     }
@@ -108,9 +108,13 @@ impl HostDaemon {
         agents: Vec<HostStartupAgent>,
         administration: Option<DaemonAdministrationConfig>,
         mini_control: Option<super::mini_control::MiniControlConfig>,
-        startup: (Option<Bindings>, Option<std::os::unix::net::UnixListener>),
+        startup: (
+            Option<Bindings>,
+            Option<std::os::unix::net::UnixListener>,
+            Option<AgentId>,
+        ),
     ) -> Result<Self, DaemonError> {
-        let (recovery, listener) = startup;
+        let (recovery, listener, session_rpc_agent) = startup;
         // Reject invalid options before opening SQLite or creating directories.
         control.validate()?;
         if host.host_idle_timeout_ms.is_some()
@@ -232,6 +236,7 @@ impl HostDaemon {
             administration.clone(),
             mini,
             listener,
+            session_rpc_agent,
         )
         .await
         {
