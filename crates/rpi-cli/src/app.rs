@@ -129,11 +129,26 @@ async fn run_inner() -> i32 {
         return crate::dev_extension::run_cleanup_helper(&argv[1..]);
     }
 
+    #[cfg(unix)]
+    if argv
+        .first()
+        .is_some_and(|arg| arg == crate::local_host::DAEMON_COMMAND)
+    {
+        return crate::local_host::run_daemon_command(&argv[1..]).await;
+    }
+
     // ---- `rpi --connect <addr>` — pure remote client ----
     // Intercepted before any provider / harness / session / extension work so
     // the client holds no local agent resources at all: it only connects to a
     // running `rpi --server` and renders the remote transcript.
     if let Some(addr) = take_flag_value(&argv, "--connect") {
+        if argv
+            .iter()
+            .any(|arg| arg == "--host" || arg.starts_with("--host="))
+        {
+            eprintln!("error: --host cannot be combined with --connect");
+            return EXIT_USAGE;
+        }
         if argv
             .iter()
             .any(|arg| arg == "--mini" || arg.starts_with("--mini="))
@@ -243,6 +258,22 @@ async fn run_inner() -> i32 {
         return code;
     }
 
+    if parsed.host.is_some() {
+        if dev_options.is_some() {
+            eprintln!("error: --host cannot be combined with dev/dev-local");
+            return EXIT_USAGE;
+        }
+        #[cfg(unix)]
+        {
+            return crate::local_host::run(parsed).await;
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("error: --host requires Unix-domain sockets");
+            return EXIT_USAGE;
+        }
+    }
+
     if dev_options.is_some() && parsed.mini {
         eprintln!("error: --mini cannot be combined with dev/dev-local");
         return EXIT_USAGE;
@@ -318,23 +349,9 @@ async fn run_inner() -> i32 {
 
     if parsed.mini {
         drop(argv);
-        let mut messages = std::mem::take(&mut parsed.messages).into_iter();
-        let mut parts = read_piped_stdin()
-            .into_iter()
-            .chain((!file_text.is_empty()).then_some(file_text))
-            .chain(messages.next());
-        let initial = parts.next().map(|mut text| {
-            for part in parts {
-                text.push_str(&part);
-            }
-            text
-        });
-        let prompts = initial
-            .or_else(|| (!file_images.is_empty()).then(String::new))
-            .into_iter()
-            .chain(messages);
+        let input = mini_input(&mut parsed, file_text, file_images);
         startup.finish();
-        return crate::mini::run(&parsed, &cwd, prompts, file_images).await;
+        return crate::mini::run(&parsed, &cwd, input).await;
     }
 
     // ---- restored-session working directory (adopted before any resource load) ----
@@ -891,7 +908,7 @@ async fn resolve_resume(parsed: &mut Args, cwd: &Path) -> Option<i32> {
     }
 }
 
-fn emit_startup_warnings(parsed: &Args) {
+pub(crate) fn emit_startup_warnings(parsed: &Args) {
     // ---- Startup warnings (ignored-but-recognized flags) ----
     if parsed.verbose {
         for warn in &parsed.ignored {
@@ -1065,7 +1082,7 @@ fn read_piped_stdin() -> Option<String> {
 /// `<file name="...">\n<contents>\n</file>\n` and concatenated.
 ///
 /// Paths are resolved relative to `cwd` (the TS uses `resolve(readPath, cwd)`).
-fn process_file_args(
+pub(crate) fn process_file_args(
     file_args: &[std::path::PathBuf],
     cwd: &Path,
 ) -> Result<(String, Vec<ImageContent>), String> {
@@ -1146,22 +1163,45 @@ fn build_initial_message(
     (initial, extra)
 }
 
-/// Print a model-resolution error with env-specific guidance. Mirrors the TS
-/// auth-guidance / model-resolver error formatting (condensed to stderr lines).
-pub(crate) fn print_resolve_error(e: &ResolveError) {
+pub(crate) fn mini_input(
+    args: &mut Args,
+    file_text: String,
+    images: Vec<ImageContent>,
+) -> crate::mini::Input {
+    let mut messages = std::mem::take(&mut args.messages).into_iter();
+    let mut parts = read_piped_stdin()
+        .into_iter()
+        .chain((!file_text.is_empty()).then_some(file_text))
+        .chain(messages.next());
+    let initial = parts.next().map(|mut text| {
+        for part in parts {
+            text.push_str(&part);
+        }
+        text
+    });
+    let prompts = initial
+        .or_else(|| (!images.is_empty()).then(String::new))
+        .into_iter()
+        .chain(messages)
+        .collect();
+    crate::mini::Input { prompts, images }
+}
+
+/// Format a model-resolution error with env-specific guidance.
+pub(crate) fn resolve_error_message(e: &ResolveError) -> String {
     match e {
         ResolveError::NoApiKey { hint } => {
-            eprintln!("error: {e}");
-            eprintln!();
-            eprintln!("Provide credentials via one of: {hint}.");
+            format!("error: {e}\n\nProvide credentials via one of: {hint}.")
         }
-        ResolveError::Config(_) => {
-            eprintln!("error: {e}");
-            eprintln!();
-            eprintln!("Check ~/.rpi/auth.json / ~/.rpi/models.json (set RPI_CODING_AGENT_DIR to relocate).");
-        }
-        _ => eprintln!("error: {e}"),
+        ResolveError::Config(_) => format!(
+            "error: {e}\n\nCheck ~/.rpi/auth.json / ~/.rpi/models.json (set RPI_CODING_AGENT_DIR to relocate)."
+        ),
+        _ => format!("error: {e}"),
     }
+}
+
+fn print_resolve_error(e: &ResolveError) {
+    eprintln!("{}", resolve_error_message(e));
 }
 
 /// Print a harness-build error with flag-specific guidance for restore requests.

@@ -143,6 +143,8 @@ pub struct Args {
 
     pub print: bool,
     pub mini: bool,
+    /// The empty string selects the configured default area.
+    pub host: Option<String>,
     pub mode: Mode,
     pub rpc_message_updates: RpcMessageUpdates,
     /// `--tui-mode regular|fullscreen` controls the interactive terminal
@@ -318,6 +320,7 @@ pub fn parse_args(args: &[String]) -> Args {
         }
     }
     let mut i = 0;
+    let mut host_arg_count = 0;
     while i < args.len() {
         let arg = args[i].clone();
         // Peel an inline `--flag=value` (long flags only — short flags never use
@@ -409,6 +412,29 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--continue" | "-c" => result.continue_session = true,
             "--resume" | "-r" => result.resume = true,
+            "--host" => {
+                if result.host.is_some() {
+                    result
+                        .errors
+                        .push("--host may only be supplied once".into());
+                }
+                let area = if let Some(area) = inline {
+                    if area.is_empty() {
+                        result.errors.push("--host= requires an area name".into());
+                    }
+                    area
+                } else if let Some(next) = args.get(i + 1).filter(|next| {
+                    !next.starts_with('-') && !next.starts_with('@') && !next.is_empty()
+                }) {
+                    i += 1;
+                    host_arg_count += 1;
+                    next.clone()
+                } else {
+                    String::new()
+                };
+                host_arg_count += 1;
+                result.host = Some(area);
+            }
             "--mini" => {
                 result.mini = true;
                 if inline.is_some() {
@@ -659,6 +685,12 @@ pub fn parse_args(args: &[String]) -> Args {
             .push("--fork-position requires --fork-entry".to_string());
     }
 
+    if result.host.is_some() && !result.mini && args.len() != host_arg_count {
+        result
+            .errors
+            .push("additional Host options require --mini".into());
+    }
+
     if result.mini {
         result.no_session = true;
         result.native_durable = false;
@@ -783,6 +815,8 @@ pub fn print_help() {
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
   --rpc-message-updates <mode>   RPC updates: compact-deltas (default) or snapshot (legacy)
+  --host [area]                  Run in a shared local Host area (Unix), in TUI or --mini mode
+  --host[=area] --mini [prompt]   Run a one-shot text prompt in that Host
   --server [--port <n>] [--bind <ip>]
                                  Headless server: serve a remote-connectable agent (no TUI)
   --connect <host:port>          Remote client: connect to a `--server` instance and run the TUI
