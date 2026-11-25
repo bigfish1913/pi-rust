@@ -952,7 +952,7 @@ pub async fn build_prepared(
 
     validate_durable_extensions(&extension_session).map_err(BuildError::HarnessCreate)?;
     let durable_binding = Arc::new(std::sync::OnceLock::new());
-    let mut tools = build_tools_bound(home, &ctx, args, durable_binding.clone());
+    let mut tools = build_tools_bound(home, &ctx, args, Some(&durable_binding));
 
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools
@@ -2623,7 +2623,7 @@ where
         &ctx.home,
         &tool_ctx,
         &effective_args,
-        ctx.durable_binding.clone(),
+        Some(&ctx.durable_binding),
     );
     merge_extension_tools(
         &mut tools,
@@ -3245,15 +3245,15 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         &crate::config::AgentHome::process(),
         ctx,
         args,
-        Arc::new(std::sync::OnceLock::new()),
+        Some(&Arc::new(std::sync::OnceLock::new())),
     )
 }
 
-fn build_tools_bound(
+pub(crate) fn build_tools_bound(
     home: &crate::config::AgentHome,
     ctx: &ExecutionToolContext,
     args: &Args,
-    durable_binding: Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>,
+    binding: Option<&Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>>,
 ) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
@@ -3292,12 +3292,12 @@ fn build_tools_bound(
         ),
     ];
 
-    if args.native_durable {
+    if let Some(binding) = binding.filter(|_| args.native_durable) {
         // Mixed read/write tool is NEVER safe for automatic replay.
         all.push((
             "durable",
             HarnessTool::new(Arc::new(crate::native_durable::NativeDurableTool::new(
-                durable_binding.clone(),
+                binding.clone(),
             ))),
         ));
     }
@@ -3319,13 +3319,14 @@ fn build_tools_bound(
     // Host-integrated agent-to-agent messaging: only when the embedding host
     // installed a delivery door. A bare CLI session never advertises a tool it
     // cannot service.
-    if crate::message_agent::handler_installed()
-        && tool_name_allowed(crate::message_agent::MESSAGE_AGENT_TOOL_NAME, args)
-    {
+    if let Some(binding) = binding.filter(|_| {
+        crate::message_agent::handler_installed()
+            && tool_name_allowed(crate::message_agent::MESSAGE_AGENT_TOOL_NAME, args)
+    }) {
         all.push((
             crate::message_agent::MESSAGE_AGENT_TOOL_NAME,
             HarnessTool::new(crate::message_agent::create_message_agent_tool(
-                durable_binding.clone(),
+                binding.clone(),
             )),
         ));
     }

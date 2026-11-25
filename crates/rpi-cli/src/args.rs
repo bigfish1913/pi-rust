@@ -142,6 +142,7 @@ pub struct Args {
     pub thinking: Option<ThinkingLevel>,
 
     pub print: bool,
+    pub mini: bool,
     pub mode: Mode,
     pub rpc_message_updates: RpcMessageUpdates,
     /// `--tui-mode regular|fullscreen` controls the interactive terminal
@@ -408,6 +409,12 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--continue" | "-c" => result.continue_session = true,
             "--resume" | "-r" => result.resume = true,
+            "--mini" => {
+                result.mini = true;
+                if inline.is_some() {
+                    result.errors.push("--mini does not take a value".into());
+                }
+            }
             "--no-session" => result.no_session = true,
             "--no-tools" | "-nt" => result.no_tools = true,
             "--no-builtin-tools" | "-nbt" => result.no_builtin_tools = true,
@@ -652,16 +659,59 @@ pub fn parse_args(args: &[String]) -> Args {
             .push("--fork-position requires --fork-entry".to_string());
     }
 
-    // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
-    if result.resource_config.is_none() && result.resource_transition.is_none() {
+    if result.mini {
+        result.no_session = true;
+        result.native_durable = false;
+        for (present, flag) in [
+            (result.continue_session, "--continue"),
+            (result.resume, "--resume"),
+            (result.session.is_some(), "--session"),
+            (result.session_id.is_some(), "--session-id"),
+            (result.session_dir.is_some(), "--session-dir"),
+            (result.fork.is_some(), "--fork"),
+            (result.name.is_some(), "--name"),
+            (
+                result.experimental_durable_epoch.is_some(),
+                "--experimental-durable-epoch",
+            ),
+            (result.mode != Mode::Text, "--mode json/rpc"),
+            (result.export.is_some(), "--export"),
+            (result.list_models.is_some(), "--list-models"),
+            (result.models.is_some(), "--models"),
+            (result.resource_config.is_some(), "--resource-config"),
+            (
+                result.resource_transition.is_some(),
+                "--resource-transition",
+            ),
+            (!result.extension.is_empty(), "--extension"),
+            (!result.extensions_dir.is_empty(), "--extensions-dir"),
+            (!result.skill.is_empty(), "--skill"),
+            (!result.prompt_template.is_empty(), "--prompt-template"),
+            (result.theme.is_some(), "--theme"),
+        ] {
+            if present {
+                result
+                    .errors
+                    .push(format!("--mini cannot be combined with {flag}"));
+            }
+        }
+        for flag in result.unknown_flags.keys() {
+            result
+                .errors
+                .push(format!("--mini does not support --{flag}"));
+        }
+    } else if result.resource_config.is_none() && result.resource_transition.is_none() {
+        // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
         env_extension_dirs.append(&mut result.extensions_dir);
         result.extensions_dir = env_extension_dirs;
     }
     // `--print` + `--mode json`: `--print` implies non-interactive, but
     // `--mode json` selects the JSON event stream. The TS `resolveAppMode`
     // treats `mode === "json"` as its own non-interactive mode; we follow that.
-    if let Err(error) = crate::native_durable::experimental_epoch::policy(&result) {
-        result.errors.push(error);
+    if !result.mini {
+        if let Err(error) = crate::native_durable::experimental_epoch::policy(&result) {
+            result.errors.push(error);
+        }
     }
     result
 }
@@ -746,6 +796,8 @@ pub fn print_help() {
   --approve, -a                  Force-enable current-project resources
   --no-approve, -na              Disable current-project resources
   --print, -p                    Non-interactive: process prompt(s) and exit
+  --mini                         Low-memory text mode: no sessions, durable, or resource discovery
+                                 Enable built-in tools explicitly with --tools <list>
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
@@ -975,6 +1027,43 @@ mod tests {
         assert!(!parse_args(&s(&["--no-native-durable"])).native_durable);
         assert!(parse_args(&s(&["--no-native-durable", "--native-durable"])).native_durable);
         assert!(!parse_args(&s(&["--native-durable", "--no-native-durable"])).native_durable);
+    }
+
+    #[test]
+    fn mini_always_disables_session_and_durable() {
+        for argv in [
+            ["--mini", "--native-durable", "hello"],
+            ["--native-durable", "--mini", "hello"],
+        ] {
+            let args = parse_args(&s(&argv));
+            assert!(args.mini && args.no_session && !args.native_durable);
+            assert!(args.errors.is_empty(), "{:?}", args.errors);
+            assert_eq!(args.messages, ["hello"]);
+        }
+    }
+
+    #[test]
+    fn mini_rejects_session_and_durable_epoch_flags() {
+        for (flags, expected) in [
+            (&["--resume"][..], "--resume"),
+            (&["--session-id", "saved"][..], "--session-id"),
+            (&["--mode", "rpc"][..], "--mode json/rpc"),
+            (
+                &["--experimental-durable-epoch", "epoch"][..],
+                "--experimental-durable-epoch",
+            ),
+        ] {
+            let argv = ["--mini"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .collect::<Vec<_>>();
+            let args = parse_args(&s(&argv));
+            assert!(
+                args.errors.iter().any(|error| error.contains(expected)),
+                "{:?}",
+                args.errors
+            );
+        }
     }
 
     #[test]
