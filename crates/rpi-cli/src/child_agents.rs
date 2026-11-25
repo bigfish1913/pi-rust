@@ -107,9 +107,13 @@ impl Job {
             match event {
                 AgentEvent::TurnEnd { .. } => state.turns += 1,
                 AgentEvent::MessageUpdate {
-                    assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
+                    assistant_message_event,
                     ..
                 } => {
+                    let AssistantMessageEvent::TextDelta { delta, .. } = *assistant_message_event
+                    else {
+                        return;
+                    };
                     if state.bytes.saturating_add(delta.len()) > MAX_OUTPUT
                         || state.events >= MAX_EVENTS
                     {

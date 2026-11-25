@@ -225,7 +225,7 @@ async fn assert_real_provider_channel_order(api: rpi_ai::Api) {
             }
             let event = AgentEvent::MessageUpdate { message_id: None,
                 message: Arc::new(nested.partial().clone()),
-                assistant_message_event: nested,
+                assistant_message_event: Box::new(nested),
             };
             let encode = |mode| decode(serde_json::from_slice(&crate::rpc::events::encode(&event, mode).unwrap()).unwrap());
             let full = full_mapper.map(&encode(Snapshot));
@@ -285,7 +285,7 @@ fn real_encoder_preserves_first_and_late_tool_identity_after_empty_start() {
             let event = AgentEvent::MessageUpdate {
                 message_id: None,
                 message: partial,
-                assistant_message_event: nested,
+                assistant_message_event: Box::new(nested),
             };
             let encode = |mode| {
                 decode(

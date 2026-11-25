@@ -4379,9 +4379,9 @@ async fn native_live_ids_match_history_for_text_thinking_tools_and_final_persist
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::MessageUpdate {
-            assistant_message_event: rpi_ai::AssistantMessageEvent::ThinkingDelta { .. },
+            assistant_message_event,
             ..
-        }
+        } if matches!(assistant_message_event.as_ref(), rpi_ai::AssistantMessageEvent::ThinkingDelta { .. })
     )));
 }
 

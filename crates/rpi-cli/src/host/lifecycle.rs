@@ -391,6 +391,11 @@ pub(super) fn prepare(
     };
     let data = encode(&receipt)?;
     transaction.execute("INSERT INTO lifecycle_requests (scope_id,request_id,epoch,agent_id,status,data) VALUES (?1,?2,?3,?4,'prepared',?5)", params![receipt.request.scope.to_string(),receipt.request.request_id.to_string(),receipt.request.epoch.to_string(),agent,data])?;
+    // Once a guarded explicit Close is admitted, a crash during native cleanup
+    // must not bring that member back. Whole-Host Stop leaves the set intact.
+    if let LifecycleAction::Close { agent_id, .. } = receipt.request.action {
+        super::recovery::prepare_close(&transaction, agent_id)?;
+    }
     transaction.commit()?;
     Ok(LifecycleAdmission {
         receipt,
@@ -402,6 +407,7 @@ pub(super) fn finish(
     epoch: HostEpoch,
     request: LifecycleRequest,
     status: LifecycleState,
+    bindings: &super::recovery::Bindings,
 ) -> CatalogResult<LifecycleReceipt> {
     if matches!(
         status,
@@ -429,6 +435,27 @@ pub(super) fn finish(
     }
     receipt.status = status;
     update(&transaction, &receipt)?;
+    if let LifecycleAction::Close { agent_id, .. } = request.action {
+        super::recovery::finish_close(
+            &transaction,
+            agent_id,
+            matches!(receipt.status, LifecycleState::Rejected { .. }),
+        )?;
+    }
+    if matches!(
+        receipt.status,
+        LifecycleState::Succeeded {
+            result: LifecycleResult::Loaded { .. }
+        }
+    ) {
+        if let LifecycleAction::CreateProfile { profile }
+        | LifecycleAction::RestoreProfile { profile, .. } = request.action
+        {
+            if let Some(binding) = bindings.get(&profile.agent_id) {
+                super::recovery::set(&transaction, profile.agent_id, *binding)?;
+            }
+        }
+    }
     transaction.commit()?;
     Ok(receipt)
 }

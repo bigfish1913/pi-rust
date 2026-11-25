@@ -1,6 +1,7 @@
 use super::lifecycle::{
     self, LifecycleAdmission, LifecycleReceipt, LifecycleRequest, LifecycleState,
 };
+use super::recovery::{self, Bindings};
 use super::{
     catalog::{is_mini, MAX_RECORD_BYTES},
     AgentId, AgentPage, AgentRecord, AgentSpec, AgentState, Capacity, CatalogError, CatalogGuard,
@@ -32,8 +33,13 @@ PRAGMA user_version = 1;";
 // Close-on-exec does not prevent fork's temporary descriptor inheritance. A
 // last-close-only flock release can outlive shutdown acknowledgement when a
 // concurrent child still references the open file description before exec.
-struct InstanceLock(Option<File>);
+pub(super) struct InstanceLock(Option<File>);
 impl InstanceLock {
+    #[cfg(target_os = "macos")]
+    pub(super) fn file(&self) -> &File {
+        self.0.as_ref().expect("held Host instance lock")
+    }
+
     fn release(&mut self) -> std::io::Result<()> {
         if let Some(file) = &self.0 {
             loop {
@@ -63,6 +69,7 @@ pub(crate) struct Registry {
     capacity: Capacity,
     config: HostConfig,
     epoch: HostEpoch,
+    bindings: Bindings,
     _instance_lock: InstanceLock,
 }
 
@@ -204,7 +211,11 @@ fn check_owner(record: &AgentRecord, epoch: HostEpoch) -> CatalogResult<()> {
 }
 
 impl Registry {
-    pub(crate) fn open(directory: &Path, config: HostConfig) -> CatalogResult<Self> {
+    pub(crate) fn open(
+        directory: &Path,
+        config: HostConfig,
+        bindings: Bindings,
+    ) -> CatalogResult<Self> {
         config.validate()?;
         let instance_lock = own_directory(directory)?;
         // Resolve trusted parent aliases (e.g. /var -> /private/var on macOS)
@@ -238,7 +249,7 @@ impl Registry {
         );
         connection.busy_timeout(std::time::Duration::from_secs(1))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if !matches!(version, 0..=2) {
+        if !matches!(version, 0..=3) {
             return Err(CatalogError::UnsupportedVersion(version));
         }
         if version == 0 {
@@ -296,6 +307,10 @@ impl Registry {
                 [epoch.to_string()],
             )?;
         }
+        if version < 3 {
+            recovery::create_schema(&transaction)?;
+        }
+        recovery::recover(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection,
@@ -303,6 +318,7 @@ impl Registry {
             capacity: Capacity::new(config.max_agents),
             config,
             epoch,
+            bindings,
             _instance_lock: instance_lock,
         })
     }
@@ -321,7 +337,13 @@ impl Registry {
         request: LifecycleRequest,
         status: LifecycleState,
     ) -> CatalogResult<LifecycleReceipt> {
-        let receipt = lifecycle::finish(&mut self.connection, self.epoch, request, status)?;
+        let receipt = lifecycle::finish(
+            &mut self.connection,
+            self.epoch,
+            request,
+            status,
+            &self.bindings,
+        )?;
         lifecycle::checkpoint(&self.connection)?;
         Ok(receipt)
     }
@@ -336,6 +358,31 @@ impl Registry {
             lifecycle::checkpoint(&self.connection)?;
         }
         Ok(receipt)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn recovery_members(
+        &self,
+        configured: &[AgentId],
+    ) -> CatalogResult<recovery::Membership> {
+        recovery::read(&self.connection, configured)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn remember_members(&mut self, loaded: &[AgentId]) -> CatalogResult<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for &id in loaded {
+            let binding = self
+                .bindings
+                .get(&id)
+                .copied()
+                .ok_or(CatalogError::InvalidRecord("missing recovery profile"))?;
+            recovery::set(&transaction, id, binding)?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(crate) fn shutdown(self) -> CatalogResult<()> {
@@ -516,7 +563,7 @@ fn check_private(path: &Path, directory: bool) -> CatalogResult<()> {
 }
 
 #[cfg(unix)]
-fn private_file(path: &Path) -> CatalogResult<File> {
+pub(super) fn private_file(path: &Path) -> CatalogResult<File> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -532,6 +579,11 @@ fn private_file(path: &Path) -> CatalogResult<File> {
 
 #[cfg(unix)]
 fn own_directory(path: &Path) -> CatalogResult<InstanceLock> {
+    own_directory_lock(path, "instance.lock")
+}
+
+#[cfg(unix)]
+pub(super) fn own_directory_lock(path: &Path, lock_name: &str) -> CatalogResult<InstanceLock> {
     use std::os::unix::fs::DirBuilderExt;
     // Never chmod existing user paths. New directories are private from creation.
     std::fs::DirBuilder::new()
@@ -539,7 +591,7 @@ fn own_directory(path: &Path) -> CatalogResult<InstanceLock> {
         .mode(0o700)
         .create(path)?;
     check_private(path, true)?;
-    let lock = private_file(&path.join("instance.lock"))?;
+    let lock = private_file(&path.join(lock_name))?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             CatalogError::AlreadyRunning
@@ -595,7 +647,8 @@ mod ownership_tests {
             let directory = root
                 .path()
                 .join(if explicit_shutdown { "ack" } else { "drop" });
-            let registry = Registry::open(&directory, HostConfig::default()).unwrap();
+            let registry =
+                Registry::open(&directory, HostConfig::default(), Bindings::new()).unwrap();
             let inherited = registry
                 ._instance_lock
                 .0
@@ -609,7 +662,7 @@ mod ownership_tests {
             } else {
                 drop(registry);
             }
-            let next = Registry::open(&directory, HostConfig::default()).unwrap();
+            let next = Registry::open(&directory, HostConfig::default(), Bindings::new()).unwrap();
             assert_eq!(
                 std::fs::metadata(directory.join("instance.lock"))
                     .unwrap()
@@ -618,13 +671,13 @@ mod ownership_tests {
                 "never unlink the singleton inode"
             );
             assert!(matches!(
-                Registry::open(&directory, HostConfig::default()),
+                Registry::open(&directory, HostConfig::default(), Bindings::new()),
                 Err(CatalogError::AlreadyRunning)
             ));
             drop(inherited);
             assert!(
                 matches!(
-                    Registry::open(&directory, HostConfig::default()),
+                    Registry::open(&directory, HostConfig::default(), Bindings::new()),
                     Err(CatalogError::AlreadyRunning)
                 ),
                 "dropping an old inherited descriptor must not unlock a new owner"

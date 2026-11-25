@@ -715,3 +715,63 @@ async fn administrative_receipt_disconnect_and_timeout_are_queries_not_unknown_m
         peer.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn mini_minor_gate_and_lost_replies_preserve_full_volatile_intent_without_retry() {
+    for case in 0..3 {
+        let endpoint = Endpoint::new();
+        let config = endpoint.config.clone();
+        let client_config = config.clone();
+        let mut ready = welcome(&config);
+        ready.version.minor = if case == 0 { 5 } else { 6 };
+        ready.capabilities.push(Capability::Mini);
+        let intent = MiniRequest {
+            scope: ControlScopeId::new(),
+            epoch: Epoch::new(),
+            request_id: RequestId::new(),
+            action: MiniAction::Submit {
+                agent_id: AgentId::new(),
+                prompt: "literal {{mini}}".into(),
+            },
+        };
+        let expected = intent.clone();
+        let peer = tokio::spawn(async move {
+            let _directory = endpoint._directory;
+            let (mut stream, _) = endpoint.listener.accept().await.unwrap();
+            authenticate(&mut stream, &config, &ready).await;
+            let frame = read_frame::<_, Request>(&mut stream, MAX_FRAME_BYTES).await;
+            if case == 0 {
+                assert!(frame.is_err());
+            } else {
+                let frame = frame.unwrap();
+                assert_eq!(frame.epoch, ready.epoch);
+                match frame.command {
+                    Command::MiniExecute { request } if case == 1 => assert_eq!(request, expected),
+                    Command::MiniReceipt { request } if case == 2 => assert_eq!(request, expected),
+                    _ => panic!("Mini intent was rewritten"),
+                }
+                // Deliberately lose the reply. Never replay in this client.
+            }
+        });
+        let mut client = HostClient::connect(client_config).await.unwrap();
+        let command = if case == 2 {
+            Command::MiniReceipt {
+                request: intent.clone(),
+            }
+        } else {
+            Command::MiniExecute {
+                request: intent.clone(),
+            }
+        };
+        let error = client.call(command).await.unwrap_err();
+        match case {
+            0 => assert_eq!(error, ClientError::NotSent(Failure::UnsupportedCapability)),
+            1 => assert!(
+                matches!(error, ClientError::OutcomeUnknown { request_id, .. } if request_id == intent.request_id)
+            ),
+            _ => assert!(matches!(error, ClientError::QueryFailed(_))),
+        }
+        client.detach();
+        peer.await.unwrap();
+    }
+}

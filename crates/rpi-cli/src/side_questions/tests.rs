@@ -401,11 +401,11 @@ async fn timeout_and_output_limits_are_terminal() {
     timed.observe(AgentEvent::MessageUpdate {
         message_id: None,
         message: message.clone(),
-        assistant_message_event: AssistantMessageEvent::TextDelta {
+        assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: "x".repeat(MAX_OUTPUT + 1),
             partial: message,
-        },
+        }),
     });
     assert!(timed.snapshot()["error"]
         .as_str()

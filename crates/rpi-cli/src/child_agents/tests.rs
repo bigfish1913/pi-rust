@@ -39,11 +39,11 @@ fn delta(text: String) -> AgentEvent {
     AgentEvent::MessageUpdate {
         message_id: None,
         message: partial.clone(),
-        assistant_message_event: AssistantMessageEvent::TextDelta {
+        assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: text,
             partial,
-        },
+        }),
     }
 }
 async fn wait(manager: &ChildAgents, parent: &AgentHarness, id: &str) -> Value {

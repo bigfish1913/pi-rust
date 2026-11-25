@@ -1009,6 +1009,7 @@ where
                     continue;
                 }
                 let lane_task = Arc::clone(&lane);
+                let harness_task = harness.clone();
                 let out_task = stdout.clone();
                 let active_task = Arc::clone(&run_active);
                 let mailbox_task = ui_dialog.clone();
@@ -1080,9 +1081,13 @@ where
                                     );
                                 }
                             }
-                            let result =
-                                rpc_compact_cancellable(&lane_task, instructions, cancel_task)
-                                    .await;
+                            let result = rpc_compact_cancellable(
+                                &harness_task,
+                                &lane_task,
+                                instructions,
+                                cancel_task,
+                            )
+                            .await;
                             if result
                                 .as_ref()
                                 .ok()
@@ -1107,9 +1112,10 @@ where
                             }
                             result
                         } else if resume {
-                            rpc_resume_cancellable(&lane_task, cancel_task).await
+                            rpc_resume_cancellable(&harness_task, &lane_task, cancel_task).await
                         } else {
-                            rpc_prompt_cancellable(&lane_task, content, cancel_task).await
+                            rpc_prompt_cancellable(&harness_task, &lane_task, content, cancel_task)
+                                .await
                         };
                         execute_timing.finish();
                         let flush_timing = RpcPhaseTiming::start(phase_diagnostics, "event_flush");
@@ -1622,39 +1628,51 @@ async fn rpc_configure_file_io(
     Ok(serde_json::json!({"readText": read_text, "writeText": write_text}))
 }
 
-/// Cancellation is delivered even if abort/stop arrives before prompt_text has
-/// registered a run. Once active, await its normal aborted outcome and cleanup.
+/// Stop an unadmitted RPC operation or keep driving an admitted one to settlement.
+async fn rpc_run_cancellable(
+    harness: &AgentHarness,
+    lane: &Arc<dyn AgentLane>,
+    cancel: tokio_util::sync::CancellationToken,
+    operation: impl std::future::Future<Output = Result<serde_json::Value, String>>,
+) -> Result<
+    (
+        serde_json::Value,
+        Option<rpi_harness::agent_harness::AbortResult>,
+    ),
+    String,
+> {
+    if cancel.is_cancelled() {
+        return Err("Operation aborted".into());
+    }
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            if !harness.active_operation_snapshot().is_some_and(|run| run.lane == "main") {
+                return Err("Operation aborted".into());
+            }
+            // The operation can hold the message-write gate across storage I/O.
+            // Keep polling it while abort waits to acquire that same gate.
+            let (abort, result) = tokio::join!(biased; lane.abort(), &mut operation);
+            Ok((result?, abort.ok()))
+        }
+        result = &mut operation => result.map(|value| (value, None)),
+    }
+}
+
 async fn rpc_prompt_cancellable(
+    harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
     content: crate::rpc::prompt_content::ParsedPrompt,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<serde_json::Value, String> {
-    if cancel.is_cancelled() {
-        return Err("Operation aborted".into());
+    let (mut value, reclaimed) =
+        rpc_run_cancellable(harness, lane, cancel, rpc_prompt_content(lane, content)).await?;
+    // Return the atomically reclaimed queue so the client can restore it.
+    if let (Some(reclaimed), Some(object)) = (reclaimed, value.as_object_mut()) {
+        object.insert("reclaimed".to_string(), reclaimed_payload(&reclaimed));
     }
-    let prompt = rpc_prompt_content(lane, content);
-    tokio::pin!(prompt);
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            // `abort()` reclaims the queue atomically. The entries are not
-            // dropped: they ride back on the settlement so the client can
-            // restore what the user staged while the run was in flight.
-            match lane.abort().await {
-                Ok(reclaimed) => prompt.await.map(|mut value| {
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert(
-                            "reclaimed".to_string(),
-                            reclaimed_payload(&reclaimed),
-                        );
-                    }
-                    value
-                }),
-                Err(_) => Err("Operation aborted".to_string()),
-            }
-        }
-        result = &mut prompt => result,
-    }
+    Ok(value)
 }
 
 /// Reclaimed queue entries from an abort, for replies that also settle a run.
@@ -1671,6 +1689,7 @@ fn reclaimed_payload(result: &rpi_harness::agent_harness::AbortResult) -> serde_
 /// call on the summary, so it takes the same single-run slot and reports the
 /// same settlement shape a prompt does.
 async fn rpc_compact_cancellable(
+    harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
     instructions: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
@@ -1681,15 +1700,9 @@ async fn rpc_compact_cancellable(
             Err(error) => Err(error.to_string()),
         }
     };
-    tokio::pin!(compact);
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            let _ = lane.abort().await;
-            compact.await
-        }
-        result = &mut compact => result,
-    }
+    rpc_run_cancellable(harness, lane, cancel, compact)
+        .await
+        .map(|(value, _)| value)
 }
 
 /// Reduce a compaction result to what a client needs: the verdict, and a line
@@ -1740,6 +1753,7 @@ fn compaction_json(result: &CompactionResult) -> serde_json::Value {
 /// `Ok(None)` from the lane means there was nothing to resume: the run is
 /// reported as `skipped` so the client can settle without inventing an outcome.
 async fn rpc_resume_cancellable(
+    harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<serde_json::Value, String> {
@@ -1759,15 +1773,9 @@ async fn rpc_resume_cancellable(
             Err(error) => Err(error.to_string()),
         }
     };
-    tokio::pin!(resume);
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            let _ = lane.abort().await;
-            resume.await
-        }
-        result = &mut resume => result,
-    }
+    rpc_run_cancellable(harness, lane, cancel, resume)
+        .await
+        .map(|(value, _)| value)
 }
 
 fn rpc_outcome_str(outcome: &HarnessRunOutcome) -> (&'static str, Option<String>, Option<String>) {
@@ -4732,7 +4740,7 @@ mod tests {
                 let event = AgentEvent::MessageUpdate {
                     message_id: None,
                     message: message.clone(),
-                    assistant_message_event,
+                    assistant_message_event: Box::new(assistant_message_event),
                 };
                 write_agent_event(&writer, &event).await;
                 tx.send(event).unwrap();
@@ -4765,11 +4773,13 @@ mod tests {
                     tx.send(AgentEvent::MessageUpdate {
                         message_id: None,
                         message: message.clone(),
-                        assistant_message_event: rpi_ai::AssistantMessageEvent::TextDelta {
-                            content_index: 0,
-                            delta: "x".into(),
-                            partial: message.clone(),
-                        },
+                        assistant_message_event: Box::new(
+                            rpi_ai::AssistantMessageEvent::TextDelta {
+                                content_index: 0,
+                                delta: "x".into(),
+                                partial: message.clone(),
+                            },
+                        ),
                     })
                     .unwrap();
                 }

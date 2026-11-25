@@ -3,7 +3,41 @@
 在 `rpi-cli` 内按文件夹划分代码边界，不新增 crate，不引入额外服务程序。
 模块间通过明确类型交互，不以 CLI 进程全局状态装配并发 Agent。
 
-## Mini 显式配置与 raw Agent 装配（#66 进行中，生产 owner/wire 未接通）
+## Mini native custody 同一管理链路验收（最新，#66 仍未结项）
+
+- 新增真实 binary + 管理 DLL + gated native-hook DLL + HTTP 验收：真实 close 回复丢失后
+  原意图对账、不自动重试，callback/finish 前保 owner/custody，最终 `RABEFU` 后 Lost。
+- 同链路覆盖 native callback 内 SIGKILL 后 Lost/no replay，并保留 staging 残留、不冒称
+  graceful settlement；SIGTERM drain 则必须等 callback、finish 与 unload 后退出。
+- 本轮没有改生产 Rust、wire 或锁包。#65 实际 Agent scoped strict Clippy 仍有4项诊断；
+  extcore 未过滤回归另出现 startup ownership 测试失败，未 retry-to-green，因此不结项。
+- [本阶段报告与失败记录](../../../../docs/host-mini-management-custody.md) /
+  [机器摘要](../../../../docs/host-mini-management-custody-validation.json)。
+
+## Mini owner / daemon / wire v1.6（历史接线阶段，后续 custody 验收见上节）
+
+- Mini 与 Persistent 使用唯一 `HostService` / `HostRuntime` 表、容量和关闭屏障；Mini
+  只持有 raw Agent、闭合资源与 DLL custody，不创建 Session/Harness/AgentLane/JSONL/writer。
+- daemon 必须显式配置独立的私有 `mini_control`：`scope`、`allowed_agents`、
+  `permissions`（`submit` / `cancel` / `close`，默认全拒绝）、`max_operations`（1–64，默认64）。
+  允许集合只能引用 `agents` 中明确配置的 Mini，不能借此获得 Persistent 行政权限。
+  未配置仍在 SQLite 或先行 Session 创建前拒绝 Mini，不公布 `mini` capability。
+- 管理工具使用 `mini_execute {request:{scope,epoch,request_id,action}}`；action 是闭合的
+  `submit {agent_id,prompt}`、`cancel {agent_id,submitted_request_id,run_id}` 或 `close {agent_id}`。
+  `mini_receipt {request}` 只对账完整原意图；`mini_result` 以 scope/原 epoch/Agent/input/run
+  隔离 UTF-8 分页输出。三项命令需要 v1.6 和独立 `mini` capability。
+- 操作与输出均 **volatile / durable=false**，不使用 Persistent admission/lifecycle journal。
+  Submit 操作成功只说明易失 admission；Cancel 只说明发出信号；Close 必须等待真实回调、
+  DLL finish 与 Lost 提交。满额不淘汰、不重放，旧 UUID 的不同意图冲突。
+- 重启沿用配置时 Mini 保持 **Lost，不 autoload/restore/replay**。旧 epoch 的查询为 unknown，
+  执行为 StaleEpoch；不得自动重写 epoch/UUID。尚无 Mini dynamic create/restore CLI。
+- `native_mini.py` 是真实 binary + 管理 DLL + HTTP 的单链路验收入口；gated native hook
+  DLL 的迟到回调/finish 另由 Rust daemon 回归覆盖，两者不能混称同一个全故障矩阵。
+  默认薄 CLI、审批/定时器/整组恢复及 #65 strict Agent Clippy 未因此完成。
+- [本阶段实际单链路、回归与失败记录](../../../../docs/host-mini-daemon-wire.md) /
+  [机器摘要](../../../../docs/host-mini-daemon-wire-validation.json)。
+
+## Mini 显式配置与 raw Agent 装配（历史前置阶段，生产 owner/wire 当时未接通）
 
 - profile 新增 `agent.mode`：缺省 `persistent` 仍必须提供 Session；显式 `mini` 不接受
   Session 引用。Mini 尚未接入唯一 service owner/volatile engine，daemon 在 catalog 或
@@ -173,8 +207,7 @@
 恢复与真正后台 daemon，而不是成员接管、选举或运行现场迁移。既有行政管理、SDK/DLL
 阶段代码全部保留，但不再作为默认 CLI 薄容器的前置扩展。
 
-**A 批目前只接通配置解析、校验和启动前拒绝；后台运行、自动重启、整组恢复尚未接通。**
-现有 `HostDaemon`/`serve` 仍是前台。以下为现有私有 Host 配置的新增字段片段，不是完整配置：
+`rpi host serve` 默认前台运行。下面的私有配置字段分别控制后台启动、整组恢复和异常重启。
 
 ```json
 {
@@ -186,17 +219,11 @@
 }
 ```
 
-- 省略这些字段保持旧行为。`mode` 仅接受字符串 `foreground`/`daemon`；`recovery` 必须是
-  对象，字段必须是真正的 boolean；拒绝未知/重复字段、null、数组和拼写别名。
-- `restart_on_crash: true` 只允许与 `mode: daemon` 组合。`restore_on_start: false` 不会
-  删除 Session，也不阻止显式启动 profile 复用原 Session；它不自动恢复额外目标成员。
-- 当前 `serve` 对 `daemon` 或 `restore_on_start: true` 明确报未实现，在读取 Agent profile、
-  创建 catalog/Session/socket 或后台工作进程前拒绝，不静默退回前台或部分恢复。
-- 查询可以读取合法的未来模式配置并联系**已运行**的 Host；它不会应用启动策略、读取
-  startup profile 或创建后台进程。配置文件里的 mode 不证明远端进程实际以该模式运行。
-- 这些字段仅属于私有启动配置，不加入公开 `HostConfig` 或控制协议，不改变四合同。
-- 后续复用现有 catalog/Session 保存目标成员集合；未知工具副作用不自动重放，正常 Stop
-  不触发自动重启。Unix 主进程被强杀后的工具后代退出仍须专门实现和实际验证。
+- 省略字段时采用图中的默认值。`recovery` 接受对象和布尔字段。解析会拒绝未知字段、重复字段、`null`、数组和别名。查询仍然只联系已运行的 Host。
+- `restore_on_start` 启用后，Host 在 SQLite 记录 Persistent 目标成员。下一次启动先验证精确 profile 内容、资源身份、历史和当前授权，再启动整组。动态成员需要当前配置的 `restore` 权限。整组 Stop 保留目标成员，已接受的单成员 Close 移除它。关闭恢复时仍可通过显式 `agents` 加载 Session。
+- `mode: daemon` 当前支持 macOS。一个脱离终端的监督进程运行一个工作 Host，并在 worker 装载整组、开始监听后报告 `host_ready`。后台诊断写入 Host 状态目录中权限为 `0600` 的 `supervisor.log`。
+- `restart_on_crash` 需要 `mode: daemon`。成功启动后的异常退出最多触发三次重新启动，等待 250、500、1000 毫秒。已接受的 IPC Stop 和监督进程收到的停止信号结束监督。启动失败结束监督并留下日志。运行中的未知请求和 `pending_deferred` 需要显式处理。Mini 仍按易失模式运行。
+- macOS 监督进程靠独立 Unix 会话检查并清理旧 worker 的受管工具后代，包括原 shell 已退出后仍留在会话的进程。清理结论不明确时继续持有启动锁并重试。托管范围以该会话为边界。监督进程意外退出时，仍在运行的 worker 会请求关闭并清理会话。监督进程和 worker 都退出后，由操作者重新启动。
 
 ### A 批验证记录（历史快照）
 

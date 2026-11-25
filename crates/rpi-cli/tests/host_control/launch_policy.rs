@@ -1,42 +1,31 @@
-// Private launch policy is data, not a claim that daemon/recovery is working.
+// Unsupported platforms still reject daemon before opening any resources.
 
+#[cfg(not(target_os = "macos"))]
 #[tokio::test(flavor = "current_thread")]
 async fn actual_binary_rejects_unimplemented_launch_policy_before_profiles_or_catalog() {
-    for mode in ["foreground", "daemon"] {
-        for restore in [false, true] {
-            for restart in [false, true] {
-                if mode == "foreground" && (!restore || restart) {
-                    continue; // Default is covered by existing startup tests; invalid below.
-                }
-                let mut fixture = Fixture::new();
-                fixture.value["mode"] = json!(mode);
-                fixture.value["recovery"] = json!({
-                    "restore_on_start": restore, "restart_on_crash": restart
-                });
-                // If the launch gate runs too late this deliberately invalid
-                // private profile would mask its diagnostic.
-                fixture.value["agents"] = json!([fixture.root.path().join("must-not-read.json")]);
-                fixture.save();
-                let output = fixture.call("serve", &[]).await;
-                assert_eq!(output.status.code(), Some(1));
-                assert!(output.stdout.is_empty());
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let expected = if mode == "daemon" {
-                    "shared Host daemon mode is not implemented"
-                } else {
-                    "shared Host whole-host startup recovery is not implemented"
-                };
-                assert!(
-                    stderr.contains(expected),
-                    "{mode}/{restore}/{restart}: {stderr}"
-                );
-                assert!(!stderr.contains("invalid Agent profile"));
-                assert!(!stderr.contains(fixture.value["token"].as_str().unwrap()));
-                assert!(!stderr.contains("must-not-read"));
-                assert!(!fixture.directory().exists());
-                assert!(!fixture.socket().exists());
-                fixture.no_resources();
-            }
+    for restore in [false, true] {
+        for restart in [false, true] {
+            let mut fixture = Fixture::new();
+            fixture.value["mode"] = json!("daemon");
+            fixture.value["recovery"] = json!({
+                "restore_on_start": restore, "restart_on_crash": restart
+            });
+            fixture.value["agents"] = json!([fixture.root.path().join("must-not-read.json")]);
+            fixture.save();
+            let output = fixture.call("serve", &[]).await;
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("shared Host daemon mode is currently supported on macOS"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("invalid Agent profile"));
+            assert!(!stderr.contains(fixture.value["token"].as_str().unwrap()));
+            assert!(!stderr.contains("must-not-read"));
+            assert!(!fixture.directory().exists());
+            assert!(!fixture.socket().exists());
+            fixture.no_resources();
         }
     }
 }

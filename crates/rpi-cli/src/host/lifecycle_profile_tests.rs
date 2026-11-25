@@ -341,7 +341,7 @@ async fn literal_v2_legacy_and_versioned_profile_rows_recover_without_replay_or_
             .db()
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     assert_eq!(fixture.catalog.status().await.unwrap().registered, 1);
     assert_eq!(fixture.catalog.status().await.unwrap().resident, 0);

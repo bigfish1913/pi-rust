@@ -824,7 +824,7 @@ async fn stream_assistant_response(
                                 // streaming delta, and the provider already built the
                                 // snapshot it hands us.
                                 message: Arc::clone(partial),
-                                assistant_message_event: event,
+                                assistant_message_event: Box::new(event),
                             },
                         )
                         .await;
@@ -954,7 +954,7 @@ async fn reject_ambiguous_tool_batch(
 
 /// Fail every tool call in a truncated message. Mirrors TS
 /// `failToolCallsFromTruncatedMessage`. Each call gets a `tool_execution_start`
-/// + `tool_execution_end` (is_error:true) + tool-result `MessageStart`/`End`,
+/// and `tool_execution_end` (is_error:true), plus tool-result `MessageStart`/`End`,
 /// but is *not* executed.
 async fn fail_tool_calls_from_truncated_message(
     tool_calls: &[ToolCall],
@@ -1746,25 +1746,22 @@ async fn finalize_tool_call(
             is_error,
             context: current_context,
         };
-        match after(ctx, config.signal.clone()).await {
-            Some(after_result) => {
-                if let Some(c) = after_result.content {
-                    result.content = c;
-                }
-                if let Some(d) = after_result.details {
-                    result.details = d;
-                }
-                if let Some(u) = after_result.usage {
-                    result.usage = Some(u);
-                }
-                if let Some(t) = after_result.terminate {
-                    result.terminate = t;
-                }
-                if let Some(ie) = after_result.is_error {
-                    is_error = ie;
-                }
+        if let Some(after_result) = after(ctx, config.signal.clone()).await {
+            if let Some(c) = after_result.content {
+                result.content = c;
             }
-            None => {}
+            if let Some(d) = after_result.details {
+                result.details = d;
+            }
+            if let Some(u) = after_result.usage {
+                result.usage = Some(u);
+            }
+            if let Some(t) = after_result.terminate {
+                result.terminate = t;
+            }
+            if let Some(ie) = after_result.is_error {
+                is_error = ie;
+            }
         }
     }
 

@@ -6,7 +6,8 @@
 //! control daemon/CLI. Importing this module starts no services. The journal alone
 //! dispatches nothing; explicit daemon policy owns native administration. IPC
 //! exposes allowed profile refs, full-intent receipts and journalled profile
-//! create/restore/guarded close. Cancel/Stop IPC and mini are not implemented.
+//! create/restore/guarded close, cancel and stop. Session-free Mini has separate
+//! opt-in private authority and v1.6 volatile operations; never durable replay.
 
 #[cfg(unix)]
 pub mod administration;
@@ -49,17 +50,24 @@ mod in_process;
 #[cfg(unix)]
 mod launch_policy;
 pub mod lifecycle;
+/// Session-free owned execution; volatile results, not the persistent wire API.
+pub mod mini;
+#[cfg(unix)]
+pub mod mini_control;
 pub mod ordinary;
 mod profile;
 mod profile_set;
 pub mod protocol;
 pub use profile::{AgentProfileFile, HostStartupAgent, MAX_PROFILE_BYTES};
 pub use profile_set::{PreparedProfile, TrustedProfileSet, MAX_TRUSTED_PROFILES};
+mod recovery;
 mod registry;
 mod runtime;
 #[cfg(unix)]
 pub mod server;
 pub mod service;
+#[cfg(target_os = "macos")]
+mod supervisor;
 mod types;
 
 pub use capacity::{Capacity, CapacitySnapshot, ResidentPermit};

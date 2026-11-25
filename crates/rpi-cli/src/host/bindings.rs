@@ -147,6 +147,14 @@ impl NativeBindingProfile {
         Ok(binding)
     }
 
+    /// Pure Mini preflight: closed Provider/path/resource validation only. No
+    /// raw Agent, DLL load, Session or catalog mutation occurs here.
+    #[cfg(unix)]
+    pub(super) async fn preflight_mini(&self, expected: &AgentSpec) -> BackendResult<()> {
+        drop(self.resolve_binding(expected, AgentMode::Mini).await?);
+        Ok(())
+    }
+
     /// Build the existing raw Agent loop with no Harness/Session construction.
     /// Caller must already retain `custody` in the owning Host entry before
     /// awaiting this method; dropping the request waiter is not cleanup.

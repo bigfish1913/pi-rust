@@ -89,12 +89,19 @@ struct ShellConfig {
 mod append;
 mod read;
 
-/// The open lock file is the storage-level ownership capability. Keeping the
-/// file handle inside this value is essential: dropping it releases the OS
-/// advisory lock without stale-lock cleanup or a second authority.
+/// The open lock file is the storage-level ownership capability.
 struct OsWriterLease {
     file: std::fs::File,
     fence: u64,
+}
+
+#[cfg(unix)]
+impl Drop for OsWriterLease {
+    fn drop(&mut self) {
+        // A child in the fork-to-exec window can still share this open file
+        // description. Unlock even if closing our descriptor is insufficient.
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 impl WriterLease for OsWriterLease {
@@ -1708,6 +1715,33 @@ mod durability_tests {
             std::fs::read_to_string(temp.path().join("journal.jsonl.lock")).unwrap(),
             "2"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn os_writer_lease_releases_a_shared_open_file_description() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = OsExecutionEnv::with_cwd(temp.path().to_path_buf());
+        let lock = temp.path().join("journal.jsonl.lock");
+        std::fs::write(&lock, "1").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&file).unwrap();
+        let inherited = file.try_clone().unwrap();
+        let lease = OsWriterLease { file, fence: 1 };
+        assert!(env.try_acquire_writer_lease("journal.jsonl").await.is_err());
+        drop(lease);
+        let next = env
+            .try_acquire_writer_lease("journal.jsonl")
+            .await
+            .expect("retired writer retained a lock through the shared description")
+            .unwrap();
+        next.verify_fence().unwrap();
+        assert_eq!(std::fs::read_to_string(lock).unwrap(), "2");
+        drop(inherited);
     }
 }
 

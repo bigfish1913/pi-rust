@@ -82,11 +82,8 @@ impl LaunchPolicy {
     /// may read a valid future policy without trying to launch a background Host.
     pub fn require_implemented(self) -> Result<(), &'static str> {
         self.validate()?;
-        if self.mode == HostRunMode::Daemon {
-            return Err("shared Host daemon mode is not implemented");
-        }
-        if self.recovery.restore_on_start {
-            return Err("shared Host whole-host startup recovery is not implemented");
+        if self.mode == HostRunMode::Daemon && !cfg!(target_os = "macos") {
+            return Err("shared Host daemon mode is currently supported on macOS");
         }
         Ok(())
     }
@@ -122,10 +119,10 @@ mod tests {
                         policy.validate().is_ok(),
                         !restart_on_crash || mode == HostRunMode::Daemon
                     );
-                    // A valid policy can still name an unimplemented capability.
                     assert_eq!(
                         policy.require_implemented().is_ok(),
-                        policy == LaunchPolicy::default()
+                        (!restart_on_crash || mode == HostRunMode::Daemon)
+                            && (mode == HostRunMode::Foreground || cfg!(target_os = "macos"))
                     );
                 }
             }

@@ -45,7 +45,19 @@ fn main() -> ExitCode {
 fn run() -> ExitCode {
     // `block_in_place`（provider 流的同步桥）要求多线程 runtime，和原来的
     // `#[tokio::main(flavor = "multi_thread")]` 保持一致。
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    #[cfg(target_os = "macos")]
+    let detached_supervisor = std::env::args_os()
+        .skip(1)
+        .take(2)
+        .eq(["host", "__supervisor"]);
+    #[cfg(not(target_os = "macos"))]
+    let detached_supervisor = false;
+    let mut builder = if detached_supervisor {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    };
+    let runtime = builder
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");

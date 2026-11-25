@@ -18,6 +18,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone, Default)]
+struct ControlAuthority {
+    administration: Option<DaemonAdministration>,
+    mini: Option<super::mini_control::MiniControl>,
+}
+
 #[derive(Clone)]
 pub struct ControlConfig {
     pub socket_path: PathBuf,
@@ -59,13 +65,29 @@ pub enum ServerError {
 
 /// Remove only the socket inode this listener created. Never remove a newer
 /// listener, replacement file or stale socket belonging to somebody else.
-struct SocketLease {
+pub(super) struct SocketLease {
     path: PathBuf,
     dev: u64,
     ino: u64,
+    unlink_on_drop: bool,
 }
-impl Drop for SocketLease {
-    fn drop(&mut self) {
+impl SocketLease {
+    #[cfg(target_os = "macos")]
+    pub(super) fn identity(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn inherited(path: PathBuf, (dev, ino): (u64, u64)) -> Self {
+        Self {
+            path,
+            dev,
+            ino,
+            unlink_on_drop: false,
+        }
+    }
+
+    pub(super) fn remove(&self) {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
             if metadata.file_type().is_socket()
@@ -77,7 +99,14 @@ impl Drop for SocketLease {
         }
     }
 }
-fn bind_endpoint(
+impl Drop for SocketLease {
+    fn drop(&mut self) {
+        if self.unlink_on_drop {
+            self.remove();
+        }
+    }
+}
+pub(super) fn bind_endpoint(
     path: PathBuf,
 ) -> Result<(std::os::unix::net::UnixListener, SocketLease), ServerError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -99,6 +128,7 @@ fn bind_endpoint(
         path: path.clone(),
         dev: metadata.dev(),
         ino: metadata.ino(),
+        unlink_on_drop: true,
     };
     if !metadata.file_type().is_socket()
         || metadata.nlink() != 1
@@ -132,12 +162,31 @@ impl ControlServer {
         service: HostService,
         administration: Option<DaemonAdministration>,
     ) -> Result<Self, ServerError> {
+        Self::bind_with_controls(config, service, administration, None, None).await
+    }
+    pub(crate) async fn bind_with_controls(
+        config: ControlConfig,
+        service: HostService,
+        administration: Option<DaemonAdministration>,
+        mini: Option<super::mini_control::MiniControl>,
+        inherited: Option<std::os::unix::net::UnixListener>,
+    ) -> Result<Self, ServerError> {
         config.validate()?;
-        let path = config.socket_path.clone();
-        // An abandoned spawn_blocking result still drops its socket lease.
-        let (listener, lease) = tokio::task::spawn_blocking(move || bind_endpoint(path))
-            .await
-            .map_err(|_| ServerError::TaskStopped)??;
+        let authority = ControlAuthority {
+            administration,
+            mini,
+        };
+        let (listener, lease) = match inherited {
+            Some(listener) => (listener, None),
+            None => {
+                let path = config.socket_path.clone();
+                // An abandoned spawn_blocking result still drops its socket lease.
+                let (listener, lease) = tokio::task::spawn_blocking(move || bind_endpoint(path))
+                    .await
+                    .map_err(|_| ServerError::TaskStopped)??;
+                (listener, Some(lease))
+            }
+        };
         let listener = UnixListener::from_std(listener).map_err(|_| ServerError::Bind)?;
         let mut welcome = Welcome {
             protocol: PROTOCOL.into(),
@@ -159,7 +208,10 @@ impl ControlServer {
                 ..Limits::default()
             },
         };
-        if administration.is_some() {
+        if authority.mini.is_some() {
+            welcome.capabilities.push(Capability::Mini);
+        }
+        if authority.administration.is_some() {
             welcome.capabilities.extend([
                 Capability::Profiles,
                 Capability::AdministrativeReceipts,
@@ -176,7 +228,7 @@ impl ControlServer {
             lease,
             config,
             service,
-            administration,
+            authority,
             welcome.clone(),
             stop.clone(),
         ));
@@ -219,14 +271,15 @@ impl Drop for ControlServer {
 
 async fn serve(
     listener: UnixListener,
-    lease: SocketLease,
+    lease: Option<SocketLease>,
     config: ControlConfig,
     service: HostService,
-    administration: Option<DaemonAdministration>,
+    authority: ControlAuthority,
     welcome: Welcome,
     stop: CancellationToken,
 ) -> Result<bool, ServerError> {
-    let native_stop = administration
+    let native_stop = authority
+        .administration
         .as_ref()
         .map(DaemonAdministration::stop_completed)
         .unwrap_or_default();
@@ -241,7 +294,7 @@ async fn serve(
                 let (stream, _) = match accepted { Ok(pair) => pair, Err(_) => break Err(ServerError::ListenerStopped) };
                 // No task, frame allocation, or auth work for excess connections.
                 if connections.len() >= config.max_connections { drop(stream); continue; }
-                connections.spawn(connection(stream, config.clone(), service.clone(), administration.clone(), welcome.clone(), native_stop.clone()));
+                connections.spawn(connection(stream, config.clone(), service.clone(), authority.clone(), welcome.clone(), native_stop.clone()));
             }
         }
     };
@@ -265,7 +318,7 @@ async fn connection(
     mut stream: UnixStream,
     config: ControlConfig,
     service: HostService,
-    administration: Option<DaemonAdministration>,
+    authority: ControlAuthority,
     welcome: Welcome,
     native_stop: CancellationToken,
 ) {
@@ -315,13 +368,7 @@ async fn connection(
                     code: ErrorCode::Unsupported,
                 }
             } else {
-                dispatch(
-                    &service,
-                    administration.as_ref(),
-                    config.host_id,
-                    request.command,
-                )
-                .await
+                dispatch(&service, &authority, config.host_id, request.command).await
             };
             let response = Response {
                 call_id: request.call_id,
@@ -380,10 +427,21 @@ fn backend_code(error: &super::ordinary::BackendError) -> ErrorCode {
 }
 async fn dispatch(
     service: &HostService,
-    administration: Option<&DaemonAdministration>,
+    authority: &ControlAuthority,
     host_id: HostId,
     command: Command,
 ) -> Reply {
+    if matches!(
+        command,
+        Command::MiniExecute { .. } | Command::MiniReceipt { .. } | Command::MiniResult { .. }
+    ) {
+        return match &authority.mini {
+            Some(mini) => mini.dispatch(command).await,
+            None => Reply::Error {
+                code: ErrorCode::Unsupported,
+            },
+        };
+    }
     if matches!(
         command,
         Command::Profiles { .. }
@@ -394,7 +452,7 @@ async fn dispatch(
             | Command::AdministrativeCancel { .. }
             | Command::AdministrativeStop { .. }
     ) {
-        return administrative::dispatch(administration, command).await;
+        return administrative::dispatch(authority.administration.as_ref(), command).await;
     }
     let result = match command {
         Command::Status {} => service.catalog().status().await.map(|status| serde_json::json!({
