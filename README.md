@@ -467,6 +467,54 @@ with the full `execute`→`poll`→`cancel`→`destroy` lifecycle — and read
 [`docs/extensions/authoring.md`](docs/extensions/authoring.md) for the safety
 rules, which are load-bearing rather than stylistic.
 
+## Shared local Host on Unix
+
+```bash
+rpi --host          # Start or join the configured default area
+rpi --host default  # Explicitly select the area named default
+rpi --host work     # Start or join the area named work
+```
+
+Each area has one local Host process per agent home. Each terminal opens its
+own AgentLoop and session with its own history, working directory and run
+controls. The TUI shows the area, Host PID, Session ID and Agent ID. The Host
+stays available after TUI exit.
+
+The area named `default` uses the ordinary session store. Other areas keep
+session files under `<agent-home>/local-host-v1/area-<name>/sessions`. Areas
+share the agent home's settings and credentials and can access the same
+workspace files. This entry supports built-in providers and tools.
+
+The optional `<agent-home>/host.json` selects a default area and sets limits and
+provider, model and tool overrides per area. With no file, `rpi --host` selects
+`default`. A CLI area name takes precedence over `defaultArea`.
+
+```json
+{
+  "defaultArea": "work",
+  "areas": {
+    "work": {
+      "tools": ["read", "bash"],
+      "maxAgents": 32,
+      "idleTimeoutSeconds": 1800
+    }
+  }
+}
+```
+
+Area names contain 1–32 lowercase ASCII letters, digits, hyphens or underscores
+and start with a letter or digit. Areas can be opened on demand without an
+entry in `areas`. The Host reads its area overrides when it starts.
+
+- `maxAgents` limits agents per area, including agents starting or shutting
+  down. The default is 32 and the allowed range is 1–256. At capacity, new
+  clients receive an error. Larger areas may need a higher OS open-file limit.
+- `idleTimeoutSeconds` defaults to `0`, which disables expiration. A positive
+  value closes the client session after that many seconds without RPC activity.
+  The timer starts after any prompt, compaction or pending RPC work finishes.
+  Expiration releases its Agent slot, preserves its history and leaves the area
+  Host available for the next connection.
+
 ## Remote mode
 
 ```bash

@@ -733,6 +733,7 @@ pub fn print_help() {
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
   --rpc-message-updates <mode>   RPC updates: compact-deltas (default) or snapshot (legacy)
+  --host [area]                  Open a new TUI session in a shared local Host area (Unix)
   --server [--port <n>] [--bind <ip>]
                                  Headless server: serve a remote-connectable agent (no TUI)
   --connect <host:port>          Remote client: connect to a `--server` instance and run the TUI

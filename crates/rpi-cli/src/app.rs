@@ -129,6 +129,17 @@ async fn run_inner() -> i32 {
         return crate::dev_extension::run_cleanup_helper(&argv[1..]);
     }
 
+    match argv.first().map(String::as_str) {
+        #[cfg(unix)]
+        Some("--host" | "__rpi_local_host") => return crate::local_host::run(&argv).await,
+        #[cfg(not(unix))]
+        Some("--host") => {
+            eprintln!("error: --host requires Unix-domain sockets");
+            return EXIT_USAGE;
+        }
+        _ => {}
+    }
+
     // ---- `rpi --connect <addr>` — pure remote client ----
     // Intercepted before any provider / harness / session / extension work so
     // the client holds no local agent resources at all: it only connects to a

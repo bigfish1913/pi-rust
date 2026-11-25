@@ -909,6 +909,44 @@ pub async fn build_prepared(
     ),
     BuildError,
 > {
+    build_prepared_inner(home, resolved, args, cwd, project_trusted, prepared, true).await
+}
+
+#[cfg(unix)]
+pub(crate) async fn build_host_session(
+    home: &crate::config::AgentHome,
+    resolved: &ResolvedModel,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<
+    (
+        AgentHarness,
+        tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
+        ReloadContext,
+    ),
+    BuildError,
+> {
+    let prepared = prepare_extensions(home, args, cwd, project_trusted)?;
+    build_prepared_inner(home, resolved, args, cwd, project_trusted, prepared, false).await
+}
+
+async fn build_prepared_inner(
+    home: &crate::config::AgentHome,
+    resolved: &ResolvedModel,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    prepared: PreparedExtensions,
+    publish_process_settings: bool,
+) -> Result<
+    (
+        AgentHarness,
+        tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
+        ReloadContext,
+    ),
+    BuildError,
+> {
     let experimental_policy = crate::native_durable::experimental_epoch::policy(args)
         .map_err(BuildError::HarnessCreate)?;
     let fresh_session_only = false;
@@ -1005,7 +1043,11 @@ pub async fn build_prepared(
     // their per-session state off it. A session without an id (ephemeral) leaves
     // the field unset and a plugin is expected to fall back to project scope.
     if let Ok(metadata) = session.get_metadata().await {
-        publish_session_identity(&tool_context, &metadata.id);
+        if publish_process_settings {
+            publish_session_identity(&tool_context, &metadata.id);
+        } else {
+            tool_context.set_session_id(metadata.id);
+        }
     }
     // `--name`/`-n` sets the session display name durably (a `name` fact in the
     // log). It applies to whichever session this launch works in — a fresh one
@@ -1346,12 +1388,8 @@ pub async fn build_prepared(
     // they are configured (`pi-ai/src/http.rs`), and upstream does the same thing
     // with this key — an explicit environment variable still wins, so a shell-level
     // proxy override is not silently replaced by the setting.
-    if let Some(proxy) = &saved_settings.http_proxy {
-        for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
-            if std::env::var_os(key).is_none() {
-                std::env::set_var(key, proxy);
-            }
-        }
+    if publish_process_settings {
+        apply_process_proxy(saved_settings.http_proxy.as_deref());
     }
 
     // Share the live session cell with both /reload and the approval hook.
@@ -4163,6 +4201,16 @@ pub(crate) async fn open_session_by_id_in_dir(
             other => other.to_string(),
         })
     })
+}
+
+pub(crate) fn apply_process_proxy(proxy: Option<&str>) {
+    if let Some(proxy) = proxy {
+        for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, proxy);
+            }
+        }
+    }
 }
 
 /// Publish the active session's id to plugins, on both channels that carry it.

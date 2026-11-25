@@ -51,6 +51,8 @@ pub mod fs_watch;
 pub mod install;
 pub mod interactive_tui;
 pub mod key_trace;
+#[cfg(unix)]
+mod local_host;
 pub mod message_agent;
 pub mod model_registry;
 pub mod modes;
