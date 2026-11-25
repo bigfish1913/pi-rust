@@ -364,3 +364,56 @@ fn symlink_aliases_are_refused() {
     }
     clear();
 }
+
+/// Review PR #345 blocker 2: the advertised child-process guarantee is
+/// Linux-only. The tool-layer guard and the explicit-path pre-flight check
+/// must stay cross-platform, while the capability flag tells callers that a
+/// child can still bypass the heuristic with an indirect path elsewhere.
+#[test]
+fn child_write_guarantee_is_platform_scoped() {
+    use rpi_tools::active_session_guard::CHILD_BARRIER_AVAILABLE;
+
+    assert_eq!(
+        CHILD_BARRIER_AVAILABLE,
+        cfg!(target_os = "linux"),
+        "the child barrier is Linux-only; other platforms must not advertise it"
+    );
+
+    let _g = probe_lock();
+    let tmp = dir("pr328-platform-");
+    let session = tmp.path().join("active.jsonl");
+    std::fs::write(&session, b"original\n").unwrap();
+    install_active(Some(&session));
+
+    let env = Arc::new(OsExecutionEnv::with_cwd(tmp.path().to_path_buf()));
+    let rt = runtime();
+
+    // Cross-platform: the tool-level FileSystem guard refuses the write.
+    let result = rt.block_on(async {
+        env.write_file(
+            &absolute(&session),
+            FileContent::Bytes(b"CORRUPT".to_vec()),
+            None,
+        )
+        .await
+    });
+    assert!(
+        result.is_err(),
+        "FileSystem guard must work on every platform"
+    );
+    assert_eq!(std::fs::read(&session).unwrap(), b"original\n");
+
+    // Cross-platform: an explicit write-intent command naming the active file
+    // is refused before spawn, independently of the OS child barrier.
+    let cmd = format!(
+        "python3 -c \"open('{}','wb').write(b'CORRUPT')\"",
+        absolute(&session)
+    );
+    let result = rt.block_on(async { env.exec(&cmd, ShellExecOptions::default()).await });
+    assert!(
+        result.is_err(),
+        "pre-flight must work on every platform even without a child barrier"
+    );
+    assert_eq!(std::fs::read(&session).unwrap(), b"original\n");
+    clear();
+}

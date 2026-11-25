@@ -18,21 +18,23 @@
 //!   a symlink alias that resolves to a protected file is still rejected.
 //! * Read operations are never blocked.
 //!
-//! `bash` children do not call `FileSystem`. On Linux they are covered by a
-//! small `LD_PRELOAD` shim built into this crate ([`child_barrier_env`]): it
+//! `bash` children do not call `FileSystem`. [`check_bash_command`] rejects
+//! obvious write-intent commands that name a protected path before spawn, on
+//! every platform. On **Linux only**, a small `LD_PRELOAD` shim compiled at
+//! build time and embedded in the binary ([`child_barrier_env`]) additionally
 //! interposes `open`/`open64`/`fopen`/`openat`/`truncate`/`unlink`/`rename`
-//! and fails write-intent calls on the three protected paths with `EPERM`
-//! *after the child has spawned*, for the child's whole lifetime. All other
-//! writes pass through unchanged. [`check_bash_command`] additionally refuses
-//! obvious write-intent commands before spawning so the user gets an
-//! actionable error instead of a raw libc `EPERM`.
+//! and fails write-intent calls with `EPERM` for the child's whole lifetime.
+//! It needs no C compiler on the user's machine. All other writes pass through
+//! unchanged.
 //!
-//! This is an OS dynamic-loader barrier, not a kernel sandbox. Linux Landlock
-//! is an allowlist (rules are OR-ed inside a layer) and cannot express "allow
-//! all writes except these three files"; unprivileged mount namespaces with
-//! read-only bind mounts are not available in every container. A child that
-//! deliberately unsets `LD_PRELOAD` or issues raw syscalls bypasses the shim;
-//! the PR body states that residual boundary explicitly.
+//! The child-process barrier is a dynamic-loader mechanism, not a kernel
+//! sandbox: it only covers dynamically linked children on Linux, and a child
+//! that unsets `LD_PRELOAD` or issues raw syscalls bypasses it. macOS
+//! (`DYLD_INSERT_LIBRARIES` is restricted by SIP for protected binaries) and
+//! Windows have no equivalent here, so on those platforms only the pre-flight
+//! and tool-layer checks apply; an indirect child write that hides the path
+//! from the command text is not stopped. The PR body states that boundary
+//! explicitly; the general cross-platform sandbox is a separate feature.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -235,167 +237,12 @@ pub fn check_write(
 // Linux child-process barrier (LD_PRELOAD)
 // ---------------------------------------------------------------------------
 
-/// The C shim source, embedded here so the guard and its interposition
-/// contract are reviewable together. [`child_barrier_so`] compiles it once per
-/// process with the host C compiler: that is the same compiler Python/tee/sed
-/// children are linked against, so the interposed libc symbols match the
-/// running system even for cross-target Rust builds where a C cross-compiler
-/// is not configured.
-#[cfg(target_os = "linux")]
-const CHILD_BARRIER_C: &str = r#"
-#define _GNU_SOURCE
-#include <dlfcn.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <linux/limits.h>
-
-static int resolve_path(const char *path, char *out, size_t cap) {
-    char buf[PATH_MAX];
-    if (realpath(path, buf)) {
-        snprintf(out, cap, "%s", buf);
-        return 1;
-    }
-    /* Target does not exist yet (e.g. a to-be-created .lock): resolve the
-       literal path against the process cwd so relative aliases still match. */
-    if (path[0] == '/') {
-        snprintf(out, cap, "%s", path);
-    } else if (getcwd(buf, sizeof(buf))) {
-        snprintf(out, cap, "%s/%s", buf, path);
-    } else {
-        snprintf(out, cap, "%s", path);
-    }
-    return 1;
-}
-
-static int deny(const char *path) {
-    if (!path || !*path) return 0;
-    const char *env = getenv("RPI_ACTIVE_SESSION_FILES");
-    if (!env || !*env) return 0;
-    char resolved[PATH_MAX];
-    if (!resolve_path(path, resolved, sizeof(resolved))) return 0;
-    size_t want = strlen(resolved);
-    const char *p = env;
-    while (*p) {
-        size_t n = strcspn(p, ":");
-        if (n == want && !memcmp(p, resolved, n)) {
-            errno = EPERM;
-            return 1;
-        }
-        p += n;
-        if (*p == ':') p++;
-    }
-    return 0;
-}
-static int write_flags(int flags) {
-    return (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0
-        || (flags & O_ACCMODE) != O_RDONLY;
-}
-static int write_mode(const char *mode) {
-    return mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'));
-}
-
-int open(const char *path, int flags, ...) {
-    static int (*real)(const char *, int, ...);
-    if (!real) real = dlsym(RTLD_NEXT, "open");
-    mode_t m = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags); m = va_arg(ap, mode_t); va_end(ap);
-    }
-    if (write_flags(flags) && deny(path)) return -1;
-    if (flags & O_CREAT) return real(path, flags, m);
-    return real(path, flags);
-}
-int open64(const char *path, int flags, ...) {
-    static int (*real)(const char *, int, ...);
-    if (!real) real = dlsym(RTLD_NEXT, "open64");
-    mode_t m = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags); m = va_arg(ap, mode_t); va_end(ap);
-    }
-    if (write_flags(flags) && deny(path)) return -1;
-    if (flags & O_CREAT) return real(path, flags, m);
-    return real(path, flags);
-}
-static int deny_at(int dirfd, const char *path) {
-    if (!path || !*path || path[0] == '/' || dirfd == AT_FDCWD) return deny(path);
-    /* A relative name paired with a non-cwd dirfd resolves against that fd.
-       Recover its path from /proc so an obfuscated `os.open(..., dir_fd=d)`
-       cannot slip past the cwd-based comparison. */
-    char fdpath[64], base[PATH_MAX], joined[PATH_MAX * 2];
-    snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", dirfd);
-    ssize_t n = readlink(fdpath, base, sizeof(base) - 1);
-    if (n <= 0) return deny(path);
-    base[n] = 0;
-    snprintf(joined, sizeof(joined), "%s/%s", base, path);
-    return deny(joined);
-}
-
-int openat(int dirfd, const char *path, int flags, ...) {
-    static int (*real)(int, const char *, int, ...);
-    if (!real) real = dlsym(RTLD_NEXT, "openat");
-    mode_t m = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags); m = va_arg(ap, mode_t); va_end(ap);
-    }
-    if (write_flags(flags) && deny_at(dirfd, path)) return -1;
-    if (flags & O_CREAT) return real(dirfd, path, flags, m);
-    return real(dirfd, path, flags);
-}
-int openat64(int dirfd, const char *path, int flags, ...) {
-    static int (*real)(int, const char *, int, ...);
-    if (!real) real = dlsym(RTLD_NEXT, "openat64");
-    mode_t m = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags); m = va_arg(ap, mode_t); va_end(ap);
-    }
-    if (write_flags(flags) && deny_at(dirfd, path)) return -1;
-    if (flags & O_CREAT) return real(dirfd, path, flags, m);
-    return real(dirfd, path, flags);
-}
-int creat(const char *path, mode_t mode) {
-    static int (*real)(const char *, mode_t);
-    if (!real) real = dlsym(RTLD_NEXT, "creat");
-    if (deny(path)) return -1;
-    return real(path, mode);
-}
-FILE *fopen(const char *path, const char *mode) {
-    static FILE *(*real)(const char *, const char *);
-    if (!real) real = dlsym(RTLD_NEXT, "fopen");
-    if (write_mode(mode) && deny(path)) return NULL;
-    return real(path, mode);
-}
-FILE *fopen64(const char *path, const char *mode) {
-    static FILE *(*real)(const char *, const char *);
-    if (!real) real = dlsym(RTLD_NEXT, "fopen64");
-    if (write_mode(mode) && deny(path)) return NULL;
-    return real(path, mode);
-}
-int truncate(const char *path, off_t length) {
-    static int (*real)(const char *, off_t);
-    if (!real) real = dlsym(RTLD_NEXT, "truncate");
-    if (deny(path)) return -1;
-    return real(path, length);
-}
-int unlink(const char *path) {
-    static int (*real)(const char *);
-    if (!real) real = dlsym(RTLD_NEXT, "unlink");
-    if (deny(path)) return -1;
-    return real(path);
-}
-int rename(const char *oldpath, const char *newpath) {
-    static int (*real)(const char *, const char *);
-    if (!real) real = dlsym(RTLD_NEXT, "rename");
-    if (deny(oldpath) || deny(newpath)) return -1;
-    return real(oldpath, newpath);
-}
-"#;
+/// Whether this build installs a child-process barrier. It is **true only on
+/// Linux**: macOS limits `DYLD_INSERT_LIBRARIES` for protected binaries and
+/// Windows has no equivalent, so elsewhere only the pre-flight command check
+/// and the cross-platform tool-layer `FileSystem` guard apply. Exposed so
+/// callers and tests can state the boundary without a `cfg` of their own.
+pub const CHILD_BARRIER_AVAILABLE: bool = cfg!(target_os = "linux");
 
 /// Environment variable read by the preload shim: colon-separated canonical
 /// paths of the three protected files. Set only on the child's `Command`.
@@ -409,38 +256,24 @@ pub const CHILD_BARRIER_ENV: &str = "RPI_ACTIVE_SESSION_FILES";
 /// `>` redirection) uses to open a file for writing. On a match it sets
 /// `errno=EPERM` and returns failure *before* the syscall, so the file is never
 /// truncated or created. All other paths and all read-only opens are forwarded
-/// to the real libc symbol via `dlsym(RTLD_NEXT, ...)`. See
-/// [`CHILD_BARRIER_C`] for the source.
+/// to the real libc symbol via `dlsym(RTLD_NEXT, ...)`. The C source lives in
+/// `guard_shim.c` next to this crate and is compiled by `build.rs` at build
+/// time (not on the user's machine); see the module header for the boundary.
 
-/// Materialize (once per process) the embedded shared object and return its
-/// path. Failures are returned to the caller so `Shell::exec` refuses the
-/// command instead of silently spawning an unprotected child. A host C
-/// compiler is required on Linux only when an active session is installed.
+/// Materialize (once per process) the build-time shared object and return its
+/// path. The bytes are embedded in the binary by `include_bytes!`, so a host C
+/// compiler is **not** needed at runtime: only a writable temp dir is. A
+/// write failure is returned to the caller so `Shell::exec` refuses the spawn
+/// instead of silently running an unprotected child.
 #[cfg(target_os = "linux")]
 fn child_barrier_so() -> Result<PathBuf, String> {
     static SO: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     SO.get_or_init(|| {
+        const SO_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libguard.so"));
         let dir = std::env::temp_dir().join(format!("rpi-active-guard-{}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|e| format!("guard shim dir: {e}"))?;
-        let c = dir.join("guard.c");
         let so = dir.join("libguard.so");
-        std::fs::write(&c, CHILD_BARRIER_C).map_err(|e| format!("guard shim source: {e}"))?;
-        let out = std::process::Command::new("cc")
-            .arg("-shared")
-            .arg("-fPIC")
-            .arg("-O2")
-            .arg("-o")
-            .arg(&so)
-            .arg(&c)
-            .arg("-ldl")
-            .output()
-            .map_err(|e| format!("guard shim compiler: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "guard shim compile failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
+        std::fs::write(&so, SO_BYTES).map_err(|e| format!("guard shim install: {e}"))?;
         Ok(so)
     })
     .clone()
@@ -616,6 +449,34 @@ mod tests {
         // Append is write intent too (O_APPEND); the child barrier enforces it,
         // so the pre-flight check must not exempt `>>`.
         assert!(has_write_intent("cat active.jsonl >> /dev/null"));
+    }
+
+    /// Review PR #345 blocker 1: a normal durable-session bash command must
+    /// not depend on a C compiler at runtime. Clear `PATH` around the shim
+    /// installation so any `Command::new("cc")` would fail to spawn; the
+    /// build-time embedded bytes must still materialize the .so. This calls
+    /// `child_barrier_so` directly so it does not touch the process-global
+    /// active-session state shared by the other tests.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_barrier_needs_no_runtime_compiler() {
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", "");
+        let result = child_barrier_so();
+        match original_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        let so = result.expect("the shim must install without a compiler on PATH");
+        assert!(
+            so.exists(),
+            "the build-time embedded shim must be materialized: {}",
+            so.display()
+        );
+        assert!(
+            std::fs::metadata(&so).unwrap().len() > 0,
+            "materialized shim must not be empty"
+        );
     }
 
     #[test]
