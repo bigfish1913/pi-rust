@@ -70,6 +70,7 @@ struct State {
     role: String,
     task_preview: String,
     parent_session_id: String,
+    parent_tool_call_id: Option<String>,
     journal: observations::Journal,
 }
 
@@ -337,6 +338,18 @@ impl ChildAgents {
         if task.trim().is_empty() || task.len() > 20_000 || role.is_empty() || role.len() > 200 {
             return Err("child task must contain 1-20000 bytes and role 1-200 bytes".into());
         }
+        let parent_tool_call_id = args
+            .get("toolCallId")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|id| {
+                        !id.is_empty() && id.len() <= 200 && !id.chars().any(char::is_control)
+                    })
+                    .map(str::to_owned)
+                    .ok_or("invalid parent toolCallId")
+            })
+            .transpose()?;
         let turns = bounded_number(args, "maxTurns", 8, 1, 32)? as u32;
         let timeout = bounded_number(args, "timeoutSeconds", 300, 10, 1800)?;
         let tools = args
@@ -367,6 +380,7 @@ impl ChildAgents {
                 role: role.to_string(),
                 task_preview: task.chars().take(200).collect(),
                 parent_session_id: parent.session().storage().metadata().id.clone(),
+                parent_tool_call_id,
                 ..State::default()
             }),
         });

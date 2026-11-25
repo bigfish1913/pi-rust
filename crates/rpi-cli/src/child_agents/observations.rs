@@ -11,7 +11,7 @@ const PAGE_BYTES: usize = 131072;
 pub(crate) fn capabilities() -> Value {
     json!({"version":1,"listCommand":"get_child_agents",
         "eventsCommand":"get_child_agent_events","cancelCommand":"cancel_child_agent",
-        "retention":"volatile","maxChildren":RETAINED_CHILDREN,"maxEvents":JOURNAL_EVENTS,
+        "parentToolCallId":true,"retention":"volatile","maxChildren":RETAINED_CHILDREN,"maxEvents":JOURNAL_EVENTS,
         "maxEventBytes":EVENT_BYTES,"maxPageCount":32,"maxResponseBytes":PAGE_BYTES,
         "sequence":"childEpochSeq-v1"})
 }
@@ -131,7 +131,7 @@ impl ChildAgents {
                     (state.parent_session_id == parent).then(|| {
                         json!({"childId":id,
                     "status":status(&state),"turns":state.turns,"role":state.role,
-                    "taskPreview":state.task_preview,"startedMs":state.started_ms,
+                    "taskPreview":state.task_preview,"parentToolCallId":state.parent_tool_call_id,"startedMs":state.started_ms,
                     "finishedMs":state.finished_ms,"earliestSeq":state.journal.earliest(),
                     "lastSeq":state.journal.seq})
                     })

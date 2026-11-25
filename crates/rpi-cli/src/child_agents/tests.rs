@@ -595,3 +595,37 @@ fn cancellation_keeps_native_tool_cleanup_events_observable() {
         vec!["tool_execution_start", "child_status", "tool_execution_end"]
     );
 }
+
+#[tokio::test]
+async fn observation_roster_preserves_parent_tool_call_binding() {
+    let parent = parent(FauxScript::new().with_text("bound child")).await;
+    let manager = ChildAgents::default();
+    let started = manager
+        .handle(
+            &parent,
+            7,
+            json!({"op":"start","task":"report","role":"same-role","toolCallId":"parent-call-42"}),
+        )
+        .await
+        .unwrap();
+    let roster = manager
+        .query("parent", observation_query("parent", "get_child_agents"))
+        .unwrap();
+    let row = roster["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["childId"] == started["childId"])
+        .unwrap();
+    assert_eq!(row["parentToolCallId"], "parent-call-42");
+    assert_eq!(observation_capabilities()["parentToolCallId"], true);
+    assert!(manager
+        .handle(
+            &parent,
+            7,
+            json!({"op":"start","task":"report","toolCallId":42})
+        )
+        .await
+        .is_err());
+    manager.cancel_owner(7);
+}
