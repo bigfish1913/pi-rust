@@ -15,6 +15,9 @@ use rpi_harness::session::Session;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+mod observations;
+pub(crate) use observations::capabilities as observation_capabilities;
+
 const MAX_JOBS: usize = 16;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
@@ -31,6 +34,7 @@ pub(crate) struct ChildAgents {
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     revoked: Mutex<HashSet<u64>>,
     active: Arc<AtomicUsize>,
+    observations: Mutex<observations::Observations>,
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -65,6 +69,8 @@ struct State {
     finished_ms: Option<u64>,
     role: String,
     task_preview: String,
+    parent_session_id: String,
+    journal: observations::Journal,
 }
 
 impl Job {
@@ -74,6 +80,14 @@ impl Job {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.finished_ms.is_none() {
             state.finished_ms = Some(now_ms());
+            let status = if state.error.is_some() {
+                "failed"
+            } else {
+                "done"
+            };
+            state
+                .journal
+                .push(json!({"type":"child_status", "status":status}));
         }
     }
 
@@ -91,6 +105,8 @@ impl Job {
         let mut limit_hit = false;
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // Cleanup events remain observable after a cancellation request.
+            state.journal.observe(&event);
             if state.result.is_some() || state.error.is_some() {
                 return;
             }
@@ -350,6 +366,7 @@ impl ChildAgents {
                 started_ms: now_ms(),
                 role: role.to_string(),
                 task_preview: task.chars().take(200).collect(),
+                parent_session_id: parent.session().storage().metadata().id.clone(),
                 ..State::default()
             }),
         });
@@ -381,6 +398,10 @@ impl ChildAgents {
             }
             permit = Permit(self.active.clone());
             jobs.insert(id.clone(), job.clone());
+            self.observations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remember(id.clone(), job.clone());
         }
         let session = Session::new(
             Arc::new(InMemorySessionStorage::new(
@@ -400,6 +421,7 @@ impl ChildAgents {
         {
             Ok(child) => child,
             Err(error) => {
+                job.fail("child construction failed");
                 self.jobs
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -496,9 +518,8 @@ async fn run_child(child: ChildHarness, job: Arc<Job>, prompt: String, turns: u3
                     outcome["turns"] = json!(state.turns);
                     outcome["turnLimited"] = json!(state.turns >= turns);
                     state.result = Some(outcome);
-                    if state.finished_ms.is_none() {
-                        state.finished_ms = Some(now_ms());
-                    }
+                    drop(state);
+                    job.mark_finished();
                 }
             }
             Err(error) => job.fail(format!("child run failed: {error}")),

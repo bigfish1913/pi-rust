@@ -572,6 +572,17 @@ impl RuntimeActionHost for HarnessActionHost {
     fn stop_child_agent(&self, child_id: &str) -> Result<serde_json::Value, String> {
         self.children.stop(child_id)
     }
+    fn query_child_agents(
+        &self,
+        parent_session_id: &str,
+        query: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let current = self.harness()?.session().storage().metadata().id.clone();
+        if current != parent_session_id {
+            return Err("child parent session changed".into());
+        }
+        self.children.query(parent_session_id, query)
+    }
     fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
         self.set_catalog(models);
     }

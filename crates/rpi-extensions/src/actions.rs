@@ -701,6 +701,15 @@ pub trait RuntimeActionHost: Send + Sync {
     fn stop_child_agent(&self, _child_id: &str) -> Result<serde_json::Value, String> {
         Err("child agent control is not supported by this host; upgrade rpi".into())
     }
+    /// Host-only, parent-session-scoped bounded child observations/control.
+    /// Never exposed through a plugin runtime action or plugin owner handle.
+    fn query_child_agents(
+        &self,
+        _parent_session_id: &str,
+        _query: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("child agent observations are not supported by this host".into())
+    }
     /// `SendMessage` — Pi-compatible `triggerTurn` and `deliverAs` scheduling.
     /// Defaults append while idle and steer while running; explicit `true`
     /// starts an idle run, `false` only updates context, and `nextTurn` waits

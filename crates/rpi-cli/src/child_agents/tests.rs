@@ -416,3 +416,182 @@ fn child_limits_reject_wrong_types_and_out_of_range_values() {
 
 mod invocation;
 mod security;
+
+fn observation_query(parent: &str, command: &str) -> Value {
+    json!({"type":command,"version":1,"parentSessionId":parent})
+}
+
+#[tokio::test]
+async fn native_observations_survive_disposal_and_are_parent_scoped() {
+    let parent = parent(FauxScript::new().with_text("native child final")).await;
+    let manager = ChildAgents::default();
+    let child = manager
+        .handle(&parent, 7, json!({"op":"start","task":"report"}))
+        .await
+        .unwrap();
+    let id = child["childId"].as_str().unwrap();
+    wait(&manager, &parent, id).await;
+    manager
+        .handle_existing(7, json!({"op":"dispose","childId":id}))
+        .unwrap();
+    let roster = manager
+        .query("parent", observation_query("parent", "get_child_agents"))
+        .unwrap();
+    assert_eq!(roster["children"][0]["childId"], id);
+    assert_eq!(roster["children"][0]["status"], "done");
+    let query = json!({"type":"get_child_agent_events","version":1,"parentSessionId":"parent",
+        "epoch":roster["epoch"],"childId":id,"afterSeq":0,"limit":32});
+    let page = manager.query("parent", query.clone()).unwrap();
+    assert!(page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["event"]["type"] == "message_end"));
+    assert!(page.to_string().contains("native child final"));
+    assert!(!page["resyncRequired"].as_bool().unwrap());
+    assert!(manager.query("another-parent", query).is_err());
+    assert!(manager
+        .query(
+            "parent",
+            json!({"type":"cancel_child_agent","version":1,
+        "parentSessionId":"parent","epoch":"stale","childId":id})
+        )
+        .is_err());
+    let other = manager
+        .query("other", observation_query("other", "get_child_agents"))
+        .unwrap();
+    assert!(other["children"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn observation_tails_are_bounded_and_report_eviction_and_oversized_events() {
+    let manager = ChildAgents::default();
+    let child = job(7);
+    {
+        let mut state = child.state.lock().unwrap();
+        state.parent_session_id = "parent".into();
+        for _ in 0..400 {
+            state.journal.push(json!({"type":"owned-fixture"}));
+        }
+        state.journal.observe(&delta("x".repeat(40000)));
+    }
+    manager
+        .observations
+        .lock()
+        .unwrap()
+        .remember("child".into(), child);
+    let roster = manager
+        .query("parent", observation_query("parent", "get_child_agents"))
+        .unwrap();
+    let mut request = json!({"type":"get_child_agent_events","version":1,"parentSessionId":"parent",
+        "epoch":roster["epoch"],"childId":"child","afterSeq":0,"limit":32});
+    let page = manager.query("parent", request.clone()).unwrap();
+    assert_eq!(page["resyncRequired"], true);
+    assert_eq!(page["events"].as_array().unwrap().len(), 32);
+    assert_eq!(page["hasMore"], true);
+    request["afterSeq"] = json!(400);
+    let last = manager.query("parent", request.clone()).unwrap();
+    assert_eq!(last["events"][0]["event"]["type"], "observation_gap");
+    assert_eq!(last["nextSeq"], 401);
+    assert!(serde_json::to_vec(&last).unwrap().len() <= 131072);
+    request["afterSeq"] = json!(402);
+    assert!(manager.query("parent", request).is_err());
+}
+
+#[tokio::test]
+async fn native_child_cancel_reaches_the_owned_runner() {
+    let parent = parent(
+        FauxScript::new()
+            .with_text("slow")
+            .with_tokens_per_second(0.1),
+    )
+    .await;
+    let manager = ChildAgents::default();
+    let started = manager
+        .handle(&parent, 7, json!({"op":"start","task":"report"}))
+        .await
+        .unwrap();
+    let roster = manager
+        .query("parent", observation_query("parent", "get_child_agents"))
+        .unwrap();
+    let reply = manager
+        .query(
+            "parent",
+            json!({"type":"cancel_child_agent","version":1,
+        "parentSessionId":"parent","epoch":roster["epoch"],"childId":started["childId"]}),
+        )
+        .unwrap();
+    assert_eq!(reply["status"], "cancelled");
+    let final_value = wait(&manager, &parent, started["childId"].as_str().unwrap()).await;
+    assert_eq!(final_value["status"], "failed");
+    assert!(final_value["error"]
+        .as_str()
+        .unwrap()
+        .contains("cancelled by user"));
+}
+
+#[test]
+fn observation_retention_evicts_finished_children_without_reviving_handles() {
+    let manager = ChildAgents::default();
+    for i in 0..40 {
+        let child = job(7);
+        child.state.lock().unwrap().parent_session_id = "parent".into();
+        child.fail("synthetic completion");
+        manager
+            .observations
+            .lock()
+            .unwrap()
+            .remember(format!("child-{i}"), child);
+    }
+    let roster = manager
+        .query("parent", observation_query("parent", "get_child_agents"))
+        .unwrap();
+    let children = roster["children"].as_array().unwrap();
+    assert_eq!(children.len(), 32);
+    assert_eq!(children[0]["childId"], "child-39");
+    assert_eq!(children[31]["childId"], "child-8");
+    assert!(manager.jobs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn cancellation_keeps_native_tool_cleanup_events_observable() {
+    let child = job(7);
+    child.observe(AgentEvent::ToolExecutionStart {
+        tool_call_id: "tool".into(),
+        tool_name: "owned-fixture".into(),
+        args: json!({}),
+    });
+    child.fail("cancel requested");
+    child.observe(AgentEvent::ToolExecutionEnd {
+        tool_call_id: "tool".into(),
+        tool_name: "owned-fixture".into(),
+        result: Default::default(),
+        is_error: true,
+    });
+    let state = child.state.lock().unwrap();
+    assert!(state.error.is_some());
+    // The journal is queried through the real bounded native envelope below.
+    drop(state);
+    let manager = ChildAgents::default();
+    child.state.lock().unwrap().parent_session_id = "parent".into();
+    manager
+        .observations
+        .lock()
+        .unwrap()
+        .remember("child".into(), child);
+    let roster = manager
+        .query("parent", observation_query("parent", "get_child_agents"))
+        .unwrap();
+    let page=manager.query("parent",json!({"type":"get_child_agent_events","version":1,
+        "parentSessionId":"parent","epoch":roster["epoch"],"childId":"child","afterSeq":0,"limit":32})).unwrap();
+    let kinds: Vec<_> = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["event"]["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["tool_execution_start", "child_status", "tool_execution_end"]
+    );
+}

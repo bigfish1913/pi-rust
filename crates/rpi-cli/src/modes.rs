@@ -1326,6 +1326,22 @@ where
                 }
                 Ok(data)
             }
+            "get_child_agents" | "get_child_agent_events" | "cancel_child_agent" => {
+                let bridge = match &extension_session {
+                    Some(cell) => cell
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .action_bridge(),
+                    None => None,
+                };
+                match bridge.filter(|bridge| bridge.is_active()) {
+                    Some(bridge) => bridge.clone_host().query_child_agents(
+                        &harness.session().storage().metadata().id,
+                        msg.clone(),
+                    ),
+                    None => Err("child agent observations require a native extension host".into()),
+                }
+            }
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
             "get_tool_program_branch" => {
                 crate::rpc::tool_program_queries::branch(harness, &msg).await
