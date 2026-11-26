@@ -85,6 +85,13 @@ async fn run_inner() -> i32 {
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--session-preview" || arg.starts_with("--session-preview="))
+    {
+        return crate::session_preview::run(&argv);
+    }
     if let Err(error) = crate::native_durable::experimental_epoch::early_check(&argv) {
         eprintln!("error: {error}");
         return EXIT_USAGE;

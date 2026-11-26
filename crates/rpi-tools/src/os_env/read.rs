@@ -148,6 +148,10 @@ fn join_error(error: tokio::task::JoinError) -> FileError {
 }
 #[async_trait]
 impl ReadFile for OsReadFile {
+    fn native_metadata(&self) -> Option<std::fs::Metadata> {
+        self.file.lock().ok()?.metadata().ok()
+    }
+
     async fn read_all(&self) -> Result<Vec<u8>, FileError> {
         self.read(None).await
     }

@@ -37,7 +37,9 @@ use rpi_agent::message::AgentMessage;
 use crate::error::{SessionError, SessionResult};
 use crate::events::{HarnessEvent, HarnessEventBus};
 use crate::session::session::Session;
-use crate::session::types::{EntryOrder, LaneRecord, OperationIntent, RecordQuery};
+use crate::session::types::{
+    EntryOrder, LaneRecord, OperationIntent, RecordQuery, RecoveryEntryCheck,
+};
 
 /// How many open operations constitute corruption (mirrors the TS
 /// `find_open_operations(limit: 2)` rule).
@@ -268,9 +270,26 @@ impl SessionRuntime {
         // provisioned id was committed; for a tool frame, its reserved result
         // entry must carry the matching call ID AND tool name. Provider IDs
         // alone may recur in another batch, branch or lane.
-        // Look up each reserved ID session-wide, not on the current lane or
-        // branch. Hydrate at most one entry at a time; unrelated payloads (and
-        // lanes with no recovery records) must not be read.
+        // Look up reserved IDs session-wide, in the order of their records.
+        let checks: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                LaneRecord::WriteDeferred(w) => Some(RecoveryEntryCheck::DeferredWrite(
+                    w.target.get("id").and_then(|v| v.as_str()),
+                )),
+                LaneRecord::ToolStarted(t) => Some(RecoveryEntryCheck::ToolResult {
+                    id: &t.result_entry_id,
+                    call_id: &t.tool_call_id,
+                    tool_name: &t.tool_name,
+                }),
+                _ => None,
+            })
+            .collect();
+        let mut settled = self
+            .session
+            .recovery_entries_settled(&checks)
+            .await?
+            .into_iter();
 
         for record in records {
             match record {
@@ -282,10 +301,8 @@ impl SessionRuntime {
                         .map(str::to_string);
                     // The commit landed: this write is history, not a pending
                     // frame, whatever happened to the operation afterwards.
-                    if let Some(id) = provisioned_id.as_deref() {
-                        if self.session.get_entry(id).await?.is_some() {
-                            continue;
-                        }
+                    if settled.next().expect("settlement for each recovery check") {
+                        continue;
                     }
                     if !open_ids.contains(&w.run_id) {
                         findings.push(RecoveryFinding::DanglingWrite {
@@ -299,15 +316,7 @@ impl SessionRuntime {
                     });
                 }
                 LaneRecord::ToolStarted(t) => {
-                    // Read and verify the reserved row, retaining only call identity.
-                    let landed = self
-                        .session
-                        .tool_result_identity(&t.result_entry_id)
-                        .await?
-                        .is_some_and(|(call_id, name)| {
-                            call_id == t.tool_call_id && name == t.tool_name
-                        });
-                    if landed {
+                    if settled.next().expect("settlement for each recovery check") {
                         continue;
                     }
                     if !open_ids.contains(&t.run_id) {

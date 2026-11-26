@@ -809,6 +809,7 @@ pub fn print_help() {
   --fork-position <at|before>    With --fork-entry: keep the selected message in the
                                  new branch (at) or drop it (before). Default: before
   --session-dir <dir>            Directory for session storage
+  --session-preview <uuid>       Read the recent saved transcript (standalone with --session-dir)
   --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
   --tools, -t <list>             Comma-separated allowlist of tool names to enable

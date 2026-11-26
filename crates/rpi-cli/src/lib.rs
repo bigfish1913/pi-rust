@@ -73,6 +73,7 @@ pub mod session;
 pub mod session_cwd;
 pub mod session_driver;
 pub mod session_gc;
+mod session_preview;
 pub mod settings;
 mod side_questions;
 pub mod source_info;
