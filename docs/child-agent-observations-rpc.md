@@ -63,3 +63,24 @@ parent-run cancellation semantics are unchanged.
 每个子任务只保留 256 条 / 1 MiB，淘汰时明确返回 resyncRequired；超过 32 KiB 的
 单条事件返回 observation_gap。最多保留 32 个子任务，进程重启后记录消失。
 取消响应仅证明原生已接受取消信号，不能当作操作系统进程已清理的证据。
+
+## Native ToolProgram records inside a delegated child
+
+Delegated child sessions publish their own canonical native journal commits into
+that child's existing bounded observation tail. `tool_program_child_begin` and
+`tool_program_child_phase` retain the native source Session, lane, entry ID,
+sequence, origin and descriptor. No independent HTTP Session is created.
+
+`tool_program_child_body` contains a verified native body fragment with
+`sourceSessionId`, `lane`, `childId`, `phaseEntryId`, `descriptorId`, `byteOffset`,
+base64 `data` and fragment `sha256`. Fragments are at most 8192 decoded bytes;
+a phase hydrates at most 256 KiB. The canonical phase descriptor remains the
+whole-body identity and checksum. A consumer must not claim full-body integrity
+until all descriptor bytes are available and its SHA-256 matches.
+
+The child runner owns the commit receiver, reads bodies through the existing
+strict harness query, and drains after native cleanup. Neither observation nor
+hydration executes tools or changes run settlement. Channel lag, body limits,
+source loss and bounded drain timeout produce `observation_gap`. Existing tail
+retention (256 events / 1 MiB) and epoch rules remain unchanged. Consumers can
+mirror the observed records with explicit gaps; the tail is not durable history.

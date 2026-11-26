@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 mod observations;
+mod tool_program;
 pub(crate) use observations::capabilities as observation_capabilities;
 
 const MAX_JOBS: usize = 16;
@@ -443,6 +444,8 @@ impl ChildAgents {
                 return Err(error.to_string());
             }
         };
+        let program_observer =
+            tool_program::Observer::start(child.harness.session().clone(), job.clone());
         let prompt = format!("You are a delegated {role} subagent. Complete the task in at most {turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
         let worker = job.clone();
         let execution_scope = child.execution_scope.clone();
@@ -466,6 +469,7 @@ impl ChildAgents {
             // Also retain capacity when run_child unwinds after starting a
             // background driver; catch_unwind is not a cleanup completion.
             execution_scope.wait_idle().await;
+            program_observer.finish().await;
         });
         Ok(json!({"childId":id,"sessionId":id,"status":"running"}))
     }
