@@ -134,3 +134,10 @@ RPI_TEST_SUBAGENT_LIBRARY=/path/to/rpi_subagents.dll cargo test -p rpi-cli --tes
 范围、父审批 UI、headless 拒绝、别名递归拒绝、重复注册和 reload 回退，
 以及连续取消超过 handle 容量后的复用和 harness/provider/DLL 释放，
 不需要真实 API key。
+
+## Remote observation / 远程观察
+
+Capability-negotiated native RPC can expose bounded parent-scoped child event
+tails and native-owned cancellation without making children independently
+resumable. See [the observation contract](../child-agent-observations-rpc.md).
+原生 RPC 可提供父会话范围内的有界消息与工具事件观察及取消；子会话仍不可独立续聊。

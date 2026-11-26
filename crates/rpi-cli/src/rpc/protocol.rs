@@ -27,6 +27,10 @@ pub enum Command {
     },
     Abort,
     GetState,
+    /// Strict bounded host-only delegated-child query/control envelopes.
+    GetChildAgents,
+    GetChildAgentEvents,
+    CancelChildAgent,
     /// Versioned, bounded exact startup resource observations.
     GetResourceState {
         version: Option<u32>,
@@ -295,6 +299,9 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_durable_request",
     "get_durable_runs",
     "get_state",
+    "get_child_agents",
+    "get_child_agent_events",
+    "cancel_child_agent",
     "get_commands",
     "execute_command",
     "get_tool_program_branch",
@@ -375,6 +382,7 @@ pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
         "promptContent": super::prompt_content::prompt_capabilities(),
         "fileIO": super::file_io::capabilities(),
         "durable": crate::native_durable::capabilities(false),
+        "childAgents": crate::child_agents::observation_capabilities(),
         "toolProgramChildren": {
             "version": 1,
             "summaryCommand": "get_tool_program_children",
@@ -779,5 +787,26 @@ mod tests {
             serde_json::from_value(value).unwrap();
         assert!(legacy.is_ok());
         assert_eq!(legacy.result.unwrap()["accepted"], true);
+    }
+}
+
+#[cfg(test)]
+mod child_observation_tests {
+    use super::*;
+    #[test]
+    fn child_observation_profile_advertises_additive_host_commands() {
+        let ready = ready(crate::args::RpcMessageUpdates::default());
+        assert_eq!(
+            ready["childAgents"],
+            crate::child_agents::observation_capabilities()
+        );
+        for command in [
+            "get_child_agents",
+            "get_child_agent_events",
+            "cancel_child_agent",
+        ] {
+            assert!(SUPPORTED_COMMANDS.contains(&command));
+            serde_json::from_value::<Request>(json!({"type":command})).unwrap();
+        }
     }
 }

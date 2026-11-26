@@ -552,6 +552,18 @@ where
     .await
 }
 
+fn child_observation_bridge(
+    session: Option<&crate::session::ExtensionSessionCell>,
+) -> Option<Arc<rpi_extensions::ActionBridge>> {
+    session
+        .and_then(|cell| {
+            cell.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .action_bridge()
+        })
+        .filter(|bridge| bridge.is_active())
+}
+
 async fn rpc_with_native_durable_io<R, W>(
     harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
@@ -731,6 +743,18 @@ where
         }
     };
     let mut ready = rpc_protocol::ready(message_updates);
+    if child_observation_bridge(extension_session.as_ref()).is_none() {
+        ready.as_object_mut().unwrap().remove("childAgents");
+        ready["supportedCommands"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|command| {
+                !matches!(
+                    command.as_str(),
+                    Some("get_child_agents" | "get_child_agent_events" | "cancel_child_agent")
+                )
+            });
+    }
     // Advertise active semantics, not merely support. Legacy clients must not
     // receive autonomous settlements that can clear another request's admission.
     if !correlated_execution {
@@ -1360,6 +1384,15 @@ where
                     }));
                 }
                 Ok(data)
+            }
+            "get_child_agents" | "get_child_agent_events" | "cancel_child_agent" => {
+                match child_observation_bridge(extension_session.as_ref()) {
+                    Some(bridge) => bridge.clone_host().query_child_agents(
+                        &harness.session().storage().metadata().id,
+                        msg.clone(),
+                    ),
+                    None => Err("child agent observations require a native extension host".into()),
+                }
             }
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
             "get_tool_program_branch" => {

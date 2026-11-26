@@ -784,3 +784,127 @@ async fn production_command_panic_closes_transport_without_a_successful_settleme
         .iter()
         .any(|event| event["type"] == "agent_settled"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_child_observations_are_not_advertised_without_a_bridge() {
+    let (harness, _) = rpc_test_harness("unused", 0.0).await;
+    let parent_id = harness.session().storage().metadata().id.clone();
+    let (mut client, output, task) =
+        start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+    let ready = output.wait_for(|m| m["type"] == "ready").await;
+    assert!(ready.get("childAgents").is_none());
+    for command in [
+        "get_child_agents",
+        "get_child_agent_events",
+        "cancel_child_agent",
+    ] {
+        assert!(!ready["supportedCommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == command));
+    }
+    send(&mut client, json!({"type":"get_child_agents","id":"unavailable","version":1,"parentSessionId":parent_id})).await;
+    assert_eq!(
+        output.wait_for(|m| m["id"] == "unavailable").await["success"],
+        false
+    );
+    stop(&mut client, task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_child_observation_rpc_preserves_binding_and_disposed_history() {
+    use rpi_extensions::RuntimeActionHost;
+    let (harness, _) = rpc_test_harness("delegated native observation", 0.0).await;
+    let parent_id = harness.session().storage().metadata().id.clone();
+    let retained = Arc::new(harness.clone());
+    let (host, cell) = crate::extensions_actions::HarnessActionHost::new_empty(
+        vec![],
+        std::env::temp_dir(),
+        tokio::runtime::Handle::current(),
+        Default::default(),
+        rpi_extensions::ToolCallContext::default(),
+    );
+    crate::extensions_actions::HarnessActionHost::set_harness(&cell, retained.clone());
+    let host = Arc::new(host);
+    let bridge = rpi_extensions::ActionBridge::new(tokio::runtime::Handle::current(), host.clone());
+    let session = rpi_extensions::ExtensionSession::from_parts(
+        Arc::new(rpi_extensions::ExtensionRegistry::new().snapshot()),
+        Arc::new(rpi_extensions::PluginKeepalive::new(
+            Vec::new(),
+            Some(bridge.clone()),
+        )),
+        Vec::new(),
+        Some(bridge),
+    );
+    let (mut client, output, task) = super::tests::start_test_rpc_with_lifecycle(
+        harness,
+        rpi_extensions::UiDialogMailbox::new(),
+        Some(Arc::new(std::sync::Mutex::new(session))),
+    );
+    let ready = output.wait_for(|m| m["type"] == "ready").await;
+    assert_eq!(
+        ready["childAgents"],
+        crate::child_agents::observation_capabilities()
+    );
+    for command in [
+        "get_child_agents",
+        "get_child_agent_events",
+        "cancel_child_agent",
+    ] {
+        assert!(ready["supportedCommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == command));
+    }
+    let child = host
+        .child_agent(7, json!({"op":"start","task":"return a short report"}))
+        .await
+        .unwrap();
+    let child_id = child["childId"].as_str().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let result = host
+                .child_agent(7, json!({"op":"poll","childId":child_id}))
+                .await
+                .unwrap();
+            if result["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    host.child_agent(7, json!({"op":"dispose","childId":child_id}))
+        .await
+        .unwrap();
+    send(
+        &mut client,
+        json!({"type":"get_child_agents","id":"roster","version":1,"parentSessionId":parent_id}),
+    )
+    .await;
+    let response = output.wait_for(|m| m["id"] == "roster").await;
+    assert_eq!(response["success"], true);
+    assert_eq!(response["data"]["children"][0]["childId"], child_id);
+    send(&mut client,json!({"type":"get_child_agent_events","id":"child-events","version":1,
+        "parentSessionId":parent_id,"epoch":response["data"]["epoch"],"childId":child_id,"afterSeq":0,"limit":32})).await;
+    let events = output.wait_for(|m| m["id"] == "child-events").await;
+    assert_eq!(events["success"], true);
+    assert!(events["data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["event"]["type"] == "message_end"));
+    send(
+        &mut client,
+        json!({"type":"get_child_agents","id":"foreign","version":1,"parentSessionId":"wrong"}),
+    )
+    .await;
+    assert_eq!(
+        output.wait_for(|m| m["id"] == "foreign").await["success"],
+        false
+    );
+    stop(&mut client, task).await;
+}
