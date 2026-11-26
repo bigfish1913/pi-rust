@@ -827,7 +827,9 @@ fn load_session_mixed_impl(
             continue;
         }
         let result = match images {
-            SessionImages::Original => open_library(&path, &path).map(|library| (library, None)),
+            SessionImages::Original => {
+                open_library(&path, &path).map(|library| (library, None::<Arc<dyn Send + Sync>>))
+            }
             SessionImages::Staged(stage) => {
                 let Some(name) = path.file_name() else {
                     continue;
