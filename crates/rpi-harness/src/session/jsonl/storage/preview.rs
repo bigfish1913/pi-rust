@@ -237,6 +237,9 @@ impl ResidentState {
             }
             next = entry.parent_id.clone();
         }
+        if rows.is_empty() {
+            return None;
+        }
         rows.reverse();
         Some(PreviewIndex {
             version: VERSION,
