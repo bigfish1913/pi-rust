@@ -3330,6 +3330,19 @@ pub(crate) async fn interactive_tui_with_terminal(
             break;
         }
         match rx.recv().await {
+            Some(
+                TuiMessage::SwitchSession(_)
+                | TuiMessage::ImportSession(_)
+                | TuiMessage::ForkSession
+                | TuiMessage::ExportSession
+                | TuiMessage::ExportSessionWithFormat(_),
+            ) if args.mini => {
+                add_error_message(
+                    &state.notice_container(),
+                    "--mini does not support saved sessions or session exports.",
+                );
+                tui.request_render(false);
+            }
             Some(TuiMessage::OpenProviderSelector) => {
                 let current = lane.get_model().await.ok();
                 open_provider_selector(

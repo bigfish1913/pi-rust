@@ -142,6 +142,7 @@ pub struct Args {
     pub thinking: Option<ThinkingLevel>,
 
     pub print: bool,
+    /// Select an ephemeral session and turn off native durable execution.
     pub mini: bool,
     /// The empty string selects the configured default area.
     pub host: Option<String>,
@@ -710,13 +711,19 @@ pub fn parse_args(args: &[String]) -> Args {
             (result.session_id.is_some(), "--session-id"),
             (result.session_dir.is_some(), "--session-dir"),
             (result.fork.is_some(), "--fork"),
-            (result.name.is_some(), "--name"),
-            (
-                result.experimental_durable_epoch.is_some(),
-                "--experimental-durable-epoch",
-            ),
-            (result.mode != Mode::Text, "--mode json/rpc"),
             (result.export.is_some(), "--export"),
+        ] {
+            if present {
+                result
+                    .errors
+                    .push(format!("--mini cannot be combined with {flag}"));
+            }
+        }
+    }
+    if result.host.is_some() && result.mini {
+        for (present, flag) in [
+            (result.name.is_some(), "--name"),
+            (result.mode != Mode::Text, "--mode json/rpc"),
             (result.list_models.is_some(), "--list-models"),
             (result.models.is_some(), "--models"),
             (result.resource_config.is_some(), "--resource-config"),
@@ -741,7 +748,8 @@ pub fn parse_args(args: &[String]) -> Args {
                 .errors
                 .push(format!("--mini does not support --{flag}"));
         }
-    } else if result.resource_config.is_none() && result.resource_transition.is_none() {
+    }
+    if result.resource_config.is_none() && result.resource_transition.is_none() {
         // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
         env_extension_dirs.append(&mut result.extensions_dir);
         result.extensions_dir = env_extension_dirs;
@@ -749,10 +757,8 @@ pub fn parse_args(args: &[String]) -> Args {
     // `--print` + `--mode json`: `--print` implies non-interactive, but
     // `--mode json` selects the JSON event stream. The TS `resolveAppMode`
     // treats `mode === "json"` as its own non-interactive mode; we follow that.
-    if !result.mini {
-        if let Err(error) = crate::native_durable::experimental_epoch::policy(&result) {
-            result.errors.push(error);
-        }
+    if let Err(error) = crate::native_durable::experimental_epoch::policy(&result) {
+        result.errors.push(error);
     }
     result
 }
@@ -839,8 +845,7 @@ pub fn print_help() {
   --approve, -a                  Force-enable current-project resources
   --no-approve, -na              Disable current-project resources
   --print, -p                    Non-interactive: process prompt(s) and exit
-  --mini                         Low-memory text mode: no sessions, durable, or resource discovery
-                                 Enable built-in tools explicitly with --tools <list>
+  --mini                         Use an in-memory session and disable native durable execution
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
@@ -1082,7 +1087,25 @@ mod tests {
             assert!(args.mini && args.no_session && !args.native_durable);
             assert!(args.errors.is_empty(), "{:?}", args.errors);
             assert_eq!(args.messages, ["hello"]);
+            assert_eq!(resolve_mode(&args, true, true), RunMode::Interactive);
         }
+    }
+
+    #[test]
+    fn mini_accepts_regular_modes_and_resource_flags() {
+        let args = parse_args(&s(&[
+            "--mini",
+            "--mode",
+            "rpc",
+            "--tools",
+            "read",
+            "--extension",
+            "extension.dylib",
+        ]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(resolve_mode(&args, true, true), RunMode::Rpc);
+        assert_eq!(args.tools.unwrap(), ["read"]);
+        assert_eq!(args.extension, [PathBuf::from("extension.dylib")]);
     }
 
     #[test]
@@ -1090,7 +1113,7 @@ mod tests {
         for (flags, expected) in [
             (&["--resume"][..], "--resume"),
             (&["--session-id", "saved"][..], "--session-id"),
-            (&["--mode", "rpc"][..], "--mode json/rpc"),
+            (&["--export", "session.jsonl"][..], "--export"),
             (
                 &["--experimental-durable-epoch", "epoch"][..],
                 "--experimental-durable-epoch",

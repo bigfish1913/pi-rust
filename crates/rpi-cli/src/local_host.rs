@@ -141,6 +141,12 @@ struct MiniRequest {
     exclude_tools: Option<Vec<String>>,
     no_tools: bool,
     no_builtin_tools: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    no_skills: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    no_prompt_templates: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    no_context_files: bool,
     system_prompt: Option<String>,
     append_system_prompt: Vec<String>,
     debug_system_prompt: bool,
@@ -162,6 +168,9 @@ impl MiniRequest {
             exclude_tools: args.exclude_tools,
             no_tools: args.no_tools,
             no_builtin_tools: args.no_builtin_tools,
+            no_skills: args.no_skills,
+            no_prompt_templates: args.no_prompt_templates,
+            no_context_files: args.no_context_files,
             system_prompt: args.system_prompt,
             append_system_prompt: args.append_system_prompt,
             debug_system_prompt: args.debug_system_prompt,
@@ -185,6 +194,9 @@ impl MiniRequest {
             exclude_tools: self.exclude_tools,
             no_tools: self.no_tools,
             no_builtin_tools: self.no_builtin_tools,
+            no_skills: self.no_skills,
+            no_prompt_templates: self.no_prompt_templates,
+            no_context_files: self.no_context_files,
             system_prompt: self.system_prompt,
             append_system_prompt: self.append_system_prompt,
             debug_system_prompt: self.debug_system_prompt,
@@ -515,10 +527,9 @@ async fn serve_session(
         let signal = CancellationToken::new();
         let mut diagnostics = Vec::new();
         let result = {
-            let run =
-                crate::mini::execute(&home, &args, &cwd, request, signal.clone(), |message| {
-                    diagnostics.push(message);
-                });
+            let run = crate::mini::execute(&home, args, &cwd, request, signal.clone(), |message| {
+                diagnostics.push(message);
+            });
             tokio::pin!(run);
             tokio::select! {
                 _ = input.fill_buf() => {
