@@ -68,6 +68,16 @@ pub fn execution_context() -> Option<serde_json::Value> {
         .flatten()
 }
 
+/// Tool bindings exposed by GetExecutionContext. The scope also carries
+/// host-only state used by built-in tools and access checks.
+pub fn public_execution_context() -> Option<serde_json::Value> {
+    let mut context = execution_context()?;
+    context
+        .as_object_mut()?
+        .retain(|key, _| matches!(key.as_str(), "model" | "thinkingLevel" | "tools"));
+    Some(context)
+}
+
 /// A blocking driver owns this guard until its final foreign callback returns.
 pub struct BackgroundToolGuard(Arc<ToolExecutionScope>);
 impl Drop for BackgroundToolGuard {
@@ -92,15 +102,19 @@ mod tests {
     #[tokio::test]
     async fn identity_and_context_are_scoped_and_never_leak_to_the_parent() {
         let scope = Arc::new(ToolExecutionScope::with_context(
-            serde_json::json!({"childAgent":false,"tools":["read"]}),
+            serde_json::json!({"nativeDurableActor":"child-1","tools":["read"]}),
         ));
         assert!(!is_child_execution());
         scope
             .run(async {
                 assert!(is_child_execution());
                 assert_eq!(
-                    execution_context().unwrap()["tools"],
-                    serde_json::json!(["read"])
+                    execution_context().unwrap()["nativeDurableActor"],
+                    "child-1"
+                );
+                assert_eq!(
+                    public_execution_context().unwrap(),
+                    serde_json::json!({"tools":["read"]})
                 );
             })
             .await;

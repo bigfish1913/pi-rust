@@ -46,7 +46,7 @@ fn delta(text: String) -> AgentEvent {
         },
     }
 }
-async fn wait(manager: &ChildAgents, parent: &AgentHarness, id: &str) -> Value {
+async fn wait(manager: &ChildRuns, parent: &AgentHarness, id: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let value = manager
@@ -66,7 +66,7 @@ async fn wait(manager: &ChildAgents, parent: &AgentHarness, id: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn child_reports_and_owner_scoped_disposal_are_independent_of_parent_transcript() {
     let parent = parent(FauxScript::new().with_text("child report")).await;
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     let started = manager
         .handle(&parent, 7, json!({"op":"start","task":"report"}))
         .await
@@ -98,7 +98,7 @@ async fn cancellation_and_unload_stop_pending_children_and_reject_stale_starts()
             .with_tokens_per_second(0.1),
     )
     .await;
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     let started = manager
         .handle(&parent, 7, json!({"op":"start","task":"report"}))
         .await
@@ -184,7 +184,7 @@ fn text_and_event_budgets_are_enforced_before_queue_growth() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn poll_drains_bounded_batches_before_delivering_a_terminal_result() {
     let parent = parent(FauxScript::new()).await;
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     let job = job(7);
     for _ in 0..4 {
         job.observe(delta("x".repeat(32 * 1024)));
@@ -209,7 +209,7 @@ async fn poll_drains_bounded_batches_before_delivering_a_terminal_result() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_is_bounded_even_while_disposed_children_are_cleaning_up() {
     let parent = parent(FauxScript::new()).await;
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     manager.active.store(MAX_JOBS, Ordering::Release);
     assert!(manager
         .handle(&parent, 7, json!({"op":"start","task":"report"}))
@@ -236,7 +236,7 @@ async fn roster_reports_live_children_and_stop_terminates_by_id() {
             .with_tokens_per_second(0.1),
     )
     .await;
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     let started = manager
         .handle(
             &parent,
@@ -289,7 +289,7 @@ async fn roster_reports_live_children_and_stop_terminates_by_id() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stop_on_a_finished_child_reports_already_finished_without_rewriting_it() {
     let parent = parent(FauxScript::new().with_text("child report")).await;
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     let started = manager
         .handle(&parent, 7, json!({"op":"start","task":"report"}))
         .await
@@ -372,7 +372,7 @@ async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
             .with_tokens_per_second(0.1),
     )
     .await;
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     let started = manager
         .handle(&parent, 7, json!({"op":"start","task":"report"}))
         .await
