@@ -1402,7 +1402,7 @@ impl JsonlSessionStorage {
         // The target lease must precede creation of the progress companion and
         // the staged replacement, otherwise a competing fork can leave a
         // partially initialized target behind a failed ownership check.
-        let _target_lease = file_result(
+        let target_lease = file_result(
             self.fs.try_acquire_writer_lease(path).await,
             &format!("Failed to acquire writer lease for fork {path}"),
         )?;
@@ -1537,7 +1537,13 @@ impl JsonlSessionStorage {
             })
         })
         .await?;
-        JsonlSessionStorage::load(self.fs.clone(), path, clock, ids).await
+        let storage = Self::load(self.fs.clone(), path, clock, ids).await?;
+        // Publish the destination's index under the creation lease, then
+        // return the handle with the same ownership semantics as a plain load.
+        *storage.writer_lease.lock().unwrap() = target_lease;
+        storage.publish_preview().await;
+        storage.writer_lease.lock().unwrap().take();
+        Ok(storage)
     }
 
     /// Wait for all in-flight appends to settle. Mirrors TS `drain`.
