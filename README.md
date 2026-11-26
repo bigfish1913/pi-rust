@@ -485,8 +485,10 @@ rpi --mini --host=work "explain this error"  # Run Mini in the named area
 
 Each area has one local Host process per agent home. Each terminal opens its
 own AgentLoop and session with its own history, working directory and run
-controls. The TUI shows the area, Host PID, Session ID and Agent ID. The Host
-stays available after TUI exit.
+controls. `rpi --host` runs the same interactive TUI as `rpi`, including
+`/session`, `/tree` and `/new`. The client relays terminal input and output over
+its area's local socket. The Host stays available after TUI exit. Restart an
+area running an earlier binary before attaching the native TUI.
 
 `--mini` runs once in the selected Host and prints the final response on the
 client's stdout. It accepts piped input and `@file` attachments, uses one
@@ -527,8 +529,8 @@ entry in `areas`. The Host reads its area overrides when it starts.
   down. The default is 32 and the allowed range is 1–256. At capacity, new
   clients receive an error. Larger areas may need a higher OS open-file limit.
 - `idleTimeoutSeconds` defaults to `0`, which disables expiration. A positive
-  value closes the client session after that many seconds without RPC activity.
-  The timer starts after any prompt, compaction or pending RPC work finishes.
+  value closes an idle client session. Active turns and compaction can finish
+  before expiration. In the terminal, input restarts the interval.
   Expiration releases its Agent slot, preserves its history and leaves the area
   Host available for the next connection.
 

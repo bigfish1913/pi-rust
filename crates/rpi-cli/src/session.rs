@@ -4258,13 +4258,24 @@ pub(crate) async fn set_active_session(
     session: Session,
     tool_context: Option<&rpi_extensions::ToolCallContext>,
 ) -> Result<(), String> {
+    set_active_session_with_identity(harness, session, tool_context, true).await
+}
+
+pub(crate) async fn set_active_session_with_identity(
+    harness: &AgentHarness,
+    session: Session,
+    tool_context: Option<&rpi_extensions::ToolCallContext>,
+    publish_process_identity: bool,
+) -> Result<(), String> {
     let metadata = session.get_metadata().await.ok();
     harness
         .set_session(session)
         .await
         .map_err(|e| e.to_string())?;
     if let Some(metadata) = metadata {
-        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, &metadata.id);
+        if publish_process_identity {
+            std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, &metadata.id);
+        }
         if let Some(context) = tool_context {
             context.set_session_id(metadata.id);
         }

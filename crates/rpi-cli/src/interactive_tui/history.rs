@@ -382,7 +382,7 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
         (resident.generation, storage, resident.page.clone())
     };
     let task_state = state.clone();
-    *worker = Some(tokio::spawn(async move {
+    let load = async move {
         let state = task_state;
         let tree = Session::new(storage.clone(), None).view("main");
         let Ok(expected_leaf) = tree.get_leaf_id().await else {
@@ -483,7 +483,11 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
                 tui.request_render(false);
             }
         }
-    }));
+    };
+    *worker = Some(tokio::spawn(rpi_tui::display_context::scope(
+        rpi_tui::display_context::current(),
+        load,
+    )));
 }
 
 /// Only operation settlement reloads latest, never individual token events.

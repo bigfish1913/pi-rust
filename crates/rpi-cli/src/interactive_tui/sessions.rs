@@ -134,9 +134,13 @@ pub(super) async fn switch_to_session(
             // Route through the funnel so the plugin channels follow the swap;
             // a bare `set_session` would leave every plugin naming the session
             // it was serving before this call.
-            if let Err(error) =
-                crate::session::set_active_session(harness, restored.session, Some(tool_context))
-                    .await
+            if let Err(error) = crate::session::set_active_session_with_identity(
+                harness,
+                restored.session,
+                Some(tool_context),
+                state.publish_process_identity,
+            )
+            .await
             {
                 add_error_message(
                     &state.notice_container(),
@@ -212,9 +216,7 @@ pub(super) async fn import_session(
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) {
     state.history_page.invalidate();
-    use std::path::Path as FsPath;
-
-    let src = FsPath::new(path);
+    let src = cwd.join(path);
     if !src.is_file() {
         add_error_message(
             &state.notice_container(),
@@ -254,7 +256,7 @@ pub(super) async fn import_session(
         return;
     }
     let result =
-        crate::session::import_session_file(src, &cwd.to_string_lossy(), &state.session_dir).await;
+        crate::session::import_session_file(&src, &cwd.to_string_lossy(), &state.session_dir).await;
     let new_session = match result {
         Ok(session) => session,
         Err(error) => {
@@ -266,8 +268,13 @@ pub(super) async fn import_session(
             return;
         }
     };
-    if let Err(error) =
-        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    if let Err(error) = crate::session::set_active_session_with_identity(
+        harness,
+        new_session,
+        Some(tool_context),
+        state.publish_process_identity,
+    )
+    .await
     {
         state.set_status(RunStatus::Idle);
         add_error_message(
@@ -342,8 +349,13 @@ pub(super) async fn fork_session(
             return;
         }
     };
-    if let Err(error) =
-        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    if let Err(error) = crate::session::set_active_session_with_identity(
+        harness,
+        new_session,
+        Some(tool_context),
+        state.publish_process_identity,
+    )
+    .await
     {
         state.set_status(RunStatus::Idle);
         add_error_message(
@@ -458,8 +470,13 @@ pub(super) async fn start_new_session(
     // Route through the funnel so the plugin channels follow the swap; a bare
     // `set_session` would leave every plugin naming the session it was serving
     // before this call.
-    if let Err(error) =
-        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    if let Err(error) = crate::session::set_active_session_with_identity(
+        harness,
+        new_session,
+        Some(tool_context),
+        state.publish_process_identity,
+    )
+    .await
     {
         add_error_message(
             &state.notice_container(),

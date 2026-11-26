@@ -5,25 +5,24 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::app::{EXIT_RUNTIME, EXIT_USAGE};
 use crate::args::{Args, Mode};
 use crate::config::AgentHome;
-use crate::remote::protocol::RemoteCommand;
-use crate::session_driver::{DriverCommand, DriverEvent, RemoteEventMapper, SessionDriver};
+mod terminal;
+mod terminal_event;
+pub(crate) use terminal::{HostTerminal, NativeInput};
 
 pub(crate) const DAEMON_COMMAND: &str = "__rpi_local_host";
 const DEFAULT_AREA: &str = "default";
@@ -122,6 +121,8 @@ struct OpenSession {
     workspace: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mini: Option<Box<MiniRequest>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal: Option<terminal::TerminalRequest>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -201,6 +202,7 @@ enum OpenReply {
         agent_id: String,
         session_id: String,
     },
+    TerminalOpened,
     MiniFinished {
         exit_code: i32,
         text: Option<String>,
@@ -225,7 +227,7 @@ pub(crate) async fn run(mut args: Args) -> i32 {
     if args.mini {
         exit_code(run_mini_client(&home, area, args).await)
     } else {
-        exit_code(run_client(&home, area).await.map(|()| 0))
+        exit_code(run_client(&home, area, &args).await)
     }
 }
 
@@ -483,7 +485,7 @@ async fn run_daemon(
 async fn serve_session(
     stream: UnixStream,
     home: AgentHome,
-    args: Args,
+    mut args: Args,
     idle_timeout: Option<Duration>,
 ) -> Result<(), String> {
     let (input, mut output) = stream.into_split();
@@ -542,6 +544,16 @@ async fn serve_session(
         )
         .await;
     }
+    if let Some(terminal) = &open.terminal {
+        args.mode = Mode::Text;
+        args.tui_mode = if terminal.regular {
+            crate::args::TuiMode::Regular
+        } else {
+            crate::args::TuiMode::Fullscreen
+        };
+        args.theme = terminal.theme.clone();
+        args.no_themes = terminal.no_themes;
+    }
     let built = async {
         let trusted = crate::session::resolve_project_trust_for(&home, &args, &cwd);
         let resolved = crate::provider::resolve_for_cwd(
@@ -560,13 +572,39 @@ async fn serve_session(
             crate::session::build_host_session(&home, &resolved, &args, &cwd, trusted)
                 .await
                 .map_err(|error| error.to_string())?;
-        Ok::<_, String>((harness, events, context, models))
+        Ok::<_, String>((harness, events, context, models, resolved.theme))
     }
     .await;
-    let (harness, events, context, models) = match built {
+    let (harness, events, context, models, theme) = match built {
         Ok(session) => session,
         Err(message) => return write_json(&mut output, &OpenReply::Error { message }).await,
     };
+    if let Some(terminal) = open.terminal {
+        write_json(&mut output, &OpenReply::TerminalOpened).await?;
+        return terminal::serve(
+            &harness,
+            terminal,
+            idle_timeout,
+            (input, output),
+            async |terminal| {
+                Box::pin(crate::modes::interactive_with_terminal(
+                    &harness,
+                    Some(events),
+                    &args,
+                    models,
+                    None,
+                    &[],
+                    Vec::new(),
+                    args.theme.as_deref().or(theme.as_deref()),
+                    args.no_themes,
+                    &context,
+                    crate::interactive_tui::InteractiveTerminal::Host(terminal),
+                ))
+                .await
+            },
+        )
+        .await;
+    }
     let opened = OpenReply::Opened {
         host_pid: std::process::id(),
         agent_id: uuid::Uuid::new_v4().to_string(),
@@ -661,6 +699,7 @@ async fn run_mini_client(home: &AgentHome, area: &str, mut args: Args) -> Result
             version: VERSION,
             workspace,
             mini: Some(Box::new(MiniRequest::new(args, input))),
+            terminal: None,
         },
     )
     .await?;
@@ -675,12 +714,12 @@ async fn run_mini_client(home: &AgentHome, area: &str, mut args: Args) -> Result
             Ok(exit_code)
         }
         Some(OpenReply::Error { message }) => Err(message),
-        Some(OpenReply::Opened { .. }) => Err("local Host returned a session for a Mini run".into()),
+        Some(OpenReply::TerminalOpened | OpenReply::Opened { .. }) => Err("local Host returned a session for a Mini run".into()),
         None => Err("local Host closed before returning a Mini result. Check that the area's running Host supports --mini".into()),
     }
 }
 
-async fn run_client(home: &AgentHome, area: &str) -> Result<(), String> {
+async fn run_client(home: &AgentHome, area: &str, args: &Args) -> Result<i32, String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("rpi --host requires a terminal".into());
     }
@@ -694,97 +733,17 @@ async fn run_client(home: &AgentHome, area: &str) -> Result<(), String> {
             version: VERSION,
             workspace,
             mini: None,
+            terminal: Some(terminal::TerminalRequest::new(args)),
         },
     )
     .await?;
     let opened = timeout(Duration::from_secs(90), read_json::<OpenReply>(&mut input))
         .await
         .map_err(|_| "local Host session startup timed out")??;
-    let (host_pid, agent_id, session_id) = match opened {
-        Some(OpenReply::Opened {
-            host_pid,
-            agent_id,
-            session_id,
-        }) => (host_pid, agent_id, session_id),
-        Some(OpenReply::Error { message }) => return Err(message),
-        Some(OpenReply::MiniFinished { .. }) => {
-            return Err("local Host returned a Mini result for a session".into())
-        }
-        None => return Err("local Host closed before opening a session".into()),
-    };
-    let (tx, rx) = mpsc::unbounded_channel();
-    let (expired_tx, mut expired_rx) = oneshot::channel();
-    let reader = tokio::spawn(async move {
-        let mut mapper = RemoteEventMapper::default();
-        loop {
-            match read_json::<serde_json::Value>(&mut input).await {
-                Ok(Some(line)) => {
-                    if let Some(seconds) = line
-                        .get("idleTimeoutSeconds")
-                        .and_then(serde_json::Value::as_u64)
-                        .filter(|_| line["type"] == "host_idle_timeout")
-                    {
-                        let _ = expired_tx.send(seconds);
-                        break;
-                    }
-                    if !mapper.forward(line, &tx) {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = tx.send(DriverEvent::Notice(format!("local Host stream: {error}")));
-                    break;
-                }
-            }
-        }
-        let _ = tx.send(DriverEvent::Ended);
-    });
-    let driver = HostDriver {
-        output: tokio::sync::Mutex::new(output),
-        next_id: AtomicU64::new(1),
-        events: Mutex::new(Some(rx)),
-    };
-    let result = async {
-        driver.send(DriverCommand::RefreshState).await?;
-        crate::tui_shell::run_driver_tui(
-            &driver,
-            &format!("Host {host_pid} · Area {area} · Session {session_id} · Agent {agent_id}"),
-        )
-        .await
-    }
-    .await;
-    if let Ok(seconds) = expired_rx.try_recv() {
-        return Err(format!(
-            "Host session closed after {seconds} seconds of inactivity"
-        ));
-    }
-    let _ = driver.send_rpc(RemoteCommand::Stop).await;
-    reader.abort();
-    result
-}
-
-struct HostDriver {
-    output: tokio::sync::Mutex<OwnedWriteHalf>,
-    next_id: AtomicU64,
-    events: Mutex<Option<mpsc::UnboundedReceiver<DriverEvent>>>,
-}
-
-impl HostDriver {
-    async fn send_rpc(&self, command: RemoteCommand) -> Result<(), String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        write_json(&mut *self.output.lock().await, &command.with_id(id)).await
-    }
-}
-
-#[async_trait]
-impl SessionDriver for HostDriver {
-    fn events(&self) -> Option<mpsc::UnboundedReceiver<DriverEvent>> {
-        self.events.lock().unwrap().take()
-    }
-
-    async fn send(&self, command: DriverCommand) -> Result<(), String> {
-        self.send_rpc(command.into()).await
+    match opened {
+        Some(OpenReply::TerminalOpened) => terminal::attach(input, output).await,
+        Some(OpenReply::Error { message }) => Err(message),
+        _ => Err(format!("Host area {area:?} did not open a native terminal session. Restart the area if it is running an earlier rpi version.")),
     }
 }
 

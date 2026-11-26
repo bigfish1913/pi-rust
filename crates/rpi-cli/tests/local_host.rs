@@ -23,6 +23,15 @@ impl Client {
     }
 
     async fn handshake(socket: &Path, workspace: &Path) -> (Self, Value) {
+        let mut client = Self::connect(socket).await;
+        client
+            .send(json!({"version": 1, "workspace": workspace}))
+            .await;
+        let opened = client.next().await;
+        (client, opened)
+    }
+
+    async fn connect(socket: &Path) -> Self {
         let stream = loop {
             match UnixStream::connect(socket).await {
                 Ok(stream) => break stream,
@@ -37,12 +46,7 @@ impl Client {
                 Err(error) => panic!("could not connect to test Host: {error}"),
             }
         };
-        let mut client = Self(BufReader::new(stream));
-        client
-            .send(json!({"version": 1, "workspace": workspace}))
-            .await;
-        let opened = client.next().await;
-        (client, opened)
+        Self(BufReader::new(stream))
     }
 
     async fn send(&mut self, frame: Value) {
@@ -554,4 +558,142 @@ async fn capacity_probe() {
     assert_eq!(stopped["success"], true, "{stopped}");
     next.0.read_to_end(&mut Vec::new()).await.unwrap();
     daemon.kill().await.unwrap();
+}
+
+async fn open_terminal(socket: &Path, workspace: &Path, regular: bool) -> Client {
+    let mut client = Client::connect(socket).await;
+    client
+        .send(json!({
+            "version": 1,
+            "workspace": workspace,
+            "terminal": {
+                "regular": regular, "theme": null, "no_themes": true, "images": "None",
+                "geometry": {"columns": 100, "rows": 30, "width": 0, "height": 0}
+            }
+        }))
+        .await;
+    let opened = client.next().await;
+    assert_eq!(opened["type"], "terminal_opened", "{opened}");
+    client
+}
+
+async fn terminal_key(client: &mut Client, code: &str, modifiers: u8) {
+    let code = match code {
+        "Enter" | "Esc" => json!(code),
+        _ => json!({"Char": code}),
+    };
+    client
+        .send(json!({"Event":{"Key":{
+            "code":code,"modifiers":modifiers,"kind":"Press","state":0
+        }}}))
+        .await;
+}
+
+async fn terminal_submit(client: &mut Client, text: &str) {
+    client.send(json!({"Event":{"Paste":text}})).await;
+    terminal_key(client, "Enter", 0).await;
+}
+
+async fn terminal_text(client: &mut Client, needle: &str) -> String {
+    let mut output = String::new();
+    loop {
+        let frame = client.next().await;
+        assert!(
+            frame.get("Finished").is_none(),
+            "closed while waiting for {needle:?}: {output}"
+        );
+        if let Some(text) = frame["Write"].as_str() {
+            output.push_str(text);
+            if output.contains(needle) {
+                return output;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_attachment_runs_native_session_commands_in_the_host() {
+    timeout(Duration::from_secs(30), async {
+        let root = tempfile::Builder::new()
+            .prefix("rh-tui-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let agent = root.path().join("agent");
+        let workspace = root.path().join("project");
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        write_fixture(&agent, provider.local_addr().unwrap());
+        std::fs::write(
+            agent.join("host.json"),
+            r#"{"areas":{"default":{"maxAgents":2}}}"#,
+        )
+        .unwrap();
+        let mut daemon = spawn_daemon(root.path(), &agent, None, &sessions);
+        let socket = agent.join("local-host-v1/rpc.sock");
+        let (mut regular, mut fullscreen) = tokio::join!(
+            open_terminal(&socket, &workspace, true),
+            open_terminal(&socket, &workspace, false)
+        );
+        assert!(!terminal_text(&mut regular, "fixture")
+            .await
+            .contains("\x1b[?1049h"));
+        assert!(terminal_text(&mut fullscreen, "fixture")
+            .await
+            .contains("\x1b[?1049h"));
+        let (_, rejected) = Client::handshake(&socket, &workspace).await;
+        assert!(rejected["message"]
+            .as_str()
+            .unwrap()
+            .contains("maxAgents: 2"));
+
+        terminal_submit(&mut regular, "/name terminal-one").await;
+        terminal_text(&mut regular, "Session renamed to").await;
+        terminal_submit(&mut regular, "run from the native TUI").await;
+        let (mut upstream, _) = provider.accept().await.unwrap();
+        assert!(provider_request(&mut upstream)
+            .await
+            .contains("run from the native TUI"));
+        complete(&mut upstream).await;
+        terminal_text(&mut regular, "area response").await;
+        terminal_submit(&mut regular, "/tree").await;
+        terminal_text(&mut regular, "Session tree").await;
+        terminal_key(&mut regular, "Esc", 0).await;
+        terminal_submit(&mut regular, "/session").await;
+        terminal_text(&mut regular, "Tab: all projects").await;
+        terminal_key(&mut regular, "Esc", 0).await;
+        terminal_submit(&mut regular, "/new").await;
+        terminal_text(&mut regular, "Started new session").await;
+        terminal_key(&mut regular, "d", 2).await;
+        assert_eq!(
+            regular.until(|frame| frame.get("Finished").is_some()).await["Finished"],
+            0
+        );
+
+        terminal_submit(&mut fullscreen, "/name terminal-two").await;
+        terminal_text(&mut fullscreen, "terminal-two").await;
+        terminal_key(&mut fullscreen, "d", 2).await;
+        assert_eq!(
+            fullscreen
+                .until(|frame| frame.get("Finished").is_some())
+                .await["Finished"],
+            0
+        );
+        let journals = journals(&sessions);
+        let first = journals
+            .iter()
+            .find(|(_, text)| text.contains("run from the native TUI"))
+            .unwrap();
+        assert!(first.1.contains("terminal-one") && first.1.contains("operation_finished"));
+        let second = journals
+            .iter()
+            .find(|(_, text)| text.contains("terminal-two"))
+            .unwrap();
+        assert_ne!(first.0, second.0);
+        assert!(daemon.try_wait().unwrap().is_none());
+        daemon.kill().await.unwrap();
+    })
+    .await
+    .expect("native Host TUI probe timed out");
 }

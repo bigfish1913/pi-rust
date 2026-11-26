@@ -3342,6 +3342,35 @@ pub async fn interactive(
     no_themes: bool,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
+    Box::pin(interactive_with_terminal(
+        harness,
+        event_rx,
+        args,
+        model_catalog,
+        initial,
+        extra_messages,
+        initial_images,
+        theme,
+        no_themes,
+        reload_context,
+        crate::interactive_tui::InteractiveTerminal::Process,
+    ))
+    .await
+}
+
+pub(crate) async fn interactive_with_terminal(
+    harness: &AgentHarness,
+    event_rx: Option<tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>>,
+    args: &Args,
+    model_catalog: Vec<rpi_ai::Model>,
+    initial: Option<String>,
+    extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
+    theme: Option<&str>,
+    no_themes: bool,
+    reload_context: &crate::session::ReloadContext,
+    terminal: crate::interactive_tui::InteractiveTerminal,
+) -> i32 {
     // ---- Session lifecycle (P1): BeforeTuiStart ----
     // `BeforeTuiStart`: extensions may prepare (connect a server, load a
     // resource) before the interactive UI initializes. Runs with a per-event
@@ -3354,7 +3383,10 @@ pub async fn interactive(
     )
     .await
     {
-        eprintln!("[rpi] startup vetoed by extension: {reason}");
+        terminal.report(
+            &format!("[rpi] startup vetoed by extension: {reason}"),
+            true,
+        );
         return crate::app::EXIT_VETOED;
     }
 
@@ -3362,11 +3394,11 @@ pub async fn interactive(
     let force_tui = std::env::var("RPI_FORCE_TUI")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let code = if force_tui || crate::interactive_tui::is_tui_supported() {
+    let code = if terminal.is_host() || force_tui || crate::interactive_tui::is_tui_supported() {
         // Use TUI-based interactive mode. The TUI future is intentionally
         // heap-allocated: its large state machine otherwise overflows the
         // default Windows main-thread stack before its body starts polling.
-        Box::pin(crate::interactive_tui::interactive_tui(
+        Box::pin(crate::interactive_tui::interactive_tui_with_terminal(
             harness,
             event_rx,
             args,
@@ -3377,6 +3409,7 @@ pub async fn interactive(
             theme,
             no_themes,
             reload_context,
+            terminal,
         ))
         .await
     } else {

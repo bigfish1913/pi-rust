@@ -321,6 +321,7 @@ pub fn parse_args(args: &[String]) -> Args {
     }
     let mut i = 0;
     let mut host_arg_count = 0;
+    let mut host_tui_arg_count = 0;
     while i < args.len() {
         let arg = args[i].clone();
         // Peel an inline `--flag=value` (long flags only — short flags never use
@@ -398,6 +399,7 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--tui-mode" => {
                 if let Some(v) = take_value(&mut result, "--tui-mode") {
+                    host_tui_arg_count += if inline.is_some() { 1 } else { 2 };
                     result.tui_mode = match v.to_ascii_lowercase().as_str() {
                         "regular" => TuiMode::Regular,
                         "fullscreen" => TuiMode::Fullscreen,
@@ -626,8 +628,14 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--theme" => {
                 result.theme = take_value(&mut result, "--theme");
+                if result.theme.is_some() {
+                    host_tui_arg_count += if inline.is_some() { 1 } else { 2 };
+                }
             }
-            "--no-themes" => result.no_themes = true,
+            "--no-themes" => {
+                host_tui_arg_count += 1;
+                result.no_themes = true;
+            }
             // Unknown long flag (with or without `=`). Preserve it for an
             // extension to claim after extension registration, matching Pi's
             // `unknownFlags` behavior. A bare flag is boolean true; a following
@@ -685,10 +693,11 @@ pub fn parse_args(args: &[String]) -> Args {
             .push("--fork-position requires --fork-entry".to_string());
     }
 
-    if result.host.is_some() && !result.mini && args.len() != host_arg_count {
-        result
-            .errors
-            .push("additional Host options require --mini".into());
+    if result.host.is_some() && !result.mini && args.len() != host_arg_count + host_tui_arg_count {
+        result.errors.push(
+            "Host TUI accepts --tui-mode, --theme and --no-themes; prompt options require --mini"
+                .into(),
+        );
     }
 
     if result.mini {
@@ -1547,6 +1556,29 @@ mod tests {
         );
         let invalid = parse_args(&s(&["--tui-mode", "split"]));
         assert!(!invalid.errors.is_empty());
+    }
+
+    #[test]
+    fn host_accepts_terminal_presentation_flags() {
+        let args = parse_args(&s(&[
+            "--host",
+            "work",
+            "--tui-mode",
+            "regular",
+            "--theme=light",
+        ]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(args.host.as_deref(), Some("work"));
+        assert_eq!(args.tui_mode, TuiMode::Regular);
+        assert_eq!(args.theme.as_deref(), Some("light"));
+
+        let args = parse_args(&s(&["--no-themes", "--tui-mode=fullscreen", "--host=work"]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(args.tui_mode, TuiMode::Fullscreen);
+        assert!(args.no_themes);
+        assert!(!parse_args(&s(&["--host", "--provider", "fixture"]))
+            .errors
+            .is_empty());
     }
 
     #[test]
