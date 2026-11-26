@@ -11,6 +11,18 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.29.0](https://github.com/bigfish1913/pi-rust/compare/v0.28.0...v0.29.0) - 2026-11-26
+
+### Added
+
+- *(cli)* add a low-memory mini mode ([#424](https://github.com/bigfish1913/pi-rust/pull/424))
+- *(fork)* allow branching at a selected message ([#411](https://github.com/bigfish1913/pi-rust/pull/411))
+
+### Fixed
+
+- *(cli)* [**breaking**] validate AgentHome eagerly and drop stale --agent-dir wording ([#414](https://github.com/bigfish1913/pi-rust/pull/414))
+- *(cli)* defer Homebrew updates to brew ([#423](https://github.com/bigfish1913/pi-rust/pull/423))
+
 ## [0.28.0](https://github.com/bigfish1913/pi-rust/compare/v0.27.1...v0.28.0) - 2026-11-25
 
 ### Added
