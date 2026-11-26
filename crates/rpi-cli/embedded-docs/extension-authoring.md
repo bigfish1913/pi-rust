@@ -167,7 +167,7 @@ ABI 里的字符串与步骤返回都是裸指针，SDK 因此提供了一组宏
 `GetExecutionContext`（23）返回当前模型身份、thinking、活动工具、cwd 和会话 ID，
 不包含凭据、认证头或 endpoint。`ChildAgent`（24）使用 `op` 分派：
 
-- `start`：`task`（必填，最多 20,000 bytes）、`role`、`maxTurns`（1–32，默认 8）、
+- `start`：`task`（必填，最多 20,000 bytes）、`role`、`maxTurns`（0 表示无限轮次，1–32 为有限预算，默认 8）、
   `timeoutSeconds`（10–1800，默认 300），以及可选的父活动工具子集 `tools`。
   立即返回 `childId`、独立 `sessionId` 和 `status: running`。
 - `poll`：传入 `childId`，消费 `deltas` 数组并取得 `running/done/failed` 状态。

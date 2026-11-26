@@ -90,6 +90,29 @@ async fn child_reports_and_owner_scoped_disposal_are_independent_of_parent_trans
     assert!(manager.jobs.lock().unwrap().is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlimited_child_is_not_reported_as_turn_limited() {
+    let parent = parent(FauxScript::new().with_text("unlimited child report")).await;
+    let manager = ChildAgents::default();
+    let started = manager
+        .handle(
+            &parent,
+            7,
+            json!({"op":"start","task":"report","maxTurns":0}),
+        )
+        .await
+        .unwrap();
+    let id = started["childId"].as_str().unwrap();
+    let result = wait(&manager, &parent, id).await;
+    assert_eq!(result["status"], "done");
+    assert_eq!(result["result"]["turnLimited"], false);
+    assert_eq!(result["result"]["text"], "unlimited child report");
+    manager
+        .handle(&parent, 7, json!({"op":"dispose","childId":id}))
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancellation_and_unload_stop_pending_children_and_reject_stale_starts() {
     let parent = parent(
@@ -408,10 +431,14 @@ async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
 
 #[test]
 fn child_limits_reject_wrong_types_and_out_of_range_values() {
-    for value in [json!(-1), json!(0), json!(33), json!("8"), Value::Null] {
-        assert!(bounded_number(&json!({"maxTurns":value}), "maxTurns", 8, 1, 32).is_err());
+    for value in [json!(-1), json!(33), json!("8"), Value::Null] {
+        assert!(bounded_number(&json!({"maxTurns":value}), "maxTurns", 8, 0, 32).is_err());
     }
-    assert_eq!(bounded_number(&json!({}), "maxTurns", 8, 1, 32).unwrap(), 8);
+    assert_eq!(bounded_number(&json!({}), "maxTurns", 8, 0, 32).unwrap(), 8);
+    assert_eq!(
+        bounded_number(&json!({"maxTurns":0}), "maxTurns", 8, 0, 32).unwrap(),
+        0
+    );
 }
 
 mod invocation;

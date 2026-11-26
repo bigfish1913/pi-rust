@@ -321,7 +321,8 @@ impl ChildAgents {
         if task.trim().is_empty() || task.len() > 20_000 || role.is_empty() || role.len() > 200 {
             return Err("child task must contain 1-20000 bytes and role 1-200 bytes".into());
         }
-        let turns = bounded_number(args, "maxTurns", 8, 1, 32)? as u32;
+        // Zero explicitly disables the turn guard; omission keeps the published default.
+        let turns = bounded_number(args, "maxTurns", 8, 0, 32)? as u32;
         let timeout = bounded_number(args, "timeoutSeconds", 300, 10, 1800)?;
         let tools = args
             .get("tools")
@@ -407,7 +408,12 @@ impl ChildAgents {
                 return Err(error.to_string());
             }
         };
-        let prompt = format!("You are a delegated {role} subagent. Complete the task in at most {turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
+        let turn_instruction = if turns == 0 {
+            "Complete the task without a fixed turn limit.".to_owned()
+        } else {
+            format!("Complete the task in at most {turns} turns.")
+        };
+        let prompt = format!("You are a delegated {role} subagent. {turn_instruction} Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
         let worker = job.clone();
         let execution_scope = child.execution_scope.clone();
         let cleanup_harness = child.harness.clone();
@@ -494,7 +500,7 @@ async fn run_child(child: ChildHarness, job: Arc<Job>, prompt: String, turns: u3
                         .get_or_insert_with(|| "child output limit exceeded".into());
                 } else if state.error.is_none() {
                     outcome["turns"] = json!(state.turns);
-                    outcome["turnLimited"] = json!(state.turns >= turns);
+                    outcome["turnLimited"] = json!(turns > 0 && state.turns >= turns);
                     state.result = Some(outcome);
                     if state.finished_ms.is_none() {
                         state.finished_ms = Some(now_ms());

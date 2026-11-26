@@ -81,8 +81,10 @@ impl AgentHarness {
         if self.is_child || rpi_agent::tool_execution_scope::is_child_execution() {
             return Err(HarnessError::io("recursive child agents are not allowed"));
         }
-        if !(1..=32).contains(&max_turns) {
-            return Err(HarnessError::io("child maxTurns must be between 1 and 32"));
+        if max_turns > 32 {
+            return Err(HarnessError::io(
+                "child maxTurns must be 0 (unlimited) or between 1 and 32",
+            ));
         }
         if session.storage().metadata().id == self.session.storage().metadata().id {
             return Err(HarnessError::io(
@@ -168,6 +170,7 @@ impl AgentHarness {
         )
         .await?;
         child.is_child = true;
+        // Some(0) explicitly disables the guard instead of inheriting an env default.
         child.max_turns = Some(max_turns);
         child.inner.lock().unwrap().execution_scope = Some(execution_scope.clone());
         Ok(ChildHarness {
