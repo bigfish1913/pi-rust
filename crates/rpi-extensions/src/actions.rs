@@ -1160,6 +1160,11 @@ impl ActionBridge {
         self.stdio.clone()
     }
 
+    /// Refuse stdio ownership for plugins in a shared process. Set before loading.
+    pub fn disable_stdio_claims(&self) {
+        self.stdio.disable_claims();
+    }
+
     pub(crate) fn claim_stdio(&self) -> Result<(), String> {
         let (id, name) = self
             .plugin_identity
@@ -1937,6 +1942,30 @@ mod tests {
             "a new RuntimeActionId was added: re-verify that host-only child-agent control \
              (un-owner-scoped roster/stop) is still unreachable from the plugin ABI"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_host_refuses_stdio_during_registration() {
+        let master = ActionBridge::new(
+            Handle::current(),
+            Arc::new(MockHost {
+                prompt: String::new(),
+                saw: Mutex::new(Vec::new()),
+            }),
+        );
+        master.disable_stdio_claims();
+        let plugin = crate::HostApi::with_action_bridge(
+            "stdio-plugin",
+            crate::ExtensionRegistry::new(),
+            Arc::new(crate::NullDiagnostics),
+            master.clone(),
+        );
+        let vtable = plugin.build_vtable();
+        let _registration = crate::enter_current_api(&plugin);
+        let declare = vtable.declare.unwrap();
+        assert_ne!(declare(StbStringRef::from_str(r#"{"ownsStdio":true}"#)), 0);
+        assert!(plugin.take_registry().unwrap().declared_owns_stdio());
+        assert!(master.stdio_lifecycle().validate().is_ok());
     }
 
     #[tokio::test(flavor = "current_thread")]

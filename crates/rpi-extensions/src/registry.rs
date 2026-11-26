@@ -747,10 +747,8 @@ impl ExtensionRegistry {
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect::<Vec<String>>()
             });
-        if let Some(owns) = value.get("ownsStdio").and_then(|v| v.as_bool()) {
-            // A claim, not a toggle: once a plugin owns stdio it stays claimed
-            // (and `absorb` ORs it across plugins).
-            self.owns_stdio = self.owns_stdio || owns;
+        if value.get("ownsStdio").and_then(|v| v.as_bool()) == Some(true) {
+            self.record_stdio_claim();
         }
         self.apply_declaration(priority, platforms);
         true
@@ -1000,6 +998,10 @@ impl ExtensionRegistry {
     /// P2: the plugin's declared platforms (empty = all).
     pub fn declared_platforms(&self) -> &[String] {
         &self.platforms
+    }
+
+    pub(crate) fn record_stdio_claim(&mut self) {
+        self.owns_stdio = true;
     }
 
     /// Whether this plugin claimed ownership of the host process's stdio

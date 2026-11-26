@@ -407,12 +407,11 @@ async fn run_daemon(
     let directory = host_directory(home, area)?;
     let args = Args {
         mode: Mode::Rpc,
-        no_extensions: true,
         session_dir: (area != DEFAULT_AREA).then(|| directory.join("sessions")),
         provider: profile.and_then(|config| config.provider.clone()),
         model: profile.and_then(|config| config.model.clone()),
         tools: profile.and_then(|config| config.tools.clone()),
-        ..Args::default()
+        ..crate::args::parse_args(&[])
     };
     let lock = OpenOptions::new()
         .create(true)
@@ -555,6 +554,9 @@ async fn serve_session(
         )
         .await;
     }
+    for directory in &mut args.extensions_dir {
+        *directory = cwd.join(&*directory);
+    }
     if let Some(terminal) = &open.terminal {
         args.mode = Mode::Text;
         args.tui_mode = if terminal.regular {
@@ -567,20 +569,22 @@ async fn serve_session(
     }
     let built = async {
         let trusted = crate::session::resolve_project_trust_for(&home, &args, &cwd);
-        let resolved = crate::provider::resolve_for_cwd(
+        // Native registration may synchronously call back into the Tokio runtime.
+        let prepared = tokio::task::block_in_place(|| {
+            crate::session::prepare_host_extensions(&home, &args, &cwd, trusted)
+        })
+        .map_err(|error| error.to_string())?;
+        let resolved = crate::provider::resolve_with_extensions(
             &home,
-            args.provider.as_deref(),
-            args.model.as_deref(),
-            None,
-            None,
-            None,
+            &args,
             &cwd,
             trusted,
+            &prepared.extension_session,
         )
         .map_err(|error| error.to_string())?;
         let models = crate::provider::authenticated_catalog(&resolved);
         let (harness, events, context) =
-            crate::session::build_host_session(&home, &resolved, &args, &cwd, trusted)
+            crate::session::build_prepared(&home, &resolved, &args, &cwd, trusted, prepared)
                 .await
                 .map_err(|error| error.to_string())?;
         Ok::<_, String>((harness, events, context, models, resolved.theme))
@@ -616,6 +620,14 @@ async fn serve_session(
         )
         .await;
     }
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        &context,
+        rpi_plugin_sdk::EventTag::BeforeTuiStart,
+    )
+    .await
+    {
+        return write_json(&mut output, &OpenReply::Error { message: reason }).await;
+    }
     let opened = OpenReply::Opened {
         host_pid: std::process::id(),
         agent_id: uuid::Uuid::new_v4().to_string(),
@@ -627,13 +639,12 @@ async fn serve_session(
         &harness,
         events,
         models,
-        context.ui_dialog.clone(),
+        &context,
         home,
         idle_timeout,
         (input, SocketWriter(output)),
     )
     .await;
-    drop(context);
     Ok(())
 }
 

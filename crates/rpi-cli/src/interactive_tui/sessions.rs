@@ -386,7 +386,7 @@ pub(super) async fn fork_session(
 /// `/new` (alias `/clear`): begin a fresh session.
 ///
 /// Creates a new JSONL session file, swaps it onto the harness through the
-/// shared [`crate::session::set_active_session`] funnel (so plugin channels
+/// shared [`crate::session::set_active_session_with_identity`] funnel (so plugin channels
 /// follow the swap), rebuilds the transcript with the session's REAL capability
 /// snapshot, and drops every per-session counter in the footer.
 ///

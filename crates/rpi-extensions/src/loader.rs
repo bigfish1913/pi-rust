@@ -38,6 +38,8 @@ pub enum PluginLoadError {
     Symbol { path: PathBuf, error: String },
     #[error("register returned nonzero code {code} for {path}")]
     RegisterReturned { path: PathBuf, code: i32 },
+    #[error("plugin {path} requires process stdio, which is unavailable in a shared Host")]
+    StdioUnavailable { path: PathBuf },
     /// ABI version reported by the plugin mismatches the host's. Skip + diag.
     #[error(
         "ABI version mismatch in {path}: plugin built for {plugin_version}, host is {host_version}"
@@ -185,18 +187,20 @@ pub fn load_one(
     diagnostics: Arc<dyn PluginDiagnostics>,
     action_bridge: Option<Arc<ActionBridge>>,
 ) -> Result<LoadedPlugin, PluginLoadError> {
-    load_one_guarded(path.as_ref(), diagnostics, action_bridge, None)
+    let path = path.as_ref();
+    load_one_guarded(path, path, diagnostics, action_bridge, None)
 }
 
 fn load_one_guarded(
     path: &Path,
+    module: &Path,
     diagnostics: Arc<dyn PluginDiagnostics>,
     action_bridge: Option<Arc<ActionBridge>>,
     host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> Result<LoadedPlugin, PluginLoadError> {
     let path = path.to_path_buf();
     // 1. Open the cdylib.
-    let library = unsafe { Library::new(&path) }.map_err(|e| PluginLoadError::Open {
+    let library = unsafe { Library::new(module) }.map_err(|e| PluginLoadError::Open {
         path: path.clone(),
         source: e,
     })?;
@@ -285,6 +289,15 @@ fn load_one_guarded(
             path: path.clone(),
             code: -2,
         })?;
+
+    if registry.declared_owns_stdio()
+        && host_api
+            .action_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.stdio_lifecycle().claims_disabled())
+    {
+        return Err(PluginLoadError::StdioUnavailable { path });
+    }
 
     tracing::debug!(path = %path.display(), abi_version, "loaded native plugin");
 
@@ -609,6 +622,38 @@ pub fn load_session_mixed_guarded(
     action_bridge: Option<Arc<ActionBridge>>,
     host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> ExtensionSession {
+    load_session_mixed_impl(dirs, files, diagnostics, action_bridge, host_guard, None)
+}
+
+/// Register separate library images so sessions in a shared process have
+/// independent plugin globals. The guard owns the private staging directory
+/// through the last callback and finalization, including failed registrations.
+pub fn load_session_mixed_staged(
+    dirs: &[PathBuf],
+    files: &[PathBuf],
+    diagnostics: Arc<dyn PluginDiagnostics>,
+    action_bridge: Option<Arc<ActionBridge>>,
+    host_guard: Arc<dyn Send + Sync>,
+    stage: &Path,
+) -> ExtensionSession {
+    load_session_mixed_impl(
+        dirs,
+        files,
+        diagnostics,
+        action_bridge,
+        Some(host_guard),
+        Some(stage),
+    )
+}
+
+fn load_session_mixed_impl(
+    dirs: &[PathBuf],
+    files: &[PathBuf],
+    diagnostics: Arc<dyn PluginDiagnostics>,
+    action_bridge: Option<Arc<ActionBridge>>,
+    host_guard: Option<Arc<dyn Send + Sync>>,
+    stage: Option<&Path>,
+) -> ExtensionSession {
     let mut loaded: Vec<LoadedPlugin> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let paths = dirs
@@ -621,8 +666,28 @@ pub fn load_session_mixed_guarded(
         if !seen.insert(identity) {
             continue;
         }
+        let module = if let Some(stage) = stage {
+            let destination = stage.join(seen.len().to_string());
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let module = destination.join(name);
+            if let Err(error) =
+                std::fs::create_dir(&destination).and_then(|()| std::fs::copy(&path, &module))
+            {
+                diagnostics.warn(&format!(
+                    "could not stage plugin {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+            module
+        } else {
+            path.clone()
+        };
         match load_one_guarded(
             &path,
+            &module,
             Arc::clone(&diagnostics),
             action_bridge.clone(),
             host_guard.clone(),

@@ -504,7 +504,10 @@ binary before using the combined flags.
 The area named `default` uses the ordinary session store. Other areas keep
 session files under `<agent-home>/local-host-v1/area-<name>/sessions`. Areas
 share the agent home's settings and credentials and can access the same
-workspace files. This entry supports built-in providers and tools.
+workspace files. Ordinary Host sessions discover built-in and native extension
+tools using the same settings and workspace trust rules as `rpi`. Extensions
+that claim process-wide standard input and output require a dedicated `rpi`
+process.
 
 The optional `<agent-home>/host.json` selects a default area and sets limits and
 provider, model and tool overrides per area. With no file, `rpi --host` selects

@@ -59,8 +59,13 @@ pub(crate) async fn execute(
         report(format!("warning: models.json: {warning}"));
     }
     let debug_system_prompt = std::mem::take(&mut args.debug_system_prompt);
+    let prepared =
+        crate::session::prepare_host_extensions(home, &args, cwd, trusted).map_err(|error| {
+            report(format!("error: {error}"));
+            EXIT_RUNTIME
+        })?;
     let (harness, events, _context) =
-        crate::session::build_host_session(home, &resolved, &args, cwd, trusted)
+        crate::session::build_prepared(home, &resolved, &args, cwd, trusted, prepared)
             .await
             .map_err(|error| {
                 report(format!("error: {error}"));
