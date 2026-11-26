@@ -337,7 +337,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .write_all(b"pending\n")
-                .map(|_| None);
+                .map(|_| (None, None));
             (Some(state), Vec::new(), result)
         }));
         assert!(tokio::time::timeout(
