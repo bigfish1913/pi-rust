@@ -46,7 +46,9 @@ fn run() -> ExitCode {
     // `block_in_place`（provider 流的同步桥）要求多线程 runtime，和原来的
     // `#[tokio::main(flavor = "multi_thread")]` 保持一致。
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
-    if std::env::args_os().skip(1).any(|arg| arg == "--mini") {
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none()
+        && std::env::args_os().skip(1).any(|arg| arg == "--mini")
+    {
         runtime.worker_threads(1);
     }
     let runtime = runtime

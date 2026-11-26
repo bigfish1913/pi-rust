@@ -693,7 +693,7 @@ pub fn prepare_extensions(
     let action_host = Arc::new(
         action_host
             .with_session_dir(session_dir.clone())
-            .with_fresh_session_only(false)
+            .with_ephemeral_sessions_only(args.mini)
             .with_native_durable(args.native_durable),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = action_host.clone();
@@ -949,7 +949,6 @@ async fn build_prepared_inner(
 > {
     let experimental_policy = crate::native_durable::experimental_epoch::policy(args)
         .map_err(BuildError::HarnessCreate)?;
-    let fresh_session_only = false;
     let cwd_str = cwd.to_string_lossy().to_string();
     // Plugin tools get the session's identity injected into every call's
     // arguments (see `rpi_extensions::ToolCallContext`). It is created here,
@@ -990,7 +989,7 @@ async fn build_prepared_inner(
 
     validate_durable_extensions(&extension_session).map_err(BuildError::HarnessCreate)?;
     let durable_binding = Arc::new(std::sync::OnceLock::new());
-    let mut tools = build_tools_bound(home, &ctx, args, Some(&durable_binding));
+    let mut tools = build_tools_bound(home, &ctx, args, durable_binding.clone());
 
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools
@@ -1058,11 +1057,6 @@ async fn build_prepared_inner(
         let name = requested.trim();
         let name = if name.is_empty() { None } else { Some(name) };
         if let Err(error) = session.set_name(name).await {
-            if fresh_session_only {
-                return Err(BuildError::SessionOpen(format!(
-                    "native session name persistence failed: {error}"
-                )));
-            }
             if args.verbose {
                 eprintln!("warning: could not set session name: {error}");
             }
@@ -1729,7 +1723,7 @@ async fn build_prepared_inner(
     reload_args.session_dir = Some(session_dir);
     let reload_context = ReloadContext {
         resource_leases,
-        fresh_session_only,
+        ephemeral_sessions_only: args.mini,
         extension_session: extension_session_cell,
         durable_binding,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
@@ -2023,8 +2017,8 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 #[derive(Clone)]
 pub struct ReloadContext {
     resource_leases: Arc<Vec<crate::resource_management::Lease>>,
-    /// Startup routing capability, retained independently of mutable args/settings.
-    fresh_session_only: bool,
+    /// Keep mini's storage policy across extension reloads.
+    ephemeral_sessions_only: bool,
     /// One neutral router for all built-ins, including those reconstructed on reload.
     pub file_io: Arc<rpi_tools::file_io::FileIORouter>,
     /// The live extension-session cell (swapped on reload).
@@ -2355,7 +2349,7 @@ where
             Arc::new(
                 action_host
                     .with_session_dir(ctx.session_dir())
-                    .with_fresh_session_only(ctx.fresh_session_only)
+                    .with_ephemeral_sessions_only(ctx.ephemeral_sessions_only)
                     .with_native_durable(ctx.args.native_durable),
             )
         }
@@ -2661,7 +2655,7 @@ where
         &ctx.home,
         &tool_ctx,
         &effective_args,
-        Some(&ctx.durable_binding),
+        ctx.durable_binding.clone(),
     );
     merge_extension_tools(
         &mut tools,
@@ -3283,15 +3277,15 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         &crate::config::AgentHome::process(),
         ctx,
         args,
-        Some(&Arc::new(std::sync::OnceLock::new())),
+        Arc::new(std::sync::OnceLock::new()),
     )
 }
 
-pub(crate) fn build_tools_bound(
+fn build_tools_bound(
     home: &crate::config::AgentHome,
     ctx: &ExecutionToolContext,
     args: &Args,
-    binding: Option<&Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>>,
+    durable_binding: Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>,
 ) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
@@ -3330,12 +3324,12 @@ pub(crate) fn build_tools_bound(
         ),
     ];
 
-    if let Some(binding) = binding.filter(|_| args.native_durable) {
+    if args.native_durable {
         // Mixed read/write tool is NEVER safe for automatic replay.
         all.push((
             "durable",
             HarnessTool::new(Arc::new(crate::native_durable::NativeDurableTool::new(
-                binding.clone(),
+                durable_binding.clone(),
             ))),
         ));
     }
@@ -3357,14 +3351,13 @@ pub(crate) fn build_tools_bound(
     // Host-integrated agent-to-agent messaging: only when the embedding host
     // installed a delivery door. A bare CLI session never advertises a tool it
     // cannot service.
-    if let Some(binding) = binding.filter(|_| {
-        crate::message_agent::handler_installed()
-            && tool_name_allowed(crate::message_agent::MESSAGE_AGENT_TOOL_NAME, args)
-    }) {
+    if crate::message_agent::handler_installed()
+        && tool_name_allowed(crate::message_agent::MESSAGE_AGENT_TOOL_NAME, args)
+    {
         all.push((
             crate::message_agent::MESSAGE_AGENT_TOOL_NAME,
             HarnessTool::new(crate::message_agent::create_message_agent_tool(
-                binding.clone(),
+                durable_binding.clone(),
             )),
         ));
     }

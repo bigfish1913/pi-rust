@@ -274,10 +274,6 @@ async fn run_inner() -> i32 {
         }
     }
 
-    if dev_options.is_some() && parsed.mini {
-        eprintln!("error: --mini cannot be combined with dev/dev-local");
-        return EXIT_USAGE;
-    }
     if dev_options.is_some()
         && (parsed.resource_config.is_some() || parsed.resource_transition.is_some())
     {
@@ -346,13 +342,6 @@ async fn run_inner() -> i32 {
             return EXIT_USAGE;
         }
     };
-
-    if parsed.mini {
-        drop(argv);
-        let input = mini_input(&mut parsed, file_text, file_images);
-        startup.finish();
-        return crate::mini::run(&parsed, &cwd, input).await;
-    }
 
     // ---- restored-session working directory (adopted before any resource load) ----
     // A session records the cwd it was created in; restoring one must return
@@ -480,16 +469,12 @@ async fn run_inner() -> i32 {
         eprintln!("warning: models.json: {warning}");
     }
 
-    // The full authenticated catalog (read-only) for the TUI's `/model`
-    // selector, derived from the built provider runtimes so auth headers and
-    // base-url overrides survive.
-    let model_catalog = crate::provider::authenticated_catalog(&resolved);
-
     // `--models <patterns>`: persist the Ctrl+P cycle scope to settings.json
     // (the same set `/scoped-models` edits). Each pattern matches catalog ids
     // case-insensitively; unmatched patterns are reported so a typo doesn't
     // silently empty the cycle.
     if let Some(patterns) = &parsed.models {
+        let model_catalog = crate::provider::authenticated_catalog(&resolved);
         let mut matched: Vec<String> = Vec::new();
         for p in patterns {
             let hits: Vec<String> = model_catalog
@@ -591,6 +576,7 @@ async fn run_inner() -> i32 {
         Some(file_text.as_str())
     };
     let (initial, extra) = build_initial_message(&parsed, stdin_text.as_deref(), file_text_opt);
+    let initial = initial.or_else(|| (!file_images.is_empty()).then(String::new));
 
     // ---- mode dispatch (TS resolveAppMode → runPrintMode / InteractiveMode / runRpcMode) ----
     let stdin_is_tty = std::io::stdin().is_terminal();
@@ -644,16 +630,19 @@ async fn run_inner() -> i32 {
         None
     };
 
+    let model_catalog = || {
+        reload_context
+            .catalog
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    };
     let exit_code = match mode {
         RunMode::Print => {
-            crate::modes::print(
-                &harness,
-                &parsed,
-                initial.clone(),
-                &extra,
-                file_images.clone(),
-            )
-            .await
+            // Print mode only consumes the completed reply. Keeping the receiver
+            // alive buffers unread snapshots of the growing streamed message.
+            drop(event_rx);
+            crate::modes::print(&harness, &parsed, initial, &extra, file_images).await
         }
         RunMode::Json => {
             crate::modes::json(
@@ -671,7 +660,7 @@ async fn run_inner() -> i32 {
                 &harness,
                 Some(event_rx),
                 &parsed,
-                model_catalog,
+                model_catalog(),
                 initial.clone(),
                 &extra,
                 file_images.clone(),
@@ -749,7 +738,7 @@ async fn run_inner() -> i32 {
                     crate::modes::rpc_with_durable_home(
                         &harness,
                         Some(event_rx),
-                        model_catalog,
+                        model_catalog(),
                         reload_context.ui_dialog.clone(),
                         oauth_snapshot,
                         Some(reload_context.extension_session.clone()),
@@ -1163,6 +1152,7 @@ fn build_initial_message(
     (initial, extra)
 }
 
+#[cfg(unix)]
 pub(crate) fn mini_input(
     args: &mut Args,
     file_text: String,

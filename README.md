@@ -140,13 +140,14 @@ export ANTHROPIC_API_KEY=...          # or OPENAI_API_KEY, or ~/.rpi/agent/model
 rpi                                   # interactive TUI
 rpi -p "summarize the README"         # one-shot
 rpi --mode json -p "list the crates"  # machine-readable event stream
-rpi --mini "explain this error"       # low-memory text run
+rpi --mini -p "explain this error"    # one-shot without saving the session
 ```
 
-`--mini` accepts prompts from arguments or piped input and prints the final
-reply. It keeps conversation context only for the current invocation and skips
-session storage, durable workflows, extension loading, and prompt resource
-discovery. Add `--tools read` to enable the built-in `read` tool.
+`--mini` uses in-memory sessions and disables native durable execution. The
+conversation ends with the process, and session import, export, fork, and
+resume are unavailable. Context compaction, tools, and resource discovery work
+as usual. Use `--tools read` to limit the tool set to `read`, or `-p` for a
+one-shot reply.
 
 Sessions persist as JSONL and survive a crash mid-run; `rpi` resumes from the
 last committed frame rather than replaying the turn. Custom Anthropic or
@@ -493,9 +494,10 @@ area running an earlier binary before attaching the native TUI.
 `--mini` runs once in the selected Host and prints the final response on the
 client's stdout. It accepts piped input and `@file` attachments, uses one
 `maxAgents` slot until the run settles, and creates no session journal. Explicit
-provider and model flags take precedence over area defaults. Use `--tools` to
-enable built-in tools in Mini. The local request and reply frames each have a
-4 MiB limit, including JSON encoding.
+provider and model flags take precedence over area defaults. Mini in a Host
+uses built-in tools and automatic context compaction. Use `--tools` to limit
+the available tools. The local request and reply frames each have a 4 MiB
+limit, including JSON encoding.
 If the area's running Host predates Mini support, restart it with the updated
 binary before using the combined flags.
 

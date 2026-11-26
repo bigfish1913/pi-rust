@@ -317,7 +317,11 @@ async fn mini_flags_run_in_the_same_host_and_use_its_capacity() {
         assert!(beta.contains("prompt-beta") && !beta.contains("prompt-alpha"), "{beta}");
         let alpha = serde_json::from_str::<Value>(&alpha).unwrap();
         let beta = serde_json::from_str::<Value>(&beta).unwrap();
-        assert!(alpha["tools"].is_null(), "{alpha}");
+        let default_tools = alpha["tools"].as_array().expect("default Mini tools");
+        for name in ["read", "bash"] {
+            assert!(default_tools.iter().any(|tool| tool["function"]["name"] == name), "{alpha}");
+        }
+        assert_eq!(beta["tools"].as_array().unwrap().len(), 1, "{beta}");
         assert_eq!(beta["tools"][0]["function"]["name"], "read", "{beta}");
         let (_, reply) = Client::handshake(&socket, &workspace).await;
         assert_eq!(reply["type"], "error", "{reply}");

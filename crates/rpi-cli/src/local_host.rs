@@ -516,10 +516,9 @@ async fn serve_session(
         let signal = CancellationToken::new();
         let mut diagnostics = Vec::new();
         let result = {
-            let run =
-                crate::mini::execute(&home, &args, &cwd, request, signal.clone(), |message| {
-                    diagnostics.push(message);
-                });
+            let run = crate::mini::execute(&home, args, &cwd, request, signal.clone(), |message| {
+                diagnostics.push(message);
+            });
             tokio::pin!(run);
             tokio::select! {
                 _ = input.fill_buf() => {
