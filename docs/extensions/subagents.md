@@ -14,14 +14,13 @@
   "thinkingLevel":"high",
   "tools":["read","bash","delegate_task"],
   "cwd":"D:/Projects/example",
-  "sessionId":"parent-session-id",
-  "childAgent":true
+  "sessionId":"parent-session-id"
 }
 ```
 
 这不是 CLI flags 的副本。交互切换模型或 thinking 后，读取的是有效状态。
 公开对象不包含 API key、认证头、endpoint、原始 Model 或 provider binding。
-`childAgent` 表示当前 harness 是否允许创建子任务；并非资源可用性探测或启动保证。
+宿主基于当前工具调用的身份检查委派权限。
 
 ## 生命周期
 

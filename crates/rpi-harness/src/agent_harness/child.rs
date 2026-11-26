@@ -63,7 +63,6 @@ impl AgentHarness {
             "model": {"id": snap.model.id, "provider": snap.model.provider, "api": snap.model.api},
             "thinkingLevel": snap.thinking_level,
             "tools": tools,
-            "childAgent": !self.is_child,
         }))
     }
 
@@ -115,7 +114,6 @@ impl AgentHarness {
                 "model": {"id":snap.model.id,"provider":snap.model.provider,"api":snap.model.api},
                 "thinkingLevel":snap.thinking_level,
                 "tools":tools.iter().map(|tool| tool.tool.schema().name.clone()).collect::<Vec<_>>(),
-                "childAgent":false,
                 // Host identity, never accepted from tool parameters. Shared parent
                 // durable tools use this restricted actor rather than owner rights.
                 "nativeDurableActor":format!("child-{}", uuid::Uuid::now_v7()),
@@ -215,7 +213,7 @@ impl AgentHarness {
         };
         let execution_scope = Arc::new(
             rpi_agent::tool_execution_scope::ToolExecutionScope::with_context(
-                serde_json::json!({"childAgent":false,"tools":[]}),
+                serde_json::json!({"tools":[]}),
             ),
         );
         let experimental_durable = self.durable_experimental_policy();

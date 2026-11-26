@@ -29,7 +29,8 @@ impl AgentTool for Alias {
     ) -> Result<AgentToolResult, AgentError> {
         let context = self.host.get_execution_context(json!({})).await.unwrap();
         assert_eq!(context["tools"], json!(["research_alias"]));
-        assert_eq!(context["childAgent"], false);
+        assert!(context.get("childAgent").is_none());
+        assert!(context.get("nativeDurableActor").is_none());
         let error = self
             .host
             .child_agent(
@@ -84,7 +85,7 @@ async fn a_narrowed_child_cannot_reenter_the_root_host_through_an_alias_tool() {
         )
         .await
         .unwrap();
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     let started = manager
         .handle(
             &parent,
@@ -170,7 +171,7 @@ async fn assert_capacity_retained(panic_after_start: bool) {
         )
         .await
         .unwrap();
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     let child = manager
         .handle(&parent, 7, json!({"op":"start","task":"slow"}))
         .await

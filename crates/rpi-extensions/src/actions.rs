@@ -986,7 +986,7 @@ impl ActionBridge {
         }
         Arc::new(Self {
             invocation: Some((child, uuid::Uuid::new_v4().to_string(), signal)),
-            execution_context: rpi_agent::tool_execution_scope::execution_context(),
+            execution_context: rpi_agent::tool_execution_scope::public_execution_context(),
             tool_program,
             stdio: self.stdio.clone(),
             plugin_identity: self.plugin_identity.clone(),

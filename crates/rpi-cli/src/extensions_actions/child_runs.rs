@@ -27,7 +27,7 @@ fn now_ms() -> u64 {
 }
 
 #[derive(Default)]
-pub(crate) struct ChildAgents {
+pub(super) struct ChildRuns {
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     revoked: Mutex<HashSet<u64>>,
     active: Arc<AtomicUsize>,
@@ -132,13 +132,13 @@ impl AgentEmitter for Emitter {
     }
 }
 
-impl Drop for ChildAgents {
+impl Drop for ChildRuns {
     fn drop(&mut self) {
         self.cancel_all();
     }
 }
 
-impl ChildAgents {
+impl ChildRuns {
     pub(crate) fn cancel_owner(&self, owner: u64) {
         self.revoked
             .lock()

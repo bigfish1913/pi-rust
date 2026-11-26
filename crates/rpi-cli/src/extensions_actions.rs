@@ -52,6 +52,8 @@ use tokio::runtime::Handle;
 
 use crate::session::{default_session_dir, open_session_by_id_in_dir};
 
+mod child_runs;
+
 /// Merge built-in / extension / prompt-template commands into the
 /// `ListCommands` payload.
 ///
@@ -154,7 +156,7 @@ pub struct HarnessActionHost {
     /// tool state keyed off the old id would otherwise keep serving the session
     /// it named before the swap.
     tool_context: rpi_extensions::ToolCallContext,
-    children: crate::child_agents::ChildAgents,
+    children: child_runs::ChildRuns,
     side_questions: crate::side_questions::SideQuestions,
     #[allow(dead_code)]
     runtime: Handle,
@@ -193,7 +195,7 @@ impl HarnessActionHost {
                 cwd,
                 cli_flags,
                 tool_context,
-                children: crate::child_agents::ChildAgents::default(),
+                children: child_runs::ChildRuns::default(),
                 side_questions: crate::side_questions::SideQuestions::default(),
                 runtime,
                 registry: std::sync::RwLock::new(None),
@@ -680,7 +682,7 @@ impl RuntimeActionHost for HarnessActionHost {
         let harness = self.harness()?;
         let mut context = harness.execution_context().map_err(|e| e.to_string())?;
         if let Some(serde_json::Value::Object(child)) =
-            rpi_agent::tool_execution_scope::execution_context()
+            rpi_agent::tool_execution_scope::public_execution_context()
         {
             context
                 .as_object_mut()

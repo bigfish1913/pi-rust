@@ -36,7 +36,6 @@ pub mod auth_guidance;
 pub mod brand;
 mod cdn;
 pub mod changelog;
-mod child_agents;
 pub mod config;
 mod credentials;
 pub mod dev_extension;
