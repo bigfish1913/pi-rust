@@ -27,10 +27,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::env::{
@@ -460,6 +459,43 @@ mod shell_jobs {
 
     pub fn forget(pid: u32) {
         JOBS.lock().unwrap().remove(&pid);
+    }
+}
+
+// A tool or harness can drop exec before its cancellation branch is polled.
+// Own the process group until wait() has actually reaped the shell. The guard
+// must be synchronous: Drop runs while the async execution future is unwinding.
+struct ShellProcessGuard {
+    pid: Option<u32>,
+    active: Arc<Mutex<HashSet<u32>>>,
+}
+impl ShellProcessGuard {
+    fn finish(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            #[cfg(windows)]
+            shell_jobs::forget(pid);
+            self.active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&pid);
+        }
+    }
+}
+impl Drop for ShellProcessGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                // Every shell is spawned into its own process group. No
+                // unrelated session or successful background command is killed.
+                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+            }
+            #[cfg(windows)]
+            shell_jobs::terminate(pid);
+            self.finish();
+        }
     }
 }
 
@@ -1024,11 +1060,20 @@ impl FileSystem for OsExecutionEnv {
     }
 
     async fn cleanup(&self) {
-        let pids: Vec<u32> = self.active_pids.lock().await.iter().copied().collect();
+        let pids: Vec<u32> = self
+            .active_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
         for pid in pids {
             kill_process_tree(pid).await;
         }
-        self.active_pids.lock().await.clear();
+        self.active_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -1154,6 +1199,7 @@ impl Shell for OsExecutionEnv {
             }
         }
         // stdio.
+        cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -1185,6 +1231,10 @@ impl Shell for OsExecutionEnv {
             }
         };
         let pid = child.id();
+        let mut process_guard = ShellProcessGuard {
+            pid,
+            active: self.active_pids.clone(),
+        };
         #[cfg(windows)]
         {
             let started = match (pid, child.raw_handle()) {
@@ -1203,7 +1253,10 @@ impl Shell for OsExecutionEnv {
             }
         }
         if let Some(pid) = pid {
-            self.active_pids.lock().await.insert(pid);
+            self.active_pids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pid);
         }
 
         // Stdin transport: write command then close. Closing happens on BOTH
@@ -1390,6 +1443,11 @@ impl Shell for OsExecutionEnv {
                     () = &mut stderr_task, if !stderr_done => stderr_done = true,
                 }
             };
+            // Disarm immediately after a successful wait, before any await:
+            // the shell has been reaped and its PID may now be reused.
+            if status_res.is_ok() {
+                process_guard.finish();
+            }
             // Drain what is already in the pipe — a completed write is already in
             // the pipe buffer, so this is not a race — then stop, without waiting
             // for an EOF that may never come. A command whose own process is gone
@@ -1429,13 +1487,6 @@ impl Shell for OsExecutionEnv {
         // already capped it.
         if timed_out {
             let _ = tokio::time::sleep(std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS)).await;
-        }
-
-        // Remove from tracked pids.
-        if let Some(pid) = pid {
-            #[cfg(windows)]
-            shell_jobs::forget(pid);
-            self.active_pids.lock().await.remove(&pid);
         }
 
         // Resolution priority: timedOut → cancelled → status.
