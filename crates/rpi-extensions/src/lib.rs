@@ -80,6 +80,8 @@ pub use actions::{
 pub use cleanup::{PluginCleanupReceipt, PluginCleanupStatus};
 pub use editor_text::{EditorDraft, EditorTextEdit, EditorTextMailbox, EditorTextMode};
 pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
+#[cfg(unix)]
+pub use loader::SharedPluginImages;
 pub use loader::{
     load_dir, load_explicit_session_owned, load_explicit_session_owned_checked, load_one,
     load_session, load_session_mixed, load_session_mixed_guarded, load_session_mixed_staged,

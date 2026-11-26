@@ -452,6 +452,7 @@ async fn run_daemon(
     let idle_timeout = profile
         .filter(|config| config.idle_timeout_seconds != 0)
         .map(|config| Duration::from_secs(u64::from(config.idle_timeout_seconds)));
+    let plugin_images = Arc::new(rpi_extensions::SharedPluginImages::default());
     let capacity = Arc::new(Semaphore::new(max_agents));
     let rejections = Arc::new(Semaphore::new(MAX_CAPACITY_REJECTIONS));
     loop {
@@ -476,9 +477,12 @@ async fn run_daemon(
         if let Ok(permit) = Arc::clone(&capacity).try_acquire_owned() {
             let home = home.clone();
             let args = args.clone();
+            let plugin_images = plugin_images.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(error) = serve_session(stream, home, args, idle_timeout).await {
+                if let Err(error) =
+                    serve_session(stream, home, args, idle_timeout, plugin_images).await
+                {
                     tracing::debug!(%error, "local Host connection ended");
                 }
             });
@@ -504,6 +508,7 @@ async fn serve_session(
     home: AgentHome,
     mut args: Args,
     idle_timeout: Option<Duration>,
+    plugin_images: Arc<rpi_extensions::SharedPluginImages>,
 ) -> Result<(), String> {
     let (input, mut output) = stream.into_split();
     let mut input = BufReader::new(input);
@@ -542,9 +547,17 @@ async fn serve_session(
         let signal = CancellationToken::new();
         let mut diagnostics = Vec::new();
         let result = {
-            let run = crate::mini::execute(&home, args, &cwd, request, signal.clone(), |message| {
-                diagnostics.push(message);
-            });
+            let run = crate::mini::execute(
+                &home,
+                args,
+                &cwd,
+                plugin_images,
+                request,
+                signal.clone(),
+                |message| {
+                    diagnostics.push(message);
+                },
+            );
             tokio::pin!(run);
             tokio::select! {
                 _ = input.fill_buf() => {
@@ -590,7 +603,7 @@ async fn serve_session(
         let trusted = crate::session::resolve_project_trust_for(&home, &args, &cwd);
         // Native registration may synchronously call back into the Tokio runtime.
         let prepared = tokio::task::block_in_place(|| {
-            crate::session::prepare_host_extensions(&home, &args, &cwd, trusted)
+            crate::session::prepare_host_extensions(&home, &args, &cwd, trusted, plugin_images)
         })
         .map_err(|error| error.to_string())?;
         let resolved = crate::provider::resolve_with_extensions(

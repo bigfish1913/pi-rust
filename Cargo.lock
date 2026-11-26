@@ -2223,6 +2223,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "futures",
+ "libc",
  "libloading",
  "rpi-agent",
  "rpi-ai",

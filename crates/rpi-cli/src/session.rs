@@ -410,11 +410,16 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
         .unwrap_or_else(|| cwd.join(".rpi").join("sessions"))
 }
 
+#[cfg(unix)]
+type HostPluginImages = Arc<rpi_extensions::SharedPluginImages>;
+#[cfg(not(unix))]
+type HostPluginImages = ();
+
 /// Extensions are loaded exactly once before model resolution. Their action
 /// host remains unbound until the harness and authenticated catalog exist.
 pub struct PreparedExtensions {
     plugin_cleanup: Arc<crate::host::cli_cleanup::PluginCleanupLedger>,
-    shared_host: bool,
+    host_plugin_images: Option<HostPluginImages>,
     resource_leases: Arc<Vec<crate::resource_management::Lease>>,
     resource_selection: Option<crate::resource_selection::ResolvedSelection>,
     session_selection: SessionSelection,
@@ -616,7 +621,7 @@ pub fn prepare_extensions(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
-    prepare_extensions_inner(home, args, cwd, project_trusted, false)
+    prepare_extensions_inner(home, args, cwd, project_trusted, None)
 }
 
 #[cfg(unix)]
@@ -625,8 +630,9 @@ pub(crate) fn prepare_host_extensions(
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
+    images: HostPluginImages,
 ) -> Result<PreparedExtensions, BuildError> {
-    prepare_extensions_inner(home, args, cwd, project_trusted, true)
+    prepare_extensions_inner(home, args, cwd, project_trusted, Some(images))
 }
 
 fn prepare_extensions_inner(
@@ -634,8 +640,9 @@ fn prepare_extensions_inner(
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
-    shared_host: bool,
+    host_plugin_images: Option<HostPluginImages>,
 ) -> Result<PreparedExtensions, BuildError> {
+    let shared_host = host_plugin_images.is_some();
     crate::native_durable::experimental_epoch::policy(args).map_err(BuildError::HarnessCreate)?;
     let resource_leases = crate::resource_management::host_leases_for(home, cwd)
         .map_err(BuildError::HarnessCreate)?;
@@ -788,9 +795,8 @@ fn prepare_extensions_inner(
             Some(Arc::clone(&action_bridge)),
             Some(resource_leases.clone()),
             plugin_cleanup.clone(),
-            shared_host,
+            host_plugin_images.as_ref(),
         )
-        .map_err(BuildError::HarnessCreate)?
     };
     if args.verbose {
         if let Some(s) = extension_session.summary() {
@@ -807,7 +813,7 @@ fn prepare_extensions_inner(
     action_host.publish_registry_impl(extension_session.snapshot_arc());
     Ok(PreparedExtensions {
         plugin_cleanup,
-        shared_host,
+        host_plugin_images,
         resource_leases,
         resource_selection,
         session_selection,
@@ -950,7 +956,7 @@ pub async fn build_prepared(
     // the session exists — the tool set has to exist before the harness does.
     let PreparedExtensions {
         plugin_cleanup,
-        shared_host,
+        host_plugin_images,
         resource_leases,
         resource_selection,
         session_selection: selection,
@@ -968,6 +974,7 @@ pub async fn build_prepared(
         extension_session,
         prepared_restore,
     } = prepared;
+    let shared_host = host_plugin_images.is_some();
     let build_tools = StartupSpan::start(Phase::BuildTools);
     let catalog = crate::provider::authenticated_catalog(resolved);
     action_host.set_catalog(catalog.clone());
@@ -1730,7 +1737,7 @@ pub async fn build_prepared(
     let reload_context = ReloadContext {
         plugin_cleanup,
         plugin_resources,
-        shared_host,
+        host_plugin_images,
         ephemeral_sessions_only: args.mini,
         extension_session: extension_session_cell,
         durable_binding,
@@ -2027,7 +2034,7 @@ pub struct ReloadContext {
     /// Non-owning evidence includes failed candidates and every reload generation.
     pub(crate) plugin_cleanup: Arc<crate::host::cli_cleanup::PluginCleanupLedger>,
     pub(crate) plugin_resources: Arc<crate::host::cli_resources::CliPluginResources>,
-    shared_host: bool,
+    host_plugin_images: Option<HostPluginImages>,
     /// Keep Mini's storage policy across extension reloads.
     ephemeral_sessions_only: bool,
     /// One neutral router for all built-ins, including those reconstructed on reload.
@@ -2372,7 +2379,7 @@ where
                 action_host
                     .with_session_dir(ctx.session_dir())
                     .with_ephemeral_sessions_only(ctx.ephemeral_sessions_only)
-                    .with_process_identity(!ctx.shared_host)
+                    .with_process_identity(ctx.host_plugin_images.is_none())
                     .with_native_durable(ctx.args.native_durable),
             )
         }
@@ -2388,7 +2395,7 @@ where
         ctx.ext_status.clone(),
         ctx.editor_text.clone(),
     );
-    if ctx.shared_host {
+    if ctx.host_plugin_images.is_some() {
         fresh_bridge.disable_stdio_claims();
     }
 
@@ -2403,25 +2410,13 @@ where
                 Some(Arc::clone(&fresh_bridge)),
                 Some(reload_permit.host_guard()),
                 ctx.plugin_cleanup.clone(),
-                ctx.shared_host,
+                ctx.host_plugin_images.as_ref(),
             )
         };
-        let loaded = if ctx.shared_host {
+        if ctx.host_plugin_images.is_some() {
             tokio::task::block_in_place(load)
         } else {
             load()
-        };
-        match loaded {
-            Ok(session) => session,
-            Err(error) => {
-                return ReloadOutcome {
-                    summary: "Reload failed while preparing extension storage".into(),
-                    had_warnings: true,
-                    details: vec![error],
-                    had_errors: true,
-                    project_trusted: None,
-                };
-            }
         }
     };
     if effective_args.native_durable {
@@ -3160,12 +3155,8 @@ fn load_extensions_tracked(
         action_bridge,
         Some(leases),
         diagnostics,
-        false,
+        None,
     )
-    .unwrap_or_else(|error| {
-        eprintln!("warning: refusing extension loading: {error}");
-        ExtensionSession::none()
-    })
 }
 
 /// Replace the default global extension directory with the registry-selected
@@ -3238,41 +3229,22 @@ fn load_extensions_from_dirs(
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
     host_guard: Option<Arc<dyn Send + Sync>>,
     diagnostics: Arc<dyn PluginDiagnostics>,
-    shared_host: bool,
-) -> Result<ExtensionSession, String> {
+    _host_plugin_images: Option<&HostPluginImages>,
+) -> ExtensionSession {
     let agent_dir = home.root().ok();
     let (dirs, files) =
         registry_aware_extension_inputs(dirs, &args.extension, agent_dir.as_deref());
-    if shared_host {
-        let mut staging = tempfile::Builder::new();
-        staging.prefix("rpi-host-extensions-");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            staging.permissions(std::fs::Permissions::from_mode(0o700));
-        }
-        let stage = Arc::new(
-            staging
-                .tempdir()
-                .map_err(|error| format!("could not create Host extension storage: {error}"))?,
-        );
-        let guard = Arc::new((host_guard, stage.clone()));
-        return Ok(rpi_extensions::load_session_mixed_staged(
-            &dirs,
-            &files,
-            diagnostics,
-            action_bridge,
-            guard,
-            stage.path(),
-        ));
+    #[cfg(unix)]
+    if let Some(images) = _host_plugin_images {
+        return images.load_session(&dirs, &files, diagnostics, action_bridge, host_guard);
     }
-    Ok(rpi_extensions::load_session_mixed_guarded(
+    rpi_extensions::load_session_mixed_guarded(
         &dirs,
         &files,
         diagnostics,
         action_bridge,
         host_guard,
-    ))
+    )
 }
 
 /// The host permanently owns both durable public names.
