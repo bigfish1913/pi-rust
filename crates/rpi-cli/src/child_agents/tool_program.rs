@@ -178,7 +178,20 @@ mod tests {
             .unwrap();
         observer.finish().await;
         source.append_custom_entry("later", None).await.unwrap();
-        assert!(job.state.lock().unwrap().journal.entries.is_empty());
+        let manager = ChildAgents::default();
+        job.state.lock().unwrap().parent_session_id = "parent".into();
+        manager
+            .observations
+            .lock()
+            .unwrap()
+            .remember("child-source".into(), job.clone());
+        let roster = manager
+            .query(
+                "parent",
+                json!({"type":"get_child_agents","version":1,"parentSessionId":"parent"}),
+            )
+            .unwrap();
+        assert_eq!(roster["children"][0]["lastSeq"], 0);
         assert!(
             !job.cancel.is_cancelled(),
             "observation cleanup must not cancel execution"
