@@ -4727,6 +4727,63 @@ async fn abort_reclaiming_is_atomic_on_an_idle_lane() {
     );
 }
 
+/// rpi-web's Stop button must cancel the active run without reclaiming queued
+/// steering/follow-up messages. `abort` deliberately transfers the queue back to
+/// a remote UI; Stop must leave it pending and visible instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_preserving_queue_keeps_follow_up_pending() {
+    let script = FauxScript::new()
+        .with_text("slow answer")
+        .with_tokens_per_second(1.0);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    harness
+        .follow_up(AgentMessage::User(UserMessage::new(
+            UserContent::Text("still queued after stop".into()),
+            0,
+        )))
+        .await
+        .expect("follow-up is accepted while idle");
+
+    let run = tokio::spawn({
+        let harness = harness.clone();
+        async move { harness.prompt_text("start", vec![]).await }
+    });
+
+    // Wait until the run is admitted, then stop it through the same boundary
+    // the native RPC `stop_run` command uses.
+    let active = loop {
+        if let Some(active) = harness.active_operation().await.unwrap() {
+            break active;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert!(harness.stop_preserving_queue(&active.run_id).await.unwrap());
+    let result = run.await.expect("stopped run joins").expect("run settles");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Aborted { .. }),
+        "unexpected outcome: {:?}",
+        result.outcome
+    );
+
+    let queued = harness.queued_messages().await.expect("queue snapshot");
+    assert_eq!(queued.follow_up.len(), 1, "{queued:?}");
+    assert_eq!(queued.follow_up[0].text, "still queued after stop");
+
+    let cancelled = harness
+        .session()
+        .find_records(&RecordQuery {
+            record_type: Some("queue_cancelled"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        cancelled.is_empty(),
+        "a queue-preserving stop must not cancel the queued entry"
+    );
+}
+
 /// `turn_end.pending_messages` must report the queue depth **without draining**.
 ///
 /// The two drain hooks (`get_steering_messages` / `get_follow_up_messages`)

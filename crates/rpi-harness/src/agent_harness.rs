@@ -584,6 +584,12 @@ pub trait AgentLane: Send + Sync {
     async fn get_result(&self, run_id: &str) -> HarnessResult<Option<RunResult>>;
     async fn accept(&self, entry_id: &str) -> HarnessResult<bool>;
     async fn request_abort(&self, run_id: &str) -> HarnessResult<bool>;
+    /// Cancel the active run without reclaiming its queues. Hosts that do not
+    /// support queue-preserving cancellation report `false`.
+    async fn stop_preserving_queue(&self, run_id: &str) -> HarnessResult<bool> {
+        let _ = run_id;
+        Ok(false)
+    }
     async fn drive(&self, operation_id: &str) -> HarnessResult<DriveResult>;
     async fn resume(&self, suspended_id: &str) -> HarnessResult<RunResult>;
 }
@@ -599,6 +605,10 @@ pub trait AgentLane: Send + Sync {
 /// loop on `main`. The `signal` is a child of the harness root token; cancel it
 /// to abort. `idle` fires when the guard is released.
 struct ActiveRun {
+    /// Set by a cooperative stop: the active run's `CancellationToken` is
+    /// cancelled, but queued follow-ups must stay pending instead of being
+    /// reclaimed into an aborted-turn tail.
+    preserve_queue_on_cancel: bool,
     /// The durable operation ended, but its final callbacks still own admission.
     finishing: bool,
     /// Recovery can replay external tools, so it cannot hold message_writes.
@@ -1057,6 +1067,40 @@ impl AgentHarness {
     pub fn request_stop_round(&self) {
         self.stop_round
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Stop the active run without reclaiming queued steering/follow-up
+    /// messages.
+    ///
+    /// This is the host-side counterpart of rpi-web's Stop button: it cancels
+    /// the in-flight operation so the current answer ends promptly, but leaves
+    /// queued messages durably pending for the next run. It is one-shot and
+    /// idempotent: a stale or idle run id leaves the queue untouched.
+    pub async fn stop_preserving_queue(&self, run_id: &str) -> HarnessResult<bool> {
+        let gate = self.message_writes.clone().lock_owned().await;
+        let harness = self.clone();
+        let run_id = run_id.to_owned();
+        tokio::spawn(async move {
+            let _gate = gate;
+            let signal = {
+                let mut inner = harness.inner.lock().unwrap();
+                if inner.closed {
+                    return Err(HarnessError::closed());
+                }
+                let Some(active) = inner.active_run.as_mut() else {
+                    return Ok(false);
+                };
+                if active.run_id != run_id {
+                    return Ok(false);
+                }
+                active.preserve_queue_on_cancel = true;
+                active.signal.clone()
+            };
+            signal.cancel();
+            Ok(true)
+        })
+        .await
+        .map_err(|error| HarnessError::io(format!("queue-preserving stop task failed: {error}")))?
     }
 
     /// Construct from options. Existing sessions require explicit restore opt-in.
@@ -3155,6 +3199,7 @@ impl AgentHarness {
             .filter(|_| self.lane == "main")
             .map(|observer| crate::execution::ExecutionLease::new(observer, &self.lane));
         inner.active_run = Some(ActiveRun {
+            preserve_queue_on_cancel: false,
             finishing: false,
             recovering: true,
             run_id: run_id.clone(),
@@ -3408,10 +3453,18 @@ impl AgentHarness {
         }))
     }
 
-    /// Take every queued item for this lane the way the loop's injection
-    /// callbacks need: record the consumption, and hand the reserved entry id to
-    /// the settle observer so the injected message is committed when it settles
-    /// rather than surviving only until the run ends.
+    /// Consume the one-shot queue-preservation marker set by
+    /// [`Self::stop_preserving_queue`]. The agent loop calls both drain hooks on
+    /// a cancelled run, so only the first hook may suppress draining; a second
+    /// suppression would leak that marker into a later run.
+    fn consume_queue_preservation_for_active_run(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(active) = inner.active_run.as_mut() else {
+            return false;
+        };
+        std::mem::take(&mut active.preserve_queue_on_cancel)
+    }
+
     async fn drain_injected(
         &self,
         queue: SharedMessageQueue,
@@ -5279,7 +5332,12 @@ impl AgentHarness {
                     let harness = harness.clone();
                     let queue = Arc::clone(&queue);
                     let settle = Arc::clone(&settle);
-                    Box::pin(async move { harness.drain_injected(queue, &settle).await })
+                    Box::pin(async move {
+                        if harness.consume_queue_preservation_for_active_run() {
+                            return Vec::new();
+                        }
+                        harness.drain_injected(queue, &settle).await
+                    })
                 })
             }),
             get_follow_up_messages: Some({
@@ -5290,7 +5348,12 @@ impl AgentHarness {
                     let harness = harness.clone();
                     let queue = Arc::clone(&queue);
                     let settle = Arc::clone(&settle);
-                    Box::pin(async move { harness.drain_injected(queue, &settle).await })
+                    Box::pin(async move {
+                        if harness.consume_queue_preservation_for_active_run() {
+                            return Vec::new();
+                        }
+                        harness.drain_injected(queue, &settle).await
+                    })
                 })
             }),
             // Read-only queue depth (**does not drain**).
@@ -6418,6 +6481,10 @@ impl AgentLane for AgentHarness {
         AgentHarness::request_abort(self, run_id).await
     }
 
+    async fn stop_preserving_queue(&self, run_id: &str) -> HarnessResult<bool> {
+        AgentHarness::stop_preserving_queue(self, run_id).await
+    }
+
     async fn drive(&self, operation_id: &str) -> HarnessResult<DriveResult> {
         AgentHarness::drive(self, operation_id).await
     }
@@ -6800,6 +6867,10 @@ impl AgentLane for LaneHandle {
 
     async fn request_abort(&self, run_id: &str) -> HarnessResult<bool> {
         self.runner().request_abort(run_id).await
+    }
+
+    async fn stop_preserving_queue(&self, run_id: &str) -> HarnessResult<bool> {
+        self.runner().stop_preserving_queue(run_id).await
     }
 
     async fn drive(&self, operation_id: &str) -> HarnessResult<DriveResult> {
