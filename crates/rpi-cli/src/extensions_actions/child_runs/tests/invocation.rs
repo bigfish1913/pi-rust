@@ -4,7 +4,7 @@ use rpi_agent::tool_execution_scope::with_invocation_signal;
 #[tokio::test]
 async fn a_start_queued_by_an_expired_invocation_cannot_attach_to_the_idle_root() {
     let parent = parent(FauxScript::new().with_text("must not run")).await;
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     let signal = CancellationToken::new();
     signal.cancel();
     let result = with_invocation_signal(
@@ -34,7 +34,7 @@ async fn an_idle_root_child_observes_the_originating_tool_cancellation() {
             .with_tokens_per_second(0.1),
     )
     .await;
-    let manager = ChildAgents::default();
+    let manager = ChildRuns::default();
     let signal = CancellationToken::new();
     let child = with_invocation_signal(
         signal.clone(),
