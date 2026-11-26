@@ -60,7 +60,7 @@ pub fn global_dir(sub: &str) -> Option<PathBuf> {
     global_dir_at(None, sub)
 }
 
-/// [`global_dir`] under an explicit agent home (`--agent-dir`).
+/// [`global_dir`] under an explicit agent home.
 fn global_dir_at(agent_dir: Option<&Path>, sub: &str) -> Option<PathBuf> {
     crate::config::agent_dir_at(agent_dir)
         .ok()
@@ -83,7 +83,7 @@ pub fn global_config_file(name: &str) -> Option<PathBuf> {
     global_config_file_at(None, name)
 }
 
-/// [`global_config_file`] under an explicit agent home (`--agent-dir`).
+/// [`global_config_file`] under an explicit agent home.
 fn global_config_file_at(agent_dir: Option<&Path>, name: &str) -> Option<PathBuf> {
     crate::config::agent_dir_at(agent_dir)
         .ok()
@@ -304,7 +304,7 @@ pub fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
     skill_dirs_at(cwd, None)
 }
 
-/// [`skill_dirs`] under an explicit agent home (`--agent-dir`).
+/// [`skill_dirs`] under an explicit agent home.
 fn skill_dirs_at(cwd: &Path, agent_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = project_skill_dirs(cwd);
     if let Some(g) = global_dir_at(agent_dir, "skills") {

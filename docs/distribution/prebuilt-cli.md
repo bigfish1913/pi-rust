@@ -7,6 +7,9 @@ does not access the network. The installer requires `rpi-release.json` and valid
 platform's distribution before downloading or replacing the executable.
 Cargo compilation is an explicit alternative: `rpi update --build`.
 
+Homebrew installations use `brew upgrade rpi`. Startup update notices show
+that command, and `rpi update` exits before attempting to replace the executable.
+
 Preview builds are published only as GitHub prereleases from the `preview` branch; they are not
 published to crates.io. Select that channel explicitly with `rpi update preview`. Stable startup
 checks never advertise prereleases, while a preview binary continues checking GitHub stable releases and

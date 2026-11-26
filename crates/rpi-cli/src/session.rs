@@ -6207,7 +6207,8 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let env_dir = cwd.path().join("env-sessions");
         let _env = crate::config::test_support::SessionDirEnv::new(Some(&env_dir));
-        let agent_home = crate::config::AgentHome::from_option(Some(home.path().to_path_buf()));
+        let agent_home =
+            crate::config::AgentHome::from_option(Some(home.path().to_path_buf())).unwrap();
         let args = Args::default();
         assert_eq!(
             configured_session_dir_for(&agent_home, &args, cwd.path()),
@@ -6225,8 +6226,8 @@ mod tests {
         );
     }
 
-    /// `/reload` must re-read resources from the `--agent-dir` home, not the
-    /// process default and not a startup snapshot.
+    /// `/reload` must re-read resources from the session's explicit agent home,
+    /// not the process default and not a startup snapshot.
     #[test]
     fn reload_inputs_reread_the_selected_agent_home() {
         struct RestoreConfigDir(Option<std::ffi::OsString>);
@@ -6257,7 +6258,8 @@ mod tests {
         std::fs::write(selected_home.path().join("settings.json"), "{}").unwrap();
 
         let selected_agent_home =
-            crate::config::AgentHome::from_option(Some(selected_home.path().to_path_buf()));
+            crate::config::AgentHome::from_option(Some(selected_home.path().to_path_buf()))
+                .unwrap();
         let args = Args {
             no_session: true,
             no_extensions: true,

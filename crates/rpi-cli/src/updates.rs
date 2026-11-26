@@ -113,6 +113,31 @@ enum UpdateChannel {
     Stable,
     Preview,
 }
+
+const HOMEBREW_UPGRADE_COMMAND: &str = "brew upgrade rpi";
+
+fn current_homebrew_keg() -> Option<PathBuf> {
+    homebrew_keg_for_exe(&std::env::current_exe().ok()?)
+}
+
+/// Resolve Homebrew's `bin/rpi` symlink to `Cellar/rpi/<version>/bin/rpi`.
+/// The receipt distinguishes a Homebrew keg from a similarly named directory.
+fn homebrew_keg_for_exe(exe: &Path) -> Option<PathBuf> {
+    let exe = exe.canonicalize().ok()?;
+    let bin = exe.parent()?;
+    let keg = bin.parent()?;
+    let formula = keg.parent()?;
+    if exe.file_name()? == crate::APP_NAME
+        && bin.file_name()? == "bin"
+        && formula.file_name()? == crate::APP_NAME
+        && formula.parent()?.file_name()? == "Cellar"
+        && keg.join("INSTALL_RECEIPT.json").is_file()
+    {
+        return Some(keg.to_path_buf());
+    }
+    None
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SelfUpdateStatus {
@@ -399,7 +424,11 @@ fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
                 name: "rpi".into(),
                 current: crate::VERSION.into(),
                 latest: latest.into(),
-                command: "rpi update".into(),
+                command: if current_homebrew_keg().is_some() {
+                    HOMEBREW_UPGRADE_COMMAND.into()
+                } else {
+                    "rpi update".into()
+                },
             });
         }
     }
@@ -658,7 +687,9 @@ fn print_self_update_help() {
          preview    use the GitHub prerelease channel instead of stable releases\n  \
          --build    explicitly compile with Cargo instead of downloading a prebuilt binary\n  \
          --force    reinstall even when this rpi is already the latest release\n  \
-         --offline  do not touch the network; report the last known answer only"
+         --offline  do not touch the network; report the last known answer only\n\n\
+         A Homebrew install is upgraded with `brew upgrade rpi`; `rpi update`\n\
+         refuses to overwrite the binary Homebrew owns."
     );
 }
 
@@ -850,6 +881,15 @@ pub fn run_self_update(args: &[String]) -> i32 {
             return 2;
         }
     };
+
+    if let Some(keg) = current_homebrew_keg() {
+        eprintln!(
+            "error: Homebrew manages this rpi installation ({}).\n\
+             Run `{HOMEBREW_UPGRADE_COMMAND}` to update it.",
+            keg.display()
+        );
+        return 1;
+    }
 
     if offline {
         reclaim_self_update_artifacts();

@@ -382,7 +382,9 @@ pub struct RpcOptions {
     pub home: crate::config::AgentHome,
 }
 
-/// Use the session agent home for RPC configuration and resource commands.
+/// [`rpc_with_durable`] with the session's explicit agent home, so RPC
+/// write/status commands operate on the same home as the running session.
+#[allow(clippy::too_many_arguments)]
 pub async fn rpc_with_durable_home(
     harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
@@ -4259,7 +4261,7 @@ mod tests {
         }).to_string()).unwrap();
 
         let session_home_value =
-            crate::config::AgentHome::from_option(Some(session_home.path().to_path_buf()));
+            crate::config::AgentHome::from_option(Some(session_home.path().to_path_buf())).unwrap();
         let reply = rpc_set_api_key(
             &serde_json::json!({"provider": "beta", "apiKey": "TENANT-B-SECRET"}),
             &session_home_value,
