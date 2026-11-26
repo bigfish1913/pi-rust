@@ -113,10 +113,8 @@ async fn preview_projects_the_latest_main_window_and_rebuilds_on_restore() {
     let storage = fixture.create().await;
     let meta = storage.jsonl_metadata();
     let index = format!("{}.preview.json", meta.path);
-    assert_eq!(
-        fixture.preview().await,
-        json!({"sessionId": ID, "messages": [], "hasMore": false})
-    );
+    assert!(!Path::new(&index).exists());
+    fixture.miss().await;
 
     for number in 0..43 {
         append(&storage, &format!("message-{number}"), "main").await;
