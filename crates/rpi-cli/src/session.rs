@@ -413,6 +413,7 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 /// Extensions are loaded exactly once before model resolution. Their action
 /// host remains unbound until the harness and authenticated catalog exist.
 pub struct PreparedExtensions {
+    shared_host: bool,
     resource_leases: Arc<Vec<crate::resource_management::Lease>>,
     resource_selection: Option<crate::resource_selection::ResolvedSelection>,
     session_selection: SessionSelection,
@@ -615,6 +616,26 @@ pub fn prepare_extensions(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
+    prepare_extensions_inner(home, args, cwd, project_trusted, false)
+}
+
+#[cfg(unix)]
+pub(crate) fn prepare_host_extensions(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<PreparedExtensions, BuildError> {
+    prepare_extensions_inner(home, args, cwd, project_trusted, true)
+}
+
+fn prepare_extensions_inner(
+    home: &crate::config::AgentHome,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    shared_host: bool,
+) -> Result<PreparedExtensions, BuildError> {
     crate::native_durable::experimental_epoch::policy(args).map_err(BuildError::HarnessCreate)?;
     let resource_leases = crate::resource_management::host_leases_for(home, cwd)
         .map_err(BuildError::HarnessCreate)?;
@@ -694,6 +715,7 @@ pub fn prepare_extensions(
         action_host
             .with_session_dir(session_dir.clone())
             .with_fresh_session_only(false)
+            .with_process_identity(!shared_host)
             .with_native_durable(args.native_durable),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = action_host.clone();
@@ -730,6 +752,9 @@ pub fn prepare_extensions(
         ext_status_mailbox.clone(),
         editor_text_mailbox.clone(),
     );
+    if shared_host {
+        action_bridge.disable_stdio_claims();
+    }
 
     let extension_register = StartupSpan::start(Phase::ExtensionRegister);
     let extension_session = if let Some(selected) = &resource_selection {
@@ -754,13 +779,16 @@ pub fn prepare_extensions(
     } else if args.no_extensions {
         ExtensionSession::none()
     } else {
-        load_extensions(
+        let dirs = startup_extension_dirs(home, args, cwd, project_trusted);
+        load_extensions_from_dirs(
             home,
             args,
-            cwd,
-            project_trusted,
+            &dirs,
             Some(Arc::clone(&action_bridge)),
+            resource_leases.clone(),
+            shared_host,
         )
+        .map_err(BuildError::HarnessCreate)?
     };
     if args.verbose {
         if let Some(s) = extension_session.summary() {
@@ -776,6 +804,7 @@ pub fn prepare_extensions(
     // via `RuntimeActionHost::publish_registry`.
     action_host.publish_registry_impl(extension_session.snapshot_arc());
     Ok(PreparedExtensions {
+        shared_host,
         resource_leases,
         resource_selection,
         session_selection,
@@ -909,44 +938,6 @@ pub async fn build_prepared(
     ),
     BuildError,
 > {
-    build_prepared_inner(home, resolved, args, cwd, project_trusted, prepared, true).await
-}
-
-#[cfg(unix)]
-pub(crate) async fn build_host_session(
-    home: &crate::config::AgentHome,
-    resolved: &ResolvedModel,
-    args: &Args,
-    cwd: &Path,
-    project_trusted: bool,
-) -> Result<
-    (
-        AgentHarness,
-        tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
-        ReloadContext,
-    ),
-    BuildError,
-> {
-    let prepared = prepare_extensions(home, args, cwd, project_trusted)?;
-    build_prepared_inner(home, resolved, args, cwd, project_trusted, prepared, false).await
-}
-
-async fn build_prepared_inner(
-    home: &crate::config::AgentHome,
-    resolved: &ResolvedModel,
-    args: &Args,
-    cwd: &Path,
-    project_trusted: bool,
-    prepared: PreparedExtensions,
-    publish_process_settings: bool,
-) -> Result<
-    (
-        AgentHarness,
-        tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
-        ReloadContext,
-    ),
-    BuildError,
-> {
     let experimental_policy = crate::native_durable::experimental_epoch::policy(args)
         .map_err(BuildError::HarnessCreate)?;
     let fresh_session_only = false;
@@ -956,6 +947,7 @@ async fn build_prepared_inner(
     // before the tools are built, and completed with the session id below once
     // the session exists — the tool set has to exist before the harness does.
     let PreparedExtensions {
+        shared_host,
         resource_leases,
         resource_selection,
         session_selection: selection,
@@ -1043,7 +1035,7 @@ async fn build_prepared_inner(
     // their per-session state off it. A session without an id (ephemeral) leaves
     // the field unset and a plugin is expected to fall back to project scope.
     if let Ok(metadata) = session.get_metadata().await {
-        if publish_process_settings {
+        if !shared_host {
             publish_session_identity(&tool_context, &metadata.id);
         } else {
             tool_context.set_session_id(metadata.id);
@@ -1388,7 +1380,7 @@ async fn build_prepared_inner(
     // they are configured (`pi-ai/src/http.rs`), and upstream does the same thing
     // with this key — an explicit environment variable still wins, so a shell-level
     // proxy override is not silently replaced by the setting.
-    if publish_process_settings {
+    if !shared_host {
         apply_process_proxy(saved_settings.http_proxy.as_deref());
     }
 
@@ -1728,6 +1720,7 @@ async fn build_prepared_inner(
     let mut reload_args = args.clone();
     reload_args.session_dir = Some(session_dir);
     let reload_context = ReloadContext {
+        shared_host,
         resource_leases,
         fresh_session_only,
         extension_session: extension_session_cell,
@@ -2022,6 +2015,7 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 /// reload callback without borrowing the harness).
 #[derive(Clone)]
 pub struct ReloadContext {
+    shared_host: bool,
     resource_leases: Arc<Vec<crate::resource_management::Lease>>,
     /// Startup routing capability, retained independently of mutable args/settings.
     fresh_session_only: bool,
@@ -2356,6 +2350,7 @@ where
                 action_host
                     .with_session_dir(ctx.session_dir())
                     .with_fresh_session_only(ctx.fresh_session_only)
+                    .with_process_identity(!ctx.shared_host)
                     .with_native_durable(ctx.args.native_durable),
             )
         }
@@ -2371,17 +2366,40 @@ where
         ctx.ext_status.clone(),
         ctx.editor_text.clone(),
     );
+    if ctx.shared_host {
+        fresh_bridge.disable_stdio_claims();
+    }
 
     let extension_session = if effective_args.no_extensions {
         rpi_extensions::ExtensionSession::none()
     } else {
-        load_extensions_from_dirs(
-            &ctx.home,
-            &effective_args,
-            &extension_dirs,
-            Some(Arc::clone(&fresh_bridge)),
-            Some(ctx.resource_leases.clone()),
-        )
+        let load = || {
+            load_extensions_from_dirs(
+                &ctx.home,
+                &effective_args,
+                &extension_dirs,
+                Some(Arc::clone(&fresh_bridge)),
+                ctx.resource_leases.clone(),
+                ctx.shared_host,
+            )
+        };
+        let loaded = if ctx.shared_host {
+            tokio::task::block_in_place(load)
+        } else {
+            load()
+        };
+        match loaded {
+            Ok(session) => session,
+            Err(error) => {
+                return ReloadOutcome {
+                    summary: "Reload failed while preparing extension storage".into(),
+                    had_warnings: true,
+                    details: vec![error],
+                    had_errors: true,
+                    project_trusted: None,
+                };
+            }
+        }
     };
     if effective_args.native_durable {
         if let Err(error) = validate_durable_extensions(&extension_session) {
@@ -3094,7 +3112,12 @@ pub(crate) fn load_extensions(
             return ExtensionSession::none();
         }
     };
-    load_extensions_from_dirs(home, args, &dirs, action_bridge, Some(leases))
+    load_extensions_from_dirs(home, args, &dirs, action_bridge, leases, false).unwrap_or_else(
+        |error| {
+            eprintln!("warning: refusing extension loading: {error}");
+            ExtensionSession::none()
+        },
+    )
 }
 
 /// Replace the default global extension directory with the registry-selected
@@ -3165,25 +3188,43 @@ fn load_extensions_from_dirs(
     args: &Args,
     dirs: &[PathBuf],
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
-    host_guard: Option<Arc<dyn Send + Sync>>,
-) -> ExtensionSession {
+    leases: Arc<Vec<crate::resource_management::Lease>>,
+    shared_host: bool,
+) -> Result<ExtensionSession, String> {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
     let agent_dir = home.root().ok();
     let (dirs, files) =
         registry_aware_extension_inputs(dirs, &args.extension, agent_dir.as_deref());
-    // B5a: the action bridge is cloned into every loaded plugin's vtable
-    // `user_data` so post-register `runtime_action` calls recover the harness
-    // host from any thread. The call site already gates `load_extensions` behind
-    // `!no_extensions` and threads `Some(bridge)`; `None` is only passed by the
-    // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
-    // and tests. Explicit `--extension`/`-e` files load after the dirs.
-    rpi_extensions::load_session_mixed_guarded(
+    if shared_host {
+        let mut staging = tempfile::Builder::new();
+        staging.prefix("rpi-host-extensions-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            staging.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let stage = Arc::new(
+            staging
+                .tempdir()
+                .map_err(|error| format!("could not create Host extension storage: {error}"))?,
+        );
+        let guard = Arc::new((leases, stage.clone()));
+        return Ok(rpi_extensions::load_session_mixed_staged(
+            &dirs,
+            &files,
+            diagnostics,
+            action_bridge,
+            guard,
+            stage.path(),
+        ));
+    }
+    Ok(rpi_extensions::load_session_mixed_guarded(
         &dirs,
         &files,
         diagnostics,
         action_bridge,
-        host_guard,
-    )
+        Some(leases),
+    ))
 }
 
 /// The host permanently owns both durable public names.
@@ -4219,7 +4260,7 @@ pub(crate) fn apply_process_proxy(proxy: Option<&str>) {
 /// Called on **every** activation of a session — the startup build AND every
 /// in-process swap (`switch_to_session`, `fork_session`, and the plugin
 /// `NewSession`/`Fork`/`SwitchSession` runtime actions all route through
-/// [`set_active_session`]). Two things must stay in step:
+/// [`set_active_session_with_identity`]). Two things must stay in step:
 ///
 /// - `ToolCallContext` — read per plugin **tool** call, which is why a stale
 ///   value there made a plugin's `todo`-style state follow the wrong session.
@@ -4250,17 +4291,8 @@ fn publish_session_identity(tool_context: &rpi_extensions::ToolCallContext, id: 
 /// plugin channels, so a bare `set_session` would leave every plugin reporting
 /// the session it had before the swap.
 ///
-/// `tool_context` is optional because not every caller has one (the harness's own
-/// tests, a headless embedder); the env channel is always published, since the
-/// provider hooks depend on it.
-pub(crate) async fn set_active_session(
-    harness: &AgentHarness,
-    session: Session,
-    tool_context: Option<&rpi_extensions::ToolCallContext>,
-) -> Result<(), String> {
-    set_active_session_with_identity(harness, session, tool_context, true).await
-}
-
+/// A shared Host publishes the session ID only through its tool context.
+/// A dedicated CLI process also publishes it through the environment.
 pub(crate) async fn set_active_session_with_identity(
     harness: &AgentHarness,
     session: Session,

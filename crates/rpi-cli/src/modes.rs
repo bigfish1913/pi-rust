@@ -432,7 +432,7 @@ pub(crate) async fn rpc_host_session<R, W>(
     harness: &AgentHarness,
     events: tokio::sync::broadcast::Receiver<AgentEvent>,
     models: Vec<rpi_ai::Model>,
-    ui_dialog: rpi_extensions::UiDialogMailbox,
+    context: &crate::session::ReloadContext,
     home: crate::config::AgentHome,
     idle_timeout: Option<std::time::Duration>,
     (input, output): (R, W),
@@ -440,15 +440,24 @@ pub(crate) async fn rpc_host_session<R, W>(
     R: tokio::io::AsyncBufRead + Unpin,
     W: Write + Send + 'static,
 {
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        context,
+        rpi_plugin_sdk::EventTag::SessionStart,
+    )
+    .await
+    {
+        tracing::warn!("extension vetoed Host RPC SessionStart (advisory): {reason}");
+    }
+    let oauth_snapshot = context.extension_session.lock().unwrap().snapshot_arc();
     rpc_with_native_durable_io(
         harness,
         Some(events),
         models,
-        ui_dialog,
-        None,
-        None,
+        context.ui_dialog.clone(),
+        oauth_snapshot,
+        Some(context.extension_session.clone()),
         crate::args::RpcMessageUpdates::default(),
-        false,
+        context.args.native_durable,
         true,
         home,
         RpcLifetime {
@@ -459,6 +468,14 @@ pub(crate) async fn rpc_host_session<R, W>(
         output,
     )
     .await;
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        context,
+        rpi_plugin_sdk::EventTag::SessionShutdown,
+    )
+    .await
+    {
+        tracing::warn!("extension vetoed Host RPC SessionShutdown (ignored, closing): {reason}");
+    }
 }
 
 /// Opt-in, payload-free stage markers. An unmatched begin identifies an

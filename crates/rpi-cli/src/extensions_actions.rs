@@ -143,6 +143,7 @@ pub struct HarnessActionHost {
     cwd: PathBuf,
     session_dir: PathBuf,
     fresh_session_only: bool,
+    publish_process_identity: bool,
     /// Host-owned startup choice, independent of model tools and plugin flags.
     /// Immutable after construction, including while the registry is published.
     native_durable: bool,
@@ -189,6 +190,7 @@ impl HarnessActionHost {
                 catalog: RwLock::new(catalog),
                 session_dir: default_session_dir(&cwd),
                 fresh_session_only: false,
+                publish_process_identity: true,
                 native_durable: false,
                 cwd,
                 cli_flags,
@@ -211,6 +213,10 @@ impl HarnessActionHost {
 
     pub(crate) fn with_fresh_session_only(mut self, locked: bool) -> Self {
         self.fresh_session_only = locked;
+        self
+    }
+    pub(crate) fn with_process_identity(mut self, publish: bool) -> Self {
+        self.publish_process_identity = publish;
         self
     }
     pub(crate) fn with_native_durable(mut self, enabled: bool) -> Self {
@@ -951,7 +957,13 @@ impl RuntimeActionHost for HarnessActionHost {
             .await
             .map_err(|e| format!("create session: {e}"))?;
         let id = session.storage().metadata().id.clone();
-        crate::session::set_active_session(&harness, session, Some(&self.tool_context)).await?;
+        crate::session::set_active_session_with_identity(
+            &harness,
+            session,
+            Some(&self.tool_context),
+            self.publish_process_identity,
+        )
+        .await?;
         Ok(serde_json::json!({ "sessionId": id }))
     }
 
@@ -964,7 +976,13 @@ impl RuntimeActionHost for HarnessActionHost {
                 .await
                 .map_err(|e| format!("fork session: {e}"))?;
         let id = new_session.storage().metadata().id.clone();
-        crate::session::set_active_session(&harness, new_session, Some(&self.tool_context)).await?;
+        crate::session::set_active_session_with_identity(
+            &harness,
+            new_session,
+            Some(&self.tool_context),
+            self.publish_process_identity,
+        )
+        .await?;
         Ok(serde_json::json!({ "sessionId": id }))
     }
 
@@ -1003,7 +1021,13 @@ impl RuntimeActionHost for HarnessActionHost {
             .map(|restored| restored.session)
             .map_err(|e| e.to_string())?;
         let new_id = new_session.storage().metadata().id.clone();
-        crate::session::set_active_session(&harness, new_session, Some(&self.tool_context)).await?;
+        crate::session::set_active_session_with_identity(
+            &harness,
+            new_session,
+            Some(&self.tool_context),
+            self.publish_process_identity,
+        )
+        .await?;
         Ok(serde_json::json!({ "sessionId": new_id }))
     }
 

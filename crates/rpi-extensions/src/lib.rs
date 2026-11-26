@@ -81,7 +81,8 @@ pub use editor_text::{EditorDraft, EditorTextEdit, EditorTextMailbox, EditorText
 pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
 pub use loader::{
     load_dir, load_one, load_session, load_session_mixed, load_session_mixed_guarded,
-    merge_registries, ExtensionSession, LoadedPlugin, PluginKeepalive, PluginLoadError,
+    load_session_mixed_staged, merge_registries, ExtensionSession, LoadedPlugin, PluginKeepalive,
+    PluginLoadError,
 };
 pub use oauth::{
     list as list_oauth_providers, request as request_oauth,
@@ -693,6 +694,12 @@ extern "C" fn trampoline_declare(json: StbStringRef) -> i32 {
             };
             if value.get("ownsStdio").and_then(serde_json::Value::as_bool) == Some(true) {
                 if let Some(bridge) = &api.action_bridge {
+                    if bridge.stdio_lifecycle().claims_disabled() {
+                        // Record the request so the loader also skips plugins that ignore
+                        // the registration error and leave partially registered hooks.
+                        reg.record_stdio_claim();
+                        return false;
+                    }
                     if let Err(error) = bridge.claim_stdio() {
                         tracing::error!("{error}");
                         return false;

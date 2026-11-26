@@ -593,6 +593,13 @@ rpi_plugin_sdk::string_handler! {
 // the version/null checks before running our registration body. Return 0 on
 // success; nonzero means the host logs and skips this plugin.
 rpi_plugin_sdk::export_plugin!(|api| {
+    // Exercise plugins that keep their registration state in library globals.
+    static REGISTERED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if std::env::var_os("RPI_PLUGIN_STUB_REQUIRE_FRESH_IMAGE").is_some()
+        && REGISTERED.set(()).is_err()
+    {
+        return 1;
+    }
     // Opt-in real registration side effect for native host lifecycle tests.
     // The build-only digest proves a test loaded its freshly built source, not
     // an unrelated DLL in a shared target directory. No output by default.
@@ -603,11 +610,8 @@ rpi_plugin_sdk::export_plugin!(|api| {
             .append(true)
             .open(path)
         {
-            let _ = writeln!(
-                log,
-                "register {}",
-                option_env!("RPI_RESOURCE_FIXTURE_SOURCE_SHA256").unwrap_or("unversioned")
-            );
+            let digest = option_env!("RPI_RESOURCE_FIXTURE_SOURCE_SHA256").unwrap_or("unversioned");
+            let _ = log.write_all(format!("register {digest}\n").as_bytes());
         }
     }
     // Register the echo tool. Build an owning StableToolSchema (name +

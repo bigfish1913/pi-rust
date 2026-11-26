@@ -173,7 +173,13 @@ async fn native_durable_reload_reuses_session_binding_and_preserves_durable_stat
         .unwrap();
     let target_revision = foreign.storage().history_revision().await.unwrap();
     let plugin_id = context.tool_context.session_id();
-    let rejected = set_active_session(&harness, foreign.clone(), Some(&context.tool_context)).await;
+    let rejected = set_active_session_with_identity(
+        &harness,
+        foreign.clone(),
+        Some(&context.tool_context),
+        true,
+    )
+    .await;
     assert!(
         rejected
             .unwrap_err()

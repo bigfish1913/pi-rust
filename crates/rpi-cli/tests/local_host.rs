@@ -1,6 +1,9 @@
 //! Exercise two simultaneous native sessions through one actual Host process.
 #![cfg(unix)]
 
+#[path = "support/resource_fixture.rs"]
+mod resource_fixture;
+
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -131,8 +134,14 @@ fn spawn_daemon(
         .current_dir(root)
         .env("HOME", root)
         .env("RPI_CODING_AGENT_DIR", agent)
+        .env_remove("RPI_EXTENSIONS_DIR")
         .env("RPI_OFFLINE", "1")
         .env("RPI_CODING_AGENT_SESSION_DIR", sessions)
+        .env(
+            "RPI_PLUGIN_STUB_REGISTRATION_LOG",
+            root.join("registrations.log"),
+        )
+        .env("RPI_PLUGIN_STUB_REQUIRE_FRESH_IMAGE", "1")
         .env("NO_PROXY", "127.0.0.1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -254,10 +263,14 @@ fn journals(root: &Path) -> Vec<(std::path::PathBuf, String)> {
 }
 
 async fn complete(socket: &mut TcpStream) {
-    let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-    socket.write_all(headers).await.unwrap();
     let text = "area response ".repeat(8);
     let body = json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":"stop"}]});
+    sse_reply(socket, body).await;
+}
+
+async fn sse_reply(socket: &mut TcpStream, body: Value) {
+    let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    socket.write_all(headers).await.unwrap();
     chunk(socket, &format!("data: {body}\n\n")).await;
     chunk(socket, "data: [DONE]\n\n").await;
     socket.write_all(b"0\r\n\r\n").await.unwrap();
@@ -334,7 +347,11 @@ async fn mini_flags_run_in_the_same_host_and_use_its_capacity() {
         assert!(provider_request(&mut request).await.contains("prompt-cancel"));
         request.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
         cancelled.kill().await.unwrap();
-        assert_eq!(request.read(&mut [0]).await.unwrap(), 0, "provider stream should close on cancellation");
+        match request.read(&mut [0]).await {
+            Ok(0) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {},
+            outcome => panic!("provider stream should close on cancellation: {outcome:?}"),
+        }
         assert!(journals(&sessions).is_empty());
         assert!(!agent.join("local-host-v1/area-work/sessions").exists());
         let (session, opened) = Client::open(&socket, &workspace).await;
@@ -596,23 +613,29 @@ async fn terminal_submit(client: &mut Client, text: &str) {
 
 async fn terminal_text(client: &mut Client, needle: &str) -> String {
     let mut output = String::new();
-    loop {
-        let frame = client.next().await;
-        assert!(
-            frame.get("Finished").is_none(),
-            "closed while waiting for {needle:?}: {output}"
-        );
-        if let Some(text) = frame["Write"].as_str() {
-            output.push_str(text);
-            if output.contains(needle) {
-                return output;
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let frame = client.next().await;
+            assert!(
+                frame.get("Finished").is_none(),
+                "closed while waiting for {needle:?}: {output}"
+            );
+            if let Some(text) = frame["Write"].as_str() {
+                output.push_str(text);
+                if output.contains(needle) {
+                    break;
+                }
             }
         }
-    }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}: {output:?}"));
+    output
 }
 
 #[tokio::test]
 async fn terminal_attachment_runs_native_session_commands_in_the_host() {
+    let extension = resource_fixture::Fixture::build().await;
     timeout(Duration::from_secs(30), async {
         let root = tempfile::Builder::new()
             .prefix("rh-tui-")
@@ -621,7 +644,13 @@ async fn terminal_attachment_runs_native_session_commands_in_the_host() {
         let agent = root.path().join("agent");
         let workspace = root.path().join("project");
         let sessions = root.path().join("sessions");
-        std::fs::create_dir(&agent).unwrap();
+        let extensions = agent.join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::copy(
+            &extension.library,
+            extensions.join(extension.library.file_name().unwrap()),
+        )
+        .unwrap();
         std::fs::create_dir(&workspace).unwrap();
         let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
         write_fixture(&agent, provider.local_addr().unwrap());
@@ -636,12 +665,19 @@ async fn terminal_attachment_runs_native_session_commands_in_the_host() {
             open_terminal(&socket, &workspace, true),
             open_terminal(&socket, &workspace, false)
         );
-        assert!(!terminal_text(&mut regular, "fixture")
+        assert!(!terminal_text(&mut regular, "echo")
             .await
             .contains("\x1b[?1049h"));
-        assert!(terminal_text(&mut fullscreen, "fixture")
+        assert!(terminal_text(&mut fullscreen, "echo")
             .await
             .contains("\x1b[?1049h"));
+        assert_eq!(
+            extension
+                .assert_registrations(&root.path().join("registrations.log"))
+                .lines()
+                .count(),
+            2
+        );
         let (_, rejected) = Client::handshake(&socket, &workspace).await;
         assert!(rejected["message"]
             .as_str()
@@ -650,13 +686,54 @@ async fn terminal_attachment_runs_native_session_commands_in_the_host() {
 
         terminal_submit(&mut regular, "/name terminal-one").await;
         terminal_text(&mut regular, "Session renamed to").await;
+        terminal_submit(&mut regular, "/reload").await;
+        terminal_text(&mut regular, "Reloaded 1 plugin(s)").await;
+        assert_eq!(
+            extension
+                .assert_registrations(&root.path().join("registrations.log"))
+                .lines()
+                .count(),
+            3
+        );
         terminal_submit(&mut regular, "run from the native TUI").await;
-        let (mut upstream, _) = provider.accept().await.unwrap();
+        let (mut upstream, _) = timeout(Duration::from_secs(8), provider.accept())
+            .await
+            .expect("timed out waiting for the first provider request")
+            .unwrap();
+        let request: Value = serde_json::from_str(&provider_request(&mut upstream).await).unwrap();
+        assert!(request["messages"]
+            .to_string()
+            .contains("run from the native TUI"));
+        let mut tools: Vec<_> = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        tools.sort_unstable();
+        assert_eq!(
+            tools,
+            ["bash", "docs", "durable", "echo", "edit", "read", "write"]
+        );
+        sse_reply(
+            &mut upstream,
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+            "index":0,"id":"host-echo","type":"function",
+            "function":{"name":"echo","arguments":json!({"text":"TOOL_FROM_HOST"}).to_string()}
+        }]},"finish_reason":"tool_calls"}]}),
+        )
+        .await;
+        drop(upstream);
+        let (mut upstream, _) = timeout(Duration::from_secs(8), provider.accept())
+            .await
+            .expect("timed out waiting for the tool result provider request")
+            .unwrap();
         assert!(provider_request(&mut upstream)
             .await
-            .contains("run from the native TUI"));
+            .contains("echo: TOOL_FROM_HOST"));
         complete(&mut upstream).await;
-        terminal_text(&mut regular, "area response").await;
+        // The fixture also transforms model text after a tool result.
+        terminal_text(&mut regular, "AREA RESPONSE").await;
         terminal_submit(&mut regular, "/tree").await;
         terminal_text(&mut regular, "Session tree").await;
         terminal_key(&mut regular, "Esc", 0).await;
