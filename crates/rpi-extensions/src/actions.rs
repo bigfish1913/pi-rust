@@ -1956,8 +1956,14 @@ mod tests {
             RuntimeActionId::try_from(32).is_ok(),
             "GetEditorText must remain a valid runtime action id"
         );
+        // IndependentRun requires a live tool invocation and uses owner-scoped
+        // handles. The host's roster and stop operations have no plugin action.
+        assert_eq!(
+            RuntimeActionId::try_from(33),
+            Ok(RuntimeActionId::IndependentRun)
+        );
         assert!(
-            RuntimeActionId::try_from(33).is_err(),
+            RuntimeActionId::try_from(34).is_err(),
             "a new RuntimeActionId was added: re-verify that host-only child-agent control \
              (un-owner-scoped roster/stop) is still unreachable from the plugin ABI"
         );
