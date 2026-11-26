@@ -19,8 +19,6 @@ mod start_request;
 
 use start_request::StartRequest;
 
-pub(super) const PROMPT_VERSION: u32 = 1;
-
 const MAX_JOBS: usize = 16;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;

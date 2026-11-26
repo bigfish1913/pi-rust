@@ -689,9 +689,6 @@ impl RuntimeActionHost for HarnessActionHost {
                 .expect("execution context is an object")
                 .extend(child);
         }
-        if context["childAgent"] == true {
-            context["childAgentPromptVersion"] = serde_json::json!(child_runs::PROMPT_VERSION);
-        }
         context["cwd"] = serde_json::json!(self.cwd);
         context["sessionId"] = serde_json::json!(harness.session().storage().metadata().id);
         Ok(context)

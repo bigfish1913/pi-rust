@@ -30,7 +30,6 @@ impl AgentTool for Alias {
         let context = self.host.get_execution_context(json!({})).await.unwrap();
         assert_eq!(context["tools"], json!(["research_alias"]));
         assert_eq!(context["childAgent"], false);
-        assert!(context.get("childAgentPromptVersion").is_none());
         let error = self
             .host
             .child_agent(

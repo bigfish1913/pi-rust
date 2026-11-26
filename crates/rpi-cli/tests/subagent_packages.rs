@@ -215,7 +215,6 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
     assert!(events.lock().unwrap().iter().any(|event|matches!(event,AgentEvent::ToolExecutionUpdate{tool_name,..} if tool_name=="delegate_task")));
     let context = host.get_execution_context(json!({})).await.unwrap();
     assert_eq!(context["model"]["id"], provider.default_model().id);
-    assert_eq!(context["childAgentPromptVersion"], 1);
     assert_eq!(context["cwd"], temp.path().to_string_lossy().as_ref());
     assert!(context.get("apiKey").is_none());
     assert!(context["model"].get("headers").is_none());

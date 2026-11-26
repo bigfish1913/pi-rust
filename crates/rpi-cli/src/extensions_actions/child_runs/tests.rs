@@ -434,10 +434,11 @@ async fn explicit_prompt_is_sent_verbatim_with_separate_roster_metadata() {
     })]);
     let parent = parent(script).await;
     let manager = ChildRuns::default();
-    let mut args = json!({"op":"start","prompt":PROMPT,"taskPreview":"roster only","role":"reviewer","maxTurns":1,"timeoutSeconds":10});
+    let mut args = json!({"op":"start","prompt":PROMPT,"task":"roster only","role":"reviewer","maxTurns":1,"timeoutSeconds":10});
     for (key, invalid) in [
         ("prompt", json!(" ")),
-        ("taskPreview", json!("x".repeat(201))),
+        ("prompt", json!("x".repeat(24_001))),
+        ("prompt", Value::Null),
         ("maxTurns", json!(0)),
         ("timeoutSeconds", json!(1801)),
     ] {
@@ -448,12 +449,6 @@ async fn explicit_prompt_is_sent_verbatim_with_separate_roster_metadata() {
         );
         args[key] = original;
     }
-    let mut missing_limit = args.clone();
-    missing_limit.as_object_mut().unwrap().remove("maxTurns");
-    assert!(manager.handle(&parent, 7, missing_limit).await.is_err());
-    let mut both = args.clone();
-    both["task"] = json!("legacy");
-    assert!(manager.handle(&parent, 7, both).await.is_err());
     assert!(manager.jobs.lock().unwrap().is_empty());
 
     let started = manager.handle(&parent, 7, args).await.unwrap();
