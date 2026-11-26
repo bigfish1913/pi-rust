@@ -232,7 +232,25 @@ async fn probe() {
         "{beta_history}"
     );
     serve.await.unwrap();
+    b.0.get_mut().shutdown().await.unwrap();
+    let mut final_frames = String::new();
+    b.0.read_to_string(&mut final_frames).await.unwrap();
     drop(b);
+
+    let mut reopened = Client::connect(&socket).await;
+    reopened
+        .send(json!({"version": 1, "workspace": workspace, "rpc": {
+            "session_id": b_opened["session_id"], "no_session": false, "native_durable": false,
+            "snapshots": true, "permission_gate": false, "bypass": false
+        }}))
+        .await;
+    let reply = reopened.next().await;
+    assert_eq!(reply["type"], "opened", "{reply}");
+    assert_eq!(reply["host_pid"], b_opened["host_pid"]);
+    assert_eq!(reply["session_id"], b_opened["session_id"]);
+    reopened.until(|frame| frame["type"] == "ready").await;
+    assert_eq!(reopened.history().await, beta_history);
+    drop(reopened);
     daemon.kill().await.unwrap();
 }
 

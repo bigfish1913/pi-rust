@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rpi_harness::agent_harness::AgentLane;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
@@ -640,32 +641,49 @@ async fn serve_session(
         )
         .await;
     }
-    if let Some(reason) = crate::session::dispatch_session_event_async(
+    let reply = match crate::session::dispatch_session_event_async(
         &context,
         rpi_plugin_sdk::EventTag::BeforeTuiStart,
     )
     .await
     {
-        return write_json(&mut output, &OpenReply::Error { message: reason }).await;
-    }
-    let opened = OpenReply::Opened {
-        host_pid: std::process::id(),
-        agent_id: uuid::Uuid::new_v4().to_string(),
-        session_id: harness.session_id(),
+        Some(message) => OpenReply::Error { message },
+        None => OpenReply::Opened {
+            host_pid: std::process::id(),
+            agent_id: uuid::Uuid::new_v4().to_string(),
+            session_id: harness.session_id(),
+        },
     };
-    write_json(&mut output, &opened).await?;
-    // Keep the session's owned resources alive through RPC run settlement.
-    crate::modes::rpc_host_session(
-        &harness,
-        events,
-        models,
-        &context,
-        home,
-        idle_timeout,
-        (input, SocketWriter(output)),
-    )
-    .await;
-    Ok(())
+    let opened = write_json(&mut output, &reply).await;
+    // Keep the socket's write half alive through settlement so a client that
+    // waits for EOF can reopen the same transcript after the writer is retired.
+    let output = Arc::new(output);
+    if opened.is_ok() && matches!(reply, OpenReply::Opened { .. }) {
+        crate::modes::rpc_host_session(
+            &harness,
+            events,
+            models,
+            &context,
+            home,
+            idle_timeout,
+            (input, SocketWriter(output.clone())),
+        )
+        .await;
+    }
+    harness
+        .wait_for_idle()
+        .await
+        .map_err(|error| error.to_string())?;
+    harness.close().await.map_err(|error| error.to_string())?;
+    harness
+        .retire_runtime_bindings()
+        .await
+        .map_err(|error| error.to_string())?;
+    context.plugin_resources.close_for_local_rpc().await?;
+    let storage = harness.session().storage();
+    storage.drain().await;
+    storage.release_writer_lease();
+    opened
 }
 
 fn validate_workspace(workspace: &Path) -> Result<PathBuf, String> {
@@ -680,12 +698,22 @@ fn validate_workspace(workspace: &Path) -> Result<PathBuf, String> {
 
 // The existing RPC writer calls this only on its blocking worker. The timeout
 // lets it fail the transport if a disconnected or stalled client cannot drain it.
-struct SocketWriter(OwnedWriteHalf);
+struct SocketWriter(Arc<OwnedWriteHalf>);
 
 impl Write for SocketWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        tokio::runtime::Handle::current()
-            .block_on(async { timeout(WRITE_TIMEOUT, self.0.write(bytes)).await? })
+        tokio::runtime::Handle::current().block_on(async {
+            timeout(WRITE_TIMEOUT, async {
+                loop {
+                    self.0.writable().await?;
+                    match self.0.try_write(bytes) {
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                        result => return result,
+                    }
+                }
+            })
+            .await?
+        })
     }
 
     fn flush(&mut self) -> io::Result<()> {

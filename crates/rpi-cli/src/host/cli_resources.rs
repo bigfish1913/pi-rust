@@ -75,8 +75,15 @@ impl CliPluginResources {
             leases,
         })
     }
-    // Staged until the remaining CLI tool/process cleanup has real evidence.
-    // Only this subset is settled here; never use it alone as a full CLI cleanup.
+    #[cfg(unix)]
+    pub(crate) async fn close_for_local_rpc(&self) -> Result<(), String> {
+        self.close_plugins_and_leases()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    // Retires the native plugin resources once the owning frontend and its
+    // operations have joined.
     #[allow(dead_code)]
     pub(super) async fn close_plugins_and_leases(&self) -> Result<(), InProcessError> {
         self.closing.store(true, Ordering::SeqCst);
