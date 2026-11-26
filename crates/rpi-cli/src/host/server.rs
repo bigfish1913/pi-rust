@@ -5,24 +5,29 @@
 //! daemon's fixed native authority and durable coordinator; legacy ops stay off.
 
 use super::{
+    area_rpc::SessionRoutes,
     client::{encode_frame, read_frame, write_frame},
     daemon::DaemonAdministration,
     protocol::*,
     service::HostService,
     CatalogError,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     net::{UnixListener, UnixStream},
     task::{JoinHandle, JoinSet},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
+
+type SessionRoutesByAgent = BTreeMap<super::AgentId, Option<Arc<tokio::sync::Mutex<()>>>>;
 
 #[derive(Clone, Default)]
 struct ControlAuthority {
     administration: Option<DaemonAdministration>,
     mini: Option<super::mini_control::MiniControl>,
-    session_rpc: Option<super::area_rpc::Session>,
+    session_rpc: Arc<SessionRoutesByAgent>,
+    idle_timeout: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -150,9 +155,15 @@ pub(super) fn bind_endpoint(
 pub struct ControlServer {
     welcome: Welcome,
     stop: CancellationToken,
-    // true only when this listener observed the current owner's completed Stop.
-    task: Option<JoinHandle<Result<bool, ServerError>>>,
-    terminal: Option<Result<bool, ServerError>>,
+    task: Option<JoinHandle<Result<ControlExit, ServerError>>>,
+    terminal: Option<Result<ControlExit, ServerError>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlExit {
+    Stopped,
+    AdministrativeStop,
+    Idle,
 }
 impl ControlServer {
     pub async fn bind(config: ControlConfig, service: HostService) -> Result<Self, ServerError> {
@@ -163,29 +174,72 @@ impl ControlServer {
         service: HostService,
         administration: Option<DaemonAdministration>,
     ) -> Result<Self, ServerError> {
-        Self::bind_with_controls(config, service, administration, None, None, None).await
+        Self::bind_with_controls(
+            config,
+            service,
+            administration,
+            None,
+            None,
+            SessionRoutes::default(),
+            None,
+        )
+        .await
     }
-    pub(crate) async fn bind_with_controls(
+    pub(super) async fn bind_with_controls(
         config: ControlConfig,
         service: HostService,
         administration: Option<DaemonAdministration>,
         mini: Option<super::mini_control::MiniControl>,
         inherited: Option<std::os::unix::net::UnixListener>,
-        session_rpc_agent: Option<super::AgentId>,
+        routes: SessionRoutes,
+        idle_timeout: Option<Duration>,
     ) -> Result<Self, ServerError> {
         config.validate()?;
-        let session_rpc = match session_rpc_agent {
-            Some(id) => Some(
-                super::area_rpc::Session::open(&service, id, config.host_id)
-                    .await
-                    .map_err(|_| ServerError::InvalidConfiguration)?,
-            ),
-            None => None,
-        };
+        if routes.restore_on_attach && administration.is_none() {
+            return Err(ServerError::InvalidConfiguration);
+        }
+        for &id in &routes.agents {
+            let record = service
+                .catalog()
+                .get(id)
+                .await
+                .map_err(|_| ServerError::InvalidConfiguration)?;
+            if record.spec.mode != super::AgentMode::Persistent {
+                return Err(ServerError::InvalidConfiguration);
+            }
+            // Set up an already-live emitter so a control-submitted run can
+            // have observers even if no Session peer was present at admission.
+            // A short idle deadline may win during startup. In that case the
+            // allowlisted route stays available for a later explicit Restore.
+            match service.ordinary_client(id) {
+                Ok(client) => match client.area_session(false).await {
+                    Ok(_) | Err(super::ordinary::BackendError::Closed) => (),
+                    Err(_) => return Err(ServerError::InvalidConfiguration),
+                },
+                Err(
+                    super::service::ServiceError::Busy | super::service::ServiceError::NotLoaded,
+                ) => (),
+                Err(_) => return Err(ServerError::InvalidConfiguration),
+            }
+        }
         let authority = ControlAuthority {
             administration,
             mini,
-            session_rpc,
+            session_rpc: Arc::new(
+                routes
+                    .agents
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            id,
+                            routes
+                                .restore_on_attach
+                                .then(|| Arc::new(tokio::sync::Mutex::new(()))),
+                        )
+                    })
+                    .collect(),
+            ),
+            idle_timeout,
         };
         let (listener, lease) = match inherited {
             Some(listener) => (listener, None),
@@ -254,7 +308,10 @@ impl ControlServer {
         &self.welcome
     }
     pub fn stopped_by_administration(&self) -> bool {
-        matches!(self.terminal, Some(Ok(true)))
+        matches!(self.terminal, Some(Ok(ControlExit::AdministrativeStop)))
+    }
+    pub(super) fn stopped_for_idleness(&self) -> bool {
+        matches!(self.terminal, Some(Ok(ControlExit::Idle)))
     }
     /// Cancellation-safe: abandoning this wait does not discard the task handle.
     pub async fn wait(&mut self) -> Result<(), ServerError> {
@@ -263,7 +320,7 @@ impl ControlServer {
         }
         let result = match self.task.as_mut() {
             Some(task) => task.await.unwrap_or(Err(ServerError::TaskStopped)),
-            None => Ok(false),
+            None => Ok(ControlExit::Stopped),
         };
         self.task.take();
         self.terminal = Some(result);
@@ -288,24 +345,55 @@ async fn serve(
     authority: ControlAuthority,
     welcome: Welcome,
     stop: CancellationToken,
-) -> Result<bool, ServerError> {
+) -> Result<ControlExit, ServerError> {
     let native_stop = authority
         .administration
         .as_ref()
         .map(DaemonAdministration::stop_completed)
         .unwrap_or_default();
     let mut connections = JoinSet::new();
+    let mut idle = authority.idle_timeout.zip(service.empty_since());
+    let mut disconnected_at = Instant::now();
     let result = loop {
+        let deadline = idle.as_mut().and_then(|(timeout, empty_since)| {
+            empty_since
+                .borrow_and_update()
+                .map(|since| since.max(disconnected_at) + *timeout)
+        });
+        let idle_expired = async {
+            if let Some(deadline) = deadline {
+                tokio::time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             biased;
-            _ = native_stop.cancelled() => break Ok(true),
-            _ = stop.cancelled() => break Ok(false),
-            Some(_) = connections.join_next(), if !connections.is_empty() => {},
+            _ = native_stop.cancelled() => break Ok(ControlExit::AdministrativeStop),
+            _ = stop.cancelled() => break Ok(ControlExit::Stopped),
+            Some(_) = connections.join_next(), if !connections.is_empty() => {
+                if connections.is_empty() {
+                    disconnected_at = Instant::now();
+                }
+            }
+            _ = async { if let Some((_, empty_since)) = idle.as_mut() { let _ = empty_since.changed().await; } }, if idle.is_some() => {},
             accepted = listener.accept() => {
                 let (stream, _) = match accepted { Ok(pair) => pair, Err(_) => break Err(ServerError::ListenerStopped) };
                 // No task, frame allocation, or auth work for excess connections.
                 if connections.len() >= config.max_connections { drop(stream); continue; }
                 connections.spawn(connection(stream, config.clone(), service.clone(), authority.clone(), welcome.clone(), native_stop.clone()));
+            }
+            _ = idle_expired, if connections.is_empty() => {
+                let (timeout, _) = idle.as_ref().expect("idle deadline requires a timeout");
+                match service.shutdown_if_idle(*timeout).await {
+                    Ok(true) => break Ok(ControlExit::Idle),
+                    Ok(false) => disconnected_at = Instant::now(),
+                    Err(error) => {
+                        use std::io::Write;
+                        let _ = writeln!(std::io::stderr().lock(), "Host idle shutdown failed: {error}");
+                        idle = None;
+                    }
+                }
             }
         }
     };
@@ -313,7 +401,7 @@ async fn serve(
     // Idle readers/handshakes observe native_stop; already-dispatched exchanges
     // may flush within their ORIGINAL total deadline. No new grace per byte,
     // waiter or connection, and no dependency on a peer reading the reply.
-    if result != Ok(true) {
+    if result != Ok(ControlExit::AdministrativeStop) {
         // External stop/listener failure may abort waits, never owned jobs.
         connections.abort_all();
     }
@@ -368,12 +456,17 @@ async fn connection(
     };
     match handshake_result {
         Ok(Ok(Some(agent))) => {
-            if let Some(session) = authority
-                .session_rpc
-                .as_ref()
-                .filter(|s| s.agent_id == agent)
-            {
-                session.serve(stream, native_stop).await;
+            if let Some(gate) = authority.session_rpc.get(&agent) {
+                let restore = gate.clone().zip(authority.administration.clone());
+                let session = tokio::select! {
+                    biased;
+                    _ = native_stop.cancelled() => return,
+                    result = tokio::time::timeout(config.handshake_timeout,
+                        super::area_rpc::Session::open(&service, agent, config.host_id, restore)) => result,
+                };
+                if let Ok(Ok(session)) = session {
+                    session.serve(stream, native_stop).await;
+                }
             }
             return;
         }

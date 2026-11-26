@@ -230,7 +230,31 @@ settings、durable、trust、Session、Provider、DLL 初始化之前分流。
 
 - client detach/EOF、等待 future 被取消、IPC server stop，均不等于关闭 Agent。
 - SIGINT/SIGTERM 请求 service 原生协作取消与结算，先排空后端、清单和单实例锁，再确认
-  control 连接任务结束并清理 socket。不强杀 backend，不伪造 shutdown grace 成功。
+  control 连接任务结束并清理 socket。配置 `host.default_timeouts.shutdown_grace_ms` 后，
+  信号停机与管理 Stop 会在各 Persistent Agent 达到宽限期时报告仍在结算的 owner，
+  并继续等待原生关闭完成。
+- 命名 area 首次配置的 `idleTimeoutMs` 和 `disconnectedTimeoutMs` 写入私有 Host 默认期限。
+  启用任一期限或 `restoreOnAttach` 时，生成的管理策略允许对默认成员及预声明成员执行 Restore 和 Cancel。
+- Persistent Agent 可配置 `host.default_timeouts.idle_ms` 或 `disconnected_ms`，以及对应的
+  `host.hard_timeout_limits`。空闲期限从加载或真实运行结算后开始。断连期限仅适用于配置了
+  area Session 路由的 Agent，从该 Agent 最后一个已认证 Session peer 离开时开始。新 peer 清除
+  断连期限，两个期限均要求当前 owner 已结算且无在线 Session peer。常规控制连接不计入每个
+  Agent 的 Session peer 数。
+- 到期在原生 admission 和 catalog lifecycle 路径上复核当前 owner、Harness 与 Session 未结事项。
+  Harness、扩展和 Session writer 清理完成后发布 `Unloaded`，释放容量并保留恢复成员资格。
+  启用任一期限需有管理 Restore 权限。管理 Restore 使用 frozen profile 和当前 revision 恢复
+  原 Agent、Session 与历史。后续认证握手查询当前 owner，并使用该 owner 独立的事件流。管理
+  Close 结束旧 owner 的连接，也可将 `Unloaded` 转为 `Closed` 并排除后续启动恢复。
+- 命名 area 可在首次初始化时开启 `restoreOnAttach`，对应私有配置 `restore_on_attach`，缺省关闭。
+  通过认证的 Session 握手按当前 revision 和冻结 profile 恢复 `Unloaded`。同一成员的并发挂接
+  共用 owner，装配时保留第一个 Session peer。该路径沿用 Restore 授权和容量、writer 检查，
+  遇到已准备的管理事务、被 Close 排除的成员或 `Closed` 状态时保留管理状态。自动挂接不写管理回执。
+- area 终端的 `/thinking <level>` 和 stdio RPC 的 `set_thinking_level` 使用普通 RPC 的档位解析。
+  在当前 owner 的控制锁内检查 Agent 已空闲并应用设置，然后向该 owner 的 Session peers 发出
+  `thinking_level_changed`。变更从后续提示生效，卸载后恢复使用冻结 profile 的档位。
+- `host.host_idle_timeout_ms` 要求 owner 表和控制端连接连续为空。到期先在独占 lifecycle 锁内
+  复核 owner 和 catalog 驻留状态，再关闭 catalog、监听器和 socket。daemon 的正常退出
+  不消耗监督进程的崩溃重启预算。
 - 原生关闭失败保留 owner/容量/catalog singleton 和查询端点，status 显示 stopping；下个
   信号或 Rust API 调用可显式重试。最终 Closed commit 失败时 writer 可能已经释放，
   保留管理槽不代表仍持 writer。完整 reconciliation 管理 API 尚未实现。

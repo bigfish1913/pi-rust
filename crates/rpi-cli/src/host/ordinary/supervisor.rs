@@ -20,7 +20,10 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::{
+    sync::{Mutex, OwnedMutexGuard},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -47,6 +50,52 @@ pub(super) struct Control {
     last_report: Option<Arc<BackendReport>>,
 }
 
+#[derive(Default)]
+pub(in crate::host) struct ReclaimClock {
+    idle: Option<Duration>,
+    disconnected: Option<Duration>,
+    idle_since: Option<Instant>,
+    disconnected_since: Option<Instant>,
+    #[cfg(unix)]
+    peers: usize,
+}
+
+impl ReclaimClock {
+    pub(in crate::host) fn deadline(&self) -> Option<Instant> {
+        let idle_since = self.idle_since?;
+        #[cfg(unix)]
+        if self.peers != 0 {
+            return None;
+        }
+        let idle = self.idle.map(|timeout| idle_since + timeout);
+        let disconnected = self
+            .disconnected
+            .zip(self.disconnected_since)
+            .map(|(timeout, since)| (since + timeout).max(idle_since));
+        idle.into_iter().chain(disconnected).min()
+    }
+}
+
+#[cfg(unix)]
+pub(in crate::host) struct AreaPeer {
+    pub(in crate::host) closed: CancellationToken,
+    clock: Option<watch::Sender<ReclaimClock>>,
+}
+
+#[cfg(unix)]
+impl Drop for AreaPeer {
+    fn drop(&mut self) {
+        if let Some(clock) = &self.clock {
+            clock.send_modify(|state| {
+                state.peers -= 1;
+                if state.peers == 0 {
+                    state.disconnected_since = Some(Instant::now());
+                }
+            });
+        }
+    }
+}
+
 pub(super) struct Backend {
     pub control: Arc<Mutex<Control>>,
     close_gate: Arc<Mutex<()>>,
@@ -54,9 +103,14 @@ pub(super) struct Backend {
     harness: AgentHarness,
     #[cfg(unix)]
     area_events: std::sync::OnceLock<super::super::area_rpc::Events>,
+    #[cfg(unix)]
+    area_closed: CancellationToken,
     storage: JsonlSessionStorage,
     extensions: Option<Arc<super::super::NativeExtensionCustody>>,
     limits: OrdinaryLimits,
+    run_timeout: Option<Duration>,
+    pub(super) shutdown_grace: Option<Duration>,
+    pub(super) reclaim: Option<watch::Sender<ReclaimClock>>,
     retiring: AtomicBool,
     closed: AtomicBool,
 }
@@ -67,6 +121,7 @@ pub(super) async fn restore(
     guard: CatalogGuard,
     limits: OrdinaryLimits,
     binding: OrdinaryBinding,
+    attach: bool,
 ) -> BackendResult<OrdinaryAgent> {
     let record = catalog.get(id).await?;
     if record.spec.mode != AgentMode::Persistent
@@ -81,7 +136,16 @@ pub(super) async fn restore(
             "a resolved model reference is required",
         ));
     }
-    let record = catalog.transition(id, guard, AgentState::Starting).await?;
+    let rollback = if record.state == AgentState::Unloaded {
+        AgentState::Unloaded
+    } else {
+        AgentState::Closed
+    };
+    let record = if attach {
+        catalog.begin_attach_restore(id, guard).await?
+    } else {
+        catalog.transition(id, guard, AgentState::Starting).await?
+    };
     match build(&catalog, &record, limits, binding).await {
         Ok(backend) => Ok(OrdinaryAgent { inner: backend }),
         Err(error @ BackendError::ExtensionUnsettled(_)) => {
@@ -93,7 +157,7 @@ pub(super) async fn restore(
             // build has drained/released any acquired writer before this rollback.
             // A failed rollback retains the reservation rather than claiming free capacity.
             catalog
-                .transition(id, catalog.guard(&record), AgentState::Closed)
+                .transition(id, catalog.guard(&record), rollback)
                 .await?;
             Err(error)
         }
@@ -252,6 +316,15 @@ async fn build_inner(
     binding: OrdinaryBinding,
     extensions: Option<Arc<super::super::NativeExtensionCustody>>,
 ) -> BackendResult<Arc<Backend>> {
+    let timeouts = catalog.resolve_timeouts(record.spec.timeouts)?;
+    let run_timeout = timeouts
+        .run
+        .milliseconds
+        .map(|ms| Duration::from_millis(ms.get()));
+    let shutdown_grace = timeouts
+        .shutdown_grace
+        .milliseconds
+        .map(|ms| Duration::from_millis(ms.get()));
     let PreparedNativeBinding {
         env,
         storage: prepared,
@@ -351,6 +424,25 @@ async fn build_inner(
             return Err(error.into());
         }
     };
+    let idle_timeout = timeouts
+        .idle
+        .milliseconds
+        .map(|ms| Duration::from_millis(ms.get()));
+    let disconnected = timeouts
+        .disconnected
+        .milliseconds
+        .map(|ms| Duration::from_millis(ms.get()));
+    let reclaim = (idle_timeout.is_some() || disconnected.is_some()).then(|| {
+        let idle_since =
+            (state == AgentState::Idle && harness.pending_resume().is_none()).then(Instant::now);
+        watch::channel(ReclaimClock {
+            idle: idle_timeout,
+            disconnected,
+            idle_since,
+            ..Default::default()
+        })
+        .0
+    });
     Ok(Arc::new(Backend {
         control: Arc::new(Mutex::new(Control {
             record: idle,
@@ -368,9 +460,14 @@ async fn build_inner(
         harness,
         #[cfg(unix)]
         area_events: std::sync::OnceLock::new(),
+        #[cfg(unix)]
+        area_closed: CancellationToken::new(),
         storage,
         extensions,
         limits,
+        run_timeout,
+        shutdown_grace,
+        reclaim,
         retiring: AtomicBool::new(false),
         closed: AtomicBool::new(false),
     }))
@@ -433,6 +530,9 @@ fn validate_bindings(
 impl Backend {
     pub fn retire(&self) {
         self.retiring.store(true, Ordering::Release);
+        if let Some(clock) = &self.reclaim {
+            clock.send_modify(|state| state.idle_since = None);
+        }
     }
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
@@ -616,6 +716,9 @@ impl Backend {
                 OrdinaryOperation::ResumeDeferred(_) => control.deferred_request_id.clone(),
                 _ => None,
             });
+        if let Some(clock) = &self.reclaim {
+            clock.send_modify(|state| state.idle_since = None);
+        }
         control.active = Some(Active {
             id,
             submitted_request_id,
@@ -691,6 +794,9 @@ impl Backend {
             // Exactly-once admission: the same request id never executes twice.
             Ok(OrdinaryOutput::AlreadyAdmitted)
         } else {
+            let deadline = self
+                .run_timeout
+                .map(|limit| tokio::time::Instant::now() + limit);
             // Keep polling the real Harness future after signalling cancellation.
             // Do not abort/drop it, even while image preparation/recovery precedes RunStart.
             let execute = async {
@@ -727,7 +833,14 @@ impl Backend {
             let execute = AssertUnwindSafe(execute).catch_unwind();
             tokio::pin!(execute);
             let request_cancel = async {
-                cancel.cancelled().await;
+                if let Some(deadline) = deadline {
+                    tokio::select! {
+                        () = cancel.cancelled() => (),
+                        () = tokio::time::sleep_until(deadline) => cancel.cancel(),
+                    }
+                } else {
+                    cancel.cancelled().await;
+                }
                 loop {
                     if let Some(active) = self.harness.active_operation_snapshot() {
                         if self
@@ -834,6 +947,13 @@ impl Backend {
             catalog_error,
         });
         control.last_report = Some(report.clone());
+        if let Some(clock) = &self.reclaim {
+            let since = (control.record.state == AgentState::Idle
+                && self.ready(&control).is_ok()
+                && self.harness.pending_resume().is_none())
+            .then(Instant::now);
+            clock.send_modify(|state| state.idle_since = since);
+        }
         #[cfg(unix)]
         if let Some(events) = self.area_events.get() {
             events.settled(&report, self.harness.pending_resume().is_some());
@@ -875,6 +995,13 @@ impl Backend {
                 if let Some(active) = &control.active {
                     active.cancel.cancel();
                 }
+            }
+        }
+        if let Some(clock) = &self.reclaim {
+            if result.is_ok() || control.uncertain {
+                // A queued message can be consumed by a future run. Its
+                // settlement will reconsider the idle deadline.
+                clock.send_modify(|state| state.idle_since = None);
             }
         }
         // Keep the control guard until the cancellation-safe Harness queue write
@@ -965,26 +1092,50 @@ impl Backend {
     }
 
     #[cfg(unix)]
-    pub async fn install_area_events(
+    pub async fn area_session(
         &self,
-        events: super::super::area_rpc::Events,
-    ) -> BackendResult<()> {
+        attach: bool,
+    ) -> BackendResult<(super::super::area_rpc::Events, Option<AreaPeer>)> {
+        let control = self.control.lock().await;
+        self.ready(&control)?;
         if self.extensions.is_some() {
             return Err(BackendError::Binding(
                 "Host area RPC requires a native Agent without extension hooks",
             ));
         }
-        self.area_events
-            .set(events.clone())
-            .map_err(|_| BackendError::Binding("Host area event stream already installed"))?;
-        self.harness
-            .set_agent_emitter(Some(Arc::new(events)))
-            .await?;
-        Ok(())
+        let events = match self.area_events.get() {
+            Some(events) => events.clone(),
+            None => {
+                let events = super::super::area_rpc::Events::new();
+                self.harness
+                    .set_agent_emitter(Some(Arc::new(events.clone())))
+                    .await?;
+                self.area_events.set(events.clone()).unwrap_or_else(|_| {
+                    unreachable!("area events are installed under the control lock")
+                });
+                events
+            }
+        };
+        // Connection admission and unload consult the clock under the same
+        // control lock. The connection holds no native owner or writer.
+        let peer = attach.then(|| {
+            let clock = self.reclaim.clone();
+            if let Some(clock) = &clock {
+                clock.send_modify(|state| {
+                    state.peers += 1;
+                    state.disconnected_since = None;
+                });
+            }
+            AreaPeer {
+                closed: self.area_closed.clone(),
+                clock,
+            }
+        });
+        Ok((events, peer))
     }
 
     #[cfg(unix)]
-    pub async fn area_query(
+    pub async fn area_command(
         &self,
         kind: &str,
         msg: &serde_json::Value,
@@ -1012,6 +1163,24 @@ impl Backend {
             "get_available_thinking_levels" => {
                 Ok(crate::modes::rpc_get_available_thinking_levels(&lane).await)
             }
+            "set_thinking_level" => {
+                // Serialize the live setting with run admission and owner close.
+                let control = self.control.lock().await;
+                self.ready(&control).map_err(|error| error.to_string())?;
+                if control.record.state != AgentState::Idle
+                    || control.active.is_some()
+                    || control.deferred.is_some()
+                    || control.uncertain
+                    || harness.pending_resume().is_some()
+                {
+                    return Err(BackendError::Busy.to_string());
+                }
+                let result = crate::modes::rpc_set_thinking_level(&lane, msg).await?;
+                if let Some(events) = self.area_events.get() {
+                    events.thinking_changed(&result["thinkingLevel"]);
+                }
+                Ok(result)
+            }
             _ => Err("command is unavailable for this Host area".into()),
         }
     }
@@ -1021,19 +1190,56 @@ impl Backend {
     }
 
     pub async fn close(&self) -> BackendResult<()> {
-        self.close_inner(None).await
+        self.close_inner(None, false).await
     }
 
     pub async fn close_guarded(&self, guard: CatalogGuard) -> BackendResult<()> {
-        self.close_inner(Some(guard)).await
+        self.close_inner(Some(guard), false).await
     }
 
-    async fn close_inner(&self, guard: Option<CatalogGuard>) -> BackendResult<()> {
+    pub(super) async fn unload_idle(&self) -> BackendResult<()> {
+        self.close_inner(None, true).await
+    }
+
+    async fn close_inner(
+        &self,
+        guard: Option<CatalogGuard>,
+        unload_idle: bool,
+    ) -> BackendResult<()> {
         let _closing = self.close_gate.try_lock().map_err(|_| BackendError::Busy)?;
-        if self.is_closed() && guard.is_none() {
+        if self.is_closed() && guard.is_none() && !unload_idle {
             return Ok(());
         }
         let mut control = self.control.lock().await;
+        let guard = if unload_idle {
+            let clock = self.reclaim.as_ref().ok_or(BackendError::Busy)?;
+            let elapsed = clock
+                .borrow()
+                .deadline()
+                .is_some_and(|deadline| deadline <= Instant::now());
+            if !elapsed
+                || self.ready(&control).is_err()
+                || control.record.state != AgentState::Idle
+                || control.active.is_some()
+                || control.deferred.is_some()
+                || control.uncertain
+            {
+                return Err(BackendError::Busy);
+            }
+            if self.harness.active_operation_snapshot().is_some()
+                || self.harness.pending_resume().is_some()
+                || !self.harness.unsaved_messages().is_empty()
+                || AgentHarness::validate_resource_transition_idle(self.harness.session())
+                    .await
+                    .is_err()
+            {
+                clock.send_modify(|state| state.idle_since = None);
+                return Err(BackendError::Busy);
+            }
+            Some(self.catalog.guard(&control.record))
+        } else {
+            guard
+        };
         if let Some(guard) = guard {
             self.validate_guard(&control, guard)?;
             if self.is_closed() || control.record.state == AgentState::Closing {
@@ -1055,16 +1261,21 @@ impl Backend {
                 // Administrative admission must win the catalog CAS BEFORE any
                 // retire/cancel flag changes. An out-of-band catalog transition
                 // must not turn a stale request into unconditional shutdown.
-                let record = self
-                    .catalog
-                    .transition(control.record.spec.id, guard, AgentState::Closing)
-                    .await
-                    .map_err(|error| match error {
-                        CatalogError::EpochConflict | CatalogError::RevisionConflict { .. } => {
-                            BackendError::GuardRejected(Arc::new(error))
-                        }
-                        other => BackendError::from(other),
-                    })?;
+                let id = control.record.spec.id;
+                let result = if unload_idle {
+                    self.catalog.begin_idle_unload(id, guard).await
+                } else {
+                    self.catalog
+                        .transition(id, guard, AgentState::Closing)
+                        .await
+                };
+                let record = result.map_err(|error| match error {
+                    CatalogError::LifecycleBusy if unload_idle => BackendError::Busy,
+                    CatalogError::EpochConflict | CatalogError::RevisionConflict { .. } => {
+                        BackendError::GuardRejected(Arc::new(error))
+                    }
+                    other => BackendError::from(other),
+                })?;
                 control.record = record;
             }
         }
@@ -1117,7 +1328,7 @@ impl Backend {
             control.fault = Some(error.clone());
             return Err(error);
         }
-        // Actual cleanup precedes the Closed commit and its capacity release.
+        // Actual cleanup precedes the terminal commit and its capacity release.
         // If that commit fails, keep a conservative reservation; retries skip the
         // already-closed Harness and only finish publishing the catalog fact.
         if !control.cleaned {
@@ -1137,7 +1348,11 @@ impl Backend {
             .transition(
                 control.record.spec.id,
                 self.catalog.guard(&control.record),
-                AgentState::Closed,
+                if unload_idle {
+                    AgentState::Unloaded
+                } else {
+                    AgentState::Closed
+                },
             )
             .await
         {
@@ -1152,6 +1367,8 @@ impl Backend {
         control.active = None;
         control.deferred_request_id = None;
         self.closed.store(true, Ordering::Release);
+        #[cfg(unix)]
+        self.area_closed.cancel();
         Ok(())
     }
 }

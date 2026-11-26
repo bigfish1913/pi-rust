@@ -548,6 +548,17 @@ async fn daemon_fixture_with_timeout(
     crate::host::daemon::HostDaemon,
     crate::host::client::ConnectionConfig,
 ) {
+    daemon_fixture_with_config(HostConfig::default(), request_timeout).await
+}
+
+async fn daemon_fixture_with_config(
+    host: HostConfig,
+    request_timeout: Duration,
+) -> (
+    Fixture,
+    crate::host::daemon::HostDaemon,
+    crate::host::client::ConnectionConfig,
+) {
     use crate::host::{
         client::ConnectionConfig,
         daemon::HostDaemon,
@@ -564,7 +575,7 @@ async fn daemon_fixture_with_timeout(
     };
     let daemon = HostDaemon::open(
         fixture.root.path().join("host"),
-        HostConfig::default(),
+        host,
         ControlConfig {
             socket_path: connection.socket_path.clone(),
             host_id: connection.host_id,
@@ -578,6 +589,404 @@ async fn daemon_fixture_with_timeout(
     .unwrap();
     fixture.catalog = daemon.service().catalog().clone();
     (fixture, daemon, connection)
+}
+
+#[tokio::test]
+async fn persistent_idle_unload_waits_for_native_settlement_and_preserves_restore_identity() {
+    let fixture = Fixture::new(1).await;
+    let service = HostService::new(fixture.catalog.clone());
+    let provider = FauxProvider::new(
+        FauxScript::new()
+            .with_tool_call("gate", serde_json::json!({}))
+            .with_text("saved-before-unload"),
+    );
+    let gate = Gate::new();
+    let mut spec = fixture.spec("idle-unload", &provider, true).await;
+    let idle_ms = std::num::NonZeroU64::new(500).unwrap();
+    spec.timeouts.idle = crate::host::TimeoutOverride::After(idle_ms);
+    let record = fixture.catalog.register(spec).await.unwrap();
+    let id = record.spec.id;
+    let env = OsExecutionEnv::with_cwd(record.spec.launch.cwd.clone());
+    let path = record.spec.session.as_ref().unwrap().path.to_str().unwrap();
+    let old_client = managed_restore(
+        &service,
+        &fixture,
+        &record,
+        binder(provider.clone(), Some(gate.clone()), None),
+    )
+    .await;
+    let ticket = old_client.submit(prompt("keep-my-session")).await.unwrap();
+    permits(&gate.entered, 1).await;
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    assert_eq!(
+        fixture.catalog.get(id).await.unwrap().state,
+        AgentState::Running
+    );
+    assert_eq!(fixture.catalog.status().await.unwrap().resident, 1);
+    assert!(env.try_acquire_writer_lease(path).await.is_err());
+
+    gate.release.add_permits(1);
+    complete(&ticket).await;
+    let idle = fixture.catalog.get(id).await.unwrap();
+    assert_eq!(idle.state, AgentState::Idle);
+    let saved = bytes(&record);
+    assert!(String::from_utf8_lossy(&saved).contains("saved-before-unload"));
+    wait_phase(&service, id, None).await;
+    let unloaded = fixture.catalog.get(id).await.unwrap();
+    assert_eq!(unloaded.state, AgentState::Unloaded);
+    assert_eq!(unloaded.spec, record.spec);
+    assert_eq!(fixture.catalog.status().await.unwrap().resident, 0);
+    assert!(env.try_acquire_writer_lease(path).await.unwrap().is_some());
+
+    let result = service
+        .restore_ordinary(
+            id,
+            fixture.catalog.guard(&unloaded),
+            OrdinaryLimits::default(),
+            Box::new(|_, _, _| Err(BackendError::Binding("test restore binding failure"))),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(ServiceError::Backend(BackendError::Binding(_)))
+    ));
+    let retry = fixture.catalog.get(id).await.unwrap();
+    assert_eq!(retry.state, AgentState::Unloaded);
+    assert!(service.phase(id).is_none());
+    let restored = managed_restore(
+        &service,
+        &fixture,
+        &retry,
+        binder(provider, Some(gate), None),
+    )
+    .await;
+    assert!(old_client.snapshot().await.is_err());
+    assert!(restored.snapshot().await.unwrap().active.is_none());
+    assert_eq!(bytes(&record), saved);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn persistent_idle_unload_preserves_pending_next_run_input() {
+    let fixture = Fixture::new(1).await;
+    let service = HostService::new(fixture.catalog.clone());
+    let provider = FauxProvider::new(FauxScript::new());
+    let mut spec = fixture.spec("idle-next-run", &provider, false).await;
+    spec.timeouts.idle =
+        crate::host::TimeoutOverride::After(std::num::NonZeroU64::new(400).unwrap());
+    let record = fixture.catalog.register(spec).await.unwrap();
+    let client = managed_restore(&service, &fixture, &record, binder(provider, None, None)).await;
+    client
+        .deliver(
+            UserMessage::new("pending-next-run", 1).into(),
+            Delivery::NextRun,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(service.phase(record.spec.id), Some(OwnerPhase::Live));
+    assert_eq!(
+        fixture.catalog.get(record.spec.id).await.unwrap().state,
+        AgentState::Idle
+    );
+    assert!(String::from_utf8_lossy(&bytes(&record)).contains("pending-next-run"));
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_session_peers_pin_only_their_owner_and_attach_again_after_restore() {
+    use crate::host::{
+        area_rpc::SessionHello,
+        client::{encode_frame, read_frame, write_frame},
+        protocol::{AuthToken, Hello, HostId, Version, MAX_FRAME_BYTES, PROTOCOL},
+        server::{ControlConfig, ControlServer},
+    };
+    use tokio::{io::AsyncReadExt, net::UnixStream};
+
+    let fixture = Fixture::new(2).await;
+    let service = HostService::new(fixture.catalog.clone());
+    let provider = FauxProvider::new(
+        FauxScript::new()
+            .with_tool_call("gate", serde_json::json!({}))
+            .with_text("before-reconnect"),
+    );
+    let gate = Gate::new();
+    let delay = Duration::from_millis(400);
+    let mut records = Vec::new();
+    let mut clients = Vec::new();
+    for name in ["first-peer", "another-agent"] {
+        let mut spec = fixture.spec(name, &provider, true).await;
+        spec.timeouts.disconnected = crate::host::TimeoutOverride::After(
+            std::num::NonZeroU64::new(delay.as_millis() as u64).unwrap(),
+        );
+        let record = fixture.catalog.register(spec).await.unwrap();
+        clients.push(
+            managed_restore(
+                &service,
+                &fixture,
+                &record,
+                binder(provider.clone(), Some(gate.clone()), None),
+            )
+            .await,
+        );
+        records.push(record);
+    }
+    let first = &records[0];
+    let second = &records[1];
+    let first_id = first.spec.id;
+    let second_id = second.spec.id;
+    let config = ControlConfig {
+        socket_path: fixture.root.path().join("host/route.sock"),
+        host_id: HostId::new(),
+        token: AuthToken::new(uuid::Uuid::new_v4().simple().to_string()).unwrap(),
+        max_connections: 8,
+        handshake_timeout: DEADLINE,
+        request_timeout: DEADLINE,
+    };
+    let mut server = ControlServer::bind_with_controls(
+        config.clone(),
+        service.clone(),
+        None,
+        None,
+        None,
+        crate::host::area_rpc::SessionRoutes {
+            agents: [first_id, second_id].into(),
+            restore_on_attach: false,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let connect = |id: AgentId| {
+        let config = config.clone();
+        async move {
+            let mut stream = UnixStream::connect(&config.socket_path).await.unwrap();
+            let hello = SessionHello {
+                session_rpc: Hello {
+                    protocol: PROTOCOL.into(),
+                    version: Version::default(),
+                    host_id: config.host_id,
+                    token: config.token,
+                },
+                agent_id: id,
+            };
+            write_frame(&mut stream, &encode_frame(&hello, MAX_FRAME_BYTES).unwrap())
+                .await
+                .unwrap();
+            tokio::time::timeout(DEADLINE, async {
+                let ready: serde_json::Value =
+                    read_frame(&mut stream, MAX_FRAME_BYTES).await.unwrap();
+                assert_eq!(ready["type"], "ready");
+                assert_eq!(ready["agentId"], id.to_string());
+                (stream, ready)
+            })
+            .await
+            .unwrap()
+        }
+    };
+    async fn receive(stream: &mut UnixStream) -> serde_json::Value {
+        tokio::time::timeout(DEADLINE, read_frame(stream, MAX_FRAME_BYTES))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    let (mut first_peer, initial) = connect(first_id).await;
+    let (mut last_peer, _) = connect(first_id).await;
+    let (mut second_peer, second_ready) = connect(second_id).await;
+    let send = |command| encode_frame(&command, MAX_FRAME_BYTES).unwrap();
+    assert!(initial["supportedCommands"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("set_thinking_level")));
+    let original_thinking = initial["state"]["thinkingLevel"].clone();
+    let change = serde_json::json!({"type":"set_thinking_level", "id":"change", "level":"high"});
+    write_frame(&mut first_peer, &send(change)).await.unwrap();
+    let response = receive(&mut first_peer).await;
+    assert_eq!(response["success"], true);
+    assert_eq!(response["data"]["thinkingLevel"], "high");
+    let changed = receive(&mut last_peer).await;
+    assert_eq!(
+        changed,
+        serde_json::json!({"type":"thinking_level_changed", "thinkingLevel":"high"})
+    );
+    write_frame(
+        &mut second_peer,
+        &send(serde_json::json!({"type":"get_state", "id":"inspect"})),
+    )
+    .await
+    .unwrap();
+    let other = receive(&mut second_peer).await;
+    assert_eq!(other["id"], "inspect");
+    assert_eq!(
+        other["data"]["thinkingLevel"],
+        second_ready["state"]["thinkingLevel"]
+    );
+    drop(first_peer);
+    tokio::time::sleep(2 * delay).await;
+    assert_eq!(service.owner_count(), 2);
+
+    let ticket = clients[0]
+        .submit(prompt("before-last-peer-left"))
+        .await
+        .unwrap();
+    permits(&gate.entered, 1).await;
+    write_frame(
+        &mut last_peer,
+        &send(serde_json::json!({"type":"set_thinking_level", "id":"busy", "level":"low"})),
+    )
+    .await
+    .unwrap();
+    let rejected = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let frame: serde_json::Value =
+                read_frame(&mut last_peer, MAX_FRAME_BYTES).await.unwrap();
+            if frame["id"] == "busy" {
+                break frame;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(rejected["success"], false);
+    assert_eq!(rejected["error"], BackendError::Busy.to_string());
+    drop(last_peer);
+    tokio::time::sleep(2 * delay).await;
+    assert_eq!(
+        fixture.catalog.get(first_id).await.unwrap().state,
+        AgentState::Running
+    );
+    gate.release.add_permits(1);
+    complete(&ticket).await;
+    wait_phase(&service, first_id, None).await;
+    let unloaded = fixture.catalog.get(first_id).await.unwrap();
+    assert_eq!(unloaded.state, AgentState::Unloaded);
+    let saved = bytes(first);
+    assert!(String::from_utf8_lossy(&saved).contains("before-reconnect"));
+    assert_eq!(service.phase(second_id), Some(OwnerPhase::Live));
+
+    managed_restore(
+        &service,
+        &fixture,
+        &unloaded,
+        binder(provider, Some(gate), None),
+    )
+    .await;
+    let (_new_peer, ready) = connect(first_id).await;
+    assert_eq!(ready["sessionId"], first.spec.session.as_ref().unwrap().id);
+    assert_eq!(ready["state"]["thinkingLevel"], original_thinking);
+    assert_eq!(bytes(first), saved);
+    assert!(clients[0].snapshot().await.is_err());
+
+    service.close_ordinary(second_id).await.unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(DEADLINE, second_peer.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(service.phase(first_id), Some(OwnerPhase::Live));
+    server.stop().await.unwrap();
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn empty_host_idle_deadline_starts_after_last_owner_and_peer_leave() {
+    use crate::host::{client::HostClient, protocol::Command};
+    let idle = Duration::from_millis(180);
+    let (fixture, mut daemon, connection) = daemon_fixture_with_config(
+        HostConfig {
+            host_idle_timeout_ms: std::num::NonZeroU64::new(idle.as_millis() as u64),
+            ..Default::default()
+        },
+        DEADLINE,
+    )
+    .await;
+    let mut client = HostClient::connect(connection.clone()).await.unwrap();
+    let provider = FauxProvider::new(FauxScript::new().with_text("idle-resident"));
+    let record = fixture
+        .record("daemon-idle-resident", &provider, false)
+        .await;
+    managed_restore(
+        daemon.service(),
+        &fixture,
+        &record,
+        binder(provider, None, None),
+    )
+    .await;
+    drop(client);
+    assert!(tokio::time::timeout(2 * idle, daemon.wait_control())
+        .await
+        .is_err());
+    assert_eq!(daemon.service().owner_count(), 1);
+    client = HostClient::connect(connection.clone()).await.unwrap();
+    daemon
+        .service()
+        .close_ordinary(record.spec.id)
+        .await
+        .unwrap();
+    assert!(tokio::time::timeout(2 * idle, daemon.wait_control())
+        .await
+        .is_err());
+    assert_eq!(
+        client.call(Command::Status {}).await.unwrap()["resident"],
+        0
+    );
+    drop(client);
+    let disconnected = tokio::time::Instant::now();
+    tokio::time::timeout(DEADLINE, daemon.wait_control())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(disconnected.elapsed() >= idle);
+    assert!(daemon.control_stopped_for_idleness());
+    assert!(daemon.service().is_closed());
+    assert!(!connection.socket_path.exists());
+    daemon.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn host_idle_deadline_cannot_preempt_an_owned_lifecycle_reservation() {
+    let idle = Duration::from_millis(120);
+    let (_fixture, mut daemon, _) = daemon_fixture_with_config(
+        HostConfig {
+            host_idle_timeout_ms: std::num::NonZeroU64::new(idle.as_millis() as u64),
+            ..Default::default()
+        },
+        DEADLINE,
+    )
+    .await;
+    let service = daemon.service().clone();
+    let (entered, held) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let reservation = tokio::spawn(async move {
+        service
+            .with_administration(move |reservation| {
+                Box::pin(async move {
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                    drop(reservation);
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    });
+    held.await.unwrap();
+    assert!(tokio::time::timeout(2 * idle, daemon.wait_control())
+        .await
+        .is_err());
+    assert!(!daemon.service().is_stopping());
+    release.send(()).unwrap();
+    reservation.await.unwrap();
+    tokio::time::timeout(DEADLINE, daemon.wait_control())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(daemon.control_stopped_for_idleness());
+    daemon.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -674,8 +1083,16 @@ async fn daemon_failed_shutdown_retains_query_access_owner_and_singleton_until_r
 }
 
 #[tokio::test]
-async fn daemon_cancelled_shutdown_wait_retains_late_callback_and_can_finish_cleanup() {
-    let (fixture, daemon, connection) = daemon_fixture().await;
+async fn daemon_shutdown_grace_and_cancelled_wait_retain_late_callback_until_cleanup() {
+    let grace = 30;
+    let host = HostConfig {
+        default_timeouts: crate::host::Timeouts {
+            shutdown_grace_ms: std::num::NonZeroU64::new(grace),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (fixture, daemon, connection) = daemon_fixture_with_config(host, DEADLINE).await;
     let provider = FauxProvider::new(
         FauxScript::new()
             .with_tool_call("gate", serde_json::json!({}))
@@ -709,6 +1126,12 @@ async fn daemon_cancelled_shutdown_wait_retains_late_callback_and_can_finish_cle
     let shutdown_daemon = daemon.clone();
     let request = tokio::spawn(async move { shutdown_daemon.lock().await.shutdown().await });
     wait_state(&fixture.catalog, record.spec.id, AgentState::Closing).await;
+    tokio::time::sleep(Duration::from_millis(2 * grace)).await;
+    assert!(!request.is_finished());
+    assert!(ticket.completion.borrow().is_none());
+    let env = OsExecutionEnv::with_cwd(record.spec.launch.cwd.clone());
+    let path = record.spec.session.as_ref().unwrap().path.to_str().unwrap();
+    assert!(env.try_acquire_writer_lease(path).await.is_err());
     request.abort();
     let _ = request.await;
     assert_eq!(fixture.catalog.status().await.unwrap().resident, 1);
@@ -724,6 +1147,7 @@ async fn daemon_cancelled_shutdown_wait_retains_late_callback_and_can_finish_cle
     late.release.add_permits(1);
     let _ = ticket.wait().await.unwrap();
     daemon.lock().await.shutdown().await.unwrap();
+    assert!(env.try_acquire_writer_lease(path).await.unwrap().is_some());
     assert!(!connection.socket_path.exists());
 }
 

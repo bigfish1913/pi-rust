@@ -3,7 +3,7 @@ use super::lifecycle::{
 };
 use super::recovery::{self, Bindings};
 use super::{
-    catalog::{is_mini, MAX_RECORD_BYTES},
+    catalog::{is_mini, TransitionSource, MAX_RECORD_BYTES},
     AgentId, AgentPage, AgentRecord, AgentSpec, AgentState, Capacity, CatalogError, CatalogGuard,
     CatalogResult, CatalogStatus, HostConfig, HostEpoch, ResidentPermit, MAX_PAGE_SIZE,
 };
@@ -462,6 +462,7 @@ impl Registry {
         id: AgentId,
         guard: CatalogGuard,
         next: AgentState,
+        source: TransitionSource,
     ) -> CatalogResult<AgentRecord> {
         if guard.epoch != self.epoch {
             return Err(CatalogError::EpochConflict);
@@ -478,6 +479,18 @@ impl Registry {
             });
         }
         let old = record.state;
+        // Background transitions must leave prepared administrative requests
+        // their original revision. A recovered Close tombstone also vetoes attach.
+        if source != TransitionSource::Explicit && lifecycle::has_pending(&transaction, Some(id))? {
+            return Err(CatalogError::LifecycleBusy);
+        }
+        if source == TransitionSource::AttachRestore
+            && (old != AgentState::Unloaded || recovery::is_removed(&transaction, id)?)
+        {
+            return Err(CatalogError::InvalidRecord(
+                "Agent is not eligible for attach restore",
+            ));
+        }
         record.state = old.transition(next, record.spec.mode)?;
         if self.permits.contains_key(&id) != old.is_resident() {
             return Err(CatalogError::InvalidRecord("resident permit mismatch"));

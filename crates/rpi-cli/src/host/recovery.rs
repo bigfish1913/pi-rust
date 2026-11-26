@@ -58,6 +58,14 @@ pub(super) fn read(connection: &Connection, configured: &[AgentId]) -> CatalogRe
     Ok(members)
 }
 
+pub(super) fn is_removed(connection: &Connection, id: AgentId) -> CatalogResult<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recovery_members WHERE agent_id=?1 AND binding IS NULL)",
+        [id.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
 pub(super) fn set(
     connection: &Connection,
     agent_id: AgentId,

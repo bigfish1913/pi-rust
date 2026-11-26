@@ -2,16 +2,21 @@
 
 use super::{
     client::{encode_frame, read_frame, write_frame, Failure},
-    ordinary::{BackendReport, OrdinaryClient, OrdinaryOutput},
+    ordinary::{AreaPeer, BackendReport, OrdinaryClient, OrdinaryOutput},
     protocol::{Hello, HostId, RequestId, MAX_FRAME_BYTES, MAX_SUBMIT_PROMPT_BYTES},
-    AgentId,
+    service::{attach_area_peer, HostService, ServiceError},
+    AgentId, AgentState,
 };
 use rpi_agent::{AgentEmitter, AgentEvent};
 use rpi_harness::agent_harness::HarnessRunOutcome;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
-use tokio::{io::AsyncWrite, net::UnixStream, sync::broadcast};
+use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Duration};
+use tokio::{
+    io::AsyncWrite,
+    net::UnixStream,
+    sync::{broadcast, Mutex},
+};
 use tokio_util::sync::CancellationToken;
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -24,6 +29,7 @@ const COMMANDS: &[&str] = &[
     "get_history",
     "get_available_models",
     "get_available_thinking_levels",
+    "set_thinking_level",
     "get_commands",
     "prompt",
     "abort",
@@ -68,6 +74,10 @@ impl Events {
         }
     }
 
+    pub(in crate::host) fn thinking_changed(&self, level: &Value) {
+        self.send(json!({"type":"thinking_level_changed", "thinkingLevel":level}));
+    }
+
     pub(in crate::host) fn settled(&self, report: &BackendReport, pending_resume: bool) {
         if self.0.receiver_count() == 0 {
             return;
@@ -109,34 +119,82 @@ impl AgentEmitter for Events {
     }
 }
 
-#[derive(Clone)]
+#[derive(Default)]
+pub(super) struct SessionRoutes {
+    pub agents: BTreeSet<AgentId>,
+    pub restore_on_attach: bool,
+}
+
 pub(super) struct Session {
-    pub agent_id: AgentId,
+    agent_id: AgentId,
     host_id: HostId,
     client: OrdinaryClient,
     events: Events,
+    peer: AreaPeer,
 }
 
 impl Session {
     pub(super) async fn open(
-        service: &super::service::HostService,
+        service: &HostService,
         agent_id: AgentId,
         host_id: HostId,
-    ) -> Result<Self, super::service::ServiceError> {
-        let client = service.ordinary_client(agent_id)?;
-        let events = Events::new();
-        client.install_area_events(events.clone()).await?;
+        restore: Option<(Arc<Mutex<()>>, super::daemon::DaemonAdministration)>,
+    ) -> Result<Self, ServiceError> {
+        let (client, (events, peer)) = if let Some((gate, administration)) = restore {
+            let gate = gate.lock_owned().await;
+            let service = service.clone();
+            service
+                .clone()
+                .with_administration(move |reserved| {
+                    Box::pin(async move {
+                        // The owned transaction keeps serialization after a lost waiter.
+                        let _gate = gate;
+                        match service.ordinary_client(agent_id) {
+                            Ok(client) => {
+                                let attachment = attach_area_peer(&client).await?;
+                                Ok((client, attachment))
+                            }
+                            Err(ServiceError::NotLoaded) => {
+                                let record = reserved
+                                    .catalog()
+                                    .get(agent_id)
+                                    .await
+                                    .map_err(super::ordinary::BackendError::from)?;
+                                if record.state != AgentState::Unloaded {
+                                    return Err(ServiceError::NotLoaded);
+                                }
+                                let prepared = administration.prepare_attach(agent_id).await?;
+                                if record.spec != prepared.spec {
+                                    return Err(ServiceError::NotLoaded);
+                                }
+                                reserved
+                                    .restore_for_attach(prepared, reserved.catalog().guard(&record))
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    })
+                })
+                .await?
+        } else {
+            let client = service.ordinary_client(agent_id)?;
+            let attachment = attach_area_peer(&client).await?;
+            (client, attachment)
+        };
         Ok(Self {
             agent_id,
             host_id,
             client,
             events,
+            peer,
         })
     }
 
     pub(super) async fn serve(&self, stream: UnixStream, stop: CancellationToken) {
         let _ = tokio::select! {
+            biased;
             _ = stop.cancelled() => Ok(()),
+            _ = self.peer.closed.cancelled() => Ok(()),
             result = self.exchange(stream) => result,
         };
     }
@@ -146,7 +204,7 @@ impl Session {
         let (mut read, mut write) = stream.into_split();
         let state = tokio::time::timeout(
             COMMAND_TIMEOUT,
-            self.client.area_query("get_state", &Value::Null),
+            self.client.area_command("get_state", &Value::Null),
         )
         .await
         .map_err(|_| Failure::Timeout)?
@@ -235,7 +293,7 @@ impl Session {
                 Ok(json!({"aborted":aborted}))
             }
             "get_commands" => Ok(json!({"commands":[]})),
-            _ => self.client.area_query(kind, msg).await,
+            _ => self.client.area_command(kind, msg).await,
         }
     }
 }

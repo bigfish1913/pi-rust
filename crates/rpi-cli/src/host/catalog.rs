@@ -11,10 +11,10 @@ use super::recovery::Bindings;
 use super::recovery::Membership;
 use super::{
     registry::Registry, AgentId, AgentMode, AgentSpec, AgentState, CatalogError, CatalogResult,
-    ControlScopeId, HostConfig, HostEpoch, RequestId,
+    ControlScopeId, EffectiveTimeouts, HostConfig, HostEpoch, RequestId, TimeoutOverrides,
 };
 use serde::{Deserialize, Serialize};
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 
 pub const MAX_PAGE_SIZE: usize = 128;
@@ -72,7 +72,14 @@ pub struct CatalogStatus {
 
 type Reply<T> = oneshot::Sender<CatalogResult<T>>;
 
-pub(crate) enum Command {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TransitionSource {
+    Explicit,
+    IdleUnload,
+    AttachRestore,
+}
+
+enum Command {
     Register {
         spec: Box<AgentSpec>,
         reply: Reply<AgentRecord>,
@@ -90,6 +97,7 @@ pub(crate) enum Command {
         id: AgentId,
         guard: CatalogGuard,
         next: AgentState,
+        source: TransitionSource,
         reply: Reply<AgentRecord>,
     },
     Status {
@@ -133,6 +141,7 @@ pub(crate) enum Command {
 pub struct HostCatalog {
     sender: mpsc::Sender<Command>,
     epoch: HostEpoch,
+    config: Arc<HostConfig>,
 }
 
 impl HostCatalog {
@@ -151,6 +160,7 @@ impl HostCatalog {
                 super::HostError::InvalidInput("registry directory must be absolute").into(),
             );
         }
+        let policy = Arc::new(config.clone());
         let (sender, mut receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (ready, started) = oneshot::channel();
         std::thread::Builder::new()
@@ -186,9 +196,10 @@ impl HostCatalog {
                             id,
                             guard,
                             next,
+                            source,
                             reply,
                         } => {
-                            let _ = reply.send(registry.transition(id, guard, next));
+                            let _ = reply.send(registry.transition(id, guard, next, source));
                         }
                         Command::Status { reply } => {
                             let _ = reply.send(registry.status());
@@ -232,7 +243,24 @@ impl HostCatalog {
                 }
             })?;
         let epoch = started.await.map_err(|_| CatalogError::WorkerStopped)??;
-        Ok(Self { sender, epoch })
+        Ok(Self {
+            sender,
+            epoch,
+            config: policy,
+        })
+    }
+
+    pub(super) fn resolve_timeouts(
+        &self,
+        overrides: TimeoutOverrides,
+    ) -> CatalogResult<EffectiveTimeouts> {
+        Ok(self.config.resolve_timeouts(overrides)?)
+    }
+
+    pub(super) fn idle_timeout(&self) -> Option<std::time::Duration> {
+        self.config
+            .host_idle_timeout_ms
+            .map(|ms| std::time::Duration::from_millis(ms.get()))
     }
 
     pub fn epoch(&self) -> HostEpoch {
@@ -296,6 +324,37 @@ impl HostCatalog {
             id,
             guard,
             next,
+            source: TransitionSource::Explicit,
+            reply,
+        })
+        .await
+    }
+
+    pub(super) async fn begin_idle_unload(
+        &self,
+        id: AgentId,
+        guard: CatalogGuard,
+    ) -> CatalogResult<AgentRecord> {
+        self.call(|reply| Command::Transition {
+            id,
+            guard,
+            next: AgentState::Closing,
+            source: TransitionSource::IdleUnload,
+            reply,
+        })
+        .await
+    }
+
+    pub(super) async fn begin_attach_restore(
+        &self,
+        id: AgentId,
+        guard: CatalogGuard,
+    ) -> CatalogResult<AgentRecord> {
+        self.call(|reply| Command::Transition {
+            id,
+            guard,
+            next: AgentState::Starting,
+            source: TransitionSource::AttachRestore,
             reply,
         })
         .await

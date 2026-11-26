@@ -337,6 +337,11 @@ pub(super) fn recover(connection: &Connection, previous: HostEpoch) -> CatalogRe
     }
     Ok(())
 }
+pub(super) fn has_pending(connection: &Connection, agent: Option<AgentId>) -> CatalogResult<bool> {
+    let agent = agent.map(|id| id.to_string());
+    Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_requests WHERE status='prepared' AND (agent_id IS NULL OR ?1 IS NULL OR agent_id=?1))", [&agent], |r| r.get(0))?)
+}
+
 pub(super) fn prepare(
     connection: &mut Connection,
     epoch: HostEpoch,
@@ -362,8 +367,7 @@ pub(super) fn prepare(
         return Err(CatalogError::LifecycleCapacity);
     }
     let agent = request.action.agent().map(|id| id.to_string());
-    let pending: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_requests WHERE status='prepared' AND (agent_id IS NULL OR ?1 IS NULL OR agent_id=?1))", [&agent], |r| r.get(0))?;
-    if pending {
+    if has_pending(&transaction, request.action.agent())? {
         return Err(CatalogError::LifecycleBusy);
     }
     if let Some(id) = request.action.agent() {

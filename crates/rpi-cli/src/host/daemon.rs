@@ -23,7 +23,7 @@ use std::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
-    #[error("shared Host daemon timers are not implemented; leave timeout policies unset")]
+    #[error("shared Host daemon does not support the requested Agent timers")]
     UnsupportedTimers,
     #[error("Host daemon catalog initialization failed")]
     Catalog(#[source] CatalogError),
@@ -96,7 +96,7 @@ impl HostDaemon {
             agents,
             administration,
             mini_control,
-            (None, None, None),
+            (None, None, super::area_rpc::SessionRoutes::default()),
         )
         .await
     }
@@ -111,21 +111,63 @@ impl HostDaemon {
         startup: (
             Option<Bindings>,
             Option<std::os::unix::net::UnixListener>,
-            Option<AgentId>,
+            super::area_rpc::SessionRoutes,
         ),
     ) -> Result<Self, DaemonError> {
-        let (recovery, listener, session_rpc_agent) = startup;
+        let (recovery, listener, routes) = startup;
+        let session_rpc_agents = &routes.agents;
         // Reject invalid options before opening SQLite or creating directories.
         control.validate()?;
-        if host.host_idle_timeout_ms.is_some()
-            || host.default_timeouts != Default::default()
-            || host.hard_timeout_limits != Default::default()
+        if routes.restore_on_attach
+            && (session_rpc_agents.is_empty()
+                || !administration.as_ref().is_some_and(|policy| {
+                    policy.permissions.restore
+                        && session_rpc_agents.is_subset(&policy.allowed_agents)
+                }))
+        {
+            return Err(ServerError::InvalidConfiguration.into());
+        }
+        if (session_rpc_agents.is_empty() && host.default_timeouts.disconnected_ms.is_some())
+            || (mini_control.is_some() && host.default_timeouts != Default::default())
         {
             return Err(DaemonError::UnsupportedTimers);
         }
         host.validate()
             .map_err(CatalogError::from)
             .map_err(DaemonError::Catalog)?;
+        for agent in agents
+            .iter()
+            .chain(administration.iter().flat_map(|policy| &policy.profiles))
+        {
+            let timers = host
+                .resolve_timeouts(agent.spec.timeouts)
+                .map_err(CatalogError::from)
+                .map_err(DaemonError::Catalog)?;
+            let has_route = session_rpc_agents.contains(&agent.spec.id);
+            if has_route
+                && agent
+                    .profile
+                    .instruction_resources
+                    .as_ref()
+                    .is_some_and(|resources| resources.has_hooks())
+            {
+                return Err(ServerError::InvalidConfiguration.into());
+            }
+            let reclaim =
+                timers.idle.milliseconds.is_some() || timers.disconnected.milliseconds.is_some();
+            let restore_granted = administration.as_ref().is_some_and(|policy| {
+                policy.permissions.restore && policy.allowed_agents.contains(&agent.spec.id)
+            });
+            if (reclaim && !restore_granted)
+                || (timers.disconnected.milliseconds.is_some() && !has_route)
+                || (agent.spec.mode == super::AgentMode::Mini
+                    && (reclaim
+                        || timers.run.milliseconds.is_some()
+                        || timers.shutdown_grace.milliseconds.is_some()))
+            {
+                return Err(DaemonError::UnsupportedTimers);
+            }
+        }
         match &mini_control {
             Some(policy) => policy.preflight(&agents).await?,
             None if agents
@@ -236,7 +278,8 @@ impl HostDaemon {
             administration.clone(),
             mini,
             listener,
-            session_rpc_agent,
+            routes,
+            service.catalog().idle_timeout(),
         )
         .await
         {
@@ -273,6 +316,9 @@ impl HostDaemon {
     }
     pub(crate) fn control_stopped_by_administration(&self) -> bool {
         self.control.stopped_by_administration()
+    }
+    pub(crate) fn control_stopped_for_idleness(&self) -> bool {
+        self.control.stopped_for_idleness()
     }
     /// Failed native settlement deliberately retains owners, catalog ownership
     /// and the query listener for diagnosis/retry. Never force-abort backends.

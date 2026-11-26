@@ -105,6 +105,10 @@ pub(super) async fn run(connection: Connection, rpc: bool) -> Result<(), String>
                 Some("message_end") if frame["message"]["role"] == "user" => {
                     history_event(&frame["message"])
                 }
+                Some("thinking_level_changed") => {
+                    status.thinking = frame["thinkingLevel"].as_str().map(str::to_owned);
+                    Some(DriverEvent::Status(status.clone()))
+                }
                 Some("agent_start" | "agent_settled") => {
                     status.streaming = frame["type"] == "agent_start";
                     if let Some(error) = frame["error"].as_str() {
@@ -142,7 +146,7 @@ fn history_event(message: &Value) -> Option<DriverEvent> {
     use crate::remote::session::message_role;
     match message_role(message) {
         "user" => Some(DriverEvent::Notice(format!("› {}", message_text(message)))),
-        "assistant" => Some(DriverEvent::Ui(UiEvent::AssistantEnd {
+        "assistant" => Some(DriverEvent::Ui(UiEvent::SavedAssistant {
             blocks: crate::transcript_view::assistant_blocks_from_value(message),
         })),
         _ => None,
@@ -176,6 +180,9 @@ impl SessionDriver for Driver {
             DriverCommand::Prompt(message) => json!({"type":"prompt","message":message}),
             DriverCommand::Abort => json!({"type":"abort"}),
             DriverCommand::RefreshState => json!({"type":"get_state"}),
+            DriverCommand::SetThinkingLevel(level) => {
+                json!({"type":"set_thinking_level", "level":level})
+            }
             _ => return Err("command is unavailable for this Host area".into()),
         };
         frame["id"] = json!(uuid::Uuid::new_v4().to_string());

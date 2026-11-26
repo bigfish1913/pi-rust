@@ -771,6 +771,10 @@ async fn recovery_preserves_members_on_rejected_close_and_removes_interrupted_cl
     .await
     .unwrap();
     let record = catalog.register(spec).await.unwrap();
+    let record = transition(&catalog, &record, AgentState::Starting).await;
+    let record = transition(&catalog, &record, AgentState::Idle).await;
+    let record = transition(&catalog, &record, AgentState::Closing).await;
+    let record = transition(&catalog, &record, AgentState::Unloaded).await;
     catalog.remember_members(vec![id]).await.unwrap();
     let request = |request_id| LifecycleRequest {
         scope: ControlScopeId::new(),
@@ -811,6 +815,13 @@ async fn recovery_preserves_members_on_rejected_close_and_removes_interrupted_cl
             .unwrap()
             .fresh
     );
+    assert!(matches!(
+        catalog
+            .begin_attach_restore(id, catalog.guard(&record))
+            .await,
+        Err(CatalogError::LifecycleBusy)
+    ));
+    assert_eq!(catalog.get(id).await.unwrap().revision, record.revision);
     catalog.shutdown().await.unwrap();
     let reopened = HostCatalog::open(path, HostConfig::default())
         .await
@@ -828,5 +839,14 @@ async fn recovery_preserves_members_on_rejected_close_and_removes_interrupted_cl
             .status,
         LifecycleState::Interrupted {}
     );
+    let unloaded = reopened.get(id).await.unwrap();
+    assert_eq!(unloaded.state, AgentState::Unloaded);
+    assert!(matches!(
+        reopened
+            .begin_attach_restore(id, reopened.guard(&unloaded))
+            .await,
+        Err(CatalogError::InvalidRecord(_))
+    ));
+    assert_eq!(reopened.status().await.unwrap().resident, 0);
     reopened.shutdown().await.unwrap();
 }

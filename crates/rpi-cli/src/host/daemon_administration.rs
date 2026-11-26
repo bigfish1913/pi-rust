@@ -44,6 +44,18 @@ impl DaemonAdministration {
     pub fn profile_references(&self) -> impl ExactSizeIterator<Item = ProfileRef> + '_ {
         self.references.iter().copied()
     }
+    pub(super) async fn prepare_attach(
+        &self,
+        id: AgentId,
+    ) -> Result<super::PreparedProfile, super::ordinary::BackendError> {
+        let reference = self
+            .profile_references()
+            .find(|reference| reference.agent_id == id && self.grant.can_restore(id))
+            .ok_or(super::ordinary::BackendError::Binding(
+                "Session attach Restore is not authorized",
+            ))?;
+        self.coordinator.prepare_attach(reference).await
+    }
     pub fn active_jobs(&self) -> usize {
         self.coordinator.active_jobs()
     }

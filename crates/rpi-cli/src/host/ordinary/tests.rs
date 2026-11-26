@@ -484,6 +484,80 @@ async fn cancelled_close_waiter_cannot_release_slot_or_writer_before_late_callba
 }
 
 #[tokio::test]
+async fn run_timeout_keeps_operation_and_writer_owned_until_late_callback_settles() {
+    let fixture = Fixture::new(1).await;
+    let provider = FauxProvider::new(
+        FauxScript::new()
+            .with_tool_call("gate", serde_json::json!({}))
+            .with_text("unused"),
+    );
+    let mut spec = fixture.spec("run-timeout", &provider, true).await;
+    spec.timeouts.run = crate::host::TimeoutOverride::After(250.try_into().unwrap());
+    let record = fixture.catalog.register(spec).await.unwrap();
+    let tool = Gate::new();
+    tool.release.add_permits(1);
+    let callback = Gate::new();
+    let callback_gate = callback.clone();
+    let hook: rpi_agent::AfterToolCall = Arc::new(move |_, _| {
+        let gate = callback_gate.clone();
+        Box::pin(async move {
+            gate.entered.add_permits(1);
+            gate.release.acquire().await.unwrap().forget();
+            None
+        })
+    });
+    let owner = fixture
+        .restore(&record, binder(provider, Some(tool), Some(hook)))
+        .await;
+    let client = owner.client();
+    let ticket = client
+        .submit(prompt("timeout-with-late-callback"))
+        .await
+        .unwrap();
+    permits(&callback.entered, 1).await;
+    let expired = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let snapshot = client.snapshot().await.unwrap();
+            if snapshot.cancel_requested {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(expired.ticket, Some(ticket.id));
+    assert_eq!(expired.record.state, AgentState::Running);
+    assert!(ticket.completion.borrow().is_none());
+    assert!(matches!(
+        client.submit(prompt("still-busy")).await,
+        Err(BackendError::Busy)
+    ));
+    assert_eq!(fixture.catalog.status().await.unwrap().resident, 1);
+    let env = OsExecutionEnv::with_cwd(record.spec.launch.cwd.clone());
+    let path = record.spec.session.as_ref().unwrap().path.to_str().unwrap();
+    assert!(env.try_acquire_writer_lease(path).await.is_err());
+
+    callback.release.add_permits(1);
+    let report = tokio::time::timeout(DEADLINE, ticket.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(report.outcome, Ok(OrdinaryOutput::Run(ref result)) if matches!(result.outcome, HarnessRunOutcome::Aborted { .. })),
+        "{report:?}"
+    );
+    assert!(!report.persistence_uncertain, "{report:?}");
+    assert_eq!(
+        client.snapshot().await.unwrap().record.state,
+        AgentState::Idle
+    );
+    owner.close().await.unwrap();
+    assert!(env.try_acquire_writer_lease(path).await.unwrap().is_some());
+    fixture.catalog.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn restart_reopens_exact_reference_not_newer_session() {
     let fixture = Fixture::new(1).await;
     let first_provider = FauxProvider::new(FauxScript::new().with_text("first-output"));

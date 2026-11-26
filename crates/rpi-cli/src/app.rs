@@ -153,6 +153,13 @@ async fn run_inner() -> i32 {
     // the regular parsed path all observe the same process-wide gate.
     crate::args::normalize_offline_mode(&argv);
 
+    #[cfg(target_os = "macos")]
+    if argv.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        if let Some(code) = crate::host::area_entry::run_default_terminal().await {
+            return code;
+        }
+    }
+
     // `rpi dev` wraps the normal CLI: consume only development-specific
     // options, then pass every remaining argument through the regular parser.
     let dev_command = argv.first().map(String::as_str);

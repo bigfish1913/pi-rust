@@ -545,8 +545,14 @@ daemon 可在启动时按显式 `agents` profile 创建/加载普通 Agent，之
 并向已加载 owner 提交文本 prompt（submit）。显式行政策略现已支持完整意图的 profile
 create/restore/guarded close/稳定输入取消 IPC 与完整请求文件 CLI；独立Stop IPC已接；**mini 与管理扩展尚未接通**；Stop提交CLI已接；协议枚举不代表已实现
 能力。普通 CLI 默认路径未切换。
-Host 超时目前只验证策略，尚未启动计时器；daemon 拒绝非空 Host timeout 策略，不静默忽略。
-IPC 握手/请求期限则已运行。清单和 control 只支持 Unix，已在 macOS 验证；Windows
+Persistent 运行超时在接纳后触发现有取消链路；停机宽限期到达时报告仍在关闭的 Agent，
+随后继续原生结算。`host.host_idle_timeout_ms` 在 owner 表和连接持续为空时触发正常停机，
+到期会复核原生 lifecycle 锁和 catalog 容量。具备管理 Restore 权限的 Persistent Agent 可启用
+`host.default_timeouts.idle_ms`。有 area Session 路由的 Agent 还可启用 `disconnected_ms`，
+从该 Agent 最后一个已认证 Session 连接离开时计时。在线 Session 保持对应 owner 驻留，运行
+及待恢复工作也会阻止卸载。卸载发布 `Unloaded`，管理 Restore 按 frozen profile 及当前
+revision 恢复原 Agent 和 Session。客户端随后可在同一 daemon 重新挂接。
+IPC 握手/请求期限已运行。清单和 control 只支持 Unix，已在 macOS 验证；Windows
 明确不支持，Linux/cgroup 仍需实机验收。
 配置、能力、生命周期和验收口径见 [控制 daemon 说明](../../../../docs/architecture/shared-host-control-daemon.md)。
 
@@ -1124,7 +1130,7 @@ ACK（只有 `submit_admitted` 提供）。尚无 request-ID 原生日志关联�
 - 启动摘要不接收自由 argv/env/prompt。调用者必须保证名称、模型/profile 引用不含秘密；
   结构验证不能识别误填入名称的凭据。共享进程也不是安全隔离边界。
 - 未配置超时不自动启用；有限硬上限不能 disabled 绕过；最大有限时长 365 天。
-  不兼容新上限的历史记录仍可查询，但不得加载。计时器与重启截止时间恢复尚未接入。
+  不兼容新上限的历史记录仍可查询，但不得加载。重启不会恢复计时器截止时间。
 
 ## Owner coordinator 与控制客户端（新增）
 

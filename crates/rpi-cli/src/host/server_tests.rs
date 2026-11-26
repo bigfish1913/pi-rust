@@ -579,7 +579,10 @@ async fn daemon_bind_failure_releases_its_catalog_and_unsupported_timer_policy_h
     assert_eq!(std::fs::read(&fixture.config.socket_path).unwrap(), b"keep");
     let directory = fixture._root.path().join("must-not-create");
     let config = HostConfig {
-        host_idle_timeout_ms: std::num::NonZeroU64::new(1),
+        default_timeouts: crate::host::Timeouts {
+            disconnected_ms: std::num::NonZeroU64::new(1),
+            ..Default::default()
+        },
         ..Default::default()
     };
     assert!(matches!(

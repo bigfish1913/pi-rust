@@ -135,7 +135,10 @@ impl AgentState {
             // A restored provider-deferred conversation is already waiting for
             // external model work; publishing it as Idle would mislead reapers.
             Self::Starting => {
-                matches!(next, Self::Idle | Self::Running | Self::Closed | Self::Lost)
+                matches!(
+                    next,
+                    Self::Idle | Self::Running | Self::Unloaded | Self::Closed | Self::Lost
+                )
             }
             Self::Idle => matches!(next, Self::Running | Self::Closing),
             Self::Running => matches!(next, Self::Idle | Self::WaitingApproval | Self::Closing),

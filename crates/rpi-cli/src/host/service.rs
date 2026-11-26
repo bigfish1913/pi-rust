@@ -6,10 +6,10 @@ pub use super::runtime::OwnerPhase;
 use super::{
     ordinary::{
         BackendError, OrdinaryAgent, OrdinaryBinder, OrdinaryBinding, OrdinaryClient,
-        OrdinaryLimits,
+        OrdinaryLimits, ReclaimClock,
     },
     runtime::{HostRuntime, OwnerEntry},
-    AgentId, CatalogError, CatalogGuard, HostCatalog, RequestId, RunId,
+    AgentId, AgentState, CatalogError, CatalogGuard, HostCatalog, RequestId, RunId,
 };
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use rpi_harness::agent_harness::HostAdmissionStatus;
@@ -18,10 +18,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::BTreeMap,
     future::Future,
+    io::Write,
     panic::AssertUnwindSafe,
-    sync::{Arc, MutexGuard},
+    sync::{Arc, MutexGuard, Weak},
+    time::Duration,
 };
-use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
+use tokio::{
+    sync::{watch, RwLockReadGuard, RwLockWriteGuard},
+    time::Instant,
+};
 
 type Result<T> = std::result::Result<T, ServiceError>;
 
@@ -68,15 +73,48 @@ impl NativeOwner {
     }
 }
 type Entry = OwnerEntry<NativeOwner, super::NativeExtensionCustody>;
+#[cfg(unix)]
+pub(super) type AreaAttachment = (super::area_rpc::Events, super::ordinary::AreaPeer);
+
+struct OrdinaryLoad {
+    client: OrdinaryClient,
+    #[cfg(unix)]
+    attachment: Option<std::result::Result<AreaAttachment, BackendError>>,
+}
+
+enum CloseIntent<'a> {
+    Close,
+    Guarded(CatalogGuard),
+    Idle(&'a Weak<NativeOwner>),
+}
 struct Inner {
     catalog: HostCatalog,
     runtime: HostRuntime<NativeOwner, super::NativeExtensionCustody>,
+    empty_since: Option<watch::Sender<Option<Instant>>>,
     #[cfg(unix)]
     administration_claimed: AtomicBool,
 }
 impl Inner {
     fn entries(&self) -> MutexGuard<'_, BTreeMap<AgentId, Entry>> {
         self.runtime.entries()
+    }
+
+    // Called under the owner table lock when its membership changes. Keep
+    // the latest boundary even if the listener misses intermediate updates.
+    fn update_empty_since(&self, entries: &BTreeMap<AgentId, Entry>) {
+        if let Some(idle) = &self.empty_since {
+            idle.send_if_modified(|since| match (entries.is_empty(), since.is_some()) {
+                (true, false) => {
+                    *since = Some(Instant::now());
+                    true
+                }
+                (false, true) => {
+                    *since = None;
+                    true
+                }
+                _ => false,
+            });
+        }
     }
 }
 
@@ -108,8 +146,31 @@ impl ServiceReservation<'_> {
         binding: OrdinaryBinding,
     ) -> Result<OrdinaryClient> {
         self.service
-            .restore_inner(self.catalog(), id, guard, limits, binding)
+            .restore_inner(id, guard, limits, binding, false)
             .await
+            .map(|loaded| loaded.client)
+    }
+
+    #[cfg(unix)]
+    pub(super) async fn restore_for_attach(
+        &self,
+        prepared: super::PreparedProfile,
+        guard: CatalogGuard,
+    ) -> Result<(OrdinaryClient, AreaAttachment)> {
+        let loaded = self
+            .service
+            .restore_inner(
+                prepared.spec.id,
+                guard,
+                prepared.limits,
+                prepared.binding,
+                true,
+            )
+            .await?;
+        Ok((
+            loaded.client,
+            loaded.attachment.ok_or(ServiceError::TaskStopped)??,
+        ))
     }
     pub(crate) async fn cancel_guarded(
         &self,
@@ -152,10 +213,34 @@ impl ServiceReservation<'_> {
                 );
             }
         }
-        self.service.close_inner(id, None).await
+        self.service.close_inner(id, CloseIntent::Close).await
     }
     pub(crate) async fn close_guarded(&self, id: AgentId, guard: CatalogGuard) -> Result<()> {
-        self.service.close_inner(id, Some(guard)).await
+        match self
+            .service
+            .close_inner(id, CloseIntent::Guarded(guard))
+            .await
+        {
+            Err(ServiceError::NotLoaded) => {
+                let record = self.catalog().get(id).await.map_err(BackendError::from)?;
+                if record.state != AgentState::Unloaded {
+                    return Err(ServiceError::NotLoaded);
+                }
+                // A concurrent restore must commit Starting before acquiring the
+                // writer. This revision guard allows only one transition to win.
+                self.catalog()
+                    .transition(id, guard, AgentState::Closed)
+                    .await
+                    .map_err(|error| match error {
+                        CatalogError::EpochConflict | CatalogError::RevisionConflict { .. } => {
+                            BackendError::GuardRejected(Arc::new(error))
+                        }
+                        error => BackendError::from(error),
+                    })?;
+                Ok(())
+            }
+            result => result,
+        }
     }
 }
 
@@ -213,10 +298,14 @@ impl HostService {
     /// The caller must not shut down another clone of this catalog while the
     /// service is live. Runtime and service lifetime belong to the daemon.
     pub fn new(catalog: HostCatalog) -> Self {
+        let empty_since = catalog
+            .idle_timeout()
+            .map(|_| watch::channel(Some(Instant::now())).0);
         Self {
             inner: Arc::new(Inner {
                 catalog,
                 runtime: HostRuntime::new(),
+                empty_since,
                 #[cfg(unix)]
                 administration_claimed: AtomicBool::new(false),
             }),
@@ -343,12 +432,12 @@ impl HostService {
 
     async fn restore_inner(
         &self,
-        catalog: &HostCatalog,
         id: AgentId,
         guard: CatalogGuard,
         limits: OrdinaryLimits,
         binding: OrdinaryBinding,
-    ) -> Result<OrdinaryClient> {
+        attach: bool,
+    ) -> Result<OrdinaryLoad> {
         {
             let mut entries = self.inner.entries();
             if entries.contains_key(&id) {
@@ -362,9 +451,24 @@ impl HostService {
                     failed_start: None,
                 },
             );
+            self.inner.update_empty_since(&entries);
         }
-        let result =
-            OrdinaryAgent::restore_bound(catalog.clone(), id, guard, limits, binding).await;
+        let result = OrdinaryAgent::restore_bound_with_intent(
+            self.catalog().clone(),
+            id,
+            guard,
+            limits,
+            binding,
+            attach,
+        )
+        .await;
+        // Lease the first peer before publishing the owner or arming the watcher.
+        // Even a failed peer setup leaves startup settlement to the owner table.
+        #[cfg(unix)]
+        let attachment = match &result {
+            Ok(owner) if attach => Some(attach_area_peer(&owner.client()).await),
+            _ => None,
+        };
         let safe_failure = result.is_err()
             && !matches!(&result, Err(BackendError::ExtensionUnsettled(_)))
             && self.failed_start_is_inactive(id).await;
@@ -372,21 +476,36 @@ impl HostService {
         match result {
             Ok(owner) => {
                 let client = owner.client();
+                let clock = owner.reclaim_clock();
+                let owner = Arc::new(NativeOwner::Ordinary(owner));
+                if let Some(clock) = clock {
+                    tokio::spawn(watch_idle(
+                        Arc::downgrade(&self.inner),
+                        id,
+                        Arc::downgrade(&owner),
+                        clock,
+                    ));
+                }
                 entries.insert(
                     id,
                     Entry {
                         phase: OwnerPhase::Live,
-                        owner: Some(Arc::new(NativeOwner::Ordinary(owner))),
+                        owner: Some(owner),
                         failed_start: None,
                     },
                 );
-                Ok(client)
+                Ok(OrdinaryLoad {
+                    client,
+                    #[cfg(unix)]
+                    attachment,
+                })
             }
             Err(error) => {
                 // Ordinary restore owns rollback/uncertainty classification;
                 // do not synthesize catalog transitions or fake an Idle row.
                 if safe_failure {
                     entries.remove(&id);
+                    self.inner.update_empty_since(&entries);
                 } else {
                     entries.insert(
                         id,
@@ -458,6 +577,7 @@ impl HostService {
                     failed_start: Some(custody.clone()),
                 },
             );
+            self.inner.update_empty_since(&entries);
         }
         let result = AssertUnwindSafe(super::mini::MiniAgent::start(
             self.inner.catalog.clone(),
@@ -489,6 +609,7 @@ impl HostService {
             failure => {
                 if safe_failure {
                     entries.remove(&id);
+                    self.inner.update_empty_since(&entries);
                 } else {
                     entries.insert(
                         id,
@@ -640,15 +761,15 @@ impl HostService {
         let service = self.clone();
         supervised(async move {
             let _reservation = service.inner.runtime.lifecycle.read().await;
-            service.close_inner(id, None).await
+            service.close_inner(id, CloseIntent::Close).await
         })
         .await
     }
-    async fn close_inner(&self, id: AgentId, guard: Option<CatalogGuard>) -> Result<()> {
+    async fn close_inner(&self, id: AgentId, intent: CloseIntent<'_>) -> Result<()> {
         if self.phase(id) == Some(OwnerPhase::StartFailed) {
             // No native owner exists to enforce this administrative guard.
             // Only the existing unconditional reconciliation path may remove it.
-            if guard.is_some() {
+            if !matches!(intent, CloseIntent::Close) {
                 return Err(ServiceError::Backend(BackendError::Faulted));
             }
             let custody = {
@@ -699,6 +820,7 @@ impl HostService {
                 match &result {
                     Ok(()) => {
                         entries.remove(&id);
+                        self.inner.update_empty_since(&entries);
                     }
                     Err(_) => {
                         if let Some(entry) = entries.get_mut(&id) {
@@ -718,6 +840,7 @@ impl HostService {
                 return Err(ServiceError::Busy);
             }
             entries.remove(&id);
+            self.inner.update_empty_since(&entries);
             return Ok(());
         }
         let (owner, previous_phase) = {
@@ -727,7 +850,12 @@ impl HostService {
                 return Err(ServiceError::Busy);
             }
             let owner = entry.owner.clone().ok_or(ServiceError::TaskStopped)?;
-            if guard.is_some() {
+            if let CloseIntent::Idle(expected) = intent {
+                if entry.phase != OwnerPhase::Live || expected.as_ptr() != Arc::as_ptr(&owner) {
+                    return Err(ServiceError::NotLoaded);
+                }
+            }
+            if !matches!(intent, CloseIntent::Close) {
                 // The persistent administrative guard is not Mini authority.
                 // Reject before changing phase or signalling any native run.
                 owner.ordinary()?;
@@ -739,9 +867,10 @@ impl HostService {
         // Contain a backend panic here as well: the owner stays in the map even
         // if native close cannot return, and a retry is never a fresh restore.
         let result = AssertUnwindSafe(async {
-            match guard {
-                Some(guard) => owner.ordinary()?.close_guarded(guard).await,
-                None => owner.close().await,
+            match intent {
+                CloseIntent::Guarded(guard) => owner.ordinary()?.close_guarded(guard).await,
+                CloseIntent::Idle(_) => owner.ordinary()?.unload_idle().await,
+                CloseIntent::Close => owner.close().await,
             }
         })
         .catch_unwind()
@@ -749,7 +878,7 @@ impl HostService {
         // Native Busy is before the close gate is acquired. GuardRejected is
         // explicitly pre-effect; generic Catalog/Harness errors are NOT assumed
         // harmless (they may follow cancellation or actual native cleanup).
-        let rejected = guard.is_some()
+        let rejected = !matches!(intent, CloseIntent::Close)
             && matches!(
                 &result,
                 Ok(Err(BackendError::GuardRejected(_) | BackendError::Busy))
@@ -758,6 +887,7 @@ impl HostService {
         match result {
             Ok(Ok(())) => {
                 entries.remove(&id);
+                self.inner.update_empty_since(&entries);
                 Ok(())
             }
             result => {
@@ -792,13 +922,60 @@ impl HostService {
         .await
     }
 
+    #[cfg(unix)]
+    pub(super) fn empty_since(&self) -> Option<watch::Receiver<Option<Instant>>> {
+        self.inner
+            .empty_since
+            .as_ref()
+            .map(watch::Sender::subscribe)
+    }
+
+    /// The listener has observed an uninterrupted peer-free interval. Fence
+    /// native admissions, then revalidate that no owner appeared in that time.
+    #[cfg(unix)]
+    pub(super) async fn shutdown_if_idle(&self, timeout: std::time::Duration) -> Result<bool> {
+        let Ok(guard) = self.inner.runtime.lifecycle.try_write() else {
+            return Ok(false);
+        };
+        let Some(since) = self
+            .inner
+            .empty_since
+            .as_ref()
+            .and_then(|value| *value.borrow())
+        else {
+            return Ok(false);
+        };
+        if self.is_stopping() || since.elapsed() < timeout {
+            return Ok(false);
+        }
+        let status = self
+            .catalog()
+            .status()
+            .await
+            .map_err(|error| ServiceError::Catalog(Arc::new(error)))?;
+        if status.resident != 0 || self.is_stopping() {
+            return Ok(false);
+        }
+        self.inner.runtime.begin_stopping();
+        DrainedService {
+            reservation: StopReservation {
+                service: self,
+                _guard: guard,
+                settled: true,
+            },
+        }
+        .close_storage()
+        .await?;
+        Ok(true)
+    }
+
     /// Caller holds the exclusive stop token; do not close catalog here. The
     /// drained token keeps it usable for journal publication before shutdown.
     async fn drain_inner(&self) -> Result<()> {
         let ids: Vec<_> = self.inner.entries().keys().copied().collect();
         let mut closes = FuturesUnordered::new();
         for id in ids {
-            closes.push(self.close_inner(id, None));
+            closes.push(self.close_during_shutdown(id));
         }
         while closes.next().await.is_some() {}
         let owners = self.owner_count();
@@ -817,6 +994,98 @@ impl HostService {
             });
         }
         Ok(())
+    }
+
+    async fn close_during_shutdown(&self, id: AgentId) -> Result<()> {
+        let grace = self
+            .inner
+            .entries()
+            .get(&id)
+            .and_then(|entry| entry.owner.as_ref()?.ordinary().ok()?.shutdown_grace());
+        let closing = self.close_inner(id, CloseIntent::Close);
+        let Some(grace) = grace else {
+            return closing.await;
+        };
+        tokio::pin!(closing);
+        tokio::select! {
+            biased;
+            result = &mut closing => return result,
+            () = tokio::time::sleep(grace) => (),
+        }
+        // This is a diagnostic within the owned drain. The same close must
+        // finish before the service can release its catalog and listener.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "Host Agent {id} exceeded shutdown grace ({} ms) and is still settling",
+            grace.as_millis()
+        );
+        closing.await
+    }
+}
+
+#[cfg(unix)]
+pub(super) async fn attach_area_peer(
+    client: &OrdinaryClient,
+) -> std::result::Result<AreaAttachment, BackendError> {
+    let (events, peer) = client.area_session(true).await?;
+    Ok((events, peer.ok_or(BackendError::TaskStopped)?))
+}
+
+// A watcher holds no strong owner or service reference while awaiting a deadline.
+// Expiry reserves the exact incarnation through the usual lifecycle fence.
+async fn watch_idle(
+    service: Weak<Inner>,
+    id: AgentId,
+    owner: Weak<NativeOwner>,
+    mut clock: watch::Receiver<ReclaimClock>,
+) {
+    let mut retry_at = None;
+    loop {
+        let deadline = clock.borrow_and_update().deadline();
+        if let Some(deadline) = deadline {
+            let deadline = deadline.max(retry_at.unwrap_or(deadline));
+            tokio::select! {
+                biased;
+                changed = clock.changed() => {
+                    if changed.is_err() { return; }
+                    retry_at = None;
+                    continue;
+                }
+                () = tokio::time::sleep_until(deadline) => (),
+            }
+            let Some(inner) = service.upgrade() else {
+                return;
+            };
+            let service = HostService { inner };
+            let expected = owner.clone();
+            let result = service
+                .with_administration(move |reservation| {
+                    Box::pin(async move {
+                        reservation
+                            .service
+                            .close_inner(id, CloseIntent::Idle(&expected))
+                            .await
+                    })
+                })
+                .await;
+            match result {
+                Err(ServiceError::Busy | ServiceError::Backend(BackendError::Busy)) => {
+                    retry_at = Some(Instant::now() + Duration::from_millis(100));
+                }
+                Err(ServiceError::NotLoaded | ServiceError::Stopping) | Ok(()) => return,
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "Host Agent {id} idle unload failed: {error}"
+                    );
+                    return;
+                }
+            }
+        } else if clock.changed().await.is_err() {
+            return;
+        } else {
+            retry_at = None;
+        }
     }
 }
 

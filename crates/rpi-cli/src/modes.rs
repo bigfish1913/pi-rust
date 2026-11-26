@@ -3176,7 +3176,7 @@ async fn rpc_set_model(
     Ok(serde_json::json!({"modelId": id, "provider": provider}))
 }
 
-async fn rpc_set_thinking_level(
+pub(crate) async fn rpc_set_thinking_level(
     lane: &Arc<dyn AgentLane>,
     msg: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {

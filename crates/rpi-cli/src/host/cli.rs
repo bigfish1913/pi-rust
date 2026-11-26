@@ -114,7 +114,7 @@ pub(super) mod unix {
     use std::{
         collections::{BTreeMap, BTreeSet},
         num::NonZeroUsize,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::Duration,
     };
 
@@ -200,6 +200,38 @@ pub(super) mod unix {
             })
         }
     }
+    #[derive(serde::Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(in crate::host) struct NamedAgentProfile {
+        pub name: String,
+        pub path: PathBuf,
+    }
+
+    pub(in crate::host) fn validate_named_profiles(
+        profiles: &[NamedAgentProfile],
+        startup_count: usize,
+        capacity: Option<NonZeroUsize>,
+    ) -> bool {
+        if profiles.is_empty() {
+            return true;
+        }
+        let member_count = startup_count.saturating_add(profiles.len());
+        if member_count > crate::host::MAX_TRUSTED_PROFILES
+            || capacity.is_some_and(|limit| member_count > limit.get())
+        {
+            return false;
+        }
+        let mut names = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        profiles.iter().all(|profile| {
+            super::super::area_entry::valid_name(&profile.name)
+                && profile.name != "agent"
+                && names.insert(&profile.name)
+                && profile.path.is_absolute()
+                && paths.insert(&profile.path)
+        })
+    }
+
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     pub(in crate::host) struct FileConfig {
@@ -226,6 +258,11 @@ pub(super) mod unix {
         agents: Vec<PathBuf>,
         #[serde(default)]
         session_rpc_agent: Option<NativeAgentId>,
+        #[serde(default)]
+        restore_on_attach: bool,
+        /// Additional startup profiles with their own Session RPC routes.
+        #[serde(default)]
+        named_agent_profiles: Vec<NamedAgentProfile>,
         /// Owner policy only; never populated from a control request.
         #[serde(default)]
         administration: Option<FileAdministration>,
@@ -254,16 +291,59 @@ pub(super) mod unix {
             self.directory.is_absolute()
                 && self.control().validate().is_ok()
                 && self.host.validate().is_ok()
+                && validate_named_profiles(
+                    &self.named_agent_profiles,
+                    self.agents.len(),
+                    self.host.max_agents,
+                )
+                && self
+                    .named_agent_profiles
+                    .iter()
+                    .all(|profile| !self.agents.contains(&profile.path))
                 && self.launch_policy().validate().is_ok()
                 && (1..=300_000).contains(&self.client_timeout_ms)
-                && self
-                    .administration
-                    .as_ref()
-                    .is_none_or(|policy| policy.valid(self.agents.len()))
+                && self.administration.as_ref().is_none_or(|policy| {
+                    policy.valid(
+                        self.agents
+                            .len()
+                            .saturating_add(self.named_agent_profiles.len()),
+                    )
+                })
                 && self
                     .mini_control
                     .as_ref()
                     .is_none_or(|policy| policy.valid())
+        }
+        #[cfg(target_os = "macos")]
+        pub(in crate::host) fn validate_area_daemon(
+            &self,
+            directory: &Path,
+        ) -> Result<(), &'static str> {
+            if self.directory != directory || self.socket_path != directory.join("control.sock") {
+                return Err("Host configuration does not belong to this area");
+            }
+            if self.mode != HostRunMode::Daemon {
+                return Err("the private area configuration must enable daemon mode");
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        pub(in crate::host) fn validate_area_restore(
+            &self,
+            directory: &Path,
+        ) -> Result<(), &'static str> {
+            self.validate_area_daemon(directory)?;
+            if !self.recovery.restore_on_start {
+                return Err("the private area configuration must enable restore_on_start");
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        pub(in crate::host) fn named_profile_path(&self, name: &str) -> Option<&Path> {
+            self.named_agent_profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .map(|profile| profile.path.as_path())
         }
         pub(in crate::host) fn connection(&self) -> ConnectionConfig {
             ConnectionConfig {
@@ -341,19 +421,23 @@ pub(super) mod unix {
         }
         Ok(config)
     }
-    fn read_profiles(
-        paths: &[PathBuf],
+    pub(in crate::host) fn decode_startup_profile(
+        bytes: &[u8],
+    ) -> Result<crate::host::HostStartupAgent, &'static str> {
+        let profile: crate::host::AgentProfileFile =
+            serde_json::from_slice(bytes).map_err(|_| "invalid Agent profile")?;
+        profile.into_startup().map_err(|_| "invalid Agent profile")
+    }
+
+    fn read_profiles<'a>(
+        paths: impl IntoIterator<Item = &'a Path>,
         config: &FileConfig,
         recovery: &mut Option<Bindings>,
     ) -> Result<Vec<crate::host::HostStartupAgent>, &'static str> {
-        let mut agents = Vec::with_capacity(paths.len());
+        let mut agents = Vec::new();
         for path in paths {
             let bytes = read_private_bytes(path, crate::host::MAX_PROFILE_BYTES)?;
-            let profile: crate::host::AgentProfileFile =
-                serde_json::from_slice(&bytes).map_err(|_| "invalid Agent profile")?;
-            let agent = profile
-                .into_startup()
-                .map_err(|_| "invalid Agent profile")?;
+            let agent = decode_startup_profile(&bytes)?;
             if let Some(bindings) = recovery.as_mut() {
                 if agent.spec.mode == crate::host::AgentMode::Persistent {
                     let version = recovery::profile_version(
@@ -693,19 +777,39 @@ pub(super) mod unix {
         #[cfg(target_os = "macos")] worker: Option<supervisor::Worker>,
     ) -> i32 {
         let mut recovery = config.recovery.restore_on_start.then(Bindings::new);
-        let agents = match read_profiles(&config.agents, &config, &mut recovery) {
+        let startup_paths = config.agents.iter().map(PathBuf::as_path).chain(
+            config
+                .named_agent_profiles
+                .iter()
+                .map(|profile| profile.path.as_path()),
+        );
+        let agents = match read_profiles(startup_paths, &config, &mut recovery) {
             Ok(agents) => agents,
             Err(error) => {
                 eprintln!("error: {error}");
                 return 1;
             }
         };
+        let session_rpc_agents = config
+            .session_rpc_agent
+            .into_iter()
+            .chain(
+                agents
+                    .iter()
+                    .skip(config.agents.len())
+                    .map(|agent| agent.spec.id),
+            )
+            .collect();
         let administration = match config
             .administration
             .as_ref()
             .map(|policy| {
-                read_profiles(&policy.profiles, &config, &mut recovery)
-                    .and_then(|profiles| policy.native(profiles))
+                read_profiles(
+                    policy.profiles.iter().map(PathBuf::as_path),
+                    &config,
+                    &mut recovery,
+                )
+                .and_then(|profiles| policy.native(profiles))
             })
             .transpose()
         {
@@ -719,7 +823,7 @@ pub(super) mod unix {
             config,
             agents,
             administration,
-            recovery,
+            (recovery, session_rpc_agents),
             #[cfg(target_os = "macos")]
             worker,
         )
@@ -729,7 +833,7 @@ pub(super) mod unix {
         config: FileConfig,
         agents: Vec<crate::host::HostStartupAgent>,
         administration: Option<DaemonAdministrationConfig>,
-        recovery: Option<Bindings>,
+        (recovery, session_rpc_agents): (Option<Bindings>, BTreeSet<NativeAgentId>),
         #[cfg(target_os = "macos")] worker: Option<supervisor::Worker>,
     ) -> i32 {
         use tokio::signal::unix::{signal, SignalKind};
@@ -754,6 +858,10 @@ pub(super) mod unix {
             return 1;
         };
         let control = config.control();
+        let routes = crate::host::area_rpc::SessionRoutes {
+            agents: session_rpc_agents,
+            restore_on_attach: config.restore_on_attach,
+        };
         let mut daemon = match HostDaemon::open_with_recovery(
             config.directory,
             config.host,
@@ -761,7 +869,7 @@ pub(super) mod unix {
             agents,
             administration,
             config.mini_control,
-            (recovery, listener, config.session_rpc_agent),
+            (recovery, listener, routes),
         )
         .await
         {
@@ -819,9 +927,10 @@ pub(super) mod unix {
                         false
                     },
                     result = daemon.wait_control(), if !listener_failed => {
-                        listener_failed = result.is_err() || !daemon.control_stopped_by_administration();
+                        let idle_stop = daemon.control_stopped_for_idleness();
+                        listener_failed = result.is_err() || !(idle_stop || daemon.control_stopped_by_administration());
                         if listener_failed { diagnostic("Host control listener stopped"); }
-                        false
+                        idle_stop
                     },
                 };
                 #[cfg(target_os = "macos")]

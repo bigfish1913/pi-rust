@@ -2,6 +2,9 @@
 //! mutation, second Agent loop, IPC, or durable input-ACK protocol lives here.
 
 mod supervisor;
+#[cfg(unix)]
+pub(super) use supervisor::AreaPeer;
+pub(super) use supervisor::ReclaimClock;
 #[cfg(all(test, unix))]
 mod tests;
 
@@ -403,18 +406,42 @@ impl OrdinaryAgent {
         limits: OrdinaryLimits,
         binding: OrdinaryBinding,
     ) -> BackendResult<Self> {
+        Self::restore_bound_with_intent(catalog, id, guard, limits, binding, false).await
+    }
+
+    pub(super) async fn restore_bound_with_intent(
+        catalog: HostCatalog,
+        id: super::AgentId,
+        guard: CatalogGuard,
+        limits: OrdinaryLimits,
+        binding: OrdinaryBinding,
+        attach: bool,
+    ) -> BackendResult<Self> {
         if limits.max_input_bytes == 0 {
             return Err(BackendError::Binding("input byte budget must be nonzero"));
         }
         // This task owns startup even if its awaiting caller disappears. An
         // unclaimed successful owner is dropped and cooperatively cleaned up.
-        owned(async move { supervisor::restore(catalog, id, guard, limits, binding).await }).await
+        owned(async move { supervisor::restore(catalog, id, guard, limits, binding, attach).await })
+            .await
     }
 
     pub fn client(&self) -> OrdinaryClient {
         OrdinaryClient {
             inner: Arc::downgrade(&self.inner),
         }
+    }
+
+    pub(super) fn shutdown_grace(&self) -> Option<std::time::Duration> {
+        self.inner.shutdown_grace
+    }
+
+    pub(super) fn reclaim_clock(&self) -> Option<watch::Receiver<ReclaimClock>> {
+        self.inner.reclaim.as_ref().map(watch::Sender::subscribe)
+    }
+
+    pub(super) async fn unload_idle(&self) -> BackendResult<()> {
+        self.inner.unload_idle().await
     }
 
     pub async fn close(&self) -> BackendResult<()> {
@@ -559,22 +586,22 @@ impl OrdinaryClient {
     }
 
     #[cfg(unix)]
-    pub(in crate::host) async fn install_area_events(
+    pub(in crate::host) async fn area_session(
         &self,
-        events: super::area_rpc::Events,
-    ) -> BackendResult<()> {
-        self.upgrade()?.install_area_events(events).await
+        attach: bool,
+    ) -> BackendResult<(super::area_rpc::Events, Option<AreaPeer>)> {
+        self.upgrade()?.area_session(attach).await
     }
 
     #[cfg(unix)]
-    pub(in crate::host) async fn area_query(
+    pub(in crate::host) async fn area_command(
         &self,
         kind: &str,
         msg: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         self.upgrade()
             .map_err(|error| error.to_string())?
-            .area_query(kind, msg)
+            .area_command(kind, msg)
             .await
     }
 

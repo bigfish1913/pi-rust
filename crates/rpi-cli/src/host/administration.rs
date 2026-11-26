@@ -107,6 +107,9 @@ impl AdministrativeGrant {
     pub fn scope(&self) -> ControlScopeId {
         self.scope
     }
+    pub(super) fn can_restore(&self, id: AgentId) -> bool {
+        self.permissions.restore && self.agents.contains(&id)
+    }
     fn authorize(&self, request: &LifecycleRequest) -> Result<(), AdministrativeError> {
         let permitted = match request.action {
             LifecycleAction::Create { .. } | LifecycleAction::CreateProfile { .. } => {
@@ -314,6 +317,13 @@ impl AdministrativeCoordinator {
         }
         observe(observer).await
     }
+    pub(super) async fn prepare_attach(
+        &self,
+        reference: ProfileRef,
+    ) -> Result<PreparedProfile, BackendError> {
+        self.inner.profiles.prepare(reference).await
+    }
+
     async fn run(&self, request: LifecycleRequest) -> AdministrativeResult {
         if let Some(receipt) = self.settled_receipt(&request)? {
             return Ok(receipt);
