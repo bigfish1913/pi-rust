@@ -529,9 +529,8 @@ async fn run_child(child: ChildHarness, job: Arc<Job>, prompt: String, turns: u3
                     .and_then(Value::as_str)
                     .map_or(0, str::len);
                 if state.bytes.saturating_add(bytes) > MAX_OUTPUT {
-                    state
-                        .error
-                        .get_or_insert_with(|| "child output limit exceeded".into());
+                    drop(state);
+                    job.fail("child output limit exceeded");
                 } else if state.error.is_none() {
                     outcome["turns"] = json!(state.turns);
                     outcome["turnLimited"] = json!(state.turns >= turns);

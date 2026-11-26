@@ -786,6 +786,33 @@ async fn production_command_panic_closes_transport_without_a_successful_settleme
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_child_observations_are_not_advertised_without_a_bridge() {
+    let (harness, _) = rpc_test_harness("unused", 0.0).await;
+    let parent_id = harness.session().storage().metadata().id.clone();
+    let (mut client, output, task) =
+        start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+    let ready = output.wait_for(|m| m["type"] == "ready").await;
+    assert!(ready.get("childAgents").is_none());
+    for command in [
+        "get_child_agents",
+        "get_child_agent_events",
+        "cancel_child_agent",
+    ] {
+        assert!(!ready["supportedCommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == command));
+    }
+    send(&mut client, json!({"type":"get_child_agents","id":"unavailable","version":1,"parentSessionId":parent_id})).await;
+    assert_eq!(
+        output.wait_for(|m| m["id"] == "unavailable").await["success"],
+        false
+    );
+    stop(&mut client, task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_child_observation_rpc_preserves_binding_and_disposed_history() {
     use rpi_extensions::RuntimeActionHost;
     let (harness, _) = rpc_test_harness("delegated native observation", 0.0).await;
@@ -815,7 +842,22 @@ async fn production_child_observation_rpc_preserves_binding_and_disposed_history
         rpi_extensions::UiDialogMailbox::new(),
         Some(Arc::new(std::sync::Mutex::new(session))),
     );
-    output.wait_for(|m| m["type"] == "ready").await;
+    let ready = output.wait_for(|m| m["type"] == "ready").await;
+    assert_eq!(
+        ready["childAgents"],
+        crate::child_agents::observation_capabilities()
+    );
+    for command in [
+        "get_child_agents",
+        "get_child_agent_events",
+        "cancel_child_agent",
+    ] {
+        assert!(ready["supportedCommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == command));
+    }
     let child = host
         .child_agent(7, json!({"op":"start","task":"return a short report"}))
         .await

@@ -5,6 +5,8 @@ separate from ToolProgram children (nested tool invocations) and from root
 sessions. Nothing here grants a plugin access to another plugin's child handle.
 The plugin ABI and its owner-scoped start/poll/cancel/dispose operations are
 unchanged. These commands are available only to the controlling native RPC host.
+The host advertises the profile and its three commands only when its extension
+action bridge is active. Hosts started without that bridge omit both.
 
 Every request requires `version: 1` and `parentSessionId` matching the harness's
 current session. Ordinary RPC `id` correlation is unchanged.

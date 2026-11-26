@@ -422,6 +422,80 @@ fn observation_query(parent: &str, command: &str) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_report_budget_failure_is_terminal_and_evictable() {
+    let report = "report";
+    let parent = parent(FauxScript::new().with_text(report)).await;
+    let child_job = job(7);
+    {
+        let mut state = child_job.state.lock().unwrap();
+        // Streamed text still fits; adding the final report exceeds the budget.
+        state.bytes = MAX_OUTPUT - 2 * report.len() + 1;
+        state.parent_session_id = "parent".into();
+    }
+    let session = Session::new(
+        Arc::new(InMemorySessionStorage::new(
+            SessionMetadata {
+                id: "over-budget".into(),
+                created_at: 0,
+                parent_session_id: Some("parent".into()),
+            },
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        )),
+        None,
+    );
+    let child = parent
+        .create_child(session, Arc::new(Emitter(child_job.clone())), 8, None)
+        .await
+        .unwrap();
+    run_child(child, child_job.clone(), "report".into(), 8, 10).await;
+    let manager = ChildAgents::default();
+    manager
+        .observations
+        .lock()
+        .unwrap()
+        .remember("over-budget".into(), child_job);
+    let roster = manager
+        .query("parent", observation_query("parent", "get_child_agents"))
+        .unwrap();
+    let row = &roster["children"][0];
+    assert_eq!(row["status"], "failed");
+    assert!(row["finishedMs"].as_u64().is_some(), "{row}");
+    let page = manager
+        .query(
+            "parent",
+            json!({"type":"get_child_agent_events","version":1,"parentSessionId":"parent",
+        "epoch":roster["epoch"],"childId":"over-budget","afterSeq":0,"limit":32}),
+        )
+        .unwrap();
+    assert_eq!(
+        page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == json!({"type":"child_status","status":"failed"}))
+            .count(),
+        1
+    );
+    for index in 0..32 {
+        let running = job(7);
+        running.state.lock().unwrap().parent_session_id = "parent".into();
+        manager
+            .observations
+            .lock()
+            .unwrap()
+            .remember(format!("running-{index}"), running);
+    }
+    let roster = manager
+        .query("parent", observation_query("parent", "get_child_agents"))
+        .unwrap();
+    let children = roster["children"].as_array().unwrap();
+    assert_eq!(children.len(), 32);
+    assert!(children.iter().all(|row| row["childId"] != "over-budget"));
+    assert_eq!(children[0]["childId"], "running-31");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_observations_survive_disposal_and_are_parent_scoped() {
     let parent = parent(FauxScript::new().with_text("native child final")).await;
     let manager = ChildAgents::default();
