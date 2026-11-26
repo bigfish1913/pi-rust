@@ -274,6 +274,7 @@ async fn mini_flags_run_in_the_same_host_and_use_its_capacity() {
             std::fs::create_dir(dir).unwrap();
         }
         std::fs::write(workspace.join("context.txt"), "attached context").unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "workspace instructions").unwrap();
         let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
         write_fixture(&agent, provider.local_addr().unwrap());
         std::fs::write(
@@ -303,7 +304,7 @@ async fn mini_flags_run_in_the_same_host_and_use_its_capacity() {
         };
         let mut a = spawn(&["--host", "--mini", "@context.txt", "prompt-alpha"]);
         a.stdin.take().unwrap().write_all(b"piped alpha ").await.unwrap();
-        let mut b = spawn(&["--mini", "--host=work", "--tools", "read", "prompt-beta"]);
+        let mut b = spawn(&["--mini", "--host=work", "--tools", "read", "--no-context-files", "prompt-beta"]);
         drop(b.stdin.take());
         let (mut first, _) = provider.accept().await.unwrap();
         let (mut second, _) = provider.accept().await.unwrap();
@@ -315,6 +316,8 @@ async fn mini_flags_run_in_the_same_host_and_use_its_capacity() {
         };
         assert!(alpha.contains("prompt-alpha") && alpha.contains("piped alpha") && alpha.contains("attached context"), "{alpha}");
         assert!(beta.contains("prompt-beta") && !beta.contains("prompt-alpha"), "{beta}");
+        assert!(alpha.contains("workspace instructions"), "{alpha}");
+        assert!(!beta.contains("workspace instructions"), "{beta}");
         let alpha = serde_json::from_str::<Value>(&alpha).unwrap();
         let beta = serde_json::from_str::<Value>(&beta).unwrap();
         let default_tools = alpha["tools"].as_array().expect("default Mini tools");
