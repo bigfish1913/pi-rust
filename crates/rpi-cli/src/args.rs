@@ -142,6 +142,10 @@ pub struct Args {
     pub thinking: Option<ThinkingLevel>,
 
     pub print: bool,
+    /// Select an ephemeral session and turn off native durable execution.
+    pub mini: bool,
+    /// The empty string selects the configured default area.
+    pub host: Option<String>,
     pub mode: Mode,
     pub rpc_message_updates: RpcMessageUpdates,
     /// `--tui-mode regular|fullscreen` controls the interactive terminal
@@ -352,6 +356,9 @@ pub fn parse_args(args: &[String]) -> Args {
         }
     }
     let mut i = 0;
+    let mut host_arg_count = 0;
+    let mut host_tui_arg_count = 0;
+    let mut unsupported_host_rpc_flag = None;
     while i < args.len() {
         let arg = args[i].clone();
         // Peel an inline `--flag=value` (long flags only — short flags never use
@@ -369,6 +376,40 @@ pub fn parse_args(args: &[String]) -> Args {
         // Take a value: prefer the inline `--flag=value`, else the next argv
         // token (when it isn't flag-shaped). Advances `i` past a consumed token.
         // (For unknown-flag diagnostics the closing arm reads `flag_key` itself.)
+        if !matches!(
+            flag_key.as_str(),
+            "--host"
+                | "--mode"
+                | "--session"
+                | "-s"
+                | "--session-id"
+                | "--session-dir"
+                | "--fork"
+                | "--fork-entry"
+                | "--fork-position"
+                | "--provider"
+                | "--model"
+                | "--resource-config"
+                | "--resource-transition"
+                | "--permission-gate"
+                | "--bypass"
+                | "--approve"
+                | "-a"
+                | "--no-approve"
+                | "-na"
+                | "--offline"
+                | "--no-native-durable"
+                | "--no-session"
+                | "--rpc-message-updates"
+                | "--help"
+                | "-h"
+                | "--version"
+                | "-v"
+        ) && flag_key.starts_with('-')
+        {
+            unsupported_host_rpc_flag.get_or_insert_with(|| flag_key.clone());
+        }
+
         let mut take_value = |result: &mut Args, _flag: &str| -> Option<String> {
             if let Some(v) = inline.clone() {
                 return Some(v);
@@ -429,6 +470,7 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--tui-mode" => {
                 if let Some(v) = take_value(&mut result, "--tui-mode") {
+                    host_tui_arg_count += if inline.is_some() { 1 } else { 2 };
                     result.tui_mode = match v.to_ascii_lowercase().as_str() {
                         "regular" => TuiMode::Regular,
                         "fullscreen" => TuiMode::Fullscreen,
@@ -443,6 +485,35 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--continue" | "-c" => result.continue_session = true,
             "--resume" | "-r" => result.resume = true,
+            "--host" => {
+                if result.host.is_some() {
+                    result
+                        .errors
+                        .push("--host may only be supplied once".into());
+                }
+                let area = if let Some(area) = inline {
+                    if area.is_empty() {
+                        result.errors.push("--host= requires an area name".into());
+                    }
+                    area
+                } else if let Some(next) = args.get(i + 1).filter(|next| {
+                    !next.starts_with('-') && !next.starts_with('@') && !next.is_empty()
+                }) {
+                    i += 1;
+                    host_arg_count += 1;
+                    next.clone()
+                } else {
+                    String::new()
+                };
+                host_arg_count += 1;
+                result.host = Some(area);
+            }
+            "--mini" => {
+                result.mini = true;
+                if inline.is_some() {
+                    result.errors.push("--mini does not take a value".into());
+                }
+            }
             "--no-session" => result.no_session = true,
             "--no-tools" | "-nt" => result.no_tools = true,
             "--no-builtin-tools" | "-nbt" => result.no_builtin_tools = true,
@@ -640,8 +711,14 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--theme" => {
                 result.theme = take_value(&mut result, "--theme");
+                if result.theme.is_some() {
+                    host_tui_arg_count += if inline.is_some() { 1 } else { 2 };
+                }
             }
-            "--no-themes" => result.no_themes = true,
+            "--no-themes" => {
+                host_tui_arg_count += 1;
+                result.no_themes = true;
+            }
             // Unknown long flag (with or without `=`). Preserve it for an
             // extension to claim after extension registration, matching Pi's
             // `unknownFlags` behavior. A bare flag is boolean true; a following
@@ -681,8 +758,75 @@ pub fn parse_args(args: &[String]) -> Args {
         .errors
         .extend(fork_errors.into_iter().map(str::to_owned));
 
-    // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
+    if result.host.is_some()
+        && !result.mini
+        && result.mode != Mode::Rpc
+        && args.len() != host_arg_count + host_tui_arg_count
+    {
+        result.errors.push(
+            "Host TUI accepts --tui-mode, --theme and --no-themes; prompt options require --mini"
+                .into(),
+        );
+    }
+
+    if result.host.is_some() && !result.mini && result.mode == Mode::Rpc {
+        if let Some(flag) = unsupported_host_rpc_flag {
+            result
+                .errors
+                .push(format!("{flag} is not supported by Host RPC"));
+        }
+    }
+
+    if result.mini {
+        result.no_session = true;
+        result.native_durable = false;
+        for (present, flag) in [
+            (result.continue_session, "--continue"),
+            (result.resume, "--resume"),
+            (result.session.is_some(), "--session"),
+            (result.session_id.is_some(), "--session-id"),
+            (result.session_dir.is_some(), "--session-dir"),
+            (result.fork.is_some(), "--fork"),
+            (result.export.is_some(), "--export"),
+        ] {
+            if present {
+                result
+                    .errors
+                    .push(format!("--mini cannot be combined with {flag}"));
+            }
+        }
+    }
+    if result.host.is_some() && result.mini {
+        for (present, flag) in [
+            (result.name.is_some(), "--name"),
+            (result.mode != Mode::Text, "--mode json/rpc"),
+            (result.list_models.is_some(), "--list-models"),
+            (result.models.is_some(), "--models"),
+            (result.resource_config.is_some(), "--resource-config"),
+            (
+                result.resource_transition.is_some(),
+                "--resource-transition",
+            ),
+            (!result.extension.is_empty(), "--extension"),
+            (!result.extensions_dir.is_empty(), "--extensions-dir"),
+            (!result.skill.is_empty(), "--skill"),
+            (!result.prompt_template.is_empty(), "--prompt-template"),
+            (result.theme.is_some(), "--theme"),
+        ] {
+            if present {
+                result
+                    .errors
+                    .push(format!("--mini cannot be combined with {flag}"));
+            }
+        }
+        for flag in result.unknown_flags.keys() {
+            result
+                .errors
+                .push(format!("--mini does not support --{flag}"));
+        }
+    }
     if result.resource_config.is_none() && result.resource_transition.is_none() {
+        // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
         env_extension_dirs.append(&mut result.extensions_dir);
         result.extensions_dir = env_extension_dirs;
     }
@@ -762,9 +906,11 @@ pub fn print_help() {
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
   --rpc-message-updates <mode>   RPC updates: compact-deltas (default) or snapshot (legacy)
+  --host [area]                  Run in a shared local Host area (Unix), in TUI, RPC, or --mini mode
+  --host[=area] --mini [prompt]   Run a one-shot text prompt in that Host
   --server [--port <n>] [--bind <ip>]
                                  Headless server: serve a remote-connectable agent (no TUI)
-  --host [area]                 Join or start a persistent local Host area (macOS)
+  --native-host [area]          Join or start a persistent Host area (macOS)
   --connect <host:port>          Remote client: connect to a `--server` instance and run the TUI
                                  (no local provider/tools/session; all agent work is remote)
   --token <token>                Auth token for `--connect` (printed by `--server`; may also
@@ -776,6 +922,7 @@ pub fn print_help() {
   --approve, -a                  Force-enable current-project resources
   --no-approve, -na              Disable current-project resources
   --print, -p                    Non-interactive: process prompt(s) and exit
+  --mini                         Use an in-memory session and disable native durable execution
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
@@ -1009,6 +1156,61 @@ mod tests {
         assert!(!parse_args(&s(&["--no-native-durable"])).native_durable);
         assert!(parse_args(&s(&["--no-native-durable", "--native-durable"])).native_durable);
         assert!(!parse_args(&s(&["--native-durable", "--no-native-durable"])).native_durable);
+    }
+
+    #[test]
+    fn mini_always_disables_session_and_durable() {
+        for argv in [
+            ["--mini", "--native-durable", "hello"],
+            ["--native-durable", "--mini", "hello"],
+        ] {
+            let args = parse_args(&s(&argv));
+            assert!(args.mini && args.no_session && !args.native_durable);
+            assert!(args.errors.is_empty(), "{:?}", args.errors);
+            assert_eq!(args.messages, ["hello"]);
+            assert_eq!(resolve_mode(&args, true, true), RunMode::Interactive);
+        }
+    }
+
+    #[test]
+    fn mini_accepts_regular_modes_and_resource_flags() {
+        let args = parse_args(&s(&[
+            "--mini",
+            "--mode",
+            "rpc",
+            "--tools",
+            "read",
+            "--extension",
+            "extension.dylib",
+        ]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(resolve_mode(&args, true, true), RunMode::Rpc);
+        assert_eq!(args.tools.unwrap(), ["read"]);
+        assert_eq!(args.extension, [PathBuf::from("extension.dylib")]);
+    }
+
+    #[test]
+    fn mini_rejects_session_and_durable_epoch_flags() {
+        for (flags, expected) in [
+            (&["--resume"][..], "--resume"),
+            (&["--session-id", "saved"][..], "--session-id"),
+            (&["--export", "session.jsonl"][..], "--export"),
+            (
+                &["--experimental-durable-epoch", "epoch"][..],
+                "--experimental-durable-epoch",
+            ),
+        ] {
+            let argv = ["--mini"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .collect::<Vec<_>>();
+            let args = parse_args(&s(&argv));
+            assert!(
+                args.errors.iter().any(|error| error.contains(expected)),
+                "{:?}",
+                args.errors
+            );
+        }
     }
 
     #[test]
@@ -1503,6 +1705,29 @@ mod tests {
         );
         let invalid = parse_args(&s(&["--tui-mode", "split"]));
         assert!(!invalid.errors.is_empty());
+    }
+
+    #[test]
+    fn host_accepts_terminal_presentation_flags() {
+        let args = parse_args(&s(&[
+            "--host",
+            "work",
+            "--tui-mode",
+            "regular",
+            "--theme=light",
+        ]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(args.host.as_deref(), Some("work"));
+        assert_eq!(args.tui_mode, TuiMode::Regular);
+        assert_eq!(args.theme.as_deref(), Some("light"));
+
+        let args = parse_args(&s(&["--no-themes", "--tui-mode=fullscreen", "--host=work"]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(args.tui_mode, TuiMode::Fullscreen);
+        assert!(args.no_themes);
+        assert!(!parse_args(&s(&["--host", "--provider", "fixture"]))
+            .errors
+            .is_empty());
     }
 
     #[test]

@@ -9,6 +9,7 @@ struct State {
     owner: Option<(u64, String)>,
     exit_code: Option<i32>,
     conflict: Option<String>,
+    claims_disabled: bool,
 }
 
 #[derive(Clone, Default)]
@@ -18,6 +19,14 @@ pub struct StdioLifecycle {
 }
 
 impl StdioLifecycle {
+    pub(crate) fn disable_claims(&self) {
+        self.state.lock().unwrap().claims_disabled = true;
+    }
+
+    pub(crate) fn claims_disabled(&self) -> bool {
+        self.state.lock().unwrap().claims_disabled
+    }
+
     pub(crate) fn claim(&self, id: u64, name: &str) -> Result<(), String> {
         let mut state = self.state.lock().unwrap();
         match &state.owner {

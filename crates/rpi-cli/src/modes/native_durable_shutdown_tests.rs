@@ -166,6 +166,7 @@ impl Fixture {
                     home: crate::config::AgentHome::process(),
                 },
                 true,
+                super::RpcLifetime::default(),
                 input,
                 output,
             )

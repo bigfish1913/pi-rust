@@ -1,6 +1,6 @@
 //! Early CLI entry for native Host areas.
 
-const HELP: &str = "Usage: rpi --host [area] [--agent name] [--mode json|rpc]\n       rpi --host --restore-areas\n\nJoin the native Host for an area, starting it on first use. The default\narea is configured in $RPI_CODING_AGENT_DIR/host.json. macOS only.\nUse --mode json to report the selected Host and Session.\nUse --restore-areas to start the initialized daemons listed in restoreAreas.";
+const HELP: &str = "Usage: rpi --native-host [area] [--agent name] [--mode json|rpc]\n       rpi --native-host --restore-areas\n\nJoin the native Host for an area, starting it on first use. The default\narea is configured in $RPI_CODING_AGENT_DIR/host.json. macOS only.\nUse --mode json to report the selected Host and Session.\nUse --restore-areas to start the initialized daemons listed in restoreAreas.";
 
 #[derive(Clone, Copy)]
 enum Mode {

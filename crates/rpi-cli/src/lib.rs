@@ -52,7 +52,11 @@ pub mod host;
 pub mod install;
 pub mod interactive_tui;
 pub mod key_trace;
+#[cfg(unix)]
+mod local_host;
 pub mod message_agent;
+#[cfg(unix)]
+mod mini;
 pub mod model_registry;
 pub mod modes;
 mod native_durable;

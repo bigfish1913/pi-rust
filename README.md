@@ -140,7 +140,14 @@ export ANTHROPIC_API_KEY=...          # or OPENAI_API_KEY, or ~/.rpi/agent/model
 rpi                                   # interactive TUI
 rpi -p "summarize the README"         # one-shot
 rpi --mode json -p "list the crates"  # machine-readable event stream
+rpi --mini -p "explain this error"    # one-shot without saving the session
 ```
+
+`--mini` uses in-memory sessions and disables native durable execution. The
+conversation ends with the process, and session import, export, fork, and
+resume are unavailable. Context compaction, tools, and resource discovery work
+as usual. Use `--tools read` to limit the tool set to `read`, or `-p` for a
+one-shot reply.
 
 Sessions persist as JSONL and survive a crash mid-run; `rpi` resumes from the
 last committed frame rather than replaying the turn. Custom Anthropic or
@@ -467,12 +474,21 @@ with the full `execute`→`poll`→`cancel`→`destroy` lifecycle — and read
 [`docs/extensions/authoring.md`](docs/extensions/authoring.md) for the safety
 rules, which are load-bearing rather than stylistic.
 
-## Shared Host areas on macOS
+## Shared local Host on Unix
+
+`rpi --host [area]` runs independent Agent Sessions in one local Host process per
+area. It supports the ordinary interactive TUI, stdio RPC, and one-shot Mini
+with `rpi --host [area] --mini "prompt"`. The `default` area uses ordinary Session
+storage. Other areas use `local-host-v1/area-<name>/sessions` under the agent home
+unless an explicit Session directory is supplied. A named area can set `maxAgents`
+(default 32, range 1–256) and `idleTimeoutSeconds` (default 0, disabled).
+
+## Persistent Shared Host areas on macOS
 
 ```bash
-rpi --host                 # Open the default area's Session in the terminal
-rpi --host work            # Open a separate area and Session
-rpi --host --mode json     # Inspect the selected area, Host and Session IDs
+rpi --native-host                 # Open the default area's Session in the terminal
+rpi --native-host work            # Open a separate area and Session
+rpi --native-host --mode json     # Inspect the selected area, Host and Session IDs
 ```
 
 First entry creates `$RPI_CODING_AGENT_DIR/host.json` (normally `~/.rpi/agent/host.json`) and starts a detached Host. With the default settings, it starts one Persistent Agent. Clients that select the same Agent share its Session. Start each client from the workspace configured for its Agent.
@@ -487,13 +503,13 @@ The timers and `restoreOnAttach` require `restore` permission. When any of these
 
 For a daemon that can run without loaded Agents, set `host.host_idle_timeout_ms` in its private configuration. It shuts down after that many consecutive milliseconds with zero resident Agents and zero control or Session connections. An in-progress lifecycle transaction can delay shutdown.
 
-To configure more Persistent Agents in one area, add `"agentProfiles":[{"name":"review","path":"/absolute/private/review.json"}]` to its settings before first entry. Each [private Agent profile](crates/rpi-cli/src/host/profile.rs) supplies its own Agent ID, Session ID and path, and workspace. The default Agent counts toward `maxAgents`. Initialize the area from the default Agent's workspace. Open a declared member from its own workspace with `rpi --host work --agent review`, adding `--mode json` or `--mode rpc` as needed. The private area configuration stores those profile references and starts the declared Agents with the default member.
+To configure more Persistent Agents in one area, add `"agentProfiles":[{"name":"review","path":"/absolute/private/review.json"}]` to its settings before first entry. Each [private Agent profile](crates/rpi-cli/src/host/profile.rs) supplies its own Agent ID, Session ID and path, and workspace. The default Agent counts toward `maxAgents`. Initialize the area from the default Agent's workspace. Open a declared member from its own workspace with `rpi --native-host work --agent review`, adding `--mode json` or `--mode rpc` as needed. The private area configuration stores those profile references and starts the declared Agents with the default member.
 
-Set `"restoreAreas":["default","work"]` in the top-level `host.json` and declare each listed area under `areas`. Run `rpi --host --restore-areas` to bring the listed daemons up together from any workspace. Each area must already have a private daemon configuration with `restore_on_start` enabled. The command validates all listed configurations before starting any daemon, reuses running areas, and reports each result as JSON. The list is an explicit recovery policy. An area stopped with `administrative-stop` starts again on the next group restore if it is still listed.
+Set `"restoreAreas":["default","work"]` in the top-level `host.json` and declare each listed area under `areas`. Run `rpi --native-host --restore-areas` to bring the listed daemons up together from any workspace. Each area must already have a private daemon configuration with `restore_on_start` enabled. The command validates all listed configurations before starting any daemon, reuses running areas, and reports each result as JSON. The list is an explicit recovery policy. An area stopped with `administrative-stop` starts again on the next group restore if it is still listed.
 
-Set `"defaultTerminal":true` in the top-level `host.json` to open the default area's Agent when you run bare `rpi` from that Agent's workspace in a terminal. Initialize the area with `rpi --host` first. Calls with arguments, redirected input or output, and other workspaces continue through the ordinary CLI. The Host terminal provides shared chat, history, and cancellation. Use the ordinary CLI entry points for the local session picker and extension UI.
+Set `"defaultTerminal":true` in the top-level `host.json` to open the default area's Agent when you run bare `rpi` from that Agent's workspace in a terminal. Initialize the area with `rpi --native-host` first. Calls with arguments, redirected input or output, and other workspaces continue through the ordinary CLI. The Host terminal provides shared chat, history, and cancellation. Use the ordinary CLI entry points for the local session picker and extension UI.
 
-The terminal supports shared text prompts, live responses, saved history, and cancellation. Use `/thinking <level>` while the Agent is idle to change the thinking level for subsequent prompts. All connected terminals for that Agent show the new level. Stdio RPC clients can use `set_thinking_level` and receive `thinking_level_changed`. The setting lasts while the Agent stays loaded. Restoring the Agent uses its frozen profile again. Closing a terminal disconnects its view. In Web, use `rpi-web --host-area` or `rpi --webserver --host-area` from the same workspace to open the shared Session.
+The terminal supports shared text prompts, live responses, saved history, and cancellation. Use `/thinking <level>` while the Agent is idle to change the thinking level for subsequent prompts. All connected terminals for that Agent show the new level. Stdio RPC clients can use `set_thinking_level` and receive `thinking_level_changed`. The setting lasts while the Agent stays loaded. Restoring the Agent uses its frozen profile again. Closing a terminal disconnects its view.
 
 ## Remote mode
 

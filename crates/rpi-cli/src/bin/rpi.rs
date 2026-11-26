@@ -57,6 +57,12 @@ fn run() -> ExitCode {
     } else {
         tokio::runtime::Builder::new_multi_thread()
     };
+    if !detached_supervisor
+        && std::env::var_os("TOKIO_WORKER_THREADS").is_none()
+        && std::env::args_os().skip(1).any(|arg| arg == "--mini")
+    {
+        builder.worker_threads(1);
+    }
     let runtime = builder
         .enable_all()
         .build()

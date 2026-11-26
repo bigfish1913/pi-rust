@@ -397,10 +397,64 @@ pub async fn rpc_with_durable_home(
         crate::rpc::execution::lifecycle_enabled(
             std::env::var_os(crate::rpc::execution::LIFECYCLE_ENV).as_deref(),
         ),
+        RpcLifetime::default(),
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
     )
     .await
+}
+
+#[cfg(unix)]
+pub(crate) async fn rpc_host_session<R, W>(
+    harness: &AgentHarness,
+    events: tokio::sync::broadcast::Receiver<AgentEvent>,
+    models: Vec<rpi_ai::Model>,
+    context: &crate::session::ReloadContext,
+    home: crate::config::AgentHome,
+    idle_timeout: Option<std::time::Duration>,
+    (input, output): (R, W),
+) where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: Write + Send + 'static,
+{
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        context,
+        rpi_plugin_sdk::EventTag::SessionStart,
+    )
+    .await
+    {
+        tracing::warn!("extension vetoed Host RPC SessionStart (advisory): {reason}");
+    }
+    let oauth_snapshot = context.extension_session.lock().unwrap().snapshot_arc();
+    rpc_with_native_durable_io(
+        harness,
+        Some(events),
+        models,
+        RpcOptions {
+            ui_dialog: context.ui_dialog.clone(),
+            oauth_snapshot,
+            extension_session: Some(context.extension_session.clone()),
+            message_updates: context.args.rpc_message_updates,
+            native_durable: context.args.native_durable,
+            home,
+        },
+        true,
+        RpcLifetime {
+            cancel_on_eof: true,
+            idle_timeout,
+        },
+        input,
+        output,
+    )
+    .await;
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        context,
+        rpi_plugin_sdk::EventTag::SessionShutdown,
+    )
+    .await
+    {
+        tracing::warn!("extension vetoed Host RPC SessionShutdown (ignored, closing): {reason}");
+    }
 }
 
 /// Opt-in, payload-free stage markers. An unmatched begin identifies an
@@ -525,10 +579,17 @@ where
             home: crate::config::AgentHome::process(),
         },
         true,
+        RpcLifetime::default(),
         input,
         output,
     )
     .await
+}
+
+#[derive(Default)]
+struct RpcLifetime {
+    cancel_on_eof: bool,
+    idle_timeout: Option<std::time::Duration>,
 }
 
 async fn rpc_with_native_durable_io<R, W>(
@@ -537,6 +598,7 @@ async fn rpc_with_native_durable_io<R, W>(
     model_catalog: Vec<rpi_ai::Model>,
     options: RpcOptions,
     correlated_execution: bool,
+    lifetime: RpcLifetime,
     mut input: R,
     output: W,
 ) -> i32
@@ -699,8 +761,9 @@ where
     let run_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut run_task: Option<OwnedRpcRun> = None;
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
-    let mut cancel_on_exit = false;
+    let mut cancel_on_exit = lifetime.cancel_on_eof;
     let mut native_shutdown_reconciled = false;
+    let mut exit_code = 0;
 
     let binding = match rpi_harness::session::SessionValues::load(harness.session()).await {
         Ok(values) => crate::resource_selection::binding_state(&values),
@@ -753,15 +816,41 @@ where
     events_ready.cancel();
     setup_timing.finish();
 
-    loop {
-        let incoming = tokio::select! {
-            _ = writer_failed.cancelled() => {
-                cancel_on_exit = true;
-                break;
+    'requests: loop {
+        // Keep the frame reader pinned while reaping tasks. A partial frame has
+        // already consumed bytes and must survive a settlement notification.
+        let incoming = crate::rpc::framing::read_frame(&mut input);
+        tokio::pin!(incoming);
+        let idle_timeout = lifetime.idle_timeout;
+        let line = loop {
+            let idle = run_task.is_none() && command_tasks.is_empty();
+            tokio::select! {
+                biased;
+                _ = writer_failed.cancelled() => {
+                    cancel_on_exit = true;
+                    break 'requests;
+                }
+                line = &mut incoming => break line,
+                result = async { run_task.as_mut().unwrap().await }, if idle_timeout.is_some() && run_task.is_some() => {
+                    run_task = None;
+                    if let Err(error) = result {
+                        eprintln!("[rpi] rpc prompt task failed: {error}");
+                        exit_code = 1;
+                    }
+                }
+                _ = async { command_tasks.last_mut().unwrap().await }, if idle_timeout.is_some() && !command_tasks.is_empty() => {
+                    command_tasks.pop();
+                }
+                _ = async { tokio::time::sleep(idle_timeout.unwrap()).await }, if idle_timeout.is_some() && idle => {
+                    write_line(&stdout, &serde_json::json!({
+                        "type": "host_idle_timeout",
+                        "idleTimeoutSeconds": idle_timeout.unwrap().as_secs(),
+                    })).await;
+                    break 'requests;
+                }
             }
-            line = crate::rpc::framing::read_frame(&mut input) => line,
         };
-        let line = match incoming {
+        let line = match line {
             Ok(Some(line)) => line,
             Ok(None) => break, // EOF
             Err(error) => {
@@ -1372,9 +1461,9 @@ where
         write_line(&stdout, &response).await;
     }
 
-    // EOF closes the input half of the protocol, not an accepted prompt.
-    // There can be no more dialog answers, so release approvals, then await the
-    // run before SessionShutdown can unload plugins or the runtime exits.
+    // Stdio supports draining an accepted prompt after EOF. A Host socket
+    // belongs to one TUI, so disconnect cancels that session's run.
+    // Release approvals and await settlement before tearing down the session.
     ui_dialog.detach();
     if cancel_on_exit && !(native_durable && native_shutdown_reconciled) {
         run_cancel.cancel();
@@ -1389,7 +1478,6 @@ where
     for task in command_tasks {
         let _ = task.await;
     }
-    let mut exit_code = 0;
     // A broken transport during healthy EOF waiting must still cancel the run.
     if let Some(mut task) = run_task {
         let result = tokio::select! {
@@ -3282,6 +3370,27 @@ pub async fn interactive(
     startup: InteractiveStartup<'_>,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
+    Box::pin(interactive_with_terminal(
+        harness,
+        event_rx,
+        args,
+        model_catalog,
+        startup,
+        reload_context,
+        crate::interactive_tui::InteractiveTerminal::Process,
+    ))
+    .await
+}
+
+pub(crate) async fn interactive_with_terminal(
+    harness: &AgentHarness,
+    event_rx: Option<tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>>,
+    args: &Args,
+    model_catalog: Vec<rpi_ai::Model>,
+    startup: InteractiveStartup<'_>,
+    reload_context: &crate::session::ReloadContext,
+    terminal: crate::interactive_tui::InteractiveTerminal,
+) -> i32 {
     // ---- Session lifecycle (P1): BeforeTuiStart ----
     // `BeforeTuiStart`: extensions may prepare (connect a server, load a
     // resource) before the interactive UI initializes. Runs with a per-event
@@ -3294,7 +3403,10 @@ pub async fn interactive(
     )
     .await
     {
-        eprintln!("[rpi] startup vetoed by extension: {reason}");
+        terminal.report(
+            &format!("[rpi] startup vetoed by extension: {reason}"),
+            true,
+        );
         return crate::app::EXIT_VETOED;
     }
 
@@ -3302,17 +3414,18 @@ pub async fn interactive(
     let force_tui = std::env::var("RPI_FORCE_TUI")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let code = if force_tui || crate::interactive_tui::is_tui_supported() {
+    let code = if terminal.is_host() || force_tui || crate::interactive_tui::is_tui_supported() {
         // Use TUI-based interactive mode. The TUI future is intentionally
         // heap-allocated: its large state machine otherwise overflows the
         // default Windows main-thread stack before its body starts polling.
-        Box::pin(crate::interactive_tui::interactive_tui(
+        Box::pin(crate::interactive_tui::interactive_tui_with_terminal(
             harness,
             event_rx,
             args,
             model_catalog,
             startup,
             reload_context,
+            terminal,
         ))
         .await
     } else {
@@ -4321,6 +4434,7 @@ mod tests {
                     home: crate::config::AgentHome::process(),
                 },
                 correlated_execution,
+                RpcLifetime::default(),
                 tokio::io::BufReader::new(input),
                 captured,
             )

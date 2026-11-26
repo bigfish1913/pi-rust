@@ -363,9 +363,7 @@ pub struct ThemeManager {
 /// every host having to walk the tree and call `invalidate` (upstream's
 /// `theme-controller.ts` does both: swap the palette and `ui.invalidate()`).
 pub fn theme_revision() -> u64 {
-    global_theme_manager()
-        .revision
-        .load(std::sync::atomic::Ordering::Acquire)
+    with_theme_manager(|manager| manager.revision.load(std::sync::atomic::Ordering::Acquire))
 }
 
 impl ThemeManager {
@@ -523,7 +521,7 @@ pub enum ThemePreset {
 
 /// Global theme helper functions.
 pub fn theme() -> Theme {
-    global_theme_manager().get()
+    with_theme_manager(ThemeManager::get)
 }
 
 /// Apply a preset to the process-wide theme read by every component.
@@ -531,7 +529,19 @@ pub fn theme() -> Theme {
 /// Creating a standalone [`ThemeManager`] does not affect components that call
 /// [`theme`]. Hosts should use this function for live theme switching.
 pub fn apply_theme_preset(preset: ThemePreset) {
-    global_theme_manager().apply_preset(preset);
+    with_theme_manager(|manager| manager.apply_preset(preset));
+}
+
+/// Apply a theme to the active terminal palette.
+pub fn set_theme(theme: Theme) {
+    with_theme_manager(|manager| manager.set(theme));
+}
+
+fn with_theme_manager<R>(f: impl FnOnce(&ThemeManager) -> R) -> R {
+    match crate::display_context::current() {
+        Some(context) => f(&context.theme),
+        None => f(global_theme_manager()),
+    }
 }
 
 /// Return the process-wide theme manager.

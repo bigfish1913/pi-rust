@@ -90,9 +90,13 @@ async fn run_inner() -> i32 {
     if argv.first().map(String::as_str) == Some("host") {
         return crate::host::cli::run(&argv[1..]).await;
     }
-    if argv
-        .first()
-        .is_some_and(|arg| arg == "--host" || arg.starts_with("--host="))
+    if let Some(first) = argv.first_mut() {
+        if first == "--native-host" || first.starts_with("--native-host=") {
+            *first = first.replacen("--native-host", "--host", 1);
+            return crate::host::area_entry::run(&argv).await;
+        }
+    }
+    if matches!(argv.as_slice(), [host, restore] if host == "--host" && restore == "--restore-areas")
     {
         return crate::host::area_entry::run(&argv).await;
     }
@@ -140,11 +144,33 @@ async fn run_inner() -> i32 {
         return crate::dev_extension::run_cleanup_helper(&argv[1..]);
     }
 
+    #[cfg(unix)]
+    if argv
+        .first()
+        .is_some_and(|arg| arg == crate::local_host::DAEMON_COMMAND)
+    {
+        return crate::local_host::run_daemon_command(&argv[1..]).await;
+    }
+
     // ---- `rpi --connect <addr>` — pure remote client ----
     // Intercepted before any provider / harness / session / extension work so
     // the client holds no local agent resources at all: it only connects to a
     // running `rpi --server` and renders the remote transcript.
     if let Some(addr) = take_flag_value(&argv, "--connect") {
+        if argv
+            .iter()
+            .any(|arg| arg == "--host" || arg.starts_with("--host="))
+        {
+            eprintln!("error: --host cannot be combined with --connect");
+            return EXIT_USAGE;
+        }
+        if argv
+            .iter()
+            .any(|arg| arg == "--mini" || arg.starts_with("--mini="))
+        {
+            eprintln!("error: --mini cannot be combined with --connect");
+            return EXIT_USAGE;
+        }
         let token = resolve_connect_token(&argv);
         return crate::remote::tui::run(&addr, token.as_deref()).await;
     }
@@ -252,6 +278,22 @@ async fn run_inner() -> i32 {
     // ---- Parsed startup stages ----
     if let Some(code) = handle_parse_short_circuits(&parsed) {
         return code;
+    }
+
+    if parsed.host.is_some() {
+        if dev_options.is_some() {
+            eprintln!("error: --host cannot be combined with dev/dev-local");
+            return EXIT_USAGE;
+        }
+        #[cfg(unix)]
+        {
+            return crate::local_host::run(parsed).await;
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("error: --host requires Unix-domain sockets");
+            return EXIT_USAGE;
+        }
     }
 
     if dev_options.is_some()
@@ -449,16 +491,12 @@ async fn run_inner() -> i32 {
         eprintln!("warning: models.json: {warning}");
     }
 
-    // The full authenticated catalog (read-only) for the TUI's `/model`
-    // selector, derived from the built provider runtimes so auth headers and
-    // base-url overrides survive.
-    let model_catalog = crate::provider::authenticated_catalog(&resolved);
-
     // `--models <patterns>`: persist the Ctrl+P cycle scope to settings.json
     // (the same set `/scoped-models` edits). Each pattern matches catalog ids
     // case-insensitively; unmatched patterns are reported so a typo doesn't
     // silently empty the cycle.
     if let Some(patterns) = &parsed.models {
+        let model_catalog = crate::provider::authenticated_catalog(&resolved);
         let mut matched: Vec<String> = Vec::new();
         for p in patterns {
             let hits: Vec<String> = model_catalog
@@ -560,6 +598,7 @@ async fn run_inner() -> i32 {
         Some(file_text.as_str())
     };
     let (initial, extra) = build_initial_message(&parsed, stdin_text.as_deref(), file_text_opt);
+    let initial = initial.or_else(|| (!file_images.is_empty()).then(String::new));
 
     // ---- mode dispatch (TS resolveAppMode → runPrintMode / InteractiveMode / runRpcMode) ----
     let stdin_is_tty = std::io::stdin().is_terminal();
@@ -613,16 +652,19 @@ async fn run_inner() -> i32 {
         None
     };
 
+    let model_catalog = || {
+        reload_context
+            .catalog
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    };
     let exit_code = match mode {
         RunMode::Print => {
-            crate::modes::print(
-                &harness,
-                &parsed,
-                initial.clone(),
-                &extra,
-                file_images.clone(),
-            )
-            .await
+            // Print mode only consumes the completed reply. Keeping the receiver
+            // alive buffers unread snapshots of the growing streamed message.
+            drop(event_rx);
+            crate::modes::print(&harness, &parsed, initial, &extra, file_images).await
         }
         RunMode::Json => {
             crate::modes::json(
@@ -640,7 +682,7 @@ async fn run_inner() -> i32 {
                 &harness,
                 Some(event_rx),
                 &parsed,
-                model_catalog,
+                model_catalog(),
                 crate::modes::InteractiveStartup {
                     initial: initial.clone(),
                     extra_messages: &extra,
@@ -720,7 +762,7 @@ async fn run_inner() -> i32 {
                     crate::modes::rpc_with_durable_home(
                         &harness,
                         Some(event_rx),
-                        model_catalog,
+                        model_catalog(),
                         crate::modes::RpcOptions {
                             ui_dialog: reload_context.ui_dialog.clone(),
                             oauth_snapshot,
@@ -877,7 +919,7 @@ async fn resolve_resume(parsed: &mut Args, cwd: &Path) -> Option<i32> {
     }
 }
 
-fn emit_startup_warnings(parsed: &Args) {
+pub(crate) fn emit_startup_warnings(parsed: &Args) {
     // ---- Startup warnings (ignored-but-recognized flags) ----
     if parsed.verbose {
         for warn in &parsed.ignored {
@@ -1051,7 +1093,7 @@ fn read_piped_stdin() -> Option<String> {
 /// `<file name="...">\n<contents>\n</file>\n` and concatenated.
 ///
 /// Paths are resolved relative to `cwd` (the TS uses `resolve(readPath, cwd)`).
-fn process_file_args(
+pub(crate) fn process_file_args(
     file_args: &[std::path::PathBuf],
     cwd: &Path,
 ) -> Result<(String, Vec<ImageContent>), String> {
@@ -1132,22 +1174,46 @@ fn build_initial_message(
     (initial, extra)
 }
 
-/// Print a model-resolution error with env-specific guidance. Mirrors the TS
-/// auth-guidance / model-resolver error formatting (condensed to stderr lines).
-fn print_resolve_error(e: &ResolveError) {
+#[cfg(unix)]
+pub(crate) fn mini_input(
+    args: &mut Args,
+    file_text: String,
+    images: Vec<ImageContent>,
+) -> crate::mini::Input {
+    let mut messages = std::mem::take(&mut args.messages).into_iter();
+    let mut parts = read_piped_stdin()
+        .into_iter()
+        .chain((!file_text.is_empty()).then_some(file_text))
+        .chain(messages.next());
+    let initial = parts.next().map(|mut text| {
+        for part in parts {
+            text.push_str(&part);
+        }
+        text
+    });
+    let prompts = initial
+        .or_else(|| (!images.is_empty()).then(String::new))
+        .into_iter()
+        .chain(messages)
+        .collect();
+    crate::mini::Input { prompts, images }
+}
+
+/// Format a model-resolution error with env-specific guidance.
+pub(crate) fn resolve_error_message(e: &ResolveError) -> String {
     match e {
         ResolveError::NoApiKey { hint } => {
-            eprintln!("error: {e}");
-            eprintln!();
-            eprintln!("Provide credentials via one of: {hint}.");
+            format!("error: {e}\n\nProvide credentials via one of: {hint}.")
         }
-        ResolveError::Config(_) => {
-            eprintln!("error: {e}");
-            eprintln!();
-            eprintln!("Check ~/.rpi/auth.json / ~/.rpi/models.json (set RPI_CODING_AGENT_DIR to relocate).");
-        }
-        _ => eprintln!("error: {e}"),
+        ResolveError::Config(_) => format!(
+            "error: {e}\n\nCheck ~/.rpi/auth.json / ~/.rpi/models.json (set RPI_CODING_AGENT_DIR to relocate)."
+        ),
+        _ => format!("error: {e}"),
     }
+}
+
+fn print_resolve_error(e: &ResolveError) {
+    eprintln!("{}", resolve_error_message(e));
 }
 
 /// Print a harness-build error with flag-specific guidance for restore requests.

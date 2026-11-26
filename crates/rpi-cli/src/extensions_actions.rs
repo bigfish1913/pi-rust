@@ -142,7 +142,8 @@ pub struct HarnessActionHost {
     /// locate the session dir.
     cwd: PathBuf,
     session_dir: PathBuf,
-    fresh_session_only: bool,
+    ephemeral_sessions_only: bool,
+    publish_process_identity: bool,
     /// Host-owned startup choice, independent of model tools and plugin flags.
     /// Immutable after construction, including while the registry is published.
     native_durable: bool,
@@ -188,7 +189,8 @@ impl HarnessActionHost {
                 harness: Arc::clone(&harness),
                 catalog: RwLock::new(catalog),
                 session_dir: default_session_dir(&cwd),
-                fresh_session_only: false,
+                ephemeral_sessions_only: false,
+                publish_process_identity: true,
                 native_durable: false,
                 cwd,
                 cli_flags,
@@ -226,17 +228,21 @@ impl HarnessActionHost {
             .unwrap_or_else(|error| error.into_inner()) = catalog;
     }
 
-    pub(crate) fn with_fresh_session_only(mut self, locked: bool) -> Self {
-        self.fresh_session_only = locked;
+    pub(crate) fn with_ephemeral_sessions_only(mut self, enabled: bool) -> Self {
+        self.ephemeral_sessions_only = enabled;
+        self
+    }
+    pub(crate) fn with_process_identity(mut self, publish: bool) -> Self {
+        self.publish_process_identity = publish;
         self
     }
     pub(crate) fn with_native_durable(mut self, enabled: bool) -> Self {
         self.native_durable = enabled;
         self
     }
-    fn allow_session_routing(&self) -> Result<(), String> {
-        if self.fresh_session_only {
-            Err("experimental native print session forbids session routing actions".into())
+    fn allow_saved_sessions(&self) -> Result<(), String> {
+        if self.ephemeral_sessions_only {
+            Err("--mini does not support saved sessions".into())
         } else {
             Ok(())
         }
@@ -958,22 +964,31 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn new_session(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
-        self.allow_session_routing()?;
         let harness = self.harness()?;
-        let cwd_str = self.cwd.to_string_lossy().to_string();
-        let dir = &self.session_dir;
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("create session dir {}: {e}", dir.display()))?;
-        let session = crate::session::create_jsonl_session(dir, &cwd_str)
-            .await
-            .map_err(|e| format!("create session: {e}"))?;
+        let session = if self.ephemeral_sessions_only {
+            crate::session::ephemeral_session()
+        } else {
+            let cwd_str = self.cwd.to_string_lossy();
+            let dir = &self.session_dir;
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("create session dir {}: {e}", dir.display()))?;
+            crate::session::create_jsonl_session(dir, &cwd_str)
+                .await
+                .map_err(|e| format!("create session: {e}"))?
+        };
         let id = session.storage().metadata().id.clone();
-        crate::session::set_active_session(&harness, session, Some(&self.tool_context)).await?;
+        crate::session::set_active_session_with_identity(
+            &harness,
+            session,
+            Some(&self.tool_context),
+            self.publish_process_identity,
+        )
+        .await?;
         Ok(serde_json::json!({ "sessionId": id }))
     }
 
     async fn fork(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
-        self.allow_session_routing()?;
+        self.allow_saved_sessions()?;
         let harness = self.harness()?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
         let new_session =
@@ -981,12 +996,17 @@ impl RuntimeActionHost for HarnessActionHost {
                 .await
                 .map_err(|e| format!("fork session: {e}"))?;
         let id = new_session.storage().metadata().id.clone();
-        crate::session::set_active_session(&harness, new_session, Some(&self.tool_context)).await?;
+        crate::session::set_active_session_with_identity(
+            &harness,
+            new_session,
+            Some(&self.tool_context),
+            self.publish_process_identity,
+        )
+        .await?;
         Ok(serde_json::json!({ "sessionId": id }))
     }
 
     async fn navigate_tree(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
-        self.allow_session_routing()?;
         let target_id = arg_str_opt(&args, "targetId");
         let summarize = arg_bool(&args, "summarize");
         let custom = arg_str_opt(&args, "customInstructions");
@@ -1011,7 +1031,7 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn switch_session(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
-        self.allow_session_routing()?;
+        self.allow_saved_sessions()?;
         let harness = self.harness()?;
         let id = arg_str(&args, "id")?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
@@ -1020,7 +1040,13 @@ impl RuntimeActionHost for HarnessActionHost {
             .map(|restored| restored.session)
             .map_err(|e| e.to_string())?;
         let new_id = new_session.storage().metadata().id.clone();
-        crate::session::set_active_session(&harness, new_session, Some(&self.tool_context)).await?;
+        crate::session::set_active_session_with_identity(
+            &harness,
+            new_session,
+            Some(&self.tool_context),
+            self.publish_process_identity,
+        )
+        .await?;
         Ok(serde_json::json!({ "sessionId": new_id }))
     }
 
