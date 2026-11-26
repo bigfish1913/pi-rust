@@ -682,7 +682,7 @@ impl RuntimeActionHost for HarnessActionHost {
         let harness = self.harness()?;
         let mut context = harness.execution_context().map_err(|e| e.to_string())?;
         if let Some(serde_json::Value::Object(child)) =
-            rpi_agent::tool_execution_scope::execution_context()
+            rpi_agent::tool_execution_scope::public_execution_context()
         {
             context
                 .as_object_mut()

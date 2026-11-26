@@ -15,10 +15,6 @@ use rpi_harness::session::Session;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-mod start_request;
-
-use start_request::StartRequest;
-
 const MAX_JOBS: usize = 16;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
@@ -313,13 +309,20 @@ impl ChildRuns {
         {
             return Err("parent tool invocation cancelled".into());
         }
-        let StartRequest {
-            prompt,
-            role,
-            task_preview,
-            turns,
-            timeout,
-        } = StartRequest::parse(args)?;
+        let task = args
+            .get("task")
+            .and_then(Value::as_str)
+            .ok_or("missing child task")?;
+        let role = args
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("worker")
+            .trim();
+        if task.trim().is_empty() || task.len() > 20_000 || role.is_empty() || role.len() > 200 {
+            return Err("child task must contain 1-20000 bytes and role 1-200 bytes".into());
+        }
+        let turns = bounded_number(args, "maxTurns", 8, 1, 32)? as u32;
+        let timeout = bounded_number(args, "timeoutSeconds", 300, 10, 1800)?;
         let tools = args
             .get("tools")
             .map(|value| {
@@ -345,8 +348,8 @@ impl ChildRuns {
             invocation_signal,
             state: Mutex::new(State {
                 started_ms: now_ms(),
-                role,
-                task_preview,
+                role: role.to_string(),
+                task_preview: task.chars().take(200).collect(),
                 ..State::default()
             }),
         });
@@ -404,6 +407,7 @@ impl ChildRuns {
                 return Err(error.to_string());
             }
         };
+        let prompt = format!("You are a delegated {role} subagent. Complete the task in at most {turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
         let worker = job.clone();
         let execution_scope = child.execution_scope.clone();
         let cleanup_harness = child.harness.clone();
@@ -429,6 +433,25 @@ impl ChildRuns {
         });
         Ok(json!({"childId":id,"sessionId":id,"status":"running"}))
     }
+}
+
+fn bounded_number(
+    args: &Value,
+    key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    let value = match args.get(key) {
+        None => default,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("{key} must be an integer"))?,
+    };
+    if !(min..=max).contains(&value) {
+        return Err(format!("{key} must be between {min} and {max}"));
+    }
+    Ok(value)
 }
 
 async fn run_child(child: ChildHarness, job: Arc<Job>, prompt: String, turns: u32, timeout: u64) {

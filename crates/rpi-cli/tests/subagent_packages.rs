@@ -217,6 +217,7 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
     assert_eq!(context["model"]["id"], provider.default_model().id);
     assert_eq!(context["cwd"], temp.path().to_string_lossy().as_ref());
     assert!(context.get("apiKey").is_none());
+    assert!(context.get("childAgent").is_none());
     assert!(context["model"].get("headers").is_none());
     // The same inherited approval hook must fail closed without a UI consumer.
     ui.detach();

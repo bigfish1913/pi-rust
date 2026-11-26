@@ -409,56 +409,9 @@ async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
 #[test]
 fn child_limits_reject_wrong_types_and_out_of_range_values() {
     for value in [json!(-1), json!(0), json!(33), json!("8"), Value::Null] {
-        assert!(StartRequest::parse(&json!({"task":"report","maxTurns":value})).is_err());
+        assert!(bounded_number(&json!({"maxTurns":value}), "maxTurns", 8, 1, 32).is_err());
     }
-    assert_eq!(
-        StartRequest::parse(&json!({"task":"report"}))
-            .unwrap()
-            .turns,
-        8
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_prompt_is_sent_verbatim_with_separate_roster_metadata() {
-    use rpi_ai::providers::faux::FauxStep;
-
-    const PROMPT: &str = "A caller-supplied child prompt";
-    let script = FauxScript::new();
-    script.set_responses(vec![FauxStep::factory(|context| {
-        let messages = serde_json::to_string(context).unwrap();
-        assert!(messages.contains(PROMPT));
-        assert!(!messages.contains("roster only"));
-        assert!(!messages.contains("You are a delegated"));
-        faux_assistant_message("report", StopReason::Stop)
-    })]);
-    let parent = parent(script).await;
-    let manager = ChildRuns::default();
-    let mut args = json!({"op":"start","prompt":PROMPT,"task":"roster only","role":"reviewer","maxTurns":1,"timeoutSeconds":10});
-    for (key, invalid) in [
-        ("prompt", json!(" ")),
-        ("prompt", json!("x".repeat(24_001))),
-        ("prompt", Value::Null),
-        ("maxTurns", json!(0)),
-        ("timeoutSeconds", json!(1801)),
-    ] {
-        let original = std::mem::replace(&mut args[key], invalid);
-        assert!(
-            manager.handle(&parent, 7, args.clone()).await.is_err(),
-            "{key}"
-        );
-        args[key] = original;
-    }
-    assert!(manager.jobs.lock().unwrap().is_empty());
-
-    let started = manager.handle(&parent, 7, args).await.unwrap();
-    let id = started["childId"].as_str().unwrap();
-    let job = manager.jobs.lock().unwrap().get(id).unwrap().clone();
-    assert_eq!(job.state.lock().unwrap().task_preview, "roster only");
-    assert_eq!(
-        wait(&manager, &parent, id).await["result"]["text"],
-        "report"
-    );
+    assert_eq!(bounded_number(&json!({}), "maxTurns", 8, 1, 32).unwrap(), 8);
 }
 
 mod invocation;

@@ -14,14 +14,13 @@
   "thinkingLevel":"high",
   "tools":["read","bash","delegate_task"],
   "cwd":"D:/Projects/example",
-  "sessionId":"parent-session-id",
-  "childAgent":true
+  "sessionId":"parent-session-id"
 }
 ```
 
 这不是 CLI flags 的副本。交互切换模型或 thinking 后，读取的是有效状态。
 公开对象不包含 API key、认证头、endpoint、原始 Model 或 provider binding。
-`childAgent` 表示当前 harness 是否允许创建子任务；并非资源可用性探测或启动保证。
+宿主基于当前工具调用的身份检查委派权限。
 
 ## 生命周期
 
@@ -49,14 +48,12 @@
 ### start
 
 ```json
-{"op":"start","prompt":"检查 parser 并汇报结果。","task":"检查 parser","role":"reviewer","maxTurns":8,"timeoutSeconds":300,"tools":["read"]}
+{"op":"start","task":"检查 parser","role":"reviewer","maxTurns":8,"timeoutSeconds":300,"tools":["read"]}
 ```
 
-- `task` 必填，1–20,000 bytes，任务列表显示前 200 个字符。`role` 默认 `worker`，1–200 bytes。
-- `prompt` 可选，1–24,000 bytes。宿主原样提交给子会话。省略时，宿主根据 `task`
-  生成提示词。较早的宿主会忽略该字段并使用 `task`。
-- `maxTurns` 默认 8，范围 1–32。`timeoutSeconds` 默认 300，范围 10–1800。
-  宿主拒绝非法类型或越界值。
+- `task` 必填，1–20,000 bytes；`role` 默认 `worker`，1–200 bytes。
+- `maxTurns` 默认 8，范围 1–32；`timeoutSeconds` 默认 300，范围 10–1800。
+  宿主拒绝非法类型或越界值，不隐式扩张预算。
 - `tools` 可省略以继承有效父工具；指定时只能缩小集合。`[]` 表示无工具。
 - `delegate_task` 从子任务的工具注册表中删除；child harness 和工具执行作用域
   均拒绝创建孙任务，插件别名也不能经根宿主绕过子任务工具子集。
