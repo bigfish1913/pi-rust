@@ -504,10 +504,11 @@ and parent completion or cancellation stops the child. This is capability
 inheritance and session isolation, not an OS sandbox.
 
 Use a compatible host and subagent extension; unsupported hosts fail explicitly
-rather than falling back to a differently configured subprocess. The SDK entry
-point is `AgentHarness::create_child`; extensions use `GetExecutionContext` and
-`ChildAgent` runtime actions. See the [subagent protocol](docs/extensions/subagents.md)
-for lifecycle, limits and compatibility details.
+rather than falling back to a differently configured subprocess. Rust callers use
+`AgentHarness::create_child`. Extensions read the active bindings with
+`GetExecutionContext` and manage runs with `IndependentRun`. `ChildAgent` remains
+available for compatibility with released extensions. See the
+[subagent protocol](docs/extensions/subagents.md) for lifecycle and limits.
 
 ### Authoring an extension
 

@@ -194,12 +194,17 @@ class ImagePRTests(unittest.TestCase):
         self.assert_main_untouched()
 
     def test_same_day_reuses_branch_sha_and_pr(self):
-        self.refresh()
-        image_pr.prepare(self.work)
-        previous = self.branch_head()
-        self.calls.clear()
-        self.refresh()
-        image_pr.prepare(self.work)
+        output = self.root / "github-output"
+        with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+            self.refresh()
+            image_pr.main(self.work)
+            previous = self.branch_head()
+            self.assertEqual(output.read_text(encoding="utf-8"), f"head={previous}\n")
+            output.unlink()
+            self.calls.clear()
+            self.refresh()
+            image_pr.main(self.work)
+        self.assertEqual(output.read_text(encoding="utf-8"), f"head={previous}\n")
         self.assertEqual(self.branch_head(), previous)
         self.assertFalse(any("push" in command for command in self.calls))
         self.assertFalse(any(command[:3] == ("gh", "pr", "create") for command in self.calls))
@@ -217,8 +222,11 @@ class ImagePRTests(unittest.TestCase):
         self.assertFalse(any(command[:3] == ("gh", "pr", "create") for command in self.calls))
         self.assert_main_untouched()
 
-    def test_no_changes_has_no_remote_operations(self):
-        image_pr.prepare(self.work)
+    def test_no_changes_has_no_remote_operations_or_merge_output(self):
+        output = self.root / "github-output"
+        with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+            image_pr.main(self.work)
+        self.assertFalse(output.exists())
         self.assertFalse(any(command[0] == "gh" or "push" in command for command in self.calls))
 
     def test_missing_token_fails_even_without_changes(self):
@@ -347,7 +355,10 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("[skip ci]", text)
         self.assertNotIn("HEAD:main", text)
         self.assertIn("scripts/prepare-readme-image-pr.py", text)
-        self.assertIn("gh pr merge", text)
+        self.assertIn("if: steps.prepare.outputs.head != ''", text)
+        self.assertIn("EXPECTED_HEAD: ${{ steps.prepare.outputs.head }}", text)
+        self.assertIn('gh pr merge "$number"', text)
+        self.assertIn('--match-head-commit "$EXPECTED_HEAD"', text)
         self.assertIn("--admin", text)
         self.assertIn("--squash", text)
         self.assertIn("--delete-branch", text)

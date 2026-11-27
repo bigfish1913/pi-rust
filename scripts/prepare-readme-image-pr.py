@@ -78,8 +78,10 @@ def prepare(root=ROOT):
         # lease protects concurrent changes, including first-creation races.
         # This is NEVER a force push to main, nor a branch-protection bypass.
         remote("push", f"--force-with-lease={REF}:{previous}", "origin", f"HEAD:{REF}")
+        head = git("rev-parse", "HEAD")
     else:
         print("Stable README branch already has this tree; leaving its SHA unchanged.")
+        head = previous
 
     if prs:
         print(f"Reusing README image PR #{prs[0]['number']}.")
@@ -90,11 +92,20 @@ def prepare(root=ROOT):
            "The trusted README automation workflow verifies this README-only "
            "branch and merges it without waiting for normal CI.")
         print("Created the README image refresh PR.")
+    return head
+
+
+def main(root=ROOT):
+    head = prepare(root)
+    output = os.environ.get("GITHUB_OUTPUT")
+    if head and output:
+        with Path(output).open("a", encoding="utf-8") as stream:
+            stream.write(f"head={head}\n")
 
 
 if __name__ == "__main__":
     try:
-        prepare()
+        main()
     except (ValueError, subprocess.CalledProcessError) as error:
         # Do not echo command output or credentials on authentication/API errors.
         message = str(error) if isinstance(error, ValueError) else "Git/GitHub operation failed; inspect token permissions and branch rules"
