@@ -169,6 +169,18 @@ fn report_without_remote_checks() -> UpdateReport {
 }
 
 fn startup_http_client() -> Option<reqwest::Client> {
+    // The web UI saves its proxy in settings.json. Apply it here as well so
+    // update checks work when invoked directly, while still letting an
+    // explicit shell-level proxy override win.
+    if let Ok(settings) = crate::settings::load_settings() {
+        if let Some(proxy) = settings.http_proxy {
+            for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
+                if std::env::var_os(key).is_none() {
+                    std::env::set_var(key, &proxy);
+                }
+            }
+        }
+    }
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
         .user_agent(format!("rpi/{}", crate::VERSION))
@@ -2628,8 +2640,147 @@ fn write_windows_update_status(path: &Path, state: &str, message: &str) -> Resul
         .map_err(|error| format!("could not write update status {}: {error}", path.display()))
 }
 
+/// Machine-readable update inventory for the web UI.
+///
+/// The web UI needs the same answer as the startup notice without parsing
+/// human-readable CLI output: installed versions, latest versions, and
+/// whether each target can be updated from this install.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInventory {
+    pub current_version: String,
+    pub last_checked_at: i64,
+    pub host: UpdateInventoryEntry,
+    pub extensions: Vec<UpdateInventoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInventoryEntry {
+    pub name: String,
+    pub current: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    pub updatable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `rpi updates check --json`. Currently JSON is the only supported format so
+/// callers get a stable contract; the command rejects other arguments rather
+/// than silently inventing output.
+pub async fn run_updates(args: &[String]) -> i32 {
+    let refresh = match args {
+        [command, flag] if command == "check" && flag == "--json" => false,
+        [command, flag] if command == "refresh" && flag == "--json" => true,
+        _ => {
+            eprintln!("error: `rpi updates` accepts `check --json` or `refresh --json`");
+            return 2;
+        }
+    };
+    if refresh {
+        let _ = check_rpi_startup().await;
+    }
+    let inventory = build_inventory_from_cache();
+    match serde_json::to_string_pretty(&inventory) {
+        Ok(json) => {
+            println!("{json}");
+            0
+        }
+        Err(error) => {
+            eprintln!("error: could not serialize update inventory: {error}");
+            1
+        }
+    }
+}
+
+fn build_inventory_from_cache() -> UpdateInventory {
+    let cache = crate::config::agent_dir()
+        .ok()
+        .and_then(|dir| read_cache(&dir.join(CACHE_FILE)))
+        .unwrap_or_default();
+    let host_latest = cache
+        .rpi_latest
+        .as_ref()
+        .filter(|latest| is_newer(crate::VERSION, latest))
+        .cloned();
+    UpdateInventory {
+        current_version: crate::VERSION.to_owned(),
+        last_checked_at: cache.checked_at,
+        host: UpdateInventoryEntry {
+            name: "rpi".into(),
+            current: crate::VERSION.into(),
+            updatable: host_latest.is_some(),
+            latest: host_latest,
+            reason: None,
+        },
+        extensions: installed_extension_inventory(
+            &cache,
+            crate::install::installed_native_packages(),
+        ),
+    }
+}
+
+fn installed_extension_inventory(
+    cache: &UpdateCache,
+    packages: impl IntoIterator<Item = crate::install::InstalledNativePackage>,
+) -> Vec<UpdateInventoryEntry> {
+    packages
+        .into_iter()
+        .map(|package| {
+            let supports_update = package.prebuilt.is_some() || package.source.is_none();
+            let latest = cache
+                .native_packages
+                .get(&native_cache_key(&package))
+                .filter(|latest| supports_update && is_newer(&package.version, latest))
+                .cloned();
+            UpdateInventoryEntry {
+                name: package.name.clone(),
+                current: package.version,
+                updatable: latest.is_some(),
+                latest,
+                reason: (!supports_update).then(|| "local-install".into()),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn update_inventory_reports_registry_updates_and_skips_local_installs() {
+        let registry = crate::install::InstalledNativePackage {
+            name: "registry-ext".into(),
+            version: "1.0.0".into(),
+            source: None,
+            prebuilt: None,
+            artifacts: Vec::new(),
+        };
+        let local = crate::install::InstalledNativePackage {
+            name: "local-ext".into(),
+            version: "1.0.0".into(),
+            source: Some("local:preview".into()),
+            prebuilt: None,
+            artifacts: Vec::new(),
+        };
+        let cache = super::UpdateCache {
+            native_packages: std::collections::BTreeMap::from([
+                ("registry-ext".into(), "1.2.0".into()),
+                ("local-ext".into(), "2.0.0".into()),
+            ]),
+            ..super::UpdateCache::default()
+        };
+        let entries = super::installed_extension_inventory(&cache, vec![registry, local]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "registry-ext");
+        assert_eq!(entries[0].latest.as_deref(), Some("1.2.0"));
+        assert!(entries[0].updatable);
+        assert_eq!(entries[0].reason, None);
+        assert_eq!(entries[1].name, "local-ext");
+        assert_eq!(entries[1].reason.as_deref(), Some("local-install"));
+        assert!(!entries[1].updatable);
+    }
+
     #[test]
     fn extension_update_notices_unify_commands_and_separate_source_caches() {
         let _guard = crate::config::test_support::env_lock()

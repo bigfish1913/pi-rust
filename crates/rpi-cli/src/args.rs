@@ -726,6 +726,8 @@ pub fn print_help() {
 
 {u}Subcommands:{r}
   update                       Update the rpi CLI from crates.io
+  updates check --json          Report cached host/extension update state as JSON
+  updates refresh --json        Check registries, then report update state as JSON
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
   events path|tail               Inspect the extension event journal (needs

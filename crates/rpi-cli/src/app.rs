@@ -201,6 +201,7 @@ async fn run_inner() -> i32 {
         Some("events") => return crate::events::run(&argv[1..]).await,
         Some("session") => return crate::session_gc::run(&argv[1..]).await,
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
+        Some("updates") => return crate::updates::run_updates(&argv[1..]).await,
         Some("install") => return crate::install::run_async(&argv[1..]).await,
         Some("uninstall") => return crate::install::uninstall(&argv[1..]),
         Some("extension") => return crate::packages::run_extension(&argv[1..]),
