@@ -582,9 +582,9 @@ async fn serve_session(
         )
         .await;
     }
-    let cwd = match open.rpc {
+    let (cwd, restored) = match open.rpc {
         Some(request) => request.apply(&mut args, cwd).await,
-        None => cwd,
+        None => (cwd, None),
     };
     for directory in &mut args.extensions_dir {
         *directory = cwd.join(&*directory);
@@ -603,7 +603,14 @@ async fn serve_session(
         let trusted = crate::session::resolve_project_trust_for(&home, &args, &cwd);
         // Native registration may synchronously call back into the Tokio runtime.
         let prepared = tokio::task::block_in_place(|| {
-            crate::session::prepare_host_extensions(&home, &args, &cwd, trusted, plugin_images)
+            crate::session::prepare_host_extensions(
+                &home,
+                &args,
+                &cwd,
+                trusted,
+                plugin_images,
+                restored.as_ref(),
+            )
         })
         .map_err(|error| error.to_string())?;
         let resolved = crate::provider::resolve_with_extensions(

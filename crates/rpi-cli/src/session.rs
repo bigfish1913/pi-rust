@@ -446,31 +446,17 @@ pub(crate) fn preflight_extension_startup(
     args: &Args,
     cwd: &Path,
     trusted: bool,
-) -> Result<
-    (
-        Option<crate::resource_selection::ResolvedSelection>,
-        SessionSelection,
-    ),
-    BuildError,
-> {
-    preflight_extension_startup_for(&crate::config::AgentHome::process(), args, cwd, trusted)
-}
-
-pub(crate) fn preflight_extension_startup_for(
-    home: &crate::config::AgentHome,
-    args: &Args,
-    cwd: &Path,
-    trusted: bool,
-) -> Result<
-    (
-        Option<crate::resource_selection::ResolvedSelection>,
-        SessionSelection,
-    ),
-    BuildError,
-> {
-    let (resources, (selection, _)) =
-        preflight_extension_startup_with_restore(home, args, cwd, trusted, false)?;
-    Ok((resources, selection))
+    restored: Option<&RestoredSessionCwd>,
+) -> Result<(), BuildError> {
+    preflight_extension_startup_with_restore(
+        &crate::config::AgentHome::process(),
+        args,
+        cwd,
+        trusted,
+        false,
+        restored,
+    )?;
+    Ok(())
 }
 
 type PreparedExtensionStartup = (
@@ -487,6 +473,7 @@ fn preflight_extension_startup_with_restore(
     cwd: &Path,
     trusted: bool,
     prepare_restore: bool,
+    restored: Option<&RestoredSessionCwd>,
 ) -> Result<PreparedExtensionStartup, BuildError> {
     let resource_selection_load = StartupSpan::start(Phase::ResourceSelectionLoad);
     let mut resources =
@@ -514,14 +501,18 @@ fn preflight_extension_startup_with_restore(
                         }
                         let restore_target = StartupSpan::start(Phase::RestoreTarget);
                         let cwd_str = cwd.to_string_lossy();
-                        let target = match &selection {
-                            SessionSelection::Fork { source, dir, .. } => {
-                                match session_metadata_at(Path::new(source)) {
-                                    Some(meta) => Some(meta),
-                                    None => find_session_metadata(source, &cwd_str, dir).await?,
+                        let target = if let Some(restored) = restored {
+                            Some(restored.metadata_for_restore()?)
+                        } else {
+                            match &selection {
+                                SessionSelection::Fork { source, dir, .. } => {
+                                    match session_metadata_at(Path::new(source)) {
+                                        Some(meta) => Some(meta),
+                                        None => find_session_metadata(source, &cwd_str, dir).await?,
+                                    }
                                 }
+                                _ => resolve_restore_target(&selection, &cwd_str).await?,
                             }
-                            _ => resolve_restore_target(&selection, &cwd_str).await?,
                         };
                         restore_target.finish();
                         let Some(meta) = target else {
@@ -584,6 +575,9 @@ fn preflight_extension_startup_with_restore(
                                 None,
                             )
                         };
+                        if let Some(restored) = restored {
+                            restored.verify_metadata(&facts.metadata)?;
+                        }
                         let binding_validate = StartupSpan::start(Phase::BindingValidate);
                         crate::resource_selection::validate_session_binding(
                             &facts.values,
@@ -621,7 +615,23 @@ pub fn prepare_extensions(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
-    prepare_extensions_inner(home, args, cwd, project_trusted, None)
+    prepare_extensions_inner(home, args, cwd, project_trusted, None, None)
+}
+
+pub(crate) fn prepare_cli_extensions(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    restored: Option<&RestoredSessionCwd>,
+) -> Result<PreparedExtensions, BuildError> {
+    prepare_extensions_inner(
+        &crate::config::AgentHome::process(),
+        args,
+        cwd,
+        project_trusted,
+        None,
+        restored,
+    )
 }
 
 #[cfg(unix)]
@@ -631,8 +641,9 @@ pub(crate) fn prepare_host_extensions(
     cwd: &Path,
     project_trusted: bool,
     images: HostPluginImages,
+    restored: Option<&RestoredSessionCwd>,
 ) -> Result<PreparedExtensions, BuildError> {
-    prepare_extensions_inner(home, args, cwd, project_trusted, Some(images))
+    prepare_extensions_inner(home, args, cwd, project_trusted, Some(images), restored)
 }
 
 fn prepare_extensions_inner(
@@ -641,6 +652,7 @@ fn prepare_extensions_inner(
     cwd: &Path,
     project_trusted: bool,
     host_plugin_images: Option<HostPluginImages>,
+    restored: Option<&RestoredSessionCwd>,
 ) -> Result<PreparedExtensions, BuildError> {
     let shared_host = host_plugin_images.is_some();
     crate::native_durable::experimental_epoch::policy(args).map_err(BuildError::HarnessCreate)?;
@@ -648,7 +660,7 @@ fn prepare_extensions_inner(
         .map_err(BuildError::HarnessCreate)?;
     let preflight_prepare = StartupSpan::start(Phase::PreflightPrepare);
     let (resource_selection, (session_selection, prepared_restore)) =
-        preflight_extension_startup_with_restore(home, args, cwd, project_trusted, true)?;
+        preflight_extension_startup_with_restore(home, args, cwd, project_trusted, true, restored)?;
     preflight_prepare.finish();
     // Transition hosts own the writer before any DLL registration. The strict
     // loader cannot repair history/progress or migrate metadata on rejection.
@@ -660,13 +672,19 @@ fn prepare_extensions_inner(
             scope.spawn(|| {
             tokio::runtime::Builder::new_current_thread().enable_all().build()
                 .map_err(|e| BuildError::SessionOpen(e.to_string()))?.block_on(async {
-                    let meta = resolve_restore_target(&session_selection, &cwd.to_string_lossy()).await?
-                        .ok_or_else(|| BuildError::SessionOpen("transition session disappeared".into()))?;
+                    let meta = match restored {
+                        Some(restored) => restored.metadata_for_restore()?,
+                        None => resolve_restore_target(&session_selection, &cwd.to_string_lossy()).await?
+                            .ok_or_else(|| BuildError::SessionOpen("transition session disappeared".into()))?,
+                    };
                     let path = std::fs::canonicalize(&meta.path).map_err(|e| BuildError::SessionOpen(e.to_string()))?;
                     let storage = rpi_harness::session::jsonl::JsonlSessionStorage::load_for_resource_transition(
                         Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())), &path.to_string_lossy(),
                         Arc::new(SystemClock), Arc::new(DefaultIdGenerator::new()),
                     ).await.map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                    if let Some(restored) = restored {
+                        restored.verify_metadata(&storage.jsonl_metadata())?;
+                    }
                     storage.acquire_writer_lease().await.map_err(|e| BuildError::SessionOpen(e.to_string()))?;
                     let session = Session::new(Arc::new(storage), None);
                     crate::resource_selection::bind_session(&session, resource_selection.as_ref()).await.map_err(BuildError::SessionOpen)?;
@@ -3536,6 +3554,20 @@ async fn restore_session(
     cwd: &str,
     prepared_restore: Option<rpi_harness::session::jsonl::PreparedJsonlRestore>,
 ) -> Result<Session, BuildError> {
+    if let Some(prepared) = prepared_restore {
+        let path = prepared.metadata().path;
+        let storage = prepared
+            .commit()
+            .await
+            .map_err(|e| BuildError::SessionOpen(format!("open {path}: {e}")))?;
+        let progress_upgrade = StartupSpan::start(Phase::ProgressUpgrade);
+        let storage = storage
+            .enable_progress_under_exclusive_lock()
+            .await
+            .map_err(|e| BuildError::SessionOpen(format!("upgrade {path}: {e}")))?;
+        progress_upgrade.finish();
+        return Ok(Session::new(Arc::new(storage), None));
+    }
     // `resolve_restore_target` is newest-first; `Latest` takes the head, `ById`
     // matches the id exactly or by file-name containment (so `--session 01a02…`
     // or a partial id works, mirroring the TS id/path matching).
@@ -3561,25 +3593,6 @@ async fn restore_session(
             _ => unreachable!("resolve_restore_target only returns None for restore selections"),
         };
     };
-    if let Some(prepared) = prepared_restore {
-        let prepared_meta = prepared.metadata();
-        if prepared_meta.id != meta.id {
-            return Err(BuildError::SessionOpen(
-                "session changed during restore preparation".into(),
-            ));
-        }
-        let storage = prepared
-            .commit()
-            .await
-            .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?;
-        let progress_upgrade = StartupSpan::start(Phase::ProgressUpgrade);
-        let storage = storage
-            .enable_progress_under_exclusive_lock()
-            .await
-            .map_err(|e| BuildError::SessionOpen(format!("upgrade {}: {e}", meta.path)))?;
-        progress_upgrade.finish();
-        return Ok(Session::new(Arc::new(storage), None));
-    }
     let sessions_root = selection_dir(selection);
     open_session(&meta, cwd, &sessions_root)
         .await
@@ -3634,23 +3647,56 @@ async fn find_session_metadata(
 ) -> Result<Option<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
     let metas = list_session_metadata_in_dir(cwd, dir).await?;
     Ok(metas
-        .into_iter()
-        .find(|m| m.id == id || m.path.contains(id) || id.contains(&m.id)))
+        .iter()
+        .find(|m| m.id == id || m.path == id)
+        .cloned()
+        .or_else(|| {
+            metas
+                .into_iter()
+                .find(|m| m.path.contains(id) || id.contains(&m.id))
+        }))
 }
 
 /// What a launch that would restore a session says about the working directory.
 pub(crate) struct RestoredSessionCwd {
-    /// The id of the session this launch will restore. The host pins it into
-    /// `args` so the later build opens exactly this session — a directory
-    /// listing taken twice can disagree (another `rpi` may write a newer
-    /// session in between), and adopting one session's directory while opening
-    /// another is the very bug this restores.
-    pub id: String,
+    id: String,
+    path: PathBuf,
     /// The directory recorded in the session header.
     pub recorded: PathBuf,
     /// `Some` when the recorded directory still exists and the run adopts it;
     /// `None` when the caller must fall back to the launch cwd and say so.
     pub adopted: Option<PathBuf>,
+}
+
+impl RestoredSessionCwd {
+    /// Verify the file whose cwd was used before trust and resource discovery.
+    fn metadata_for_restore(
+        &self,
+    ) -> Result<rpi_harness::session::jsonl::JsonlSessionMetadata, BuildError> {
+        let metadata = session_metadata_at(&self.path).ok_or_else(|| self.changed())?;
+        self.verify_metadata(&metadata)?;
+        Ok(metadata)
+    }
+
+    fn verify_metadata(
+        &self,
+        metadata: &rpi_harness::session::jsonl::JsonlSessionMetadata,
+    ) -> Result<(), BuildError> {
+        if metadata.id != self.id
+            || Path::new(&metadata.path) != self.path
+            || Path::new(&metadata.cwd) != self.recorded
+        {
+            return Err(self.changed());
+        }
+        Ok(())
+    }
+
+    fn changed(&self) -> BuildError {
+        BuildError::SessionOpen(format!(
+            "session changed or disappeared during startup: {}",
+            self.path.display(),
+        ))
+    }
 }
 
 /// The working directory the launch's restored session was created in, resolved
@@ -3671,25 +3717,11 @@ pub(crate) async fn peek_restored_session_cwd(
         return None;
     }
     Some(RestoredSessionCwd {
+        path: std::fs::canonicalize(meta.path).ok()?,
         id: meta.id,
         adopted: crate::session_cwd::resolve_session_cwd(&recorded),
         recorded,
     })
-}
-
-/// Pin a peeked restore target into `args` so the later build opens exactly the
-/// session the peek inspected.
-///
-/// `Latest` (`-c`) re-lists the session directory when the build runs, and
-/// another `rpi` may have written a newer session in between. Adopting one
-/// session's working directory while opening a different conversation would put
-/// the tools in a directory that conversation never used — the exact failure
-/// this adoption exists to prevent. Pinning the resolved id turns the second
-/// listing into an exact match instead of a fresh "newest" choice.
-pub(crate) fn pin_restored_selection(args: &mut Args, restored: &RestoredSessionCwd) {
-    args.continue_session = false;
-    args.resume = false;
-    args.session = Some(restored.id.clone());
 }
 
 /// `--fork <path|id>`: open the source session, fork it into a new JSONL
@@ -7206,14 +7238,6 @@ mod tests {
         assert_eq!(restored.session.storage().metadata().id, "cwdopen001");
     }
 
-    /// The session the peek inspected must be the session the build opens.
-    ///
-    /// `-c` means "the most recent session", and the build lists the directory
-    /// again. Another `rpi` (or a `/session` new-session) can write a newer one
-    /// between the peek and the build; adopting the peeked session's directory
-    /// while opening the newer conversation would run the tools in a directory
-    /// that conversation never used. Pinning the resolved id makes the second
-    /// listing an exact match instead of a fresh newest-first choice.
     #[tokio::test]
     async fn the_peeked_session_is_the_one_the_build_opens() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7232,7 +7256,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut args = Args {
+        let args = Args {
             continue_session: true,
             session_dir: Some(sessions.clone()),
             ..Default::default()
@@ -7247,22 +7271,73 @@ mod tests {
         create_jsonl_session_with_id(
             &sessions,
             &second_project.to_string_lossy(),
-            Some("cwdrace002".into()),
+            Some("cwdrace001-newer".into()),
         )
         .await
         .unwrap();
 
-        pin_restored_selection(&mut args, &peeked);
-        let pinned = select_session_in_dir(&args, sessions.clone());
-        let reopened = resolve_restore_target(&pinned, &launch.to_string_lossy())
+        let home = crate::config::AgentHome::from_option(Some(tmp.path().join("agent"))).unwrap();
+        let cwd = first_project.to_string_lossy();
+        let newer = find_session_metadata("cwdrace001-newer", &cwd, &sessions)
             .await
             .unwrap()
-            .expect("the pinned session still exists");
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&newer.path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
         assert_eq!(
-            reopened.id, peeked.id,
-            "the build must open the session the peek adopted the directory of"
+            list_session_metadata_in_dir(&cwd, &sessions).await.unwrap()[0].id,
+            newer.id
         );
-        assert_eq!(reopened.cwd, first_project.to_string_lossy());
+        let exact = find_session_metadata(&peeked.id, &cwd, &sessions)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.id, peeked.id);
+        let (_, (selection, prepared)) = preflight_extension_startup_with_restore(
+            &home,
+            &args,
+            &first_project,
+            false,
+            true,
+            Some(&peeked),
+        )
+        .unwrap();
+        let reopened = restore_session(&selection, &cwd, prepared).await.unwrap();
+        assert_eq!(reopened.storage().metadata().id, peeked.id);
+        drop(reopened);
+
+        let (_, (selection, prepared)) = preflight_extension_startup_with_restore(
+            &home,
+            &args,
+            &first_project,
+            false,
+            true,
+            Some(&peeked),
+        )
+        .unwrap();
+        std::fs::remove_file(&peeked.path).unwrap();
+        let missing_before_preflight = preflight_extension_startup_with_restore(
+            &home,
+            &args,
+            &first_project,
+            false,
+            true,
+            Some(&peeked),
+        );
+        assert!(matches!(
+            missing_before_preflight,
+            Err(BuildError::SessionOpen(_))
+        ));
+        assert!(restore_session(&selection, &cwd, prepared).await.is_err());
+        assert!(list_session_metadata_in_dir(&cwd, &sessions)
+            .await
+            .unwrap()
+            .iter()
+            .all(|meta| meta.id != peeked.id));
     }
 
     /// Trust must be resolved against the directory it is asked about. A
