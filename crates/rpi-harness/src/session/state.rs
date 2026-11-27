@@ -43,8 +43,10 @@ mod metadata;
 mod record_page_tests;
 mod selection;
 mod snapshot;
+mod startup;
 pub(crate) use index::IndexedState;
 pub(crate) use metadata::EntryMeta;
+pub(crate) use startup::StartupIndex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum StoredLogItem {

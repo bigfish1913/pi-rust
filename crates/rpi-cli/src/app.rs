@@ -100,6 +100,13 @@ async fn run_inner() -> i32 {
     {
         return crate::host::area_entry::run(&argv).await;
     }
+    if argv
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--session-preview" || arg.starts_with("--session-preview="))
+    {
+        return crate::session_preview::run(&argv);
+    }
     if let Err(error) = crate::native_durable::experimental_epoch::early_check(&argv) {
         eprintln!("error: {error}");
         return EXIT_USAGE;

@@ -2785,7 +2785,7 @@ pub(crate) async fn rpc_get_messages(
     }))
 }
 
-fn rpc_project_transcript(
+pub(crate) fn rpc_project_transcript(
     entries: Vec<rpi_harness::session::types::Entry>,
 ) -> Result<Vec<(String, serde_json::Value)>, String> {
     use rpi_harness::session::types::Entry;
