@@ -466,33 +466,10 @@ jobs:
               --max-ready-ms 4000 --max-single-ready-ms 8000 \
               --max-get-messages-ms 250 --max-get-state-ms 2000
           }
-          latency_only_failure() {
-            python3 - "$1" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              data = json.load(stream)
-          runs = data.get("runs", [])
-          summaries = [item for item in data.get("summaries", [])
-                       if item.get("gate", {}).get("gatesExit")]
-          only_latency = bool(data.get("status") == "FAIL" and "fatalError" not in data and
-                              runs and summaries and
-                              all(run.get("status") == "PASS" and not run.get("errors")
-                                  for run in runs) and
-                              all(item["gate"].get("complete") is True for item in summaries) and
-                              all(item.get("metrics", {}).get(key) is not None
-                                  for item in summaries
-                                  for key in ("readyMs", "getMessages40Ms", "getStateMs")) and
-                              any(item.get("gate", {}).get("status") == "FAIL"
-                                  for item in summaries))
-          raise SystemExit(0 if only_latency else 1)
-          PY
-          }
           if run_benchmark "${output_base}-1"; then
             exit 0
           fi
-          if ! latency_only_failure "${output_base}-1/results.json"; then
+          if ! python3 -B scripts/resource-cold-start-retry.py "${output_base}-1/results.json"; then
             echo 'Cold-start benchmark failed for a non-latency reason; not retrying.' >&2
             exit 1
           fi
@@ -512,33 +489,10 @@ jobs:
               --max-ready-ms 6000 --max-single-ready-ms 10000 \
               --max-get-messages-ms 250 --max-get-state-ms 2000
           }
-          latency_only_failure() {
-            python3 - "$1" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              data = json.load(stream)
-          runs = data.get("runs", [])
-          summaries = [item for item in data.get("summaries", [])
-                       if item.get("gate", {}).get("gatesExit")]
-          only_latency = bool(data.get("status") == "FAIL" and "fatalError" not in data and
-                              runs and summaries and
-                              all(run.get("status") == "PASS" and not run.get("errors")
-                                  for run in runs) and
-                              all(item["gate"].get("complete") is True for item in summaries) and
-                              all(item.get("metrics", {}).get(key) is not None
-                                  for item in summaries
-                                  for key in ("readyMs", "getMessages40Ms", "getStateMs")) and
-                              any(item.get("gate", {}).get("status") == "FAIL"
-                                  for item in summaries))
-          raise SystemExit(0 if only_latency else 1)
-          PY
-          }
           if run_benchmark "${output_base}-1"; then
             exit 0
           fi
-          if ! latency_only_failure "${output_base}-1/results.json"; then
+          if ! python3 -B scripts/resource-cold-start-retry.py "${output_base}-1/results.json"; then
             echo 'Cold-start benchmark failed for a non-latency reason; not retrying.' >&2
             exit 1
           fi

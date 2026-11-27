@@ -17,7 +17,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-import textwrap
+import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -645,15 +645,11 @@ class WorkflowRetryTests(TemporaryCase):
     def assert_retry(self, data, allowed):
         path = self.base / "results.json"
         path.write_text(json.dumps(data), encoding="utf-8")
-        workflow = (REPOSITORY / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        classifiers = workflow.split("latency_only_failure() {")[1:]
-        self.assertEqual(len(classifiers), 2, "check modern and legacy retry classifiers")
-        for index, block in enumerate(classifiers):
-            source = textwrap.dedent(block.split("<<'PY'\n", 1)[1].split("\n          PY", 1)[0])
-            with self.subTest(classifier=index), mock.patch.object(sys, "argv", ["-", str(path)]):
-                with self.assertRaises(SystemExit) as raised:
-                    exec(compile(source, "ci-latency-classifier", "exec"), {})
-                self.assertEqual(raised.exception.code, 0 if allowed else 1)
+        result = subprocess.run(
+            [sys.executable, "-B", str(SCRIPT.with_name("resource-cold-start-retry.py")), str(path)],
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0 if allowed else 1, result.stderr)
 
     def test_complete_latency_failures_allow_retry(self):
         for metric, value in (("readyMs", 3001), ("getMessages40Ms", 101), ("getStateMs", 1501)):
