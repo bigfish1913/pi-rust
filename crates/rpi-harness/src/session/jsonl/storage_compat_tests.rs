@@ -462,6 +462,125 @@ async fn history_append_sync_failure_rolls_back_and_reopens_cleanly() {
 }
 
 #[tokio::test]
+async fn history_replacement_directory_sync_failure_fences_both_writers() {
+    use crate::session::SessionState;
+
+    for checkpoint in [false, true] {
+        let fs = MemoryFs::new(Mode::Stable);
+        let storage = create(fs.clone()).await;
+        let old = storage
+            .append_entry(large_message("old"), "main")
+            .await
+            .unwrap();
+        let before = storage.history_identity().await.unwrap();
+        fs.fail_next_directory_sync();
+        let result = if checkpoint {
+            let state = storage
+                .state
+                .lock()
+                .await
+                .clone()
+                .into_detached()
+                .await
+                .unwrap();
+            storage
+                .replace_history_with_checkpoint_if_revision_and_generation(
+                    before.revision,
+                    before.generation,
+                    HistoryCheckpoint::new(before, state).unwrap(),
+                )
+                .await
+        } else {
+            storage
+                .replace_history_if_revision_and_generation(
+                    before.revision,
+                    before.generation,
+                    HistoryReplacement {
+                        state: SessionState::new(),
+                        canonical_mutations: Some(Vec::new()),
+                    },
+                )
+                .await
+        };
+        assert!(result
+            .unwrap_err()
+            .message
+            .contains("injected directory sync failure"));
+        assert_eq!(storage.history_identity().await.unwrap(), before);
+        let error = storage
+            .append_entry(large_message("stale-write"), "main")
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("reopen it before writing"));
+        assert!(storage.append_progress(vec![clear_frame()]).await.is_err());
+        assert!(storage.prune_completed_progress().await.is_err());
+
+        storage.release_writer_lease();
+        let reopened = load(fs).await.unwrap();
+        assert_eq!(
+            reopened.history_generation().await.unwrap(),
+            before.generation + 1
+        );
+        assert_eq!(
+            reopened.get_entry(old.id()).await.unwrap().is_some(),
+            checkpoint
+        );
+        assert!(reopened.get_entry("stale-write").await.unwrap().is_none());
+        reopened
+            .append_entry(large_message("fresh-write"), "main")
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn history_replacement_can_retry_before_rename_and_refreshes_the_append_handle() {
+    use crate::session::SessionState;
+
+    let fs = MemoryFs::new(Mode::Stable);
+    let storage = create(fs.clone()).await;
+    storage
+        .append_entry(large_message("old"), "main")
+        .await
+        .unwrap();
+    let old_reader = fs.reader("/history.jsonl");
+    let replacement = HistoryReplacement {
+        state: SessionState::new(),
+        canonical_mutations: Some(Vec::new()),
+    };
+    fs.fail_next_sync();
+    assert!(storage
+        .replace_history_if_revision_and_generation(1, 0, replacement.clone())
+        .await
+        .is_err());
+    assert!(Arc::ptr_eq(&old_reader, &fs.reader("/history.jsonl")));
+    let identity = storage
+        .replace_history_if_revision_and_generation(1, 0, replacement)
+        .await
+        .unwrap();
+    assert_eq!(
+        identity,
+        HistoryIdentity {
+            revision: 0,
+            generation: 1
+        }
+    );
+    let old_len = old_reader.byte_len().await.unwrap();
+    storage
+        .append_entry(large_message("fresh-write"), "main")
+        .await
+        .unwrap();
+    assert_eq!(old_reader.byte_len().await.unwrap(), old_len);
+    assert!(load(fs)
+        .await
+        .unwrap()
+        .get_entry("fresh-write")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
 async fn progress_checkpoint_stage_write_failure_preserves_destination_and_cleans_tmp() {
     let fs = MemoryFs::new(Mode::Stable);
     let (storage, before) = seeded_progress(fs.clone()).await;
