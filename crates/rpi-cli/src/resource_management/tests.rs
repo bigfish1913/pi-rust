@@ -71,6 +71,7 @@ fn copy_is_bounded_and_failure_preserves_old_install() {
     mutate(
         &root,
         &options("install", Kind::Skill, "demo", Some(source.clone())),
+        None,
     )
     .unwrap();
     let old = inventory(&root.join("skills/demo")).unwrap();
@@ -85,7 +86,12 @@ fn copy_is_bounded_and_failure_preserves_old_install() {
     assert_eq!(old, inventory(&root.join("skills/demo")).unwrap());
     assert_eq!(receipt, fs::read(root.join(RECEIPTS)).unwrap());
     fs::remove_file(source.join("SKILL.md")).unwrap();
-    assert!(mutate(&root, &options("update", Kind::Skill, "demo", Some(source))).is_err());
+    assert!(mutate(
+        &root,
+        &options("update", Kind::Skill, "demo", Some(source)),
+        None
+    )
+    .is_err());
     assert_eq!(receipt, fs::read(root.join(RECEIPTS)).unwrap());
 }
 
@@ -174,6 +180,7 @@ fn actual_rename_registry_write_and_remove_failures_preserve_old_bytes() {
     mutate(
         &root,
         &options("install", Kind::Skill, "demo", Some(source)),
+        None,
     )
     .unwrap();
     let receipt = fs::read(root.join(RECEIPTS)).unwrap();
@@ -237,6 +244,7 @@ fn catalog_cannot_observe_a_paused_half_publication_and_never_creates_locks() {
     mutate(
         &root,
         &options("install", Kind::Skill, "demo", Some(source)),
+        None,
     )
     .unwrap();
     let (entered, wait) = std::sync::mpsc::channel();
@@ -290,6 +298,7 @@ fn bounded_input_depth_width_receipts_and_next_state_do_not_publish_invalid_inst
     let e = mutate(
         &root,
         &options("install", Kind::Skill, "overflow", Some(source.clone())),
+        None,
     )
     .unwrap_err();
     assert!(e.contains("128"), "{e}");
@@ -324,7 +333,7 @@ fn corrupt_metadata_missing_legacy_owners_mismatch_and_modified_installs_fail_cl
     let (_dir, root, source) = fixture();
     let o = options("install", Kind::Skill, "demo", Some(source.clone()));
     fs::write(root.join(RECEIPTS), "broken").unwrap();
-    assert!(mutate(&root, &o).is_err());
+    assert!(mutate(&root, &o, None).is_err());
     assert_eq!(fs::read(root.join(RECEIPTS)).unwrap(), b"broken");
     fs::remove_file(root.join(RECEIPTS)).unwrap();
     let lib = source.with_extension(std::env::consts::DLL_EXTENSION);
@@ -332,24 +341,28 @@ fn corrupt_metadata_missing_legacy_owners_mismatch_and_modified_installs_fail_cl
     fs::write(root.join("native-packages.json"),json!([{"name":"native-owner","version":"1","artifacts":[format!("native.{}",std::env::consts::DLL_EXTENSION)]}]).to_string()).unwrap();
     assert!(mutate(
         &root,
-        &options("install", Kind::Extension, "native", Some(lib))
+        &options("install", Kind::Extension, "native", Some(lib)),
+        None,
     )
     .unwrap_err()
     .contains("legacy"));
     mutate(
         &root,
         &options("install", Kind::Package, "bundle", Some(source.clone())),
+        None,
     )
     .unwrap();
     let before = fs::read(root.join(RECEIPTS)).unwrap();
     let mut p = packages(&root).unwrap();
     p.packages[0].source = "another-provider".into();
     fs::write(root.join("packages.json"), json_bytes(&p).unwrap()).unwrap();
-    assert!(
-        mutate(&root, &options("remove", Kind::Package, "bundle", None))
-            .unwrap_err()
-            .contains("disagrees")
-    );
+    assert!(mutate(
+        &root,
+        &options("remove", Kind::Package, "bundle", None),
+        None
+    )
+    .unwrap_err()
+    .contains("disagrees"));
     assert_eq!(fs::read(root.join(RECEIPTS)).unwrap(), before);
     fs::write(
         root.join("packages.json"),
@@ -361,11 +374,13 @@ fn corrupt_metadata_missing_legacy_owners_mismatch_and_modified_installs_fail_cl
         json_bytes(&Receipts::default()).unwrap(),
     )
     .unwrap();
-    mutate(&root, &o).unwrap();
+    mutate(&root, &o, None).unwrap();
     put(root.join("skills/demo/unowned"), "keep");
-    assert!(mutate(&root, &options("remove", Kind::Skill, "demo", None))
-        .unwrap_err()
-        .contains("changed"));
+    assert!(
+        mutate(&root, &options("remove", Kind::Skill, "demo", None), None)
+            .unwrap_err()
+            .contains("changed")
+    );
     assert_eq!(fs::read(root.join("skills/demo/unowned")).unwrap(), b"keep");
 }
 #[cfg(windows)]
@@ -377,6 +392,7 @@ fn legacy_target_aliases_cannot_bypass_owned_windows_paths() {
     mutate(
         &root,
         &options("install", Kind::Extension, "Foo", Some(library)),
+        None,
     )
     .unwrap();
     assert!(legacy_unowned_targets(&root, &[root.join("extensions/foo.dll")]).is_err());

@@ -74,7 +74,7 @@ fn unknown_package_metadata_is_never_discarded() {
         r#"{"packages":[{"name":"other","version":"1","source":"local","cargo_package":"other","artifacts":[],"owner-private":"keep"}]}"#,
     ] {
         fs::write(root.join("packages.json"), bytes).unwrap();
-        assert!(mutate(&root, &install(Kind::Package, "demo", source.clone())).is_err());
+        assert!(mutate(&root, &install(Kind::Package, "demo", source.clone()), None).is_err());
         assert_eq!(
             fs::read(root.join("packages.json")).unwrap(),
             bytes.as_bytes()
@@ -91,7 +91,7 @@ fn explicit_parent_source_is_normalized_but_owned_traversal_stays_forbidden() {
     fs::create_dir(d.path().join("nested")).unwrap();
     put(&source.join("SKILL.md"), b"body");
     let addressed = d.path().join("nested/../source");
-    let result = mutate(&root, &install(Kind::Skill, "demo", addressed)).unwrap();
+    let result = mutate(&root, &install(Kind::Skill, "demo", addressed), None).unwrap();
     assert_eq!(result["outcome"], "installed");
     assert_eq!(
         fs::read(root.join("skills/demo/SKILL.md")).unwrap(),
@@ -107,7 +107,7 @@ fn windows_extended_case_and_ancestor_source_overlap_rejected_before_staging() {
     let root = d.path().join("native");
     let source = d.path().join("source");
     put(&source.join("SKILL.md"), b"body");
-    mutate(&root, &install(Kind::Skill, "demo", source)).unwrap();
+    mutate(&root, &install(Kind::Skill, "demo", source), None).unwrap();
     let before = fs::read(root.join(RECEIPTS)).unwrap();
     let installed = fs::canonicalize(root.join("skills/demo")).unwrap();
     for source in [
@@ -116,7 +116,7 @@ fn windows_extended_case_and_ancestor_source_overlap_rejected_before_staging() {
         fs::canonicalize(&root).unwrap(),
         fs::canonicalize(d.path()).unwrap(),
     ] {
-        let e = mutate(&root, &install(Kind::Skill, "overlap", source)).unwrap_err();
+        let e = mutate(&root, &install(Kind::Skill, "overlap", source), None).unwrap_err();
         assert!(e.contains("overlap"), "{e}");
         assert_eq!(before, fs::read(root.join(RECEIPTS)).unwrap());
         assert!(!root.join("skills/overlap").exists());
@@ -146,7 +146,7 @@ fn oversized_success_is_rejected_before_commit_with_previous_state_intact() {
     let root = d.path().join("native");
     let source = d.path().join("source");
     put(&source.join("SKILL.md"), b"body");
-    mutate(&root, &install(Kind::Skill, "demo", source.clone())).unwrap();
+    mutate(&root, &install(Kind::Skill, "demo", source.clone()), None).unwrap();
     let old = fs::read(root.join(RECEIPTS)).unwrap();
     let old_content = inventory(&root.join("skills/demo")).unwrap();
     for n in 0..1250 {
@@ -183,7 +183,7 @@ fn oversized_success_is_rejected_before_commit_with_previous_state_intact() {
     }
     let mut o = install(Kind::Skill, "demo", source);
     o.op = "update".into();
-    let e = mutate(&root, &o).unwrap_err();
+    let e = mutate(&root, &o, None).unwrap_err();
     assert!(e.contains("success result"), "{e}");
     assert_eq!(old, fs::read(root.join(RECEIPTS)).unwrap());
     assert_eq!(old_content, inventory(&root.join("skills/demo")).unwrap());
