@@ -14,7 +14,7 @@
 ```
 
 - `input` 为提交给独立会话的文本，限 1–24,000 UTF-8 bytes。调用方负责组装内容。
-- `maxTurns`（1–32）和 `timeoutSeconds`（10–1800）必填。可选的 `tools` 只能缩小
+- `maxTurns`（`0` 表示不限回合，或 1–32）和 `timeoutSeconds`（10–1800）必填。可选的 `tools` 只能缩小
   父会话的活动工具集合，省略时继承该集合。`[]` 表示无工具。
 - `start` 返回 `runId`、独立 `sessionId` 和 `status: running`。`poll` 消费有界的文本
   `deltas`，并返回 `running`、`done` 或 `failed`。`done` 时检查 `result.status`、
@@ -72,7 +72,7 @@
 ```
 
 - `task` 必填，1–20,000 bytes；`role` 默认 `worker`，1–200 bytes。
-- `maxTurns` 默认 8，范围 1–32；`timeoutSeconds` 默认 300，范围 10–1800。
+- `maxTurns` 默认 8，支持 `0`（不限回合）或 1–32；`timeoutSeconds` 默认 300，范围 10–1800。
   宿主拒绝非法类型或越界值，不隐式扩张预算。
 - `tools` 可省略以继承有效父工具；指定时只能缩小集合。`[]` 表示无工具。
 - `delegate_task` 从子任务的工具注册表中删除；child harness 和工具执行作用域
@@ -95,7 +95,7 @@
 
 `done` 的 `result` 包含运行的 `status`、`text`、可能的 `error`、`turns` 和
 `turnLimited`。客户端还必须检查内部 `status` 是否为 `completed`；
-`done` 只表示生命周期结束，不等于任务成功。`turnLimited` 表示到达回合预算，
+`done` 只表示生命周期结束，不等于任务成功。`turnLimited` 表示到达回合预算（`maxTurns: 0` 时恒为 `false`），
 报告可能不完整。运行失败、取消、超时和输出超限都有明确诊断。
 
 ### 旧 `ChildAgent` 的 cancel / dispose

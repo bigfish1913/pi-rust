@@ -125,7 +125,7 @@ async fn children_cannot_expand_tools_or_create_grandchildren() {
         .await
         .is_err());
     assert!(parent
-        .create_child(session("bad"), emitter(), 0, None)
+        .create_child(session("bad"), emitter(), 33, None)
         .await
         .is_err());
 }
@@ -161,6 +161,40 @@ async fn child_turn_budget_is_per_instance_and_does_not_change_parent_or_environ
     assert!(parent.max_turns.is_none());
     assert_eq!(child.harness.max_turns, Some(1));
     assert_eq!(std::env::var_os(crate::run_budget::MAX_TURNS_ENV), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_max_turns_zero_disables_turn_ceiling_past_32_turns() {
+    let script = FauxScript::new();
+    let mut responses: Vec<FauxStep> = (0..34)
+        .map(|_| FauxStep::tool_call("read", serde_json::json!({"path": "test.txt"})))
+        .collect();
+    responses.push(FauxStep::text("completed after 35 turns"));
+    script.set_responses(responses);
+    let (parent, provider, env) = parent(script).await;
+    use rpi_tools::FileSystem;
+    env.write_file(
+        "test.txt",
+        rpi_tools::FileContent::Text("fixture".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let child = parent
+        .create_child(session("unlimited-child"), emitter(), 0, None)
+        .await
+        .unwrap();
+    assert_eq!(child.harness.max_turns, Some(0));
+    let result = child
+        .harness
+        .prompt_text("run past 32 turns", vec![])
+        .await
+        .unwrap();
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+    assert_eq!(provider.script().pending_count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

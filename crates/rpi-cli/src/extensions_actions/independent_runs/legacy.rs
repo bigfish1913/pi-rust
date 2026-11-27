@@ -32,9 +32,16 @@ impl IndependentRuns {
         if task.trim().is_empty() || task.len() > 20_000 || role.is_empty() || role.len() > 200 {
             return Err("child task must contain 1-20000 bytes and role 1-200 bytes".into());
         }
-        let turns = bounded_number(args, "maxTurns", Some(8), 1, 32)? as u32;
+        let turns = bounded_number(args, "maxTurns", Some(8), 0, 32)? as u32;
         let timeout = bounded_number(args, "timeoutSeconds", Some(300), 10, 1800)?;
-        let input = format!("You are a delegated {role} subagent. Complete the task in at most {turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
+        let turn_budget_instruction = if turns == 0 {
+            "There is no fixed turn limit; complete the task within the host timeout.".to_string()
+        } else {
+            format!("Complete the task in at most {turns} turns.")
+        };
+        let input = format!(
+            "You are a delegated {role} subagent. {turn_budget_instruction} Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}"
+        );
         self.start(
             parent,
             owner,

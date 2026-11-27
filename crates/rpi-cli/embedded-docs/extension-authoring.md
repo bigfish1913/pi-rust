@@ -223,7 +223,7 @@ ABI 里的字符串与步骤返回都是裸指针，SDK 因此提供了一组宏
 `GetExecutionContext`（23）返回当前模型身份、thinking、活动工具、cwd 和会话 ID，
 不包含凭据、认证头或 endpoint。`IndependentRun`（33）使用 `op` 分派：
 
-- `start` 接收 `input`（最多 24,000 bytes）、`maxTurns`（1–32）、`timeoutSeconds`
+- `start` 接收 `input`（最多 24,000 bytes）、`maxTurns`（`0` 表示不限回合，或 1–32）、`timeoutSeconds`
   （10–1800）及可选 `tools`。立即返回 `runId`、独立 `sessionId` 和 `status: running`。
 - `poll` 使用 `runId` 消费 `deltas`，并返回运行状态和终态结果。
 - `cancel` 设置取消信号，`dispose` 释放句柄。所有终态都必须 dispose。

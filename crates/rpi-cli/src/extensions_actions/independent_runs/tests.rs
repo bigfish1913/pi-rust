@@ -426,11 +426,15 @@ async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
 
 #[test]
 fn child_limits_reject_wrong_types_and_out_of_range_values() {
-    for value in [json!(-1), json!(0), json!(33), json!("8"), Value::Null] {
-        assert!(bounded_number(&json!({"maxTurns":value}), "maxTurns", Some(8), 1, 32).is_err());
+    for value in [json!(-1), json!(33), json!("8"), Value::Null] {
+        assert!(bounded_number(&json!({"maxTurns":value}), "maxTurns", Some(8), 0, 32).is_err());
     }
     assert_eq!(
-        bounded_number(&json!({}), "maxTurns", Some(8), 1, 32).unwrap(),
+        bounded_number(&json!({"maxTurns": 0}), "maxTurns", Some(8), 0, 32).unwrap(),
+        0
+    );
+    assert_eq!(
+        bounded_number(&json!({}), "maxTurns", Some(8), 0, 32).unwrap(),
         8
     );
 }
@@ -452,7 +456,7 @@ async fn independent_run_uses_the_input_and_generic_handle() {
     for invalid in [
         json!({"input":INPUT,"timeoutSeconds":10}),
         json!({"input":INPUT,"maxTurns":1}),
-        json!({"input":INPUT,"maxTurns":0,"timeoutSeconds":10}),
+        json!({"input":INPUT,"maxTurns":33,"timeoutSeconds":10}),
         json!({"input":"x".repeat(24_001),"maxTurns":1,"timeoutSeconds":10}),
         json!({"input":INPUT,"maxTurns":1,"timeoutSeconds":10,"tools":["not_registered"]}),
     ] {
@@ -496,6 +500,149 @@ async fn independent_run_uses_the_input_and_generic_handle() {
         .handle_run(7, &json!({"op":"dispose","runId":id}))
         .unwrap();
     assert!(manager.handle_run(7, &poll).is_err());
+}
+
+async fn parent_with_read_tool(script: FauxScript) -> AgentHarness {
+    use rpi_harness::types::HarnessTool;
+    use rpi_tools::FileSystem;
+
+    let provider = FauxProvider::new(script);
+    let env = Arc::new(rpi_tools::InMemoryExecutionEnv::new());
+    env.write_file(
+        "test.txt",
+        rpi_tools::FileContent::Text("fixture".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let ctx = rpi_tools::ExecutionToolContext::new(env.clone(), Some(env));
+    let tools = vec![HarnessTool::new(rpi_tools::create_read_tool(&ctx, None))];
+    let session = Session::new(
+        Arc::new(InMemorySessionStorage::new(
+            SessionMetadata {
+                id: "parent".into(),
+                created_at: 0,
+                parent_session_id: None,
+            },
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        )),
+        None,
+    );
+    AgentHarness::create(AgentHarnessOptions {
+        model: provider.default_model().clone(),
+        models: vec![provider],
+        tools,
+        session,
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unlimited_max_turns_zero_executes_more_than_32_turns_and_preserves_default_limit() {
+    use rpi_ai::providers::faux::{FauxBlock, FauxStep};
+
+    // 1. Legacy ChildAgent with explicit maxTurns = 0 runs past 32 turns and reports turnLimited = false.
+    let script = FauxScript::new();
+    let mut responses = vec![FauxStep::factory(|context| {
+        let payload = serde_json::to_string(context).unwrap();
+        assert!(payload.contains("no fixed turn limit"));
+        assert!(!payload.contains("at most 0 turns"));
+        faux_assistant_message(
+            vec![FauxBlock::tool_call("read", json!({"path": "test.txt"}))],
+            StopReason::ToolUse,
+        )
+    })];
+    responses.extend((0..33).map(|_| FauxStep::tool_call("read", json!({"path": "test.txt"}))));
+    responses.push(FauxStep::text("unlimited child done"));
+    script.set_responses(responses);
+    let parent = parent_with_read_tool(script).await;
+    let manager = IndependentRuns::default();
+    let started = manager
+        .handle(
+            &parent,
+            7,
+            json!({"op": "start", "task": "run many turns", "maxTurns": 0}),
+        )
+        .await
+        .unwrap();
+    let id = started["childId"].as_str().unwrap();
+    let settled = wait(&manager, &parent, id).await;
+    assert_eq!(settled["status"], "done");
+    assert_eq!(settled["result"]["text"], "unlimited child done");
+    assert_eq!(settled["result"]["turns"], 35);
+    assert_eq!(settled["result"]["turnLimited"], false);
+    manager
+        .handle(&parent, 7, json!({"op": "dispose", "childId": id}))
+        .await
+        .unwrap();
+
+    // 2. IndependentRun with explicit maxTurns = 0 also runs past 32 turns and reports turnLimited = false.
+    let script = FauxScript::new();
+    let mut responses: Vec<FauxStep> = (0..34)
+        .map(|_| FauxStep::tool_call("read", json!({"path": "test.txt"})))
+        .collect();
+    responses.push(FauxStep::text("unlimited run done"));
+    script.set_responses(responses);
+    let parent = parent_with_read_tool(script).await;
+    let started = manager
+        .start_run(
+            &parent,
+            7,
+            &json!({"input": "run many turns", "maxTurns": 0, "timeoutSeconds": 60}),
+        )
+        .await
+        .unwrap();
+    let run_id = started["runId"].as_str().unwrap();
+    let poll = json!({"op": "poll", "runId": run_id});
+    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let result = manager.handle_run(7, &poll).unwrap();
+            if result["status"] != "running" {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(settled["status"], "done");
+    assert_eq!(settled["result"]["text"], "unlimited run done");
+    assert_eq!(settled["result"]["turns"], 35);
+    assert_eq!(settled["result"]["turnLimited"], false);
+    manager
+        .handle_run(7, &json!({"op": "dispose", "runId": run_id}))
+        .unwrap();
+
+    // 3. Omitting maxTurns retains the default limit of 8 turns and sets turnLimited = true.
+    let script = FauxScript::new();
+    let mut responses = vec![FauxStep::factory(|context| {
+        let payload = serde_json::to_string(context).unwrap();
+        assert!(payload.contains("Complete the task in at most 8 turns."));
+        faux_assistant_message(
+            vec![FauxBlock::tool_call("read", json!({"path": "test.txt"}))],
+            StopReason::ToolUse,
+        )
+    })];
+    responses.extend((0..9).map(|_| FauxStep::tool_call("read", json!({"path": "test.txt"}))));
+    responses.push(FauxStep::text("must remain unused"));
+    script.set_responses(responses);
+    let parent = parent_with_read_tool(script).await;
+    let started = manager
+        .handle(&parent, 7, json!({"op": "start", "task": "default budget"}))
+        .await
+        .unwrap();
+    let default_id = started["childId"].as_str().unwrap();
+    let settled = wait(&manager, &parent, default_id).await;
+    assert_eq!(settled["status"], "done");
+    assert_eq!(settled["result"]["turns"], 8);
+    assert_eq!(settled["result"]["turnLimited"], true);
+    manager
+        .handle(&parent, 7, json!({"op": "dispose", "childId": default_id}))
+        .await
+        .unwrap();
 }
 
 mod invocation;

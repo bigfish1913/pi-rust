@@ -272,7 +272,7 @@ impl IndependentRuns {
             owner,
             Start {
                 input: input.into(),
-                turns: bounded_number(args, "maxTurns", None, 1, 32)? as u32,
+                turns: bounded_number(args, "maxTurns", None, 0, 32)? as u32,
                 timeout: bounded_number(args, "timeoutSeconds", None, 10, 1800)?,
                 tools: parse_tools(args)?,
                 legacy: None,
@@ -584,7 +584,7 @@ async fn run_child(
                         .get_or_insert_with(|| "child output limit exceeded".into());
                 } else if state.error.is_none() {
                     outcome["turns"] = json!(state.turns);
-                    outcome["turnLimited"] = json!(state.turns >= turns);
+                    outcome["turnLimited"] = json!(turns > 0 && state.turns >= turns);
                     state.result = Some(outcome);
                     if state.finished_ms.is_none() {
                         state.finished_ms = Some(now_ms());
