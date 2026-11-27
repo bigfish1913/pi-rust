@@ -121,6 +121,17 @@ pub(super) async fn run_client(home: &AgentHome, area: &str, args: Args) -> Resu
         },
     )
     .await?;
+    let mut stdout = tokio::io::stdout();
+    // Adapters opt in so existing stdio RPC clients still see `ready` first.
+    if std::env::var_os("RPI_RPC_LOCAL_HOST_STARTUP").as_deref() == Some(std::ffi::OsStr::new("1"))
+    {
+        write_json(
+            &mut stdout,
+            &serde_json::json!({"type":"starting","protocol":"rpi","transport":"local-host","version":1}),
+        )
+        .await?;
+        stdout.flush().await.map_err(|error| error.to_string())?;
+    }
     let reply = timeout(Duration::from_secs(90), read_json::<OpenReply>(&mut input))
         .await
         .map_err(|_| "local Host RPC session startup timed out")??;
@@ -155,7 +166,6 @@ pub(super) async fn run_client(home: &AgentHome, area: &str, args: Args) -> Resu
             let _ = runtime.block_on(output.shutdown());
         })
         .map_err(|error| error.to_string())?;
-    let mut stdout = tokio::io::stdout();
     tokio::io::copy(&mut input, &mut stdout)
         .await
         .map_err(|error| error.to_string())?;
