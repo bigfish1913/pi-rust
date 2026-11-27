@@ -81,31 +81,54 @@ struct Start {
     tools: Option<Vec<String>>,
 }
 
-impl Job {
-    /// Record the terminal timestamp exactly once (first finish wins; a later
-    /// dispose/cancel must not rewrite history).
-    fn mark_finished(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.finished_ms.is_none() {
-            state.finished_ms = Some(now_ms());
-        }
+impl State {
+    fn is_finished(&self) -> bool {
+        self.result.is_some() || self.error.is_some()
     }
 
-    fn fail(&self, error: impl Into<String>) {
+    fn mark_finished(&mut self) {
+        self.finished_ms.get_or_insert_with(now_ms);
+    }
+}
+
+impl Job {
+    /// Returns whether this call won the transition to a terminal state.
+    fn fail(&self, error: impl Into<String>) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.result.is_none() && state.error.is_none() {
+        let transitioned = !state.is_finished();
+        if transitioned {
             state.error = Some(error.into());
+            state.mark_finished();
         }
         drop(state);
-        self.mark_finished();
         self.cancel.cancel();
+        transitioned
+    }
+
+    fn complete(&self, mut outcome: Value, turns: u32) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_finished() {
+            return;
+        }
+        let bytes = outcome
+            .get("text")
+            .and_then(Value::as_str)
+            .map_or(0, str::len);
+        if state.bytes.saturating_add(bytes) > MAX_OUTPUT {
+            state.error = Some("child output limit exceeded".into());
+        } else {
+            outcome["turns"] = json!(state.turns);
+            outcome["turnLimited"] = json!(turns != 0 && state.turns >= turns);
+            state.result = Some(outcome);
+        }
+        state.mark_finished();
     }
 
     fn observe(&self, event: AgentEvent) {
         let mut limit_hit = false;
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.result.is_some() || state.error.is_some() {
+            if state.is_finished() {
                 return;
             }
             match event {
@@ -122,6 +145,7 @@ impl Job {
                         || state.events >= MAX_EVENTS
                     {
                         state.error = Some("child output limit exceeded".into());
+                        state.mark_finished();
                         limit_hit = true;
                     } else {
                         state.bytes += delta.len();
@@ -133,7 +157,6 @@ impl Job {
             }
         }
         if limit_hit {
-            self.mark_finished();
             self.cancel.cancel();
         }
     }
@@ -235,14 +258,10 @@ impl IndependentRuns {
             jobs.get(child_id).cloned()
         };
         let job = job.ok_or_else(|| format!("unknown childId `{child_id}`"))?;
-        let already_finished = {
-            let state = job.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.result.is_some() || state.error.is_some()
-        };
-        job.fail("child cancelled by user");
+        let cancelled = job.fail("child cancelled by user");
         Ok(json!({
             "childId": child_id,
-            "status": if already_finished { "already-finished" } else { "cancelled" },
+            "status": if cancelled { "cancelled" } else { "already-finished" },
         }))
     }
 
@@ -547,27 +566,13 @@ async fn run_child(
     };
     if let Some(result) = result {
         match result {
-            Ok(result) => {
-                let mut outcome = crate::extensions_actions::run_outcome_json(result.outcome);
-                let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
-                let bytes = outcome
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map_or(0, str::len);
-                if state.bytes.saturating_add(bytes) > MAX_OUTPUT {
-                    state
-                        .error
-                        .get_or_insert_with(|| "child output limit exceeded".into());
-                } else if state.error.is_none() {
-                    outcome["turns"] = json!(state.turns);
-                    outcome["turnLimited"] = json!(turns != 0 && state.turns >= turns);
-                    state.result = Some(outcome);
-                    if state.finished_ms.is_none() {
-                        state.finished_ms = Some(now_ms());
-                    }
-                }
+            Ok(result) => job.complete(
+                crate::extensions_actions::run_outcome_json(result.outcome),
+                turns,
+            ),
+            Err(error) => {
+                job.fail(format!("child run failed: {error}"));
             }
-            Err(error) => job.fail(format!("child run failed: {error}")),
         }
     } else {
         // Abort even if cancellation raced ahead of the run's first poll. A closed
