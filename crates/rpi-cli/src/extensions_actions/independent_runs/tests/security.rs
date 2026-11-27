@@ -85,7 +85,7 @@ async fn a_narrowed_child_cannot_reenter_the_root_host_through_an_alias_tool() {
         )
         .await
         .unwrap();
-    let manager = ChildRuns::default();
+    let manager = IndependentRuns::default();
     let started = manager
         .handle(
             &parent,
@@ -171,7 +171,7 @@ async fn assert_capacity_retained(panic_after_start: bool) {
         )
         .await
         .unwrap();
-    let manager = ChildRuns::default();
+    let manager = IndependentRuns::default();
     let child = manager
         .handle(&parent, 7, json!({"op":"start","task":"slow"}))
         .await

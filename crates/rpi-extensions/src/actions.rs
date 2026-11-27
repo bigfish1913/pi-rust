@@ -866,6 +866,15 @@ pub trait RuntimeActionHost: Send + Sync {
         Err("ChildAgent is not supported by this host".into())
     }
 
+    /// Independent run lifecycle. The bridge supplies the authenticated owner.
+    async fn independent_run(
+        &self,
+        _owner: u64,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("IndependentRun is not supported by this host".into())
+    }
+
     /// `GetSessionBranch` — query custom entries on the current main branch.
     /// Required: non-empty `customTypes` string array. Optional: `afterSeq`
     /// (exclusive), `limit` (positive), `order` (`oldestFirst` default or
@@ -1492,6 +1501,7 @@ async fn dispatch(
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
         RuntimeActionId::ToolProgram => Err("ToolProgram requires a live invocation bridge".into()),
         RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
+        RuntimeActionId::IndependentRun => Err("IndependentRun requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
         RuntimeActionId::ListCommands => host.list_commands(args).await,
         RuntimeActionId::Abort => host.abort(args).await,
@@ -1746,7 +1756,10 @@ fn run_action(
                 "ToolProgram requires an authenticated executing invocation".into(),
             ));
         }
-    } else if action == RuntimeActionId::ChildAgent {
+    } else if matches!(
+        action,
+        RuntimeActionId::ChildAgent | RuntimeActionId::IndependentRun
+    ) {
         // A registration handle cannot assert that it is a parent invocation.
         // All child-originated invocations fail closed, regardless of tool name.
         // Cancellation stops admission, not authenticated reclamation. The
@@ -1766,7 +1779,12 @@ fn run_action(
                             == Some(key.as_str()))
             });
         if !allowed {
-            let _ = tx.send(Err("ChildAgent requires a live parent tool invocation; recursive child agents are not allowed".into()));
+            let error = if action == RuntimeActionId::ChildAgent {
+                "ChildAgent requires a live parent tool invocation; recursive child agents are not allowed"
+            } else {
+                "IndependentRun requires a live top-level tool invocation"
+            };
+            let _ = tx.send(Err(error.into()));
         } else {
             let owner = bridge.plugin_identity.as_ref().map_or(0, |(id, _)| *id);
             let signal = bridge
@@ -1776,11 +1794,17 @@ fn run_action(
                 .2
                 .clone();
             bridge.runtime.spawn(async move {
-                let result = rpi_agent::tool_execution_scope::with_invocation_signal(
-                    signal,
-                    host.child_agent(owner, args),
-                )
-                .await;
+                let result =
+                    rpi_agent::tool_execution_scope::with_invocation_signal(signal, async {
+                        match action {
+                            RuntimeActionId::ChildAgent => host.child_agent(owner, args).await,
+                            RuntimeActionId::IndependentRun => {
+                                host.independent_run(owner, args).await
+                            }
+                            _ => unreachable!(),
+                        }
+                    })
+                    .await;
                 let _ = tx.send(result);
             });
         }
@@ -1932,8 +1956,14 @@ mod tests {
             RuntimeActionId::try_from(32).is_ok(),
             "GetEditorText must remain a valid runtime action id"
         );
+        // IndependentRun requires a live tool invocation and uses owner-scoped
+        // handles. The host's roster and stop operations have no plugin action.
+        assert_eq!(
+            RuntimeActionId::try_from(33),
+            Ok(RuntimeActionId::IndependentRun)
+        );
         assert!(
-            RuntimeActionId::try_from(33).is_err(),
+            RuntimeActionId::try_from(34).is_err(),
             "a new RuntimeActionId was added: re-verify that host-only child-agent control \
              (un-owner-scoped roster/stop) is still unreachable from the plugin ABI"
         );
