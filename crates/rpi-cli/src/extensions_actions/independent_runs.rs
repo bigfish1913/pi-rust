@@ -15,9 +15,6 @@ use rpi_harness::session::Session;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-mod legacy;
-use legacy::LegacyRoster;
-
 const MAX_JOBS: usize = 16;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
@@ -58,7 +55,6 @@ struct Job {
     cancel: CancellationToken,
     invocation_signal: Option<CancellationToken>,
     state: Mutex<State>,
-    legacy: Option<LegacyRoster>,
 }
 
 #[derive(Default)]
@@ -83,7 +79,6 @@ struct Start {
     turns: u32,
     timeout: u64,
     tools: Option<Vec<String>>,
-    legacy: Option<LegacyRoster>,
 }
 
 impl Job {
@@ -199,8 +194,7 @@ impl IndependentRuns {
     /// Supervisory roster for the host UI: every child this host still holds
     /// (running **and** terminated-but-not-disposed), newest first. Each row is
     /// self-contained — `childId`/`status`/`turns`/`startedMs`/`finishedMs`/
-    /// `error` — so a panel can render without polling each run. Legacy
-    /// delegation rows also include their compatibility labels.
+    /// `error` — so a panel can render without polling each run.
     ///
     /// Status vocabulary matches `poll`: `running` / `done` / `failed`.
     pub(crate) fn roster(&self) -> Vec<Value> {
@@ -216,18 +210,14 @@ impl IndependentRuns {
                 } else {
                     "running"
                 };
-                let mut row = json!({
+                json!({
                     "childId": id,
                     "status": status,
                     "turns": state.turns,
                     "startedMs": state.started_ms,
                     "finishedMs": state.finished_ms,
                     "error": state.error,
-                });
-                if let Some(legacy) = &job.legacy {
-                    legacy.populate_row(&mut row);
-                }
-                row
+                })
             })
             .collect();
         rows.sort_by_key(|row| std::cmp::Reverse(row["startedMs"].as_u64()));
@@ -272,10 +262,9 @@ impl IndependentRuns {
             owner,
             Start {
                 input: input.into(),
-                turns: bounded_number(args, "maxTurns", None, 1, 32)? as u32,
-                timeout: bounded_number(args, "timeoutSeconds", None, 10, 1800)?,
+                turns: bounded_number(args, "maxTurns", 0, 32)? as u32,
+                timeout: bounded_number(args, "timeoutSeconds", 10, 1800)?,
                 tools: parse_tools(args)?,
-                legacy: None,
             },
         )
         .await
@@ -387,7 +376,6 @@ impl IndependentRuns {
             turns,
             timeout,
             tools,
-            legacy,
         } = request;
         let id = parent.session().id_generator().next();
         let job = Arc::new(Job {
@@ -398,7 +386,6 @@ impl IndependentRuns {
                 started_ms: now_ms(),
                 ..State::default()
             }),
-            legacy,
         });
         // Reserve before awaiting construction so concurrent starts cannot exceed the cap.
         let permit;
@@ -449,14 +436,10 @@ impl IndependentRuns {
             None,
         );
         let emitter = Arc::new(Emitter(job.clone()));
-        let created = if job.legacy.is_some() {
-            parent.create_child(session, emitter, turns, tools).await
-        } else {
-            parent
-                .create_independent_run(session, emitter, turns, tools)
-                .await
-        };
-        let child = match created {
+        let child = match parent
+            .create_independent_run(session, emitter, turns, tools)
+            .await
+        {
             Ok(child) => child,
             Err(error) => {
                 preparation
@@ -501,19 +484,12 @@ impl IndependentRuns {
     }
 }
 
-fn bounded_number(
-    args: &Value,
-    key: &str,
-    default: Option<u64>,
-    min: u64,
-    max: u64,
-) -> Result<u64, String> {
-    let value = match args.get(key) {
-        None => default.ok_or_else(|| format!("missing {key}"))?,
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| format!("{key} must be an integer"))?,
-    };
+fn bounded_number(args: &Value, key: &str, min: u64, max: u64) -> Result<u64, String> {
+    let value = args
+        .get(key)
+        .ok_or_else(|| format!("missing {key}"))?
+        .as_u64()
+        .ok_or_else(|| format!("{key} must be an integer"))?;
     if !(min..=max).contains(&value) {
         return Err(format!("{key} must be between {min} and {max}"));
     }
@@ -584,7 +560,7 @@ async fn run_child(
                         .get_or_insert_with(|| "child output limit exceeded".into());
                 } else if state.error.is_none() {
                     outcome["turns"] = json!(state.turns);
-                    outcome["turnLimited"] = json!(state.turns >= turns);
+                    outcome["turnLimited"] = json!(turns != 0 && state.turns >= turns);
                     state.result = Some(outcome);
                     if state.finished_ms.is_none() {
                         state.finished_ms = Some(now_ms());

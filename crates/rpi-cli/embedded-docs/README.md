@@ -378,8 +378,8 @@ remain in effect, and parent completion or cancellation stops the child. This is
 not an OS sandbox. Use compatible host and extension versions; unsupported hosts
 fail explicitly rather than starting a subprocess with different defaults.
 
-The SDK entry point is `AgentHarness::create_child`; extensions use
-`GetExecutionContext` and `ChildAgent` runtime actions. See the
+The Rust entry point is `AgentHarness::create_independent_run`. Extensions use
+`GetExecutionContext` and `IndependentRun` runtime actions. See the
 [subagent protocol](https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/subagents.md)
 for lifecycle, limits and compatibility details.
 

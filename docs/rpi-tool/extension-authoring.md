@@ -223,12 +223,10 @@ ABI 里的字符串与步骤返回都是裸指针，SDK 因此提供了一组宏
 `GetExecutionContext`（23）返回当前模型身份、thinking、活动工具、cwd 和会话 ID，
 不包含凭据、认证头或 endpoint。`IndependentRun`（33）使用 `op` 分派：
 
-- `start` 接收 `input`（最多 24,000 bytes）、`maxTurns`（1–32）、`timeoutSeconds`
+- `start` 接收 `input`（最多 24,000 bytes）、`maxTurns`（0–32，`0` 表示无回合上限）、`timeoutSeconds`
   （10–1800）及可选 `tools`。立即返回 `runId`、独立 `sessionId` 和 `status: running`。
 - `poll` 使用 `runId` 消费 `deltas`，并返回运行状态和终态结果。
 - `cancel` 设置取消信号，`dispose` 释放句柄。所有终态都必须 dispose。
-
-现有 `ChildAgent`（24）作为兼容入口，继续接收 `task`、可选 `role` 和预算，使用 `childId`。
 
 子任务继承有效 provider 私有绑定、系统提示词/资源、项目 cwd 和权限 hook，
 不重新加载默认配置，也不进入父 transcript。权限审批和用户问题使用父 UI，
@@ -239,7 +237,7 @@ handle 按插件 owner 隔离；父结束/取消、会话切换、关闭或插�
 这不是 OS 安全沙箱；只读任务应缩小工具范围并使用权限规则。
 
 从工作线程调用同步 runtime action，避免在单线程 Tokio executor 中自锁。
-两种运行 action 都必须绑定本次工具调用的 `__rpi.runtimeHandle` / `runtimeKey`：
+运行 action 必须绑定本次工具调用的 `__rpi.runtimeHandle` / `runtimeKey`。调用方式如下。
 用 opaque handle 作为 action 的 user_data，并在参数中传入 `__rpiRuntimeKey`；
 不得跨调用缓存或输出给模型。仅注册级、失效和 child-originated 调用会被拒绝
 （包括别名工具），不能经根宿主绕过工具子集。正确的父 capability 在取消后仅允许
@@ -247,7 +245,8 @@ poll/cancel/dispose 回收已有任务，不允许 start；排队中的 start �
 同步工具回调由宿主自动绑定。后台工具、provider 和审批 driver 自己保活 DLL 和参数；
 超过两秒前台清理宽限期仍占用活动名额，直到实际退出。
 宿主 runtime binding 弱持有父 harness；候选 reload 回退不会留下可解引用的失效 bridge 指针。
-旧宿主返回未知 action 时，扩展可继续使用现有 `ChildAgent` 入口。
+宿主在 `__rpi.independentRun` 中标记工具调用是否来自独立运行。
+宿主不支持 `IndependentRun` 时，扩展应提示升级。
 完整协议与真实 DLL 测试见仓库 `docs/extensions/subagents.md`。
 
 ### 运行期间追加上下文

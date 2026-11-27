@@ -12,8 +12,9 @@
 //!
 //! Synchronous tool callbacks inherit a host-owned invocation via a scoped
 //! thread-local; workers forward the invocation handle and capability injected
-//! into `__rpi`. ChildAgent rejects registration-only, cancelled and child
-//! invocations. A cached registration cannot override a child's driver scope.
+//! into `__rpi`. IndependentRun requires a top-level invocation. Cancellation
+//! disallows new runs while preserving cleanup. A cached registration cannot
+//! override an independent run's driver scope.
 //!
 //! [`ActionBridge`] captures a Tokio [`Handle`] at construction. Dispatch can
 //! therefore spawn from foreign threads and return over a standard synchronous
@@ -857,15 +858,6 @@ pub trait RuntimeActionHost: Send + Sync {
         Err("execution context is not supported by this host".into())
     }
 
-    /// Independent child lifecycle. `owner` is supplied by the bridge, NOT JSON.
-    async fn child_agent(
-        &self,
-        _owner: u64,
-        _args: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        Err("ChildAgent is not supported by this host".into())
-    }
-
     /// Independent run lifecycle. The bridge supplies the authenticated owner.
     async fn independent_run(
         &self,
@@ -1061,6 +1053,9 @@ impl ActionBridge {
     }
     pub(crate) fn invocation_key(&self) -> Option<&str> {
         self.invocation.as_ref().map(|(_, key, _)| key.as_str())
+    }
+    pub(crate) fn is_independent_invocation(&self) -> bool {
+        self.invocation.as_ref().is_some_and(|(child, _, _)| *child)
     }
     pub(crate) fn enter_invocation(self: &Arc<Self>) -> InvocationGuard {
         InvocationGuard {
@@ -1518,7 +1513,6 @@ async fn dispatch(
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
         RuntimeActionId::ToolProgram => Err("ToolProgram requires a live invocation bridge".into()),
-        RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::IndependentRun => Err("IndependentRun requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
         RuntimeActionId::ListCommands => host.list_commands(args).await,
@@ -1774,10 +1768,7 @@ fn run_action(
                 "ToolProgram requires an authenticated executing invocation".into(),
             ));
         }
-    } else if matches!(
-        action,
-        RuntimeActionId::ChildAgent | RuntimeActionId::IndependentRun
-    ) {
+    } else if action == RuntimeActionId::IndependentRun {
         // A registration handle cannot assert that it is a parent invocation.
         // All child-originated invocations fail closed, regardless of tool name.
         // Cancellation stops admission, not authenticated reclamation. The
@@ -1797,12 +1788,9 @@ fn run_action(
                             == Some(key.as_str()))
             });
         if !allowed {
-            let error = if action == RuntimeActionId::ChildAgent {
-                "ChildAgent requires a live parent tool invocation; recursive child agents are not allowed"
-            } else {
-                "IndependentRun requires a live top-level tool invocation"
-            };
-            let _ = tx.send(Err(error.into()));
+            let _ = tx.send(Err(
+                "IndependentRun requires a live top-level tool invocation".into(),
+            ));
         } else {
             let owner = bridge.plugin_identity.as_ref().map_or(0, |(id, _)| *id);
             let signal = bridge
@@ -1812,17 +1800,11 @@ fn run_action(
                 .2
                 .clone();
             bridge.runtime.spawn(async move {
-                let result =
-                    rpi_agent::tool_execution_scope::with_invocation_signal(signal, async {
-                        match action {
-                            RuntimeActionId::ChildAgent => host.child_agent(owner, args).await,
-                            RuntimeActionId::IndependentRun => {
-                                host.independent_run(owner, args).await
-                            }
-                            _ => unreachable!(),
-                        }
-                    })
-                    .await;
+                let result = rpi_agent::tool_execution_scope::with_invocation_signal(
+                    signal,
+                    host.independent_run(owner, args),
+                )
+                .await;
                 let _ = tx.send(result);
             });
         }

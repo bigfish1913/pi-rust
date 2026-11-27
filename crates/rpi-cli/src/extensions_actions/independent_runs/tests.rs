@@ -1,20 +1,21 @@
 use super::*;
-use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript};
+use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript, FauxStep};
 use rpi_ai::types::StopReason;
 use rpi_harness::types::AgentHarnessOptions;
 
 impl IndependentRuns {
-    async fn handle(
+    async fn start_test_run(
         &self,
         parent: &AgentHarness,
         owner: u64,
-        args: Value,
+        input: &str,
     ) -> Result<Value, String> {
-        if args["op"] == "start" {
-            self.start_child(parent, owner, &args).await
-        } else {
-            self.handle_child(owner, &args)
-        }
+        self.start_run(
+            parent,
+            owner,
+            &json!({"op":"start","input":input,"maxTurns":8,"timeoutSeconds":300}),
+        )
+        .await
     }
 }
 
@@ -47,7 +48,6 @@ fn job(owner: u64) -> Arc<Job> {
         cancel: CancellationToken::new(),
         invocation_signal: None,
         state: Mutex::new(State::default()),
-        legacy: None,
     })
 }
 fn delta(text: String) -> AgentEvent {
@@ -62,12 +62,11 @@ fn delta(text: String) -> AgentEvent {
         }),
     }
 }
-async fn wait(manager: &IndependentRuns, parent: &AgentHarness, id: &str) -> Value {
+async fn wait(manager: &IndependentRuns, id: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let value = manager
-                .handle(parent, 7, json!({"op":"poll","childId":id}))
-                .await
+                .handle_run(7, &json!({"op":"poll","runId":id}))
                 .unwrap();
             if value["status"] != "running" {
                 return value;
@@ -83,25 +82,18 @@ async fn wait(manager: &IndependentRuns, parent: &AgentHarness, id: &str) -> Val
 async fn child_reports_and_owner_scoped_disposal_are_independent_of_parent_transcript() {
     let parent = parent(FauxScript::new().with_text("child report")).await;
     let manager = IndependentRuns::default();
-    let started = manager
-        .handle(&parent, 7, json!({"op":"start","task":"report"}))
-        .await
-        .unwrap();
-    let id = started["childId"].as_str().unwrap();
+    let started = manager.start_test_run(&parent, 7, "report").await.unwrap();
+    let id = started["runId"].as_str().unwrap();
     assert_ne!(id, parent.session().storage().metadata().id);
-    let final_value = wait(&manager, &parent, id).await;
+    let final_value = wait(&manager, id).await;
     assert_eq!(final_value["result"]["text"], "child report");
     assert_eq!(final_value["status"], "done");
     assert!(parent.get_tip_id().await.unwrap().is_none());
     for op in ["poll", "cancel", "dispose"] {
-        assert!(manager
-            .handle(&parent, 8, json!({"op":op,"childId":id}))
-            .await
-            .is_err());
+        assert!(manager.handle_run(8, &json!({"op":op,"runId":id})).is_err());
     }
     manager
-        .handle(&parent, 7, json!({"op":"dispose","childId":id}))
-        .await
+        .handle_run(7, &json!({"op":"dispose","runId":id}))
         .unwrap();
     assert!(manager.jobs.lock().unwrap().is_empty());
 }
@@ -115,23 +107,19 @@ async fn cancellation_and_unload_stop_pending_children_and_reject_stale_starts()
     )
     .await;
     let manager = IndependentRuns::default();
-    let started = manager
-        .handle(&parent, 7, json!({"op":"start","task":"report"}))
-        .await
-        .unwrap();
-    let id = started["childId"].as_str().unwrap();
+    let started = manager.start_test_run(&parent, 7, "report").await.unwrap();
+    let id = started["runId"].as_str().unwrap();
     manager
-        .handle(&parent, 7, json!({"op":"cancel","childId":id}))
-        .await
+        .handle_run(7, &json!({"op":"cancel","runId":id}))
         .unwrap();
-    assert!(wait(&manager, &parent, id).await["error"]
+    assert!(wait(&manager, id).await["error"]
         .as_str()
         .unwrap()
         .contains("cancelled"));
     manager.cancel_owner(7);
     assert!(manager.jobs.lock().unwrap().is_empty());
     assert!(manager
-        .handle(&parent, 7, json!({"op":"start","task":"report"}))
+        .start_test_run(&parent, 7, "report")
         .await
         .unwrap_err()
         .contains("unloaded"));
@@ -155,7 +143,7 @@ async fn explicit_timeout_and_parent_scope_cancel_are_observable() {
         .await;
         let job = job(7);
         let child = parent
-            .create_child(
+            .create_independent_run(
                 AgentHarnessOptions::default().session,
                 Arc::new(Emitter(job.clone())),
                 1,
@@ -199,9 +187,8 @@ fn text_and_event_budgets_are_enforced_before_queue_growth() {
     assert!(job.state.lock().unwrap().deltas.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn poll_drains_bounded_batches_before_delivering_a_terminal_result() {
-    let parent = parent(FauxScript::new()).await;
+#[test]
+fn poll_drains_bounded_batches_before_delivering_a_terminal_result() {
     let manager = IndependentRuns::default();
     let job = job(7);
     for _ in 0..4 {
@@ -210,15 +197,13 @@ async fn poll_drains_bounded_batches_before_delivering_a_terminal_result() {
     job.state.lock().unwrap().result = Some(json!({"status":"completed","text":"report"}));
     manager.jobs.lock().unwrap().insert("c".into(), job);
     let a = manager
-        .handle(&parent, 7, json!({"op":"poll","childId":"c"}))
-        .await
+        .handle_run(7, &json!({"op":"poll","runId":"c"}))
         .unwrap();
     assert_eq!(a["status"], "running");
     assert!(a["result"].is_null());
     assert_eq!(a["deltas"].as_array().unwrap().len(), 2);
     let b = manager
-        .handle(&parent, 7, json!({"op":"poll","childId":"c"}))
-        .await
+        .handle_run(7, &json!({"op":"poll","runId":"c"}))
         .unwrap();
     assert_eq!(b["status"], "done");
     assert_eq!(b["result"]["text"], "report");
@@ -230,7 +215,7 @@ async fn capacity_is_bounded_even_while_disposed_children_are_cleaning_up() {
     let manager = IndependentRuns::default();
     manager.active.store(MAX_JOBS, Ordering::Release);
     assert!(manager
-        .handle(&parent, 7, json!({"op":"start","task":"report"}))
+        .start_test_run(&parent, 7, "report")
         .await
         .unwrap_err()
         .contains("cleanup"));
@@ -240,7 +225,7 @@ async fn capacity_is_bounded_even_while_disposed_children_are_cleaning_up() {
         manager.jobs.lock().unwrap().insert(format!("c{n}"), job(7));
     }
     assert!(manager
-        .handle(&parent, 7, json!({"op":"start","task":"report"}))
+        .start_test_run(&parent, 7, "report")
         .await
         .unwrap_err()
         .contains("capacity"));
@@ -256,14 +241,10 @@ async fn roster_reports_live_children_and_stop_terminates_by_id() {
     .await;
     let manager = IndependentRuns::default();
     let started = manager
-        .handle(
-            &parent,
-            7,
-            json!({"op":"start","task":"survey the repo","role":"scout"}),
-        )
+        .start_test_run(&parent, 7, "survey the repo")
         .await
         .unwrap();
-    let id = started["childId"].as_str().unwrap();
+    let id = started["runId"].as_str().unwrap();
 
     let roster = manager.roster();
     let row = roster
@@ -271,12 +252,11 @@ async fn roster_reports_live_children_and_stop_terminates_by_id() {
         .find(|row| row["childId"] == id)
         .expect("the running child must be listed");
     assert_eq!(row["status"], "running");
-    assert_eq!(row["role"], "scout");
-    assert_eq!(row["taskPreview"], "survey the repo");
     assert!(row["startedMs"].as_u64().unwrap() > 0);
     assert!(row["finishedMs"].is_null());
 
     let stopped = manager.stop(id).unwrap();
+    assert_eq!(stopped["childId"], id);
     assert_eq!(stopped["status"], "cancelled");
     let row = manager
         .roster()
@@ -288,8 +268,7 @@ async fn roster_reports_live_children_and_stop_terminates_by_id() {
     assert!(manager.stop("nope").is_err());
 
     manager
-        .handle(&parent, 7, json!({"op":"dispose","childId":id}))
-        .await
+        .handle_run(7, &json!({"op":"dispose","runId":id}))
         .unwrap();
     assert!(manager.roster().is_empty());
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -308,12 +287,9 @@ async fn roster_reports_live_children_and_stop_terminates_by_id() {
 async fn stop_on_a_finished_child_reports_already_finished_without_rewriting_it() {
     let parent = parent(FauxScript::new().with_text("child report")).await;
     let manager = IndependentRuns::default();
-    let started = manager
-        .handle(&parent, 7, json!({"op":"start","task":"report"}))
-        .await
-        .unwrap();
-    let id = started["childId"].as_str().unwrap();
-    let finished = wait(&manager, &parent, id).await;
+    let started = manager.start_test_run(&parent, 7, "report").await.unwrap();
+    let id = started["runId"].as_str().unwrap();
+    let finished = wait(&manager, id).await;
     assert_eq!(finished["status"], "done");
 
     let before = manager
@@ -326,6 +302,7 @@ async fn stop_on_a_finished_child_reports_already_finished_without_rewriting_it(
     assert!(finished_ms.as_u64().unwrap() > 0);
 
     let stopped = manager.stop(id).unwrap();
+    assert_eq!(stopped["childId"], id);
     assert_eq!(stopped["status"], "already-finished");
     let after = manager
         .roster()
@@ -342,8 +319,7 @@ async fn stop_on_a_finished_child_reports_already_finished_without_rewriting_it(
     );
 
     manager
-        .handle(&parent, 7, json!({"op":"dispose","childId":id}))
-        .await
+        .handle_run(7, &json!({"op":"dispose","runId":id}))
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         while manager.active.load(Ordering::Acquire) != 0 {
@@ -391,17 +367,13 @@ async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
     )
     .await;
     let manager = IndependentRuns::default();
-    let started = manager
-        .handle(&parent, 7, json!({"op":"start","task":"report"}))
-        .await
-        .unwrap();
-    let id = started["childId"].as_str().unwrap();
+    let started = manager.start_test_run(&parent, 7, "report").await.unwrap();
+    let id = started["runId"].as_str().unwrap();
 
     // Plugin path: a different owner cannot cancel it.
     assert!(
         manager
-            .handle(&parent, 8, json!({"op":"cancel","childId":id}))
-            .await
+            .handle_run(8, &json!({"op":"cancel","runId":id}))
             .is_err(),
         "a foreign owner must not cancel another plugin's child"
     );
@@ -412,8 +384,7 @@ async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
     assert_eq!(manager.roster()[0]["status"], "failed");
 
     manager
-        .handle(&parent, 7, json!({"op":"dispose","childId":id}))
-        .await
+        .handle_run(7, &json!({"op":"dispose","runId":id}))
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         while manager.active.load(Ordering::Acquire) != 0 {
@@ -425,20 +396,28 @@ async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
 }
 
 #[test]
-fn child_limits_reject_wrong_types_and_out_of_range_values() {
-    for value in [json!(-1), json!(0), json!(33), json!("8"), Value::Null] {
-        assert!(bounded_number(&json!({"maxTurns":value}), "maxTurns", Some(8), 1, 32).is_err());
+fn run_limits_require_integers_within_their_ranges() {
+    for (key, min, max) in [("maxTurns", 0, 32), ("timeoutSeconds", 10, 1800)] {
+        assert!(bounded_number(&json!({}), key, min, max).is_err());
+        for invalid in [
+            json!(min as i64 - 1),
+            json!(max + 1),
+            json!("10"),
+            Value::Null,
+        ] {
+            assert!(bounded_number(&json!({(key):invalid}), key, min, max).is_err());
+        }
+        for value in [min, max] {
+            assert_eq!(
+                bounded_number(&json!({(key):value}), key, min, max),
+                Ok(value)
+            );
+        }
     }
-    assert_eq!(
-        bounded_number(&json!({}), "maxTurns", Some(8), 1, 32).unwrap(),
-        8
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independent_run_uses_the_input_and_generic_handle() {
-    use rpi_ai::providers::faux::FauxStep;
-
     const INPUT: &str = "Read the independent run input verbatim";
     let script = FauxScript::new();
     script.set_responses(vec![FauxStep::factory(|context| {
@@ -452,7 +431,6 @@ async fn independent_run_uses_the_input_and_generic_handle() {
     for invalid in [
         json!({"input":INPUT,"timeoutSeconds":10}),
         json!({"input":INPUT,"maxTurns":1}),
-        json!({"input":INPUT,"maxTurns":0,"timeoutSeconds":10}),
         json!({"input":"x".repeat(24_001),"maxTurns":1,"timeoutSeconds":10}),
         json!({"input":INPUT,"maxTurns":1,"timeoutSeconds":10,"tools":["not_registered"]}),
     ] {
@@ -475,17 +453,7 @@ async fn independent_run_uses_the_input_and_generic_handle() {
     assert!(parent.get_tip_id().await.unwrap().is_none());
     let poll = json!({"op":"poll","runId":id});
     assert!(manager.handle_run(8, &poll).is_err());
-    let settled = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let result = manager.handle_run(7, &poll).unwrap();
-            if result["status"] != "running" {
-                break result;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let settled = wait(&manager, id).await;
     assert_eq!(settled["runId"], id);
     assert_eq!(settled["result"]["text"], "report");
     assert_eq!(settled["result"]["turnLimited"], true);
@@ -496,6 +464,57 @@ async fn independent_run_uses_the_input_and_generic_handle() {
         .handle_run(7, &json!({"op":"dispose","runId":id}))
         .unwrap();
     assert!(manager.handle_run(7, &poll).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_run_with_zero_max_turns_completes_35_turns() {
+    use rpi_harness::types::HarnessTool;
+    use rpi_tools::{ExecutionToolContext, FileContent, FileSystem, InMemoryExecutionEnv};
+
+    let script = FauxScript::new();
+    let mut responses: Vec<_> = (0..34)
+        .map(|_| FauxStep::tool_call("read", json!({"path":"fixture.txt"})))
+        .collect();
+    responses.push(FauxStep::text("completed after 35 turns"));
+    script.set_responses(responses);
+    let parent = parent(script).await;
+
+    let env = Arc::new(InMemoryExecutionEnv::new());
+    env.write_file("fixture.txt", FileContent::Text("fixture".into()), None)
+        .await
+        .unwrap();
+    let context = ExecutionToolContext::new(env.clone(), Some(env));
+    parent
+        .set_tools(
+            vec![HarnessTool::new(rpi_tools::create_read_tool(
+                &context, None,
+            ))],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let manager = IndependentRuns::default();
+    let started = manager
+        .start_run(
+            &parent,
+            7,
+            &json!({
+                "op": "start",
+                "input": "read the fixture",
+                "maxTurns": 0,
+                "timeoutSeconds": 10,
+                "tools": ["read"],
+            }),
+        )
+        .await
+        .unwrap();
+    let settled = wait(&manager, started["runId"].as_str().unwrap()).await;
+    assert_eq!(settled["status"], "done");
+    assert_eq!(settled["result"]["status"], "completed");
+    assert_eq!(settled["result"]["text"], "completed after 35 turns");
+    assert_eq!(settled["result"]["turns"], 35);
+    assert_eq!(settled["result"]["turnLimited"], false);
 }
 
 mod invocation;

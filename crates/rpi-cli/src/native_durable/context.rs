@@ -428,7 +428,7 @@ mod tests {
         );
         let (emitter, _) = rpi_agent::CollectorEmitter::new();
         let child = parent
-            .create_child(child_session, Arc::new(emitter), 2, None)
+            .create_independent_run(child_session, Arc::new(emitter), 2, None)
             .await
             .unwrap();
         child
