@@ -254,20 +254,10 @@ async fn ordinary_tool_lifecycles_remain_in_transcript_order() {
 
 #[tokio::test]
 async fn commands_and_extension_messages_use_the_visible_transcript_slot() {
-    struct ConfigEnv(Option<std::ffi::OsString>);
-    impl Drop for ConfigEnv {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
-                None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
-            }
-        }
-    }
-    let _lock = crate::config::test_support::env_lock().lock().unwrap();
-    let _restore = ConfigEnv(std::env::var_os(crate::config::CONFIG_DIR_ENV));
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var(crate::config::CONFIG_DIR_ENV, tmp.path());
+    let home = crate::config::AgentHome::from_option(Some(tmp.path().to_path_buf())).unwrap();
     let resolved = crate::provider::resolve(
+        &home,
         Some("anthropic"),
         Some(crate::provider::DEFAULT_MODEL_ID),
         None,
@@ -285,9 +275,10 @@ async fn commands_and_extension_messages_use_the_visible_transcript_slot() {
         system_prompt: Some("test context".into()),
         ..Default::default()
     };
-    let (harness, _events, reload) = crate::session::build(&resolved, &args, tmp.path(), false)
-        .await
-        .unwrap();
+    let (harness, _events, reload) =
+        crate::session::build(&home, &resolved, &args, tmp.path(), false)
+            .await
+            .unwrap();
     let session = Arc::new(crate::agent_session::AgentSession::new(
         harness,
         vec![],
