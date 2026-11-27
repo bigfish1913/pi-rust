@@ -55,11 +55,11 @@ fn delta(text: String) -> AgentEvent {
     AgentEvent::MessageUpdate {
         message_id: None,
         message: partial.clone(),
-        assistant_message_event: AssistantMessageEvent::TextDelta {
+        assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: text,
             partial,
-        },
+        }),
     }
 }
 async fn wait(manager: &IndependentRuns, parent: &AgentHarness, id: &str) -> Value {
@@ -166,7 +166,9 @@ async fn explicit_timeout_and_parent_scope_cancel_are_observable() {
         if cancel_parent {
             child.scope.cancel();
         }
-        run_child(child, job.clone(), "report".into(), 1, 0).await;
+        run_child(child, job.clone(), "report".into(), 1, 0)
+            .await
+            .unwrap();
         let state = job.state.lock().unwrap();
         let error = state.error.as_deref().unwrap();
         assert!(

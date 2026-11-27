@@ -267,6 +267,26 @@ pub trait FileSystem: Send + Sync {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError>;
 
+    /// Atomically create an absent file and write its initial contents, never
+    /// following or replacing an existing final path. The parent must already
+    /// exist; this capability does not create directories or prove durability.
+    ///
+    /// Unsupported backends fail closed rather than emulating this with an
+    /// existence check plus truncating write. Cancellation/error after creation
+    /// may leave a partial new file; never unlink or overwrite it on retry.
+    async fn write_new_file(
+        &self,
+        path: &str,
+        _content: FileContent,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        Err(FileError::new(
+            FileErrorCode::NotSupported,
+            "exclusive file creation is unsupported",
+        )
+        .with_path(path))
+    }
+
     async fn append_file(
         &self,
         path: &str,
@@ -319,6 +339,26 @@ pub trait FileSystem: Send + Sync {
         Ok(())
     }
 
+    /// Sync a regular journal file and its containing directory through an
+    /// explicitly supported physical persistence boundary. Unlike `sync_file`
+    /// and `sync_directory`, the compatibility default fails closed: their
+    /// no-op defaults are not evidence that a journal survived a crash.
+    ///
+    /// The caller must own the journal writer and keep the addressed file and
+    /// parent stable. This does not sync newly-created ancestor directories,
+    /// progress companions, or protect against writers bypassing ownership.
+    async fn sync_file_and_parent(
+        &self,
+        path: &str,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        Err(FileError::new(
+            FileErrorCode::NotSupported,
+            "physical journal synchronization is unsupported",
+        )
+        .with_path(path))
+    }
+
     /// Optional stable-generation reader. Unsupported backends retain eager
     /// history loading; an actual open failure must be returned, not hidden.
     async fn open_read_file(
@@ -365,6 +405,24 @@ pub trait FileSystem: Send + Sync {
         path: &str,
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<FileInfo>, FileError>;
+
+    /// Whether a directory contains a file or symlink whose name ends with
+    /// `suffix`. Does not follow symlinks and does not cache negative results.
+    /// Backends may avoid collecting unrelated entries' sizes/timestamps.
+    /// The default preserves compatibility with existing filesystem adapters.
+    async fn has_file_with_suffix(
+        &self,
+        path: &str,
+        suffix: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<bool, FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let entries = self.list_dir(path, cancel).await?;
+        check_cancel_file(cancel, Some(path))?;
+        Ok(entries
+            .iter()
+            .any(|entry| entry.kind != FileKind::Directory && entry.name.ends_with(suffix)))
+    }
 
     /// Follows symlinks (`canonicalize`). Mirrors TS `canonicalPath`. Backends
     /// may return `not_found` or `not_supported` for missing/unsupported paths;

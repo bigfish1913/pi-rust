@@ -161,8 +161,6 @@ pub fn message_role(message: &Value) -> &str {
         .unwrap_or("")
 }
 
-/// Text out of a wire tool-result payload (`{content:[{type:"text",text}]}`).
-
 /// Client-side session state: the transcript plus the latest server state.
 #[derive(Debug, Clone, Default)]
 pub struct RemoteSession {

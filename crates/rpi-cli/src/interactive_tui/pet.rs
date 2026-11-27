@@ -93,7 +93,14 @@ fn pet_lines(state: &PetState, width: usize, height: usize, frame: u64) -> Vec<S
     let (eyes, label) = match state.mood.as_str() {
         "listen" => ("o.o", "认真听你说话"),
         "think" => ("-.-", "让我想一想"),
-        "speak" => (if frame % 2 == 0 { "o.o" } else { "oOo" }, "正在回答你"),
+        "speak" => (
+            if frame.is_multiple_of(2) {
+                "o.o"
+            } else {
+                "oOo"
+            },
+            "正在回答你",
+        ),
         "happy" => ("^.^", "完成啦！"),
         "error" => (";.;", "遇到一点小问题"),
         _ => ("-.-", "安静陪着你"),
@@ -223,7 +230,7 @@ impl Component for PetDocument {
         // growing past it or disturbing the editor dock.
         if lines.len() < height {
             let padding = (height - lines.len()) / 2;
-            lines.splice(1..1, std::iter::repeat(String::new()).take(padding));
+            lines.splice(1..1, std::iter::repeat_n(String::new(), padding));
         }
         lines
     }

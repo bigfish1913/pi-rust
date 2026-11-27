@@ -2074,6 +2074,22 @@ pub trait SessionStorage: Send + Sync {
     async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()>;
     async fn get_stats(&self) -> SessionResult<SessionStats>;
 
+    /// Synchronize committed history through an explicit physical persistence
+    /// boundary and return the identity covered by that barrier. Implementations
+    /// must serialize it with history mutations/replacement, fail on unsettled
+    /// writes or lost ownership, and keep an admitted barrier alive if its caller
+    /// stops waiting. Unsupported/ephemeral backends must not return success.
+    ///
+    /// This covers history only, not transient progress, other databases, or a
+    /// request receipt. Later mutations can advance or replace the returned
+    /// identity. A caller still needs a journal-linked request/admission proof;
+    /// neither `drain` nor a successful submit is such a proof.
+    async fn sync_history(&self) -> SessionResult<HistoryIdentity> {
+        Err(SessionError::storage(
+            "physical history synchronization is unsupported",
+        ))
+    }
+
     /// Wait for any in-flight durable write to settle.
     ///
     /// Only durable backends have anything to wait for. The in-memory backend is

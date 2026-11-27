@@ -55,6 +55,12 @@ use super::cold_frames::{preview, recovery_batch, ResidentState};
 #[cfg(test)]
 #[path = "storage_compat_tests.rs"]
 mod compatibility_tests;
+#[cfg(all(test, unix))]
+#[path = "exclusive_create_tests.rs"]
+mod exclusive_create_tests;
+#[cfg(all(test, unix))]
+#[path = "history_sync_tests.rs"]
+mod history_sync_tests;
 #[path = "startup_checkpoint.rs"]
 pub(super) mod startup_checkpoint;
 #[cfg(unix)]
@@ -130,20 +136,31 @@ impl PreparedJsonlRestore {
         self.facts.metadata.clone()
     }
 
+    /// Publish using the ordinary stat fast path. Matching size/mtime is a
+    /// heuristic: same-stamp rewrites/replacements may escape detection. Use
+    /// `commit_strict` when exact replay-generation validation is required.
     pub async fn commit(self) -> SessionResult<JsonlSessionStorage> {
+        self.commit_verified(false).await
+    }
+
+    /// Claim the writer lease, verify the full replay fingerprint once, then
+    /// apply deferred repair. A matching stat never skips content verification.
+    /// This does not protect against writers that ignore an already-held lease.
+    pub async fn commit_strict(self) -> SessionResult<JsonlSessionStorage> {
+        self.commit_verified(true).await
+    }
+
+    async fn commit_verified(self, strict: bool) -> SessionResult<JsonlSessionStorage> {
         let mut storage = self.storage;
-        // Ownership first, then the single fingerprint check: while the lease is
-        // held no compliant writer can change the source, so this digest proves
-        // the replay still matches the generation the deferred repair publishes.
-        // Verifying before the lease would leave a window where a concurrent
-        // append lands between the check and acquisition and is then silently
-        // replaced by the repair.
+        // Ownership precedes verification and deferred repair. Strict mode
+        // always hashes once under the lease; ordinary mode may trust its stat
+        // heuristic. Never move verification ahead of lease acquisition.
         // Timing-only phases; input/output are zero (not payload counts).
         let lease = crate::session::diagnostics::RecoveryPhase::start("prepared_writer_lease");
         storage.ensure_writer_lease().await?;
         lease.finish(0, 0);
         let verify = crate::session::diagnostics::RecoveryPhase::start("prepared_source_verify");
-        storage.verify_loaded_history().await?;
+        storage.verify_loaded_history(strict).await?;
         verify.finish(0, 0);
         let repair = crate::session::diagnostics::RecoveryPhase::start("prepared_repair");
         storage.commit_pending_repair().await?;
@@ -256,9 +273,9 @@ pub struct JsonlSessionStorage {
     /// Exact loaded legacy history, including its header, before writable opt-in.
     legacy_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
     loaded_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
-    /// Physical identity of the replayed generation. A matching stat lets a
-    /// prepared commit skip the full-history digest without weakening change
-    /// detection: any size/mtime difference falls back to the digest.
+    /// Stat hint for the replayed generation, not a content identity. Ordinary
+    /// commits may skip the digest; strict commits always verify the digest.
+    /// Any detected size/mtime difference falls back to the digest.
     loaded_history_identity: Arc<StdMutex<Option<ReplaySourceIdentity>>>,
     pending_repair: Arc<StdMutex<Option<PendingRepair>>>,
     startup_checkpoint: Option<startup_checkpoint::Update>,
@@ -456,9 +473,40 @@ impl JsonlSessionStorage {
     pub async fn create(
         fs: Arc<dyn FileSystem>,
         path: &str,
+        header: JsonlV4Header,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<Self> {
+        Self::create_inner(fs, path, header, clock, ids, false).await
+    }
+
+    /// Exclusively create a new native history and progress companion. Existing
+    /// files (including symlinks/orphans) are never overwritten. Requires a real
+    /// writer lease, atomic create support and strict file/parent synchronization.
+    ///
+    /// Initialization remains owned if the caller drops its wait. A failure may
+    /// leave partial new files for explicit inspection; it never deletes files,
+    /// falls back to legacy truncating creation, or silently adopts an orphan.
+    pub async fn create_new(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        header: JsonlV4Header,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<Self> {
+        let path = path.to_owned();
+        tokio::spawn(async move { Self::create_inner(fs, &path, header, clock, ids, true).await })
+            .await
+            .map_err(|_| SessionError::storage("exclusive Session creation task stopped"))?
+    }
+
+    async fn create_inner(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
         mut header: JsonlV4Header,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
+        exclusive: bool,
     ) -> SessionResult<Self> {
         header.progress_format = Some(super::progress::FORMAT.into());
         // Claim ownership before creating either the history or its progress
@@ -468,28 +516,55 @@ impl JsonlSessionStorage {
             fs.try_acquire_writer_lease(path).await,
             &format!("Failed to acquire writer lease for {path}"),
         )?;
+        if exclusive && lease.is_none() {
+            return Err(SessionError::storage(
+                "exclusive Session creation requires a writer lease",
+            ));
+        }
         let progress =
             super::progress::JsonlProgressStore::new(fs.clone(), path, &header.id, clock.clone());
-        progress.initialize().await?;
         let encoded_header = encode_header(&header);
-        file_result(
-            fs.write_file(path, FileContent::Text(encoded_header.clone()), None)
-                .await,
-            &format!("Failed to initialize session {path}"),
-        )?;
-        file_result(
-            fs.sync_file(path, false, None).await,
-            &format!("Failed to sync initialized session {path}"),
-        )?;
-        let absolute = file_result(
-            fs.absolute_path(path, None).await,
-            &format!("Failed to resolve initialized session {path}"),
-        )?;
-        if let Some(parent) = absolute.parent() {
+        if exclusive {
+            // Claim an EMPTY primary path before touching the companion. Do
+            // not advertise a readable header until exclusive companion creation
+            // succeeds: even an orphan with the same Session ID must not become
+            // authoritative merely because a failed create left a new header.
             file_result(
-                fs.sync_directory(&parent.to_string_lossy(), None).await,
-                &format!("Failed to sync initialized session directory {path}"),
+                fs.write_new_file(path, FileContent::Bytes(Vec::new()), None)
+                    .await,
+                &format!("Failed to exclusively initialize session {path}"),
             )?;
+            progress.initialize_new().await?;
+            file_result(
+                fs.append_file(path, FileContent::Text(encoded_header.clone()), None)
+                    .await,
+                &format!("Failed to publish new session header {path}"),
+            )?;
+            file_result(
+                fs.sync_file_and_parent(path, None).await,
+                &format!("Failed to strictly sync initialized session {path}"),
+            )?;
+        } else {
+            progress.initialize().await?;
+            file_result(
+                fs.write_file(path, FileContent::Text(encoded_header.clone()), None)
+                    .await,
+                &format!("Failed to initialize session {path}"),
+            )?;
+            file_result(
+                fs.sync_file(path, false, None).await,
+                &format!("Failed to sync initialized session {path}"),
+            )?;
+            let absolute = file_result(
+                fs.absolute_path(path, None).await,
+                &format!("Failed to resolve initialized session {path}"),
+            )?;
+            if let Some(parent) = absolute.parent() {
+                file_result(
+                    fs.sync_directory(&parent.to_string_lossy(), None).await,
+                    &format!("Failed to sync initialized session directory {path}"),
+                )?;
+            }
         }
         let info = file_result(
             fs.file_info(path, None).await,
@@ -746,23 +821,23 @@ impl JsonlSessionStorage {
         }
     }
 
-    async fn verify_loaded_history(&self) -> SessionResult<()> {
-        let identity = *self
-            .loaded_history_identity
-            .lock()
-            .map_err(|_| SessionError::storage("session history identity lock poisoned"))?;
+    async fn verify_loaded_history(&self, strict: bool) -> SessionResult<()> {
+        let identity = if strict {
+            None
+        } else {
+            *self
+                .loaded_history_identity
+                .lock()
+                .map_err(|_| SessionError::storage("session history identity lock poisoned"))?
+        };
         if let Some(identity) = identity {
             let info = file_result(
                 self.fs.file_info(&self.metadata.path, None).await,
                 "stat prepared session history verifier",
             )?;
-            // Appends, truncations and atomic replacements all change one of
-            // these, so an unchanged stat is evidence that the replay still
-            // describes the published generation and the full digest read can be
-            // skipped. It is not proof: a filesystem with one-second mtime
-            // granularity cannot see a same-size in-place rewrite inside that
-            // second, which is why the identity is only recorded when the mtime
-            // is real (`record_replay_identity` rejects 0).
+            // Heuristic only: same-length rewrites or atomic replacements may
+            // preserve even a nonzero mtime. Strict mode bypasses this shortcut;
+            // unknown mtime (0) also always falls back to the digest.
             if identity.matches(&info) && identity.mtime_ms != 0 {
                 return Ok(());
             }
@@ -2562,6 +2637,36 @@ impl SessionStorage for JsonlSessionStorage {
     async fn get_stats(&self) -> SessionResult<SessionStats> {
         let state = self.state.lock().await;
         Ok(state.get_stats().clone())
+    }
+
+    /// An explicit, writer-ordered physical history barrier. `run_owned` keeps
+    /// the tail reservation through sync and identity sampling even if the
+    /// caller drops its wait; later writes/replacements cannot overtake it.
+    async fn sync_history(&self) -> SessionResult<HistoryIdentity> {
+        self.run_owned(|s| async move {
+            if !s.writer_lease_held() {
+                return Err(SessionError::storage(
+                    "physical history synchronization requires a writer lease",
+                ));
+            }
+            file_result(
+                s.fs.sync_file_and_parent(&s.metadata.path, None).await,
+                "Failed to synchronize session history",
+            )?;
+            // A concurrent explicit retirement or a replaced lease fence must
+            // never return an apparently valid durability observation.
+            s.ensure_writer_lease().await?;
+            if !s.writer_lease_held() {
+                return Err(SessionError::storage(
+                    "session writer lease was lost during history synchronization",
+                ));
+            }
+            Ok(HistoryIdentity {
+                revision: s.state.lock().await.sequence(),
+                generation: s.generation.load(Ordering::Acquire),
+            })
+        })
+        .await
     }
 
     /// Wait for the append that is in flight, if any, to settle.

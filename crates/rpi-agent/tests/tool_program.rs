@@ -2112,7 +2112,17 @@ async fn reference_shared_tree_quota_and_foreign_programs_are_enforced() {
                     let saved = saved.clone();
                     Box::pin(async move {
                         let id = reference_start(&p, "effect").await;
-                        assert_eq!(poll(&p, &id).await["status"], "done");
+                        let retained = poll(&p, &id).await;
+                        assert_eq!(retained["status"], "done");
+                        let bytes = retained["resultReference"]["byteLength"].as_u64().unwrap();
+                        assert!(
+                            bytes > 1024 * 1024,
+                            "the fixture must still require the native reference path"
+                        );
+                        assert!(
+                            bytes < 2 * 1024 * 1024,
+                            "encoded bytes alone must not exhaust the shared tree quota"
+                        );
                         *saved.lock().unwrap() = Some((p.clone(), id));
                         let id = p
                             .handle(
@@ -2175,7 +2185,13 @@ async fn reference_shared_tree_quota_and_foreign_programs_are_enforced() {
                 Arc::new(|_, _, _| {
                     Box::pin(async {
                         let mut r = metadata(3, false);
-                        r.details = json!({"big":"x".repeat(18*1024*1024)});
+                        // 256k native nodes contribute 32 MiB before encoded
+                        // bytes/structural overhead, so one reference fits the
+                        // unchanged 64 MiB tree quota but two cannot. Its JSON
+                        // still exceeds the 1 MiB inline frame limit. This also
+                        // catches missing native-node accounting without making
+                        // a multi-step quota test an 18 MiB ASCII scan benchmark.
+                        r.details = Value::Array(vec![Value::Null; 256 * 1024]);
                         Ok(r)
                     })
                 }),

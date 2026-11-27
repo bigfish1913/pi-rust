@@ -207,7 +207,23 @@ async fn assert_capacity_retained(panic_after_start: bool) {
         .await
         .unwrap();
     let retained = manager.active.load(Ordering::Acquire);
+    manager.begin_shutdown();
+    assert!(manager
+        .handle(&parent, 7, json!({"op":"start","task":"late"}))
+        .await
+        .is_err());
+    {
+        // Even a disposed job / panicked run still has a real foreign driver.
+        // Dropping this waiter must neither abort it nor forget its custody.
+        let wait = manager.wait_shutdown();
+        tokio::pin!(wait);
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+    }
     release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), manager.wait_shutdown())
+        .await
+        .unwrap()
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while manager.active.load(Ordering::Acquire) != 0 {
             tokio::time::sleep(Duration::from_millis(2)).await;

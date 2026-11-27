@@ -85,6 +85,21 @@ async fn run_inner() -> i32 {
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // Shared Host control is an explicit independent entry point: never hydrate
+    // ambient durable/session/provider/extension state or interpret it as a prompt.
+    if argv.first().map(String::as_str) == Some("host") {
+        return crate::host::cli::run(&argv[1..]).await;
+    }
+    if let Some(first) = argv.first_mut() {
+        if first == "--native-host" || first.starts_with("--native-host=") {
+            *first = first.replacen("--native-host", "--host", 1);
+            return crate::host::area_entry::run(&argv).await;
+        }
+    }
+    if matches!(argv.as_slice(), [host, restore] if host == "--host" && restore == "--restore-areas")
+    {
+        return crate::host::area_entry::run(&argv).await;
+    }
     if argv
         .iter()
         .take_while(|arg| *arg != "--")
@@ -136,11 +151,26 @@ async fn run_inner() -> i32 {
         return crate::dev_extension::run_cleanup_helper(&argv[1..]);
     }
 
+    #[cfg(unix)]
+    if argv
+        .first()
+        .is_some_and(|arg| arg == crate::local_host::DAEMON_COMMAND)
+    {
+        return crate::local_host::run_daemon_command(&argv[1..]).await;
+    }
+
     // ---- `rpi --connect <addr>` — pure remote client ----
     // Intercepted before any provider / harness / session / extension work so
     // the client holds no local agent resources at all: it only connects to a
     // running `rpi --server` and renders the remote transcript.
     if let Some(addr) = take_flag_value(&argv, "--connect") {
+        if argv
+            .iter()
+            .any(|arg| arg == "--host" || arg.starts_with("--host="))
+        {
+            eprintln!("error: --host cannot be combined with --connect");
+            return EXIT_USAGE;
+        }
         if argv
             .iter()
             .any(|arg| arg == "--mini" || arg.starts_with("--mini="))
@@ -155,6 +185,13 @@ async fn run_inner() -> i32 {
     // Normalize the CLI flag into RPI_OFFLINE so early-dispatch subcommands and
     // the regular parsed path all observe the same process-wide gate.
     crate::args::normalize_offline_mode(&argv);
+
+    #[cfg(target_os = "macos")]
+    if argv.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        if let Some(code) = crate::host::area_entry::run_default_terminal().await {
+            return code;
+        }
+    }
 
     // `rpi dev` wraps the normal CLI: consume only development-specific
     // options, then pass every remaining argument through the regular parser.
@@ -250,10 +287,22 @@ async fn run_inner() -> i32 {
         return code;
     }
 
-    if dev_options.is_some() && parsed.mini {
-        eprintln!("error: --mini cannot be combined with dev/dev-local");
-        return EXIT_USAGE;
+    if parsed.host.is_some() {
+        if dev_options.is_some() {
+            eprintln!("error: --host cannot be combined with dev/dev-local");
+            return EXIT_USAGE;
+        }
+        #[cfg(unix)]
+        {
+            return crate::local_host::run(parsed).await;
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("error: --host requires Unix-domain sockets");
+            return EXIT_USAGE;
+        }
     }
+
     if dev_options.is_some()
         && (parsed.resource_config.is_some() || parsed.resource_transition.is_some())
     {
@@ -322,27 +371,6 @@ async fn run_inner() -> i32 {
             return EXIT_USAGE;
         }
     };
-
-    if parsed.mini {
-        drop(argv);
-        let mut messages = std::mem::take(&mut parsed.messages).into_iter();
-        let mut parts = read_piped_stdin()
-            .into_iter()
-            .chain((!file_text.is_empty()).then_some(file_text))
-            .chain(messages.next());
-        let initial = parts.next().map(|mut text| {
-            for part in parts {
-                text.push_str(&part);
-            }
-            text
-        });
-        let prompts = initial
-            .or_else(|| (!file_images.is_empty()).then(String::new))
-            .into_iter()
-            .chain(messages);
-        startup.finish();
-        return crate::mini::run(&parsed, &cwd, prompts, file_images).await;
-    }
 
     // ---- restored-session working directory (adopted before any resource load) ----
     // A session records the cwd it was created in; restoring one must return
@@ -470,16 +498,12 @@ async fn run_inner() -> i32 {
         eprintln!("warning: models.json: {warning}");
     }
 
-    // The full authenticated catalog (read-only) for the TUI's `/model`
-    // selector, derived from the built provider runtimes so auth headers and
-    // base-url overrides survive.
-    let model_catalog = crate::provider::authenticated_catalog(&resolved);
-
     // `--models <patterns>`: persist the Ctrl+P cycle scope to settings.json
     // (the same set `/scoped-models` edits). Each pattern matches catalog ids
     // case-insensitively; unmatched patterns are reported so a typo doesn't
     // silently empty the cycle.
     if let Some(patterns) = &parsed.models {
+        let model_catalog = crate::provider::authenticated_catalog(&resolved);
         let mut matched: Vec<String> = Vec::new();
         for p in patterns {
             let hits: Vec<String> = model_catalog
@@ -581,6 +605,7 @@ async fn run_inner() -> i32 {
         Some(file_text.as_str())
     };
     let (initial, extra) = build_initial_message(&parsed, stdin_text.as_deref(), file_text_opt);
+    let initial = initial.or_else(|| (!file_images.is_empty()).then(String::new));
 
     // ---- mode dispatch (TS resolveAppMode → runPrintMode / InteractiveMode / runRpcMode) ----
     let stdin_is_tty = std::io::stdin().is_terminal();
@@ -634,16 +659,19 @@ async fn run_inner() -> i32 {
         None
     };
 
+    let model_catalog = || {
+        reload_context
+            .catalog
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    };
     let exit_code = match mode {
         RunMode::Print => {
-            crate::modes::print(
-                &harness,
-                &parsed,
-                initial.clone(),
-                &extra,
-                file_images.clone(),
-            )
-            .await
+            // Print mode only consumes the completed reply. Keeping the receiver
+            // alive buffers unread snapshots of the growing streamed message.
+            drop(event_rx);
+            crate::modes::print(&harness, &parsed, initial, &extra, file_images).await
         }
         RunMode::Json => {
             crate::modes::json(
@@ -661,16 +689,18 @@ async fn run_inner() -> i32 {
                 &harness,
                 Some(event_rx),
                 &parsed,
-                model_catalog,
-                initial.clone(),
-                &extra,
-                file_images.clone(),
-                if parsed.no_themes {
-                    None
-                } else {
-                    parsed.theme.as_deref().or(resolved.theme.as_deref())
+                model_catalog(),
+                crate::modes::InteractiveStartup {
+                    initial: initial.clone(),
+                    extra_messages: &extra,
+                    initial_images: file_images.clone(),
+                    theme: if parsed.no_themes {
+                        None
+                    } else {
+                        parsed.theme.as_deref().or(resolved.theme.as_deref())
+                    },
+                    no_themes: parsed.no_themes,
                 },
-                parsed.no_themes,
                 &reload_context,
             )
             .await
@@ -739,13 +769,15 @@ async fn run_inner() -> i32 {
                     crate::modes::rpc_with_durable_home(
                         &harness,
                         Some(event_rx),
-                        model_catalog,
-                        reload_context.ui_dialog.clone(),
-                        oauth_snapshot,
-                        Some(reload_context.extension_session.clone()),
-                        parsed.rpc_message_updates,
-                        parsed.native_durable,
-                        crate::config::AgentHome::process(),
+                        model_catalog(),
+                        crate::modes::RpcOptions {
+                            ui_dialog: reload_context.ui_dialog.clone(),
+                            oauth_snapshot,
+                            extension_session: Some(reload_context.extension_session.clone()),
+                            message_updates: parsed.rpc_message_updates,
+                            native_durable: parsed.native_durable,
+                            home: reload_context.home.clone(),
+                        },
                     )
                     .await
                 };
@@ -847,17 +879,13 @@ fn prepare_dev_extension(
     };
 
     match crate::dev_extension::DevExtension::detect(cwd, options) {
-        Ok(extension) => {
-            if let Err(error) = extension.rebuild() {
-                eprintln!("error: initial extension build failed: {error}");
-                return Err(EXIT_RUNTIME);
+        Ok(extension) => match extension.prepare_initial(parsed) {
+            Ok(extension) => Ok(Some(extension)),
+            Err(error) => {
+                eprintln!("error: initial extension preparation failed: {error}");
+                Err(EXIT_RUNTIME)
             }
-            if let Err(error) = extension.apply_to_args(parsed) {
-                eprintln!("error: {error}");
-                return Err(EXIT_RUNTIME);
-            }
-            Ok(Some(extension))
-        }
+        },
         Err(error) => {
             // No Cargo cdylib found: degrade to skills-only mode.
             eprintln!("dev: {error}");
@@ -898,7 +926,7 @@ async fn resolve_resume(parsed: &mut Args, cwd: &Path) -> Option<i32> {
     }
 }
 
-fn emit_startup_warnings(parsed: &Args) {
+pub(crate) fn emit_startup_warnings(parsed: &Args) {
     // ---- Startup warnings (ignored-but-recognized flags) ----
     if parsed.verbose {
         for warn in &parsed.ignored {
@@ -957,14 +985,14 @@ async fn list_models(search: &str, args: &Args, cwd: &Path) -> i32 {
 
     fn format_tokens(value: u64) -> String {
         if value >= 1_000_000 {
-            let whole = value % 1_000_000 == 0;
+            let whole = value.is_multiple_of(1_000_000);
             if whole {
                 format!("{}M", value / 1_000_000)
             } else {
                 format!("{:.1}M", value as f64 / 1_000_000.0)
             }
         } else if value >= 1_000 {
-            let whole = value % 1_000 == 0;
+            let whole = value.is_multiple_of(1_000);
             if whole {
                 format!("{}K", value / 1_000)
             } else {
@@ -1072,7 +1100,7 @@ fn read_piped_stdin() -> Option<String> {
 /// `<file name="...">\n<contents>\n</file>\n` and concatenated.
 ///
 /// Paths are resolved relative to `cwd` (the TS uses `resolve(readPath, cwd)`).
-fn process_file_args(
+pub(crate) fn process_file_args(
     file_args: &[std::path::PathBuf],
     cwd: &Path,
 ) -> Result<(String, Vec<ImageContent>), String> {
@@ -1153,22 +1181,46 @@ fn build_initial_message(
     (initial, extra)
 }
 
-/// Print a model-resolution error with env-specific guidance. Mirrors the TS
-/// auth-guidance / model-resolver error formatting (condensed to stderr lines).
-pub(crate) fn print_resolve_error(e: &ResolveError) {
+#[cfg(unix)]
+pub(crate) fn mini_input(
+    args: &mut Args,
+    file_text: String,
+    images: Vec<ImageContent>,
+) -> crate::mini::Input {
+    let mut messages = std::mem::take(&mut args.messages).into_iter();
+    let mut parts = read_piped_stdin()
+        .into_iter()
+        .chain((!file_text.is_empty()).then_some(file_text))
+        .chain(messages.next());
+    let initial = parts.next().map(|mut text| {
+        for part in parts {
+            text.push_str(&part);
+        }
+        text
+    });
+    let prompts = initial
+        .or_else(|| (!images.is_empty()).then(String::new))
+        .into_iter()
+        .chain(messages)
+        .collect();
+    crate::mini::Input { prompts, images }
+}
+
+/// Format a model-resolution error with env-specific guidance.
+pub(crate) fn resolve_error_message(e: &ResolveError) -> String {
     match e {
         ResolveError::NoApiKey { hint } => {
-            eprintln!("error: {e}");
-            eprintln!();
-            eprintln!("Provide credentials via one of: {hint}.");
+            format!("error: {e}\n\nProvide credentials via one of: {hint}.")
         }
-        ResolveError::Config(_) => {
-            eprintln!("error: {e}");
-            eprintln!();
-            eprintln!("Check ~/.rpi/auth.json / ~/.rpi/models.json (set RPI_CODING_AGENT_DIR to relocate).");
-        }
-        _ => eprintln!("error: {e}"),
+        ResolveError::Config(_) => format!(
+            "error: {e}\n\nCheck ~/.rpi/auth.json / ~/.rpi/models.json (set RPI_CODING_AGENT_DIR to relocate)."
+        ),
+        _ => format!("error: {e}"),
     }
+}
+
+fn print_resolve_error(e: &ResolveError) {
+    eprintln!("{}", resolve_error_message(e));
 }
 
 /// Print a harness-build error with flag-specific guidance for restore requests.

@@ -1,0 +1,110 @@
+{
+  "stage": "Session-independent frozen native resources and callbacks prerequisite",
+  "production_mini_complete": false,
+  "full_host_goal_complete": false,
+  "inputs": "/tmp/rpi-host-integration-checks/host-mini-native-assembly-before/inputs.json",
+  "preservation": {
+    "core": {
+      "root": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host",
+      "head": "699b73d036138e0fe10bbf9b14e29af4119d6fad",
+      "branch": "feat/shared-host-integration",
+      "index_sha256": "19a457bbc5ef45dca355a0c0f53b2bf56d4d8be72c0aee100423114c407a7c6d",
+      "old_files": 1168,
+      "unchanged_old_files": 1162,
+      "changed_old_files": [
+        "crates/rpi-cli/src/host/README.md",
+        "crates/rpi-cli/src/host/binding_resources.rs",
+        "crates/rpi-cli/src/host/bindings.rs",
+        "crates/rpi-cli/src/host/instruction_resources.rs",
+        "crates/rpi-cli/src/host/native_hooks.rs",
+        "crates/rpi-cli/src/host/ordinary/instruction_resource_tests.rs"
+      ],
+      "new_files": [
+        "docs/host-mini-native-binding-prep.md"
+      ]
+    },
+    "extension": {
+      "root": "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host",
+      "head": "607c00d3915d16cf26129979766bcd65ec58b059",
+      "branch": "feat/shared-host-management",
+      "index_sha256": "120574b7497ced744dec434e2158a41548381e64ef18bee0550d61baabb4f875",
+      "old_files": 823,
+      "unchanged_old_files": 823,
+      "changed_old_files": [],
+      "new_files": []
+    }
+  },
+  "changed_existing_files": [
+    "crates/rpi-cli/src/host/README.md",
+    "crates/rpi-cli/src/host/binding_resources.rs",
+    "crates/rpi-cli/src/host/bindings.rs",
+    "crates/rpi-cli/src/host/instruction_resources.rs",
+    "crates/rpi-cli/src/host/native_hooks.rs",
+    "crates/rpi-cli/src/host/ordinary/instruction_resource_tests.rs"
+  ],
+  "new_files": [
+    "docs/host-mini-native-binding-prep.md"
+  ],
+  "new_or_modified_crate_production_rust_files": [
+    "crates/rpi-cli/src/host/binding_resources.rs",
+    "crates/rpi-cli/src/host/bindings.rs",
+    "crates/rpi-cli/src/host/instruction_resources.rs",
+    "crates/rpi-cli/src/host/native_hooks.rs",
+    "crates/rpi-cli/src/host/ordinary/instruction_resource_tests.rs"
+  ],
+  "resource_loader": "existing NativeExtensionCustody + exact inventory/staging + weak-owner callbacks; no second loader",
+  "session_free_prompt_configuration": "AgentHarnessResources provenance type only; no Session construction or inventory persistence",
+  "persistent_session_path": "unchanged persistent inventory, strict sync, owned binding and Harness path",
+  "mini_profile_or_runtime_owner_or_wire_added": false,
+  "cross_tree_contract_sha256": {
+    "protocol.rs": "920a93636c7e87c5a9c7053557e9f044f6030327c0be9466ec274e34ce4721e0",
+    "client.rs": "55cb9897c61594dc554baddcc06dc80dcf88d11458b1a14fff1bc137c5d9e97a",
+    "client_tests.rs": "8df4c991962ddf635b34e7dd67d9821ee3b59f411104b42e1898d2f6433759ae",
+    "fixtures/control-v1.json": "33560f0b5d074b7822710493f7bcb16bec21c63ba5237629db4765bb25dab320"
+  },
+  "unchanged_previous_evidence_files": 854,
+  "gates": {
+    "focused_resources": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-native-assembly-focused-2.log",
+      "sha256": "2d8045df19f7f0f93189f3619f2a3606b932924507e6f71493aa750c633a0ede",
+      "exit": 0,
+      "test_result": [
+        3,
+        0,
+        0
+      ]
+    },
+    "complete_ordinary_binary": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-native-assembly-binary.log",
+      "sha256": "23790d03801c4127a8ac5404a9ad597d136d3321f2da2f0266654ea4043d718f",
+      "exit": 0,
+      "test_result": [
+        39,
+        0,
+        0
+      ]
+    },
+    "strict_cli_host_clippy": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-native-assembly-clippy.log",
+      "sha256": "4cb9831d61849f692754ba6d8dd6880b88dd476ac855675296ff60d09b1f5579",
+      "exit": 0,
+      "test_result": null
+    },
+    "rustfmt_and_diff_check": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-native-assembly-format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit": 0,
+      "test_result": null
+    }
+  },
+  "not_claimed": [
+    "production mini",
+    "real mini DLL+HTTP binary E2E",
+    "mini result/admission receipt",
+    "profile mode schema",
+    "daemon/default CLI/TUI integration",
+    "full workspace/all-target/MSRV/cross-platform validation",
+    "Agent/SDK strict Clippy green"
+  ],
+  "active_owned_processes": []
+}

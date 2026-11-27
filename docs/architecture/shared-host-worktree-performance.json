@@ -1,0 +1,283 @@
+{
+  "scope": "pre-registry shared_host_probe execution baseline, NOT production Host or mini",
+  "worktree": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host",
+  "branch": "feat/shared-host",
+  "baseCommit": "61198572b76045add403705c52b29c5db97ca536",
+  "binarySha256": "59772ced6c13024c29765bdb9463d353bf2a73d9c7e73927df9c737933d3b218",
+  "profile": "release (thin LTO, 16 codegen units)",
+  "rounds": [
+    {
+      "round": 1,
+      "artifacts": "/tmp/rpi-host-worktree-perf-1795213613-tool1",
+      "configuration": {
+        "binary": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/release/examples/shared_host_probe",
+        "output_root": "/tmp/rpi-host-worktree-perf-1795213613-tool1",
+        "agents": 600,
+        "mode": "tool",
+        "tool_kind": "async",
+        "context_bytes": 1024,
+        "history_entries": 0,
+        "workers": 4,
+        "max_blocking_threads": 32,
+        "stagger_ms": 0,
+        "hold_seconds": 2,
+        "timeout": 180,
+        "cgroup": null
+      },
+      "environment": "macOS-27.0-arm64-arm-64bit",
+      "resourceLimits": {
+        "nofile": [
+          8192,
+          8192
+        ],
+        "nproc": [
+          2666,
+          4000
+        ]
+      },
+      "fixtureServer": {
+        "requests": 1200,
+        "firstRequests": 600,
+        "finalResponses": 600,
+        "toolResults": 600,
+        "peakInFlight": 600,
+        "errors": [],
+        "protocol": "HTTP/1.1, loopback, no TLS, Connection: close",
+        "measurementBoundary": "fixture server excluded; separate controller process"
+      },
+      "phases": [
+        {
+          "phase": "ready",
+          "agents": 600,
+          "mode": "tool",
+          "toolKind": "async",
+          "contextBytes": 1024,
+          "historyEntries": 0,
+          "workers": 4,
+          "maxBlockingThreads": 32,
+          "staggerMs": 0,
+          "setupMs": 8035,
+          "sessions": "independent-jsonl",
+          "sessionCreateMs": 8004,
+          "harnessCreateMs": 30,
+          "historyAppendMs": 0,
+          "extensions": false,
+          "tls": false
+        },
+        {
+          "phase": "tools_held",
+          "entered": 600,
+          "live": 600
+        },
+        {
+          "phase": "settled",
+          "agents": 600,
+          "completed": 600,
+          "toolEntered": 600,
+          "toolPeak": 600,
+          "runMs": 20474
+        },
+        {
+          "phase": "closed",
+          "agents": 600,
+          "runMs": 22566
+        },
+        {
+          "phase": "complete",
+          "success": true
+        }
+      ],
+      "peaks": {
+        "sampledPeakHostRssBytes": 215646208,
+        "sampledPeakGroupRssSumBytes": 215646208,
+        "sampledPeakGroupProcesses": 1,
+        "sampledPeakHostFootprintBytes": 167264880,
+        "sampledPeakHostThreads": 38,
+        "sampledPeakHostFds": 1809
+      },
+      "heldSamples": [
+        {
+          "phase": "ready",
+          "hostFootprintBytes": 8847792,
+          "hostRssBytes": 13254656,
+          "hostThreads": 7,
+          "hostFds": 609,
+          "fixtureInFlight": 0
+        },
+        {
+          "phase": "requests_held",
+          "hostFootprintBytes": 132104768,
+          "hostRssBytes": 139198464,
+          "hostThreads": 38,
+          "hostFds": 1809,
+          "fixtureInFlight": 600
+        },
+        {
+          "phase": "tools_held",
+          "hostFootprintBytes": 118391408,
+          "hostRssBytes": 184205312,
+          "hostThreads": 38,
+          "hostFds": 1209,
+          "fixtureInFlight": 0
+        },
+        {
+          "phase": "settled",
+          "hostFootprintBytes": 99451528,
+          "hostRssBytes": 215613440,
+          "hostThreads": 38,
+          "hostFds": 1209,
+          "fixtureInFlight": 0
+        },
+        {
+          "phase": "closed",
+          "hostFootprintBytes": 99451528,
+          "hostRssBytes": 215646208,
+          "hostThreads": 38,
+          "hostFds": 9,
+          "fixtureInFlight": 0
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "artifacts": "/tmp/rpi-host-worktree-perf-1795213613-tool2",
+      "configuration": {
+        "binary": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/release/examples/shared_host_probe",
+        "output_root": "/tmp/rpi-host-worktree-perf-1795213613-tool2",
+        "agents": 600,
+        "mode": "tool",
+        "tool_kind": "async",
+        "context_bytes": 1024,
+        "history_entries": 0,
+        "workers": 4,
+        "max_blocking_threads": 32,
+        "stagger_ms": 0,
+        "hold_seconds": 2,
+        "timeout": 180,
+        "cgroup": null
+      },
+      "environment": "macOS-27.0-arm64-arm-64bit",
+      "resourceLimits": {
+        "nofile": [
+          8192,
+          8192
+        ],
+        "nproc": [
+          2666,
+          4000
+        ]
+      },
+      "fixtureServer": {
+        "requests": 1200,
+        "firstRequests": 600,
+        "finalResponses": 600,
+        "toolResults": 600,
+        "peakInFlight": 600,
+        "errors": [],
+        "protocol": "HTTP/1.1, loopback, no TLS, Connection: close",
+        "measurementBoundary": "fixture server excluded; separate controller process"
+      },
+      "phases": [
+        {
+          "phase": "ready",
+          "agents": 600,
+          "mode": "tool",
+          "toolKind": "async",
+          "contextBytes": 1024,
+          "historyEntries": 0,
+          "workers": 4,
+          "maxBlockingThreads": 32,
+          "staggerMs": 0,
+          "setupMs": 8199,
+          "sessions": "independent-jsonl",
+          "sessionCreateMs": 8169,
+          "harnessCreateMs": 29,
+          "historyAppendMs": 0,
+          "extensions": false,
+          "tls": false
+        },
+        {
+          "phase": "tools_held",
+          "entered": 600,
+          "live": 600
+        },
+        {
+          "phase": "settled",
+          "agents": 600,
+          "completed": 600,
+          "toolEntered": 600,
+          "toolPeak": 600,
+          "runMs": 21819
+        },
+        {
+          "phase": "closed",
+          "agents": 600,
+          "runMs": 23909
+        },
+        {
+          "phase": "complete",
+          "success": true
+        }
+      ],
+      "peaks": {
+        "sampledPeakHostRssBytes": 212434944,
+        "sampledPeakGroupRssSumBytes": 212434944,
+        "sampledPeakGroupProcesses": 1,
+        "sampledPeakHostFootprintBytes": 164545136,
+        "sampledPeakHostThreads": 38,
+        "sampledPeakHostFds": 1809
+      },
+      "heldSamples": [
+        {
+          "phase": "ready",
+          "hostFootprintBytes": 8929712,
+          "hostRssBytes": 13336576,
+          "hostThreads": 7,
+          "hostFds": 609,
+          "fixtureInFlight": 0
+        },
+        {
+          "phase": "requests_held",
+          "hostFootprintBytes": 132350552,
+          "hostRssBytes": 139870208,
+          "hostThreads": 38,
+          "hostFds": 1809,
+          "fixtureInFlight": 600
+        },
+        {
+          "phase": "tools_held",
+          "hostFootprintBytes": 121373320,
+          "hostRssBytes": 182255616,
+          "hostThreads": 38,
+          "hostFds": 1209,
+          "fixtureInFlight": 0
+        },
+        {
+          "phase": "settled",
+          "hostFootprintBytes": 100450928,
+          "hostRssBytes": 212402176,
+          "hostThreads": 38,
+          "hostFds": 1209,
+          "fixtureInFlight": 0
+        },
+        {
+          "phase": "closed",
+          "hostFootprintBytes": 100450928,
+          "hostRssBytes": 212434944,
+          "hostThreads": 38,
+          "hostFds": 9,
+          "fixtureInFlight": 0
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "600 actual requests and tools verified in separate causal barrier phases",
+    "Host catalog/registry/IPC/TUI are not on the measured path",
+    "Loopback HTTP/SSE fixture, 1024-byte context, no history/extensions/TLS",
+    "Fixture controller is outside the measured process; no universal memory ceiling claim",
+    "runMs includes intentional holds; sampled peaks may miss transient peaks; not a latency SLA",
+    "No matched pre-change run, so no speedup/regression attribution is made",
+    "FD limit changed to 8192 only in the benchmark shell and its children"
+  ]
+}

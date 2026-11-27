@@ -47,10 +47,14 @@ pub mod extension_api;
 pub mod extensions_actions;
 pub mod extras;
 pub mod fs_watch;
+pub mod host;
 pub mod install;
 pub mod interactive_tui;
 pub mod key_trace;
+#[cfg(unix)]
+mod local_host;
 pub mod message_agent;
+#[cfg(unix)]
 mod mini;
 pub mod model_registry;
 pub mod modes;

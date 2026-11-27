@@ -98,8 +98,7 @@ pub(super) async fn share_session(harness: &AgentHarness, chat: &Arc<Container>)
 /// last-used model is replayed ([`restore_session_model`]) and its recorded
 /// usage folded back into the footer ([`render_session_history`]).
 pub(super) async fn switch_to_session(
-    harness: &AgentHarness,
-    lane: &Arc<dyn AgentLane>,
+    session_lane: SessionLane<'_>,
     id: &str,
     cwd: &std::path::Path,
     chat: &Arc<Container>,
@@ -107,6 +106,7 @@ pub(super) async fn switch_to_session(
     tool_context: &rpi_extensions::ToolCallContext,
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) -> bool {
+    let SessionLane { harness, lane } = session_lane;
     state.history_page.invalidate();
     if *state.status.lock().unwrap() == RunStatus::Working {
         state.set_status(RunStatus::Aborting);
@@ -134,9 +134,13 @@ pub(super) async fn switch_to_session(
             // Route through the funnel so the plugin channels follow the swap;
             // a bare `set_session` would leave every plugin naming the session
             // it was serving before this call.
-            if let Err(error) =
-                crate::session::set_active_session(harness, restored.session, Some(tool_context))
-                    .await
+            if let Err(error) = crate::session::set_active_session_with_identity(
+                harness,
+                restored.session,
+                Some(tool_context),
+                state.publish_process_identity,
+            )
+            .await
             {
                 add_error_message(
                     &state.notice_container(),
@@ -202,8 +206,7 @@ pub(super) async fn switch_to_session(
 /// `/import <path>`: validate and save a session in the selected repository,
 /// then activate it through the same funnel as other session switches.
 pub(super) async fn import_session(
-    harness: &AgentHarness,
-    lane: &Arc<dyn AgentLane>,
+    session_lane: SessionLane<'_>,
     path: &str,
     cwd: &std::path::Path,
     chat: &Arc<Container>,
@@ -211,10 +214,9 @@ pub(super) async fn import_session(
     tool_context: &rpi_extensions::ToolCallContext,
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) {
+    let SessionLane { harness, lane } = session_lane;
     state.history_page.invalidate();
-    use std::path::Path as FsPath;
-
-    let src = FsPath::new(path);
+    let src = cwd.join(path);
     if !src.is_file() {
         add_error_message(
             &state.notice_container(),
@@ -254,7 +256,7 @@ pub(super) async fn import_session(
         return;
     }
     let result =
-        crate::session::import_session_file(src, &cwd.to_string_lossy(), &state.session_dir).await;
+        crate::session::import_session_file(&src, &cwd.to_string_lossy(), &state.session_dir).await;
     let new_session = match result {
         Ok(session) => session,
         Err(error) => {
@@ -266,8 +268,13 @@ pub(super) async fn import_session(
             return;
         }
     };
-    if let Err(error) =
-        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    if let Err(error) = crate::session::set_active_session_with_identity(
+        harness,
+        new_session,
+        Some(tool_context),
+        state.publish_process_identity,
+    )
+    .await
     {
         state.set_status(RunStatus::Idle);
         add_error_message(
@@ -342,8 +349,13 @@ pub(super) async fn fork_session(
             return;
         }
     };
-    if let Err(error) =
-        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    if let Err(error) = crate::session::set_active_session_with_identity(
+        harness,
+        new_session,
+        Some(tool_context),
+        state.publish_process_identity,
+    )
+    .await
     {
         state.set_status(RunStatus::Idle);
         add_error_message(
@@ -374,7 +386,7 @@ pub(super) async fn fork_session(
 /// `/new` (alias `/clear`): begin a fresh session.
 ///
 /// Creates a new JSONL session file, swaps it onto the harness through the
-/// shared [`crate::session::set_active_session`] funnel (so plugin channels
+/// shared [`crate::session::set_active_session_with_identity`] funnel (so plugin channels
 /// follow the swap), rebuilds the transcript with the session's REAL capability
 /// snapshot, and drops every per-session counter in the footer.
 ///
@@ -458,8 +470,13 @@ pub(super) async fn start_new_session(
     // Route through the funnel so the plugin channels follow the swap; a bare
     // `set_session` would leave every plugin naming the session it was serving
     // before this call.
-    if let Err(error) =
-        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    if let Err(error) = crate::session::set_active_session_with_identity(
+        harness,
+        new_session,
+        Some(tool_context),
+        state.publish_process_identity,
+    )
+    .await
     {
         add_error_message(
             &state.notice_container(),

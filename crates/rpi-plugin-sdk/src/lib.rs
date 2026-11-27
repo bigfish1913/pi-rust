@@ -1817,6 +1817,10 @@ pub const RPI_PLUGIN_ABI_VERSION_UNIFIED: u32 = 4;
 /// The unversioned symbol for the unified ABI.
 pub const REGISTER_SYMBOL_UNIFIED: &[u8] = b"rpi_plugin_register\0";
 
+/// Optional export that opts a library into repeated, concurrent registration
+/// in one mapped image. See [`export_shared_plugin!`] for the contract.
+pub const SHARED_SESSIONS_SYMBOL_V1: &[u8] = b"rpi_plugin_shared_sessions_v1\0";
+
 /// The host-provided API struct. The first two fields (`abi_version`
 /// and `struct_size`) are contract-identity markers that survive future
 /// signature changes: a plugin reads them from the pointer before anything
@@ -2290,6 +2294,25 @@ macro_rules! export_plugin {
             // SAFETY: host guarantees `api` is valid for this call.
             unsafe { $crate::register_entrypoint(api, $body) }
         }
+    };
+}
+
+/// Export a plugin that supports multiple registrations in one library image.
+///
+/// A Host may register concurrently and may stop, reload, or fail one
+/// registration while others continue. Keep session state and host callback
+/// context with their owning registration or with individual call handles.
+/// Any shared state must be thread safe and independent of session lifetimes.
+/// A shutdown callback must release only its own registration's resources,
+/// including after a partially failed registration. Closing the last session
+/// does not reset library globals. Older hosts use the standard entrypoint.
+#[macro_export]
+macro_rules! export_shared_plugin {
+    ($body:expr) => {
+        $crate::export_plugin!($body);
+
+        #[no_mangle]
+        pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
     };
 }
 

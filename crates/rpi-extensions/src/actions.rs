@@ -993,9 +993,22 @@ impl ActionBridge {
         if let Some(program) = &tool_program {
             program.bind_signal(signal.clone());
         }
+        let mut execution_context = rpi_agent::tool_execution_scope::public_execution_context();
+        // Released Goal plugins use this field to reject mutations of the
+        // parent goal from child tools. Keep the compatibility field scoped
+        // to Goal; other plugins still receive the public execution metadata.
+        if child
+            && self
+                .plugin_identity
+                .as_ref()
+                .is_some_and(|(_, name)| name == "librpi_goal" || name.starts_with("librpi_goal-v"))
+        {
+            execution_context.get_or_insert_with(|| serde_json::json!({}))["childAgent"] =
+                serde_json::Value::Bool(false);
+        }
         Arc::new(Self {
             invocation: Some((child, uuid::Uuid::new_v4().to_string(), signal)),
-            execution_context: rpi_agent::tool_execution_scope::public_execution_context(),
+            execution_context,
             tool_program,
             stdio: self.stdio.clone(),
             plugin_identity: self.plugin_identity.clone(),
@@ -1167,6 +1180,11 @@ impl ActionBridge {
 
     pub fn stdio_lifecycle(&self) -> crate::StdioLifecycle {
         self.stdio.clone()
+    }
+
+    /// Refuse stdio ownership for plugins in a shared process. Set before loading.
+    pub fn disable_stdio_claims(&self) {
+        self.stdio.disable_claims();
     }
 
     pub(crate) fn claim_stdio(&self) -> Result<(), String> {
@@ -1967,6 +1985,30 @@ mod tests {
             "a new RuntimeActionId was added: re-verify that host-only child-agent control \
              (un-owner-scoped roster/stop) is still unreachable from the plugin ABI"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_host_refuses_stdio_during_registration() {
+        let master = ActionBridge::new(
+            Handle::current(),
+            Arc::new(MockHost {
+                prompt: String::new(),
+                saw: Mutex::new(Vec::new()),
+            }),
+        );
+        master.disable_stdio_claims();
+        let plugin = crate::HostApi::with_action_bridge(
+            "stdio-plugin",
+            crate::ExtensionRegistry::new(),
+            Arc::new(crate::NullDiagnostics),
+            master.clone(),
+        );
+        let vtable = plugin.build_vtable();
+        let _registration = crate::enter_current_api(&plugin);
+        let declare = vtable.declare.unwrap();
+        assert_ne!(declare(StbStringRef::from_str(r#"{"ownsStdio":true}"#)), 0);
+        assert!(plugin.take_registry().unwrap().declared_owns_stdio());
+        assert!(master.stdio_lifecycle().validate().is_ok());
     }
 
     #[tokio::test(flavor = "current_thread")]
