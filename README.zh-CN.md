@@ -391,7 +391,7 @@ rpi install rpi-subagents
 宿主 API 只允许缩小继承的工具范围。子智能体无法调用 `delegate_task`，宿主也会拒绝递归委派。
 审批使用父会话的界面，父会话完成或取消时会停止子智能体。隔离范围是会话和工具权限，进程仍运行在宿主的操作系统权限下。
 
-请搭配兼容版本的宿主和子智能体扩展。宿主不支持时会返回错误。Rust 调用方使用 `AgentHarness::create_child`。扩展通过 `GetExecutionContext` 读取当前绑定，通过 `IndependentRun` 管理运行。`ChildAgent` 用于兼容已发布的扩展。生命周期与限制详见[子智能体协议](docs/extensions/subagents.md)。
+请使用支持 `IndependentRun` 的子智能体扩展。Rust 调用方使用 `AgentHarness::create_independent_run`。扩展通过 `GetExecutionContext` 读取当前绑定，通过 `IndependentRun` 管理运行。生命周期与限制详见[子智能体协议](docs/extensions/subagents.md)。
 
 ### 开发扩展
 

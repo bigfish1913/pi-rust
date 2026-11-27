@@ -1,6 +1,6 @@
 # SideQuestion runtime action (25), protocol v2
 
-`SideQuestion` is command-level, owner-scoped, tool-free inference with a host-owned native side-chat workspace. It never acquires the main run lane or writes the parent transcript/steering queues. It is separate from `ChildAgent`; do not relax that action's invocation/runtime-key checks.
+`SideQuestion` is command-level, owner-scoped, tool-free inference with a host-owned native side-chat workspace. It never acquires the main run lane or writes the parent transcript/steering queues. `IndependentRun` has a separate invocation and runtime-key check.
 
 ## Wire protocol
 

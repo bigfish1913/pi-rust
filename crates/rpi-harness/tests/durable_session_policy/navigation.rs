@@ -19,7 +19,7 @@ async fn validates_candidate_not_current_before_moving() {
         .await
         .unwrap();
     let child = h
-        .create_child(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
+        .create_independent_run(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
         .await
         .unwrap();
     let session = h.session();
@@ -185,7 +185,7 @@ async fn read_failure_race_and_pre_move_cancellation_keep_old_state() {
     )
     .await;
     let child = h
-        .create_child(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
+        .create_independent_run(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
         .await
         .unwrap();
     let old_leaf = h.view().get_leaf_id().await.unwrap();

@@ -160,7 +160,7 @@ async fn close_is_immediate_but_drain_settles_admitted_work_and_rejects_waiters(
             let accepted = request(&s, "accepted", start()).await;
             let rejected = request(&s, "must-not-commit", start()).await;
             let child = h
-                .create_child(
+                .create_independent_run(
                     Session::new(
                         Arc::new(rpi_harness::session::memory::InMemorySessionStorage::new(
                             SessionMetadata {

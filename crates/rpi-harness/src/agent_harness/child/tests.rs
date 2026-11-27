@@ -70,7 +70,7 @@ async fn snapshots_live_binding_and_runs_during_an_active_parent_without_touchin
     parent.set_active_tools(vec!["read".into()]).await.unwrap();
     let (run_id, _, _) = parent.acquire_run(OperationKind::Run).await.unwrap();
     let child = parent
-        .create_child(session("child"), emitter(), 2, None)
+        .create_independent_run(session("child"), emitter(), 2, None)
         .await
         .unwrap();
     let snap = child.harness.snapshot_config().unwrap();
@@ -102,30 +102,30 @@ async fn children_cannot_expand_tools_or_create_grandchildren() {
     let (parent, _, _) = parent(FauxScript::new()).await;
     parent.set_active_tools(vec!["read".into()]).await.unwrap();
     assert!(parent
-        .create_child(parent.session().clone(), emitter(), 1, None)
+        .create_independent_run(parent.session().clone(), emitter(), 1, None)
         .await
         .is_err());
     assert!(parent
-        .create_child(session("bad"), emitter(), 1, Some(vec!["write".into()]))
+        .create_independent_run(session("bad"), emitter(), 1, Some(vec!["write".into()]))
         .await
         .is_err());
     let child = parent
-        .create_child(session("child"), emitter(), 1, Some(vec![]))
+        .create_independent_run(session("child"), emitter(), 1, Some(vec![]))
         .await
         .unwrap();
     assert!(child.harness.get_tools().await.unwrap().is_empty());
     assert!(child
         .harness
-        .create_child(session("grandchild"), emitter(), 1, None)
+        .create_independent_run(session("grandchild"), emitter(), 1, None)
         .await
         .is_err());
     assert!(child
         .execution_scope
-        .run(parent.create_child(session("via-root"), emitter(), 1, None))
+        .run(parent.create_independent_run(session("via-root"), emitter(), 1, None))
         .await
         .is_err());
     assert!(parent
-        .create_child(session("bad"), emitter(), 0, None)
+        .create_independent_run(session("bad"), emitter(), 33, None)
         .await
         .is_err());
 }
@@ -149,7 +149,7 @@ async fn child_turn_budget_is_per_instance_and_does_not_change_parent_or_environ
     .unwrap();
     let before = std::env::var_os(crate::run_budget::MAX_TURNS_ENV);
     let child = parent
-        .create_child(session("child"), emitter(), 1, None)
+        .create_independent_run(session("child"), emitter(), 1, None)
         .await
         .unwrap();
     child
@@ -183,7 +183,7 @@ async fn approval_hook_is_inherited_and_blocks_mutating_child_tools() {
         let root = weak_parent.upgrade().unwrap();
         Box::pin(async move {
             assert!(root
-                .create_child(session("recursive-hook"), emitter(), 1, None)
+                .create_independent_run(session("recursive-hook"), emitter(), 1, None)
                 .await
                 .is_err());
             Some(BeforeToolCallResult {
@@ -195,7 +195,7 @@ async fn approval_hook_is_inherited_and_blocks_mutating_child_tools() {
         })
     }));
     let child = parent
-        .create_child(session("child"), emitter(), 3, None)
+        .create_independent_run(session("child"), emitter(), 3, None)
         .await
         .unwrap();
     child.harness.prompt_text("write", vec![]).await.unwrap();
@@ -208,20 +208,20 @@ async fn approval_hook_is_inherited_and_blocks_mutating_child_tools() {
 async fn close_and_session_switch_cancel_old_scopes_but_new_session_can_delegate() {
     let (parent, _, _) = parent(FauxScript::new()).await;
     let first = parent
-        .create_child(session("first"), emitter(), 1, None)
+        .create_independent_run(session("first"), emitter(), 1, None)
         .await
         .unwrap();
     parent.set_session(session("next-parent")).await.unwrap();
     assert!(first.scope.is_cancelled());
     let next = parent
-        .create_child(session("next-child"), emitter(), 1, None)
+        .create_independent_run(session("next-child"), emitter(), 1, None)
         .await
         .unwrap();
     assert!(!next.scope.is_cancelled());
     parent.close().await.unwrap();
     assert!(next.scope.is_cancelled());
     assert!(parent
-        .create_child(session("closed"), emitter(), 1, None)
+        .create_independent_run(session("closed"), emitter(), 1, None)
         .await
         .is_err());
 }
@@ -297,12 +297,12 @@ async fn exact_none_cannot_expand_through_child_or_mutation() {
     assert!(parent.set_system_prompt(None).await.is_err());
     assert!(parent.set_session(session("swapped")).await.is_err());
     let child = parent
-        .create_child(session("child"), emitter(), 1, None)
+        .create_independent_run(session("child"), emitter(), 1, None)
         .await
         .unwrap();
     assert!(child.harness.get_tools().await.unwrap().is_empty());
     assert!(parent
-        .create_child(session("expanded"), emitter(), 1, Some(vec!["read".into()]))
+        .create_independent_run(session("expanded"), emitter(), 1, Some(vec!["read".into()]))
         .await
         .is_err());
 }
