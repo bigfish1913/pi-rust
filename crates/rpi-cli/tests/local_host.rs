@@ -113,7 +113,13 @@ async fn chunk(socket: &mut TcpStream, data: &str) {
 fn write_fixture(agent: &Path, address: std::net::SocketAddr) {
     std::fs::write(
         agent.join("settings.json"),
-        json!({"defaultProvider":"fixture", "defaultModel":"fixture"}).to_string(),
+        // Keep startup release notes from pushing the tool list off the test terminal.
+        json!({
+            "defaultProvider": "fixture",
+            "defaultModel": "fixture",
+            "lastRpiChangelogVersion": rpi_cli::VERSION,
+        })
+        .to_string(),
     )
     .unwrap();
     std::fs::write(agent.join("models.json"), json!({"providers":{"fixture":{
