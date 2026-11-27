@@ -29,18 +29,24 @@ impl AgentTool for Alias {
     ) -> Result<AgentToolResult, AgentError> {
         let context = self.host.get_execution_context(json!({})).await.unwrap();
         assert_eq!(context["tools"], json!(["research_alias"]));
-        assert!(context.get("childAgent").is_none());
+        assert!(context.get("independentRun").is_none());
         assert!(context.get("nativeDurableActor").is_none());
         let error = self
             .host
-            .child_agent(
+            .independent_run(
                 7,
-                json!({"op":"start","task":"nested","tools":["restricted"]}),
+                json!({
+                    "op": "start",
+                    "input": "nested",
+                    "maxTurns": 8,
+                    "timeoutSeconds": 300,
+                    "tools": ["restricted"],
+                }),
             )
             .await
             .expect_err("child must not reenter the root runtime host");
-        assert!(error.contains("recursive"));
-        Ok(AgentToolResult::text("nested delegation blocked"))
+        assert!(error.contains("nested independent runs"));
+        Ok(AgentToolResult::text("nested run blocked"))
     }
 }
 fn schema(name: &str) -> Tool {
@@ -87,14 +93,20 @@ async fn a_narrowed_child_cannot_reenter_the_root_host_through_an_alias_tool() {
         .unwrap();
     let manager = IndependentRuns::default();
     let started = manager
-        .handle(
+        .start_run(
             &parent,
             7,
-            json!({"op":"start","task":"outer","tools":["research_alias"]}),
+            &json!({
+                "op": "start",
+                "input": "outer",
+                "maxTurns": 8,
+                "timeoutSeconds": 300,
+                "tools": ["research_alias"],
+            }),
         )
         .await
         .unwrap();
-    let done = wait(&manager, &parent, started["childId"].as_str().unwrap()).await;
+    let done = wait(&manager, started["runId"].as_str().unwrap()).await;
     assert_eq!(done["status"], "done");
     assert_eq!(done["result"]["text"], "blocked report");
 }
@@ -172,10 +184,7 @@ async fn assert_capacity_retained(panic_after_start: bool) {
         .await
         .unwrap();
     let manager = IndependentRuns::default();
-    let child = manager
-        .handle(&parent, 7, json!({"op":"start","task":"slow"}))
-        .await
-        .unwrap();
+    let child = manager.start_test_run(&parent, 7, "slow").await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while !started.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -184,16 +193,11 @@ async fn assert_capacity_retained(panic_after_start: bool) {
     .await
     .unwrap();
     if panic_after_start {
-        let done = wait(&manager, &parent, child["childId"].as_str().unwrap()).await;
+        let done = wait(&manager, child["runId"].as_str().unwrap()).await;
         assert!(done["error"].as_str().unwrap().contains("panicked"));
     } else {
         manager
-            .handle(
-                &parent,
-                7,
-                json!({"op":"dispose","childId":child["childId"]}),
-            )
-            .await
+            .handle_run(7, &json!({"op":"dispose","runId":child["runId"]}))
             .unwrap();
     }
     tokio::time::sleep(Duration::from_millis(if panic_after_start {
@@ -208,10 +212,7 @@ async fn assert_capacity_retained(panic_after_start: bool) {
         .unwrap();
     let retained = manager.active.load(Ordering::Acquire);
     manager.begin_shutdown();
-    assert!(manager
-        .handle(&parent, 7, json!({"op":"start","task":"late"}))
-        .await
-        .is_err());
+    assert!(manager.start_test_run(&parent, 7, "late").await.is_err());
     {
         // Even a disposed job / panicked run still has a real foreign driver.
         // Dropping this waiter must neither abort it nor forget its custody.

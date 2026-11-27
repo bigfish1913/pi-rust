@@ -218,6 +218,7 @@ impl PluginToolAdapter {
             }
             context["runtimeHandle"] = serde_json::json!(invocation.user_data() as usize);
             context["runtimeKey"] = serde_json::json!(invocation.invocation_key());
+            context["independentRun"] = serde_json::json!(invocation.is_independent_invocation());
         }
         let public_binding = PublicBindingGuard::capture(&params, invocation.as_deref());
         let params = params.to_string();
