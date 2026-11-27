@@ -394,7 +394,7 @@ async fn message_update_forwards_the_provider_snapshot_without_copying() {
             message_id.is_none(),
             "direct agents have no session-owned identity"
         );
-        let partial = match assistant_message_event {
+        let partial = match assistant_message_event.as_ref() {
             AssistantMessageEvent::TextDelta { partial, .. }
             | AssistantMessageEvent::TextStart { partial, .. }
             | AssistantMessageEvent::TextEnd { partial, .. }

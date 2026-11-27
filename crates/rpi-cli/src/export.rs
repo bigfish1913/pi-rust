@@ -332,13 +332,13 @@ fn assistant_text(assistant: &rpi_ai::types::AssistantMessage) -> String {
     assistant
         .content
         .iter()
-        .filter_map(|c| match c {
-            rpi_ai::types::Content::Text(t) => Some(t.text.clone()),
+        .map(|c| match c {
+            rpi_ai::types::Content::Text(t) => t.text.clone(),
             rpi_ai::types::Content::Thinking(t) => {
-                Some(format!("<thinking>{}</thinking>", t.thinking))
+                format!("<thinking>{}</thinking>", t.thinking)
             }
-            rpi_ai::types::Content::ToolCall(tc) => Some(format!("[Tool Call: {}]", tc.name)),
-            rpi_ai::types::Content::Image(_) => Some("[Image]".to_string()),
+            rpi_ai::types::Content::ToolCall(tc) => format!("[Tool Call: {}]", tc.name),
+            rpi_ai::types::Content::Image(_) => "[Image]".to_string(),
         })
         .collect::<Vec<_>>()
         .join("\n\n")

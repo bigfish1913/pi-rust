@@ -204,7 +204,7 @@ impl RemoteEvent {
                 message,
                 assistant_message_event,
             } => {
-                let (content_index, delta) = match assistant_message_event {
+                let (content_index, delta) = match assistant_message_event.as_ref() {
                     AssistantMessageEvent::TextDelta {
                         content_index,
                         delta,

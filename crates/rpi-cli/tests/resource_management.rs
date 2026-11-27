@@ -512,6 +512,9 @@ async fn snapshots_preserve_executable_modes_and_strip_special_bits_on_every_cop
             ("reinstall", 0o4755),
         ] {
             put(&script, b"#!/bin/sh\nprintf 'helper-ran\\n'\n");
+            // macOS can inherit the temporary directory's group (e.g. wheel).
+            // Set a group the test process belongs to so chmod keeps setgid.
+            std::os::unix::fs::chown(&script, None, Some(nix::unistd::getegid().as_raw())).unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(mode)).unwrap();
             assert_eq!(
                 std::fs::metadata(&script).unwrap().permissions().mode() & 0o7777,

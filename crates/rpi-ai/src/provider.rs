@@ -382,6 +382,12 @@ pub trait DeferredProvider: Send + Sync {
 // for harness config, a separate concern.
 // ---------------------------------------------------------------------------
 
+/// Awaited per-call hook result. Legacy implementations retain their synchronous
+/// callbacks through the default adapters; blocking implementations should
+/// override the async entry points and await their owned worker instead.
+pub type ProviderHookFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
 /// A per-call provider hook. `before_request` may patch the live
 /// [`SimpleStreamOptions`] (e.g. inject/rotate headers, set metadata, override
 /// timeout) before the harness calls `stream_simple`; `after_response` observes
@@ -410,8 +416,9 @@ pub trait ProviderHooks: Send + Sync {
     /// a caller can reason about "what the model sees" independently of "how the
     /// request is sent".
     ///
-    /// Must not retain the borrow. Runs on the blocking-bridge thread inside the
-    /// harness `StreamFn` closure.
+    /// Must not retain the borrow. This synchronous compatibility callback runs
+    /// inside the asynchronous Harness factory. Blocking native transformers
+    /// require a separate awaited bridge before they can be enabled in a Host.
     fn transform_context(&self, _model: &Model, _ctx: &Context) -> Option<ContextPatch> {
         None
     }
@@ -422,8 +429,9 @@ pub trait ProviderHooks: Send + Sync {
     /// `None` to leave `opts` untouched.
     ///
     /// The hook receives a reference to the planned `opts`, not ownership — it
-    /// must not retain the borrow (the closure clones before `await`). Runs on
-    /// the blocking-bridge thread inside the harness `StreamFn` closure.
+    /// must not retain the borrow. This is the synchronous compatibility entry;
+    /// the Harness awaits [`Self::before_request_async`] so blocking hosts can
+    /// override that entry without blocking the shared executor.
     fn before_request(
         &self,
         _model: &Model,
@@ -438,6 +446,30 @@ pub trait ProviderHooks: Send + Sync {
     /// one the loop emits as `MessageEnd`). `None` lets the default no-op impl
     /// apply. Runs immediately before `MessageEnd` is emitted by the agent loop.
     fn after_response(&self, _model: &Model, _message: &AssistantMessage) {}
+
+    /// Awaited request boundary used by the Harness. The default preserves the
+    /// existing synchronous patch contract. An override may offload blocking
+    /// native work; dropping this waiter must not destroy its in-flight worker.
+    fn before_request_async<'a>(
+        &'a self,
+        model: &'a Model,
+        ctx: &'a Context,
+        opts: &'a SimpleStreamOptions,
+    ) -> ProviderHookFuture<'a, Option<SimpleStreamOptionsPatch>> {
+        Box::pin(async move { self.before_request(model, ctx, opts) })
+    }
+
+    /// Awaited terminal observation, before MessageEnd (also for cancellation
+    /// and the result-only fallback). The default preserves synchronous hooks.
+    /// A blocking override must retain its own code/callback custody until the
+    /// actual worker settles, even if this future is dropped.
+    fn after_response_async<'a>(
+        &'a self,
+        model: &'a Model,
+        message: &'a AssistantMessage,
+    ) -> ProviderHookFuture<'a, ()> {
+        Box::pin(async move { self.after_response(model, message) })
+    }
 }
 
 /// A no-op default so the harness can install a `ProviderHooks` slot cheaply

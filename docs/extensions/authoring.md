@@ -37,7 +37,7 @@
 
 ```toml
 [dependencies]
-rpi-plugin-sdk = "0.8"
+rpi-plugin-sdk = "0.29.0"
 rpi-extcore = "0.1" # 需要 native RPC / session / workspace 服务时再添加
 ```
 
@@ -93,7 +93,7 @@ repository = "https://github.com/example/my-rpi-extension"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rpi-plugin-sdk = "0.8"
+rpi-plugin-sdk = "0.29.0"
 serde_json = "1"
 ```
 
@@ -103,10 +103,10 @@ serde_json = "1"
 
 ## 3. ABI 入口
 
-宿主只加载统一 C ABI 符号 `rpi_plugin_register`。扩展使用 `export_plugin!`，
-通过同一个 `PluginApi` 注册能力并调用 `api.declare` 声明优先级/平台。
-SDK 在注册前检查 `abi_version` 和 `struct_size`；旧宿主缺少的尾部可选槽位补成
-`None`，插件可据此降级。版本不兼容或必需字段不完整时返回非零状态，宿主报告加载失败。
+宿主调用统一 C ABI 入口 `rpi_plugin_register`。扩展通常使用 `export_plugin!` 导出入口，
+通过 `PluginApi` 注册能力并调用 `api.declare` 声明优先级/平台。示例中的 SDK 在注册前
+检查 `abi_version` 和 `struct_size`，将旧宿主缺少的尾部可选槽位补成 `None`，插件可据此
+降级。ABI 版本不兼容或必需字段不完整时返回非零状态，宿主报告加载失败。
 
 ```rust
 rpi_plugin_sdk::export_plugin!(|api| {
@@ -128,8 +128,64 @@ rpi_plugin_sdk::export_plugin!(|api| {
 });
 ```
 
-`declare` 的 JSON 支持 `priority`（数字，越大越先）和 `platforms`（字符串数组，
+`declare` 的 JSON 支持 `priority`（整数，越小越先）和 `platforms`（字符串数组，
 如 `["linux","windows","macos"]`）；宿主在分发事件处理器时跳过不匹配的平台。
+
+### 可选：Unix Host 共享插件映像
+
+支持此功能的 Unix 本地 Host 可在多个会话中复用同一版本的 `cdylib` 映像。插件通过
+自身导出的 `rpi_plugin_shared_sessions_v1` 符号选择启用。宿主检查符号归属，标记函数体留空。
+未导出该符号的插件在该 Host 中继续使用各会话的独立映像。共享只涉及映射的库，
+每次注册仍有独立的 `PluginApi`、回调上下文、注册表和关闭流程。注册入口仍是
+`rpi_plugin_register`，统一 C ABI 仍为 v4。较旧的兼容宿主和其他加载路径忽略标记，
+照常调用标准入口。插件仍须检查自己使用的可选槽位。
+
+包含该宏的 SDK 可用 `rpi_plugin_sdk::export_shared_plugin!(register);` 替换
+`export_plugin!(register)`，其中 `register` 的签名为 `fn(&PluginApi) -> i32`。
+宏同时导出标准入口和共享标记。可从 pi-rust 的 `v0.29.1-preview.1583` 源码标签
+取得该宏，例如用以下 Git 依赖。该标签的 SDK manifest 版本为 `0.29.0`，
+crates.io 发布的 `0.29.0` 和 `0.3.20` 均没有此宏。
+
+```toml
+[dependencies]
+rpi-plugin-sdk = { git = "https://github.com/bigfish1913/pi-rust", tag = "v0.29.1-preview.1583" }
+```
+
+使用没有该宏的已发布 SDK 时，例如 `=0.8.3` 或 `=0.3.20`，可保留 `export_plugin!`，
+并在同一个 `cdylib` 显式导出等价的标记。`0.8.3` 提供 `register_plugin_lifecycle`。
+`0.3.20` 未声明该槽位，适合只依靠单次调用 handle 等现有机制就能安全回收资源的扩展。
+
+```rust
+rpi_plugin_sdk::export_plugin!(register);
+
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
+```
+
+启用前确认以下约定：
+
+- **注册上下文**。宿主在调用注册入口的线程上绑定本次注册，所有 registrar 都在该次
+  调用返回前同步调用。`&PluginApi` 只在注册期间借用。如需在回调中调用宿主，复制所需
+  函数指针及对应的 `api.user_data` 到本次注册的状态中。`api.user_data` 是宿主拥有的
+  不透明指针，只能按对应宿主 API 的约定使用。为接受插件 `user_data` 的回调传入插件
+  自己的注册上下文。原生宿主会把注册时的宿主 `user_data` 传给 slash command 回调。
+  ABI v4 的 `ToolExecuteFn` 不接收注册上下文。需要调用宿主的工具使用宿主注入的
+  `__rpi.runtimeHandle` 绑定当次调用。需要访问注册私有状态的工具还要绑定注册归属，
+  同一个 session ID 在 reload 期间可能对应两次注册。单次调用状态由 `StepHandle` 持有，
+  `destroy` 负责回收。
+- **关闭和注册失败**。需要跨调用存活的资源时，先检查并成功注册 `register_plugin_lifecycle`，
+  再启动后台工作或把上下文交给其他 registrar。检查返回值，钩子注册失败时由插件回收
+  尚未交出的资源。注册入口在部分注册后返回非零（含 SDK 捕获 panic）时，宿主丢弃该次
+  注册的部分结果，并仍调用已成功安装的关闭钩子。`begin` 只通知本次注册停止接单并取消在飞工作，须幂等、
+  非阻塞，不调用宿主。宿主在飞 FFI 调用与字符串释放完成后，在清理线程调用 `finish`，
+  由它 join 本次注册的后台工作并释放资源。确认相关工作都已结束后才释放上下文并返回 `0`。返回非零
+  会让宿主保留该映像及宿主回调上下文。缺少槽位时，只启用有独立安全回收路径的能力。
+- **共享状态**。注册可同时发生，旧注册在关闭或 reload 时，其他注册仍可工作。全局
+  `static`、`OnceLock` 和缓存随映像存活，只适合线程安全且与会话生命周期无关的数据。
+  关闭最后一个会话后 Host 仍可保留原映像，同一产物 reload 时也可能复用它。每次注册
+  都应初始化自己的状态，避免把宿主上下文、取消标记或会话资源放进全局单例。替换插件
+  文件后，新注册可使用新映像，仍在使用旧映像的注册继续保有各自的引用。
 
 ### 能力检测
 
@@ -400,7 +456,7 @@ if (control.is_cancelled)(control.user_data, ProviderChunkKind::Content as u32) 
 2. 对普通逻辑写 `rlib` 单元测试；对 ABI 注册、加载和卸载写至少一个宿主 smoke test。
 3. Schema 和实现使用同一字段命名，拒绝未知字段；对路径、URL、命令、数量和输出大小设置上限。
 4. `poll` 不执行长时间阻塞任务。耗时工作放入线程/任务，handle 保存状态；取消标记必须能让任务在有限时间内结束。
-5. 全局可变状态使用明确同步，避免把 session 或 tool call 状态存进无保护的 `static mut`。
+5. 共享可变数据使用明确同步，会话和单次调用的状态分别由注册上下文和调用 handle 持有。
 6. runtime action、provider、renderer、event handler 和 resources handler 都是可选能力；注册前检查 vtable slot。
 7. 插件注册失败返回非零；单个工具执行失败返回结构化错误，不要让整个宿主退出。
 8. README 记录工具 schema、权限边界、持久化文件、网络访问、支持平台和卸载方式。
@@ -521,12 +577,17 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 ## 9. 发布检查清单
 
 - `cargo fmt --check`、`cargo clippy --all-targets`、`cargo test` 通过。
-- `crate-type` 包含 `cdylib`，使用 `export_plugin!` 导出
-  `rpi_plugin_register`。
-- 依赖已发布的 `rpi-plugin-sdk` 兼容版本，不链接宿主私有 crate。
+- `crate-type` 包含 `cdylib`，导出 `rpi_plugin_register`。启用共享映像时，同时确认
+  `rpi_plugin_shared_sessions_v1` 由插件自身导出。
+- 明确锁定兼容的 `rpi-plugin-sdk` 发布版或 Git 源码版本，不链接宿主私有 crate。
 - `rpi dev --no-watch` 能编译、加载并注册预期工具。
 - `rpi install <crate> --build --force` 的干净安装路径通过。
 - Linux/macOS/Windows 构建由 CI 验证，README 标明支持矩阵。
+- 启用共享映像时，用同一 Unix Host 同时打开两个加载同一产物的会话。可记录回调函数和
+  注册上下文的地址，确认代码来自同一映像，注册状态和宿主回调各归自己的会话。在一个会话有在飞工作时触发取消和 reload，确认旧调用能观察取消并
+  退出、旧注册清理完成、另一会话继续工作、新注册从自己的初始状态开始。分别验证原产物
+  reload、替换产物后 reload，以及关闭全部会话后再打开。再让一次注册在钩子安装后失败，
+  确认只清理失败注册且不发布其部分结果。用较旧的兼容宿主验证带标记的产物仍可正常注册。
 
 ## 10. 模型执行规则
 

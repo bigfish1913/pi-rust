@@ -34,6 +34,7 @@ fn startup_banner_and_launch_notices_land_in_the_retained_header() {
         header < chat,
         "the retained history UI must exist before any startup content is added"
     );
+    assert!(source.contains("        history_page,\n        publish_process_identity:"));
     for marker in [
         "Some(add_welcome_message_with_capabilities(\n            &history_page.header,",
         "add_note_message(&history_page.header, notice);",
@@ -41,7 +42,7 @@ fn startup_banner_and_launch_notices_land_in_the_retained_header() {
         "maybe_add_startup_changelog(\n        harness,\n        &history_page.header,",
         // The same instance must be the one the TUI state owns, otherwise the
         // header is populated on a container nothing renders.
-        "    let state = Arc::new(TuiState {\n        session_write_tasks: settlement::SessionWriteTasks::new(args.native_durable),\n        history_page,",
+        "    let state = Arc::new(TuiState {",
     ] {
         assert!(
             source.contains(marker),

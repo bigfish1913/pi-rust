@@ -137,6 +137,7 @@ impl RenderScheduler {
 
 /// Alternate screen TUI with application-owned scrolling.
 pub struct TuiAltScreen {
+    display_context: Option<Arc<crate::display_context::DisplayContext>>,
     /// Serializes the complete diff/render/write transaction. Input, streaming
     /// events, and loader ticks can request frames from different threads; if
     /// they race, an older frame can otherwise overwrite `previous_screen`
@@ -359,6 +360,7 @@ impl TuiAltScreen {
             terminal: terminal.clone(),
         };
         Self {
+            display_context: crate::display_context::current(),
             render_lock: Mutex::new(()),
             jump_to_end: crate::jump_to_end::JumpToEnd::default(),
             terminal,
@@ -1375,6 +1377,12 @@ impl TuiAltScreen {
 
     /// Perform a differential render with constrained layout.
     fn do_render(&self, reuse_scroll_content: bool) {
+        crate::display_context::with(self.display_context.as_ref(), || {
+            self.render_frame(reuse_scroll_content);
+        });
+    }
+
+    fn render_frame(&self, reuse_scroll_content: bool) {
         if self.is_render_suspended() {
             return;
         }

@@ -77,7 +77,7 @@ pub enum AgentEvent {
         /// Session entry ID assigned by the durable host, absent for direct agents.
         message_id: Option<String>,
         message: Arc<AssistantMessage>,
-        assistant_message_event: AssistantMessageEvent,
+        assistant_message_event: Box<AssistantMessageEvent>,
     },
     /// Emitted when a message finishes (complement of `MessageStart`).
     MessageEnd {

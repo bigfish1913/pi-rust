@@ -321,7 +321,9 @@ fn custom_to_context_messages(
     entries: &[Entry],
     options: &SessionContextBuildOptions,
 ) -> Vec<AgentMessage> {
-    if is_tool_program_body_type(&c.custom_type) {
+    if is_tool_program_body_type(&c.custom_type)
+        || crate::durable::reserved_host_admission_type(&c.custom_type)
+    {
         return Vec::new();
     }
     match options.entry_projectors.get(&c.custom_type) {

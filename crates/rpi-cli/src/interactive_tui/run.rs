@@ -71,50 +71,39 @@ pub(super) async fn maybe_add_startup_changelog(
 
 pub(super) fn launch_external_editor(draft: String, tx: mpsc::UnboundedSender<TuiMessage>) {
     std::thread::spawn(move || {
-        let file = match tempfile::Builder::new()
-            .prefix("rpi-draft-")
-            .suffix(".md")
-            .tempfile()
-        {
-            Ok(file) => file,
-            Err(error) => {
-                let _ = tx.send(TuiMessage::ExternalEditorResult(Err(format!(
-                    "Could not create editor file: {error}"
-                ))));
-                return;
-            }
-        };
-        if let Err(error) = std::fs::write(file.path(), draft.as_bytes()) {
-            let _ = tx.send(TuiMessage::ExternalEditorResult(Err(format!(
-                "Could not write editor file: {error}"
-            ))));
-            return;
-        }
-        let editor = std::env::var("RPI_EXTERNAL_EDITOR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| std::env::var("VISUAL").ok())
-            .or_else(|| std::env::var("EDITOR").ok())
-            .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "notepad".to_string()
-                } else {
-                    "nano".to_string()
-                }
-            });
-        let status = std::process::Command::new(&editor)
-            .arg(file.path())
-            .status();
-        let result = match status {
-            Ok(status) if status.success() => std::fs::read_to_string(file.path())
-                .map_err(|error| format!("Could not read editor file: {error}")),
-            Ok(status) => Err(format!("External editor exited with {status}")),
-            Err(error) => Err(format!(
-                "Could not launch external editor `{editor}`: {error}"
-            )),
-        };
-        let _ = tx.send(TuiMessage::ExternalEditorResult(result));
+        let _ = tx.send(TuiMessage::ExternalEditorResult(edit_draft(draft)));
     });
+}
+
+pub(crate) fn edit_draft(draft: String) -> Result<String, String> {
+    let file = tempfile::Builder::new()
+        .prefix("rpi-draft-")
+        .suffix(".md")
+        .tempfile()
+        .map_err(|error| format!("Could not create editor file: {error}"))?;
+    std::fs::write(file.path(), draft.as_bytes())
+        .map_err(|error| format!("Could not write editor file: {error}"))?;
+    let editor = std::env::var("RPI_EXTERNAL_EDITOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".to_string()
+            } else {
+                "nano".to_string()
+            }
+        });
+    let status = std::process::Command::new(&editor)
+        .arg(file.path())
+        .status()
+        .map_err(|error| format!("Could not launch external editor `{editor}`: {error}"))?;
+    if !status.success() {
+        return Err(format!("External editor exited with {status}"));
+    }
+    std::fs::read_to_string(file.path())
+        .map_err(|error| format!("Could not read editor file: {error}"))
 }
 
 /// Apply the authoritative run result when it wins the race with the async
@@ -140,15 +129,6 @@ pub(super) fn reconcile_streamed_assistant_completion(
     }
 }
 
-/// Drive a single prompt through the lane. When `streaming` is true, the
-/// `AgentEvent` drain task renders the response live and the completed outcome
-/// reconciles its final snapshot. When false (no `event_rx`), this falls back
-/// to the blocking await-final-text path.
-
-/// Drive a single prompt through the lane. When `streaming` is true, the
-/// `AgentEvent` drain task renders the response live and the completed outcome
-/// reconciles its final snapshot. When false (no `event_rx`), this falls back
-/// to the blocking await-final-text path.
 /// The TUI message for a refused session write.
 ///
 /// Refusing to save is not a provider problem: retrying fails the same way, and
@@ -823,9 +803,11 @@ pub(super) fn add_image_preview(
                 }
             }
         };
-        let mut options = ImageOptions::default();
-        options.width = Some(60);
-        options.alt_text = Some("[Attached image]".into());
+        let options = ImageOptions {
+            width: Some(60),
+            alt_text: Some("[Attached image]".into()),
+            ..ImageOptions::default()
+        };
         let preview = Arc::new(Image::from_data(bytes, options));
         preview.set_inline_visible(show);
         chat.add_child(preview);

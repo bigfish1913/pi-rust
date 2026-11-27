@@ -578,13 +578,12 @@ impl JsonlSessionRepo {
         )? {
             return Ok(false);
         }
-        let files = file_result(
-            self.fs.list_dir(&directory, None).await,
-            &format!("Failed to list sessions directory {directory}"),
-        )?;
-        Ok(files
-            .iter()
-            .any(|entry| entry.kind != FileKind::Directory && entry.name.ends_with(&suffix)))
+        file_result(
+            self.fs
+                .has_file_with_suffix(&directory, &suffix, None)
+                .await,
+            &format!("Failed to scan sessions directory {directory}"),
+        )
     }
 
     /// `<root>/<cwd-encoded-dir>`. Mirrors `sessionDirectory`.

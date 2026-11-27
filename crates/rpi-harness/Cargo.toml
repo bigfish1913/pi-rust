@@ -49,8 +49,9 @@ tokio = { workspace = true, features = ["test-util"] }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 rpi-telemetry = { workspace = true }
-rpi-ai = { workspace = true }
+rpi-ai = { workspace = true, features = ["providers"] }
 rpi-agent = { workspace = true }
+reqwest = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

@@ -27,7 +27,7 @@ fn native_shutdown_settles_before_retiring_runtime_tasks() {
         .expect("shutdown tail must remain present");
     let native = &source[shutdown..];
     let native_branch_end = native
-        .find("    } else {\n        // Let anything the lane has already committed")
+        .find("    } else {\n        // Wait for session writers")
         .expect("native shutdown branch must retain a flag-off branch");
     let native_branch = &native[..native_branch_end];
 
@@ -70,7 +70,7 @@ fn flag_off_shutdown_does_not_invoke_native_settlement() {
         .expect("shutdown tail must remain present");
     let tail = &source[shutdown..];
     let flag_off = tail
-        .find("    } else {\n        // Let anything the lane has already committed")
+        .find("    } else {\n        // Wait for session writers")
         .expect("flag-off shutdown branch must remain present");
     let disabled_branch = &tail[flag_off..];
     assert!(!disabled_branch.contains("settlement::settle_native"));

@@ -1,0 +1,157 @@
+{
+  "passed": true,
+  "stage": "mini_daemon_wire_v1_6_explicit_opt_in",
+  "production_mini_qualification_complete": false,
+  "core_head": "fabb8294eff1fafcbed5e085b59f7f96cca924b5",
+  "extension_head": "bf86b1b8c61a779ef9f211cecfc93ce0bce067f5",
+  "core_changed_paths": [
+    "crates/rpi-cli/src/host/README.md",
+    "crates/rpi-cli/src/host/bindings.rs",
+    "crates/rpi-cli/src/host/bindings_tests.rs",
+    "crates/rpi-cli/src/host/cli.rs",
+    "crates/rpi-cli/src/host/client_tests.rs",
+    "crates/rpi-cli/src/host/daemon.rs",
+    "crates/rpi-cli/src/host/fixtures/control-v1.json",
+    "crates/rpi-cli/src/host/mini.rs",
+    "crates/rpi-cli/src/host/mini_control.rs",
+    "crates/rpi-cli/src/host/mini_owner_tests.rs",
+    "crates/rpi-cli/src/host/mini_wire_tests.rs",
+    "crates/rpi-cli/src/host/mod.rs",
+    "crates/rpi-cli/src/host/profile.rs",
+    "crates/rpi-cli/src/host/protocol.rs",
+    "crates/rpi-cli/src/host/runtime.rs",
+    "crates/rpi-cli/src/host/server.rs",
+    "crates/rpi-cli/src/host/service.rs",
+    "docs/host-mini-daemon-wire-validation.json",
+    "docs/host-mini-daemon-wire.md"
+  ],
+  "extension_changed_paths": [
+    "packages/rpi-extcore/src/shared_host/client_tests.rs",
+    "packages/rpi-extcore/src/shared_host/fixtures/control-v1.json",
+    "packages/rpi-extcore/src/shared_host/protocol.rs",
+    "packages/rpi-host/README.md",
+    "packages/rpi-host/src/control.rs",
+    "packages/rpi-host/src/control/tests.rs",
+    "packages/rpi-host/src/lib.rs",
+    "packages/rpi-host/src/schema.json",
+    "packages/rpi-host/src/tests.rs",
+    "packages/rpi-host/tests/native_mini.py"
+  ],
+  "contract_sha256": {
+    "protocol.rs": "aa41f7dbf4613a8348127491c3e0df3f461135b88d88ad2637b92f26fea2cc10",
+    "client.rs": "55cb9897c61594dc554baddcc06dc80dcf88d11458b1a14fff1bc137c5d9e97a",
+    "client_tests.rs": "5c3be31231940f5b4e934cc66f9559eb33129fa8ee5df6ab54d6689efc1b20de",
+    "fixtures/control-v1.json": "a312686a2824051bde0f7c2febd4f687ec206773ca6a032c39fcc1439e13169f"
+  },
+  "binary_sha256": "026cc40a77061d006e36f43a3911455a6c791b83929e77bb58a5495ad2015d07",
+  "plugin_sha256": "39cb5fd04d2b998fcb032d1b6dda40d62e282080691ce5957a3f0caed5f3f281",
+  "tests": {
+    "cli_lib": {
+      "passed": 1556,
+      "failed": 0,
+      "ignored": 3
+    },
+    "host_control": {
+      "passed": 39,
+      "failed": 0,
+      "ignored": 0
+    },
+    "extcore_lib": {
+      "passed": 407,
+      "failed": 0,
+      "ignored": 2
+    },
+    "management_lib": {
+      "passed": 20,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "mini_native": {
+    "checks": [
+      "explicit_private_mini_capability_and_single_owner_table",
+      "volatile_exact_utf8_multipage_output",
+      "no_replay_conflict_scope_agent_and_run_isolation",
+      "real_raw_agent_builtin_read_roundtrip_without_template_expansion",
+      "real_provider_failure_is_not_green",
+      "active_cancel_signal_is_not_native_settlement",
+      "explicit_mini_close_settles_then_lost",
+      "crash_restart_lost_unknown_no_autoload_or_replay",
+      "no_workspace_file_effects_or_jsonl"
+    ],
+    "management_tool_calls": 43,
+    "native_provider_calls": 7,
+    "management_workspace_separate": true,
+    "mini_workspace_unchanged": true,
+    "mini_workspace_tree": {
+      "input.txt": "e6aaf723c098ff3b7ebb0e322b3cb13b49311251da3e6bc76a7a89fd40d9e830"
+    },
+    "actual_late_hook_dll_in_this_chain": false,
+    "all_fixture_resources_joined": true
+  },
+  "persistent_native": {
+    "basic_calls": [
+      7,
+      1
+    ],
+    "administrative_calls": [
+      21,
+      1
+    ],
+    "error_cases": 10,
+    "result_scenarios": 9,
+    "results_calls": [
+      31,
+      6
+    ]
+  },
+  "scoped_cli_strict_clippy_passed": true,
+  "scoped_management_all_targets_strict_clippy_passed": true,
+  "sdk_export_macro_existing_command_line_exception": "-A clippy::not_unsafe_ptr_arg_deref",
+  "source_lint_exemptions_added": false,
+  "expanded_extcore_clippy_passed": false,
+  "expanded_extcore_clippy_diagnostics": 3,
+  "baseline_failure_reproduced": false,
+  "workspace_all_targets_check_passed": true,
+  "workspace_manifest_unused_dependency_warnings_retained": true,
+  "workspace_strict_clippy_claimed": false,
+  "all_test_targets_strict_clippy_claimed": false,
+  "all_platforms_claimed": false,
+  "gated_native_hook_dll_coverage": "separate real Rust daemon test, not Python management DLL chain",
+  "outstanding": [
+    "same binary/management-DLL chain for gated late native callback/finish and disconnect faults",
+    "task 65 actual Agent strict scoped Clippy",
+    "default thin CLI, approval/timers, daemon/group recovery"
+  ],
+  "tasks_14_65_66_completed": false,
+  "committed_pushed_merged_released_installed_deployed": false,
+  "new_crates_dependencies_or_lockfile_changes": false,
+  "evidence_directory": "/private/tmp/rpi-host-integration-checks/mini-daemon-wire-20261124T231922388222Z",
+  "source_snapshot": "final-mini-wire-source-snapshot.json",
+  "passing_log_stems": [
+    "mini-wire-core-check-1",
+    "mini-wire-core-tests-1",
+    "mini-wire-core-clippy-1",
+    "mini-wire-core-format-1",
+    "mini-wire-core-full-tests-1",
+    "mini-wire-extension-tests-3",
+    "mini-wire-extension-format-1",
+    "mini-wire-extension-host-scoped-clippy-1",
+    "mini-wire-extension-build-1",
+    "mini-wire-workspace-check-1",
+    "mini-wire-native-mini-3",
+    "mini-wire-native-mini-4",
+    "mini-wire-native-persistent-basic-1",
+    "mini-wire-native-persistent-administrative-1",
+    "mini-wire-native-persistent-errors-1",
+    "mini-wire-native-persistent-results-1"
+  ],
+  "preserved_failure_exit_codes": {
+    "mini-wire-extension-tests-1": 101,
+    "mini-wire-extension-tests-2": 101,
+    "mini-wire-extension-clippy-1": 101,
+    "mini-wire-native-mini-1": 1,
+    "mini-wire-native-mini-diagnostic-2": 1,
+    "mini-wire-final-validation-v1": 1
+  }
+}

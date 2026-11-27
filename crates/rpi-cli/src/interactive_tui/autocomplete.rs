@@ -649,9 +649,7 @@ pub(super) fn resolve_enter_completion(
         let sel = *state.autocomplete_selection.lock().unwrap();
         sel.min(popup.items.len().saturating_sub(1))
     };
-    let Some(top) = popup.items.get(index) else {
-        return None;
-    };
+    let top = popup.items.get(index)?;
     // A path completion consumes the Enter. Keep the conservative submit
     // behavior for ambiguous file matches, but let the highest-ranked
     // directory win so recursive `@dir-prefix` results can be entered in one

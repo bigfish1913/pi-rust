@@ -1324,10 +1324,10 @@ mod volatile_tests {
         events.push(AgentEvent::MessageUpdate {
             message_id: None,
             message: Arc::clone(&partial),
-            assistant_message_event: AssistantMessageEvent::TextStart {
+            assistant_message_event: Box::new(AssistantMessageEvent::TextStart {
                 content_index: 0,
                 partial,
-            },
+            }),
         });
         for delta in ["ahead", " 🐈", "", "!"] {
             if delta != "ahead" {
@@ -1339,11 +1339,11 @@ mod volatile_tests {
             events.push(AgentEvent::MessageUpdate {
                 message_id: None,
                 message: Arc::clone(&partial),
-                assistant_message_event: AssistantMessageEvent::TextDelta {
+                assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
                     content_index: 0,
                     delta: delta.into(),
                     partial,
-                },
+                }),
             });
         }
         events

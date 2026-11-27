@@ -243,22 +243,10 @@ impl RemoteDriver {
         let mut lines = client.start_event_pump(subscription_id);
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let mut session = RemoteSession::new();
             let mut mapper = RemoteEventMapper::default();
-            let mut last_error: Option<String> = None;
             while let Some(line) = lines.recv().await {
-                session.apply_line(&line);
-                let _ = tx.send(DriverEvent::Status(status_of(&session)));
-                if session.last_error != last_error {
-                    last_error = session.last_error.clone();
-                    if let Some(error) = &last_error {
-                        let _ = tx.send(DriverEvent::Notice(format!("error: {error}")));
-                    }
-                }
-                if let Ok(event) = serde_json::from_value::<RemoteEvent>(line) {
-                    if let Some(event) = mapper.map(&event) {
-                        let _ = tx.send(event);
-                    }
+                if !mapper.forward(line, &tx) {
+                    break;
                 }
             }
             let _ = tx.send(DriverEvent::Ended);
@@ -289,7 +277,18 @@ impl SessionDriver for RemoteDriver {
     }
 
     async fn send(&self, command: DriverCommand) -> Result<(), String> {
-        let remote = match command {
+        let remote = RemoteCommand::from(command);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut client = self.client.lock().await;
+        client
+            .send_command(&self.session_id, remote.with_id(id))
+            .await
+    }
+}
+
+impl From<DriverCommand> for RemoteCommand {
+    fn from(command: DriverCommand) -> Self {
+        match command {
             DriverCommand::UiDialogResponse { request_id, answer } => {
                 RemoteCommand::UiDialogResponse {
                     request_id,
@@ -303,12 +302,7 @@ impl SessionDriver for RemoteDriver {
             DriverCommand::SetModel(model) => RemoteCommand::SetModel { model },
             DriverCommand::SetThinkingLevel(level) => RemoteCommand::SetThinkingLevel { level },
             DriverCommand::SetActiveTools(tools) => RemoteCommand::SetActiveTools { tools },
-        };
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut client = self.client.lock().await;
-        client
-            .send_command(&self.session_id, remote.with_id(id))
-            .await
+        }
     }
 }
 
@@ -333,12 +327,45 @@ fn status_of(session: &RemoteSession) -> DriverStatus {
 
 /// Stateful wire-to-UI adapter used by the actual remote event pump. Keep the
 /// stateless projection below available for callers with complete snapshots.
-#[derive(Default)]
-struct RemoteEventMapper {
+pub(crate) struct RemoteEventMapper {
     messages: crate::remote::message_accumulator::MessageAccumulator,
+    session: RemoteSession,
+    last_error: Option<String>,
+}
+
+impl Default for RemoteEventMapper {
+    fn default() -> Self {
+        Self {
+            messages: Default::default(),
+            session: RemoteSession::new(),
+            last_error: None,
+        }
+    }
 }
 
 impl RemoteEventMapper {
+    pub(crate) fn forward(&mut self, line: Value, tx: &mpsc::UnboundedSender<DriverEvent>) -> bool {
+        self.session.apply_line(&line);
+        if tx
+            .send(DriverEvent::Status(status_of(&self.session)))
+            .is_err()
+        {
+            return false;
+        }
+        if self.session.last_error != self.last_error {
+            self.last_error.clone_from(&self.session.last_error);
+            if let Some(error) = &self.last_error {
+                let _ = tx.send(DriverEvent::Notice(format!("error: {error}")));
+            }
+        }
+        if let Ok(event) = serde_json::from_value::<RemoteEvent>(line) {
+            if let Some(event) = self.map(&event) {
+                let _ = tx.send(event);
+            }
+        }
+        true
+    }
+
     fn map(&mut self, event: &RemoteEvent) -> Option<DriverEvent> {
         map_remote_driver_event(&self.messages.apply(event))
     }

@@ -27,7 +27,7 @@ pub(crate) fn encode(
     else {
         return serde_json::to_vec(&project(event));
     };
-    let (index, delta, partial) = match assistant_message_event {
+    let (index, delta, partial) = match assistant_message_event.as_ref() {
         AssistantMessageEvent::TextDelta {
             content_index,
             delta,
@@ -52,7 +52,7 @@ pub(crate) fn encode(
             "delta": delta,
         });
         if matches!(
-            assistant_message_event,
+            assistant_message_event.as_ref(),
             AssistantMessageEvent::ToolCallDelta { .. }
         ) {
             if let Some(rpi_ai::Content::ToolCall(call)) = partial.content.get(*index) {
@@ -158,7 +158,7 @@ mod tests {
                 let event = AgentEvent::MessageUpdate {
                     message_id: Some("entry-\"🐈".into()),
                     message: Arc::clone(&message),
-                    assistant_message_event: event,
+                    assistant_message_event: Box::new(event),
                 };
                 let bytes = encode(&event, Snapshot).unwrap();
                 assert_eq!(
@@ -173,10 +173,15 @@ mod tests {
                     .as_object_mut()
                     .unwrap()
                     .remove("partial");
-                if let AgentEvent::MessageUpdate {
-                    assistant_message_event: AssistantMessageEvent::ToolCallDelta { partial, .. },
+                let AgentEvent::MessageUpdate {
+                    assistant_message_event,
                     ..
                 } = &event
+                else {
+                    unreachable!();
+                };
+                if let AssistantMessageEvent::ToolCallDelta { partial, .. } =
+                    assistant_message_event.as_ref()
                 {
                     let Content::ToolCall(call) = &partial.content[2] else {
                         panic!("tool")
@@ -222,7 +227,7 @@ mod tests {
                                 &AgentEvent::MessageUpdate {
                                     message_id: Some("entry-\"🐈".into()),
                                     message: message.clone(),
-                                    assistant_message_event: delta,
+                                    assistant_message_event: Box::new(delta),
                                 },
                                 mode,
                             )
@@ -318,7 +323,7 @@ mod tests {
                 .map(|assistant_message_event| AgentEvent::MessageUpdate {
                     message_id: Some("entry-\"🐈".into()),
                     message: message.clone(),
-                    assistant_message_event,
+                    assistant_message_event: Box::new(assistant_message_event),
                 })
                 .collect();
             events.extend([

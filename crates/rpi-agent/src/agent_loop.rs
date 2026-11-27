@@ -2,9 +2,9 @@
 //!
 //! Two public free functions, [`run_agent_loop`] (new prompt) and
 //! [`run_agent_loop_continue`] (no new prompt), drive the outer follow-up loop
-//! and inner steering+tool loop. The only LLM boundary is [`StreamFn`]
-//! (sync return → `AssistantMessageEventStream`); everything else talks in
-//! [`AgentMessage`].
+//! and inner steering+tool loop. The LLM boundary is [`StreamSource`], supporting
+//! the original synchronous [`StreamFn`] and borrowed asynchronous opening;
+//! everything else talks in [`AgentMessage`].
 //!
 //! Critical invariants enforced here (plan §5):
 //! - **Tool-execution ordering**: in a parallel batch, `ToolExecutionEnd` fires
@@ -25,7 +25,7 @@ use crate::error::AgentError;
 use crate::events::{AgentEmitter, AgentEvent};
 use crate::hooks::AgentLoopConfig;
 use crate::message::AgentMessage;
-use crate::stream_fn::StreamFn;
+use crate::stream_fn::{StreamFn, StreamSource};
 use crate::types::{
     AfterToolCallContext, AgentContext, AgentToolResult, BeforeToolCallContext, TextContentOrImage,
     ToolExecutionMode,
@@ -87,6 +87,18 @@ pub async fn run_agent_loop(
     emit: Arc<dyn AgentEmitter>,
     stream_fn: StreamFn,
 ) -> Result<NewMessages, AgentError> {
+    run_agent_loop_with_stream(prompts, context, config, emit, stream_fn.into()).await
+}
+
+/// Run a new prompt with either the synchronous compatibility factory or a
+/// native async factory. Otherwise identical to [`run_agent_loop`].
+pub async fn run_agent_loop_with_stream(
+    prompts: Vec<AgentMessage>,
+    context: AgentContext,
+    config: AgentLoopConfig,
+    emit: Arc<dyn AgentEmitter>,
+    stream_fn: StreamSource,
+) -> Result<NewMessages, AgentError> {
     let mut new_messages: Vec<AgentMessage> = prompts.clone();
     // The caller transferred ownership. Only prompts need a separate copy for
     // the returned additions; the existing history can move into the loop.
@@ -135,6 +147,16 @@ pub async fn run_agent_loop_continue(
     emit: Arc<dyn AgentEmitter>,
     stream_fn: StreamFn,
 ) -> Result<NewMessages, AgentError> {
+    run_agent_loop_continue_with_stream(context, config, emit, stream_fn.into()).await
+}
+
+/// Continue with either stream-opening contract; see [`run_agent_loop_continue`].
+pub async fn run_agent_loop_continue_with_stream(
+    context: AgentContext,
+    config: AgentLoopConfig,
+    emit: Arc<dyn AgentEmitter>,
+    stream_fn: StreamSource,
+) -> Result<NewMessages, AgentError> {
     if context.messages.is_empty() {
         return Err(AgentError::State(
             "cannot continue: no messages in context".into(),
@@ -180,6 +202,17 @@ pub async fn run_agent_loop_from_assistant(
     config: AgentLoopConfig,
     emit: Arc<dyn AgentEmitter>,
     stream_fn: StreamFn,
+) -> Result<NewMessages, AgentError> {
+    run_agent_loop_from_assistant_with_stream(context, config, emit, stream_fn.into()).await
+}
+
+/// Resume unanswered assistant tools with either opening contract. Tools run
+/// before opening a provider, as in [`run_agent_loop_from_assistant`].
+pub async fn run_agent_loop_from_assistant_with_stream(
+    context: AgentContext,
+    config: AgentLoopConfig,
+    emit: Arc<dyn AgentEmitter>,
+    stream_fn: StreamSource,
 ) -> Result<NewMessages, AgentError> {
     let mut current_context = context;
     let Some(AgentMessage::Assistant(assistant)) = current_context.messages.last().cloned() else {
@@ -230,7 +263,7 @@ async fn run_loop(
     new_messages: &mut Vec<AgentMessage>,
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
-    stream_fn: &StreamFn,
+    stream_fn: &StreamSource,
     // `pending_assistant`: an assistant message already sitting at the end of
     // `current_context` whose tool calls have not run yet (see
     // `run_agent_loop_from_assistant`). When set, the first iteration executes its
@@ -653,13 +686,13 @@ async fn stream_assistant_response(
     config: &AgentLoopConfig,
     provider_cache: &mut ProviderMessageCache,
     emit: &Arc<dyn AgentEmitter>,
-    stream_fn: &StreamFn,
+    stream_fn: &StreamSource,
 ) -> Result<AssistantMessage, AgentError> {
     let mut diagnostics =
         AssistantRequestDiagnostics::new(context.messages.len(), context.tools.len());
     // The incremental path owns the converted provider messages between turns.
-    // Moving them into `Context` avoids cloning the full provider history; the
-    // synchronous stream factory cannot retain the borrowed context.
+    // Moving them into `Context` avoids cloning the full provider history.
+    // Neither factory form may retain the borrowed context after opening.
     let cached_messages = provider_cache.take_messages(context, config);
     let cache_enabled =
         config.transform_context.is_none() && config.convert_to_llm_incremental.is_some();
@@ -719,7 +752,7 @@ async fn stream_assistant_response(
 
     let opts = config.to_stream_options(resolved_api_key);
     let stream_open_started = diagnostics.enabled.then(Instant::now);
-    let mut response = stream_fn(&config.model, &llm_context, &opts);
+    let mut response = stream_fn.open(&config.model, &llm_context, &opts).await;
     if cache_enabled {
         provider_cache.source_len = context.messages.len();
         provider_cache.restore_messages(std::mem::take(&mut llm_context.messages));
@@ -791,7 +824,7 @@ async fn stream_assistant_response(
                                 // streaming delta, and the provider already built the
                                 // snapshot it hands us.
                                 message: Arc::clone(partial),
-                                assistant_message_event: event,
+                                assistant_message_event: Box::new(event),
                             },
                         )
                         .await;
@@ -821,7 +854,9 @@ async fn stream_assistant_response(
                         .await;
                 }
                 if let Some(hooks) = &config.provider_hooks {
-                    hooks.after_response(&config.model, &final_message);
+                    hooks
+                        .after_response_async(&config.model, &final_message)
+                        .await;
                 }
                 diagnostics
                     .emit_agent_event(
@@ -866,7 +901,9 @@ async fn stream_assistant_response(
             .await;
     }
     if let Some(hooks) = &config.provider_hooks {
-        hooks.after_response(&config.model, &final_message);
+        hooks
+            .after_response_async(&config.model, &final_message)
+            .await;
     }
     diagnostics
         .emit_agent_event(
@@ -917,7 +954,7 @@ async fn reject_ambiguous_tool_batch(
 
 /// Fail every tool call in a truncated message. Mirrors TS
 /// `failToolCallsFromTruncatedMessage`. Each call gets a `tool_execution_start`
-/// + `tool_execution_end` (is_error:true) + tool-result `MessageStart`/`End`,
+/// and `tool_execution_end` (is_error:true), plus tool-result `MessageStart`/`End`,
 /// but is *not* executed.
 async fn fail_tool_calls_from_truncated_message(
     tool_calls: &[ToolCall],
@@ -1709,25 +1746,22 @@ async fn finalize_tool_call(
             is_error,
             context: current_context,
         };
-        match after(ctx, config.signal.clone()).await {
-            Some(after_result) => {
-                if let Some(c) = after_result.content {
-                    result.content = c;
-                }
-                if let Some(d) = after_result.details {
-                    result.details = d;
-                }
-                if let Some(u) = after_result.usage {
-                    result.usage = Some(u);
-                }
-                if let Some(t) = after_result.terminate {
-                    result.terminate = t;
-                }
-                if let Some(ie) = after_result.is_error {
-                    is_error = ie;
-                }
+        if let Some(after_result) = after(ctx, config.signal.clone()).await {
+            if let Some(c) = after_result.content {
+                result.content = c;
             }
-            None => {}
+            if let Some(d) = after_result.details {
+                result.details = d;
+            }
+            if let Some(u) = after_result.usage {
+                result.usage = Some(u);
+            }
+            if let Some(t) = after_result.terminate {
+                result.terminate = t;
+            }
+            if let Some(ie) = after_result.is_error {
+                is_error = ie;
+            }
         }
     }
 

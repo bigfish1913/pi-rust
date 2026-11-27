@@ -41,12 +41,15 @@ async fn request_body(socket: &mut tokio::net::TcpStream) -> Value {
     serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap()
 }
 
-/// A one-request fixture provider: captures the request body, answers with a
-/// plain stop frame.
-async fn serve_one_request(listener: Arc<tokio::net::TcpListener>, bodies: Arc<Mutex<Vec<Value>>>) {
+async fn serve_response(
+    listener: &tokio::net::TcpListener,
+    delta: Value,
+    finish_reason: &str,
+) -> Value {
     let (mut socket, _) = listener.accept().await.unwrap();
     let body = request_body(&mut socket).await;
-    let frame = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let chunk = json!({"choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]});
+    let frame = format!("data: {chunk}\n\ndata: [DONE]\n\n");
     socket
         .write_all(
             format!(
@@ -58,6 +61,11 @@ async fn serve_one_request(listener: Arc<tokio::net::TcpListener>, bodies: Arc<M
         .await
         .unwrap();
     socket.write_all(frame.as_bytes()).await.unwrap();
+    body
+}
+
+async fn serve_one_request(listener: Arc<tokio::net::TcpListener>, bodies: Arc<Mutex<Vec<Value>>>) {
+    let body = serve_response(&listener, json!({"content": "ok."}), "stop").await;
     bodies.lock().unwrap().push(body);
 }
 
@@ -124,7 +132,6 @@ async fn run_rpi(
             "--no-skills",
             "--no-prompt-templates",
             "--no-context-files",
-            "--no-builtin-tools",
             "--provider",
             "fixture",
             "--model",
@@ -151,7 +158,7 @@ async fn run_rpi(
 }
 
 #[tokio::test]
-async fn mini_uses_in_process_context_without_opening_a_session() {
+async fn mini_keeps_context_and_honors_an_explicit_tool_list_without_saving() {
     let fixture = start_fixture().await;
     let cwd = fixture.root.path().join("session-cwd-project");
     let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -163,38 +170,27 @@ async fn mini_uses_in_process_context_without_opening_a_session() {
         }
     });
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_rpi"))
-            .current_dir(&cwd)
-            .env("RPI_CODING_AGENT_DIR", &fixture.agent)
-            .env("RPI_CODING_AGENT_SESSION_DIR", &fixture.sessions)
-            .env("NO_PROXY", "127.0.0.1")
-            .args([
-                "--mini",
-                "--offline",
-                "--provider",
-                "fixture",
-                "--model",
-                "reasoner",
-                "--system-prompt",
-                "mini system",
-                "--tools",
-                "read,durable",
-                "first",
-                "second",
-                "third",
-            ])
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+    let (status, stdout, stderr) = run_rpi(
+        &fixture,
+        &cwd,
+        &[
+            "--mini",
+            "--system-prompt",
+            "mini system",
+            "--tools",
+            "read,durable",
+            "first",
+            "second",
+        ],
+        "third",
     )
-    .await
-    .expect("mini should finish all prompts")
-    .unwrap();
-    assert!(output.status.success(), "{:?}", output);
-    assert_eq!(output.stdout, b"ok.\n");
-    server.await.unwrap();
+    .await;
+    assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "ok.\n");
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("the provider should receive all three prompts")
+        .unwrap();
 
     let bodies = bodies.lock().unwrap();
     let request = &bodies[2];
@@ -212,6 +208,128 @@ async fn mini_uses_in_process_context_without_opening_a_session() {
     assert_eq!(tools[0]["function"]["name"], "read");
     assert!(fixture.sessions.read_dir().unwrap().next().is_none());
     assert!(!cwd.join(".rpi/sessions").exists());
+}
+
+#[tokio::test]
+async fn mini_runs_default_tools_and_compacts_context_without_saving() {
+    let fixture = start_fixture().await;
+    let cwd = fixture.root.path().join("session-cwd-project");
+    std::fs::write(cwd.join("notes.txt"), "content returned by read").unwrap();
+    std::fs::write(
+        fixture.agent.join("settings.json"),
+        json!({"compaction": {"reserveTokens": 130000, "keepRecentTokens": 1}}).to_string(),
+    )
+    .unwrap();
+
+    let listener = fixture.listener.clone();
+    let server = tokio::spawn(async move {
+        let initial = serve_response(
+            &listener,
+            json!({"tool_calls": [{
+                "index": 0, "id": "read-notes", "type": "function",
+                "function": {"name": "read", "arguments": "{\"path\":\"notes.txt\"}"}
+            }]}),
+            "tool_calls",
+        )
+        .await;
+        let after_tool = serve_response(
+            &listener,
+            json!({"content": "old conversation detail ".repeat(500)}),
+            "stop",
+        )
+        .await;
+        let summary =
+            serve_response(&listener, json!({"content": "compressed history"}), "stop").await;
+        let after_compaction = serve_response(&listener, json!({"content": "ok."}), "stop").await;
+        (initial, after_tool, summary, after_compaction)
+    });
+
+    let (status, stdout, stderr) = run_rpi(
+        &fixture,
+        &cwd,
+        &["--mini", "inspect notes"],
+        "next question",
+    )
+    .await;
+    assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "ok.\n");
+    let (initial, after_tool, summary, after_compaction) = server.await.unwrap();
+    let tools = initial["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["function"]["name"] == "read"));
+    assert!(tools.iter().any(|tool| tool["function"]["name"] == "write"));
+    assert!(!tools
+        .iter()
+        .any(|tool| tool["function"]["name"] == "durable"));
+    assert!(after_tool["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| {
+            message["role"] == "tool"
+                && message["tool_call_id"] == "read-notes"
+                && message["content"]
+                    .to_string()
+                    .contains("content returned by read")
+        }));
+    assert!(summary["messages"]
+        .to_string()
+        .contains("old conversation detail"));
+    let messages = after_compaction["messages"].to_string();
+    assert!(messages.contains("compressed history") && messages.contains("next question"));
+    assert!(!messages.contains("old conversation detail"));
+    assert!(fixture.sessions.read_dir().unwrap().next().is_none());
+    assert!(!cwd.join(".rpi/sessions").exists());
+}
+
+#[tokio::test]
+async fn mini_rpc_rejects_durable_mutation_without_saving() {
+    let fixture = start_fixture().await;
+    let cwd = fixture.root.path().join("session-cwd-project");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rpi"))
+        .current_dir(&cwd)
+        .env("RPI_CODING_AGENT_DIR", &fixture.agent)
+        .env("RPI_CODING_AGENT_SESSION_DIR", &fixture.sessions)
+        .args([
+            "--mini",
+            "--native-durable",
+            "--mode",
+            "rpc",
+            "--offline",
+            "--no-extensions",
+            "--provider",
+            "fixture",
+            "--model",
+            "reasoner",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(
+            br#"{"type":"durable_mutate","id":1,"version":1,"requestId":"mini-test","action":{"action":"start","name":"test","steps":[{"id":"only","title":"Only step"}]}}
+"#,
+        )
+        .await
+        .unwrap();
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+        .await
+        .expect("mini RPC should finish at EOF")
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let output_text = String::from_utf8(output.stdout).unwrap();
+    let messages: Vec<Value> = output_text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(messages[0]["durable"]["enabled"], false, "{output_text}");
+    let response = messages.iter().find(|message| message["id"] == 1).unwrap();
+    assert_eq!(response["errorDetails"]["code"], "disabled", "{response}");
+    assert!(fixture.sessions.read_dir().unwrap().next().is_none());
 }
 
 /// A session created in `project-a` and resumed (`-c`) from a different

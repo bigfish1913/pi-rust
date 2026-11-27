@@ -156,6 +156,7 @@ impl NativePackageMutationLock {
         let lock_path = parent.join(NATIVE_PACKAGES_LOCK_FILE);
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)

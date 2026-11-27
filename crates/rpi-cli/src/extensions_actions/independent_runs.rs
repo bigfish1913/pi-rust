@@ -31,9 +31,19 @@ fn now_ms() -> u64 {
 
 #[derive(Default)]
 pub(super) struct IndependentRuns {
-    jobs: Mutex<HashMap<String, Arc<Job>>>,
-    revoked: Mutex<HashSet<u64>>,
+    jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
+    revoked: Arc<Mutex<HashSet<u64>>>,
     active: Arc<AtomicUsize>,
+    tasks: crate::host::cli_tasks::CliTaskScope,
+}
+
+// Owned preparation holds the shared registry state and its own admission.
+struct RunPreparation {
+    jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
+    revoked: Arc<Mutex<HashSet<u64>>>,
+    active: Arc<AtomicUsize>,
+    admission: crate::host::cli_tasks::CliTaskAdmission,
+    signal: CancellationToken,
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -106,9 +116,13 @@ impl Job {
             match event {
                 AgentEvent::TurnEnd { .. } => state.turns += 1,
                 AgentEvent::MessageUpdate {
-                    assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
+                    assistant_message_event,
                     ..
                 } => {
+                    let AssistantMessageEvent::TextDelta { delta, .. } = *assistant_message_event
+                    else {
+                        return;
+                    };
                     if state.bytes.saturating_add(delta.len()) > MAX_OUTPUT
                         || state.events >= MAX_EVENTS
                     {
@@ -143,11 +157,21 @@ impl AgentEmitter for Emitter {
 
 impl Drop for IndependentRuns {
     fn drop(&mut self) {
-        self.cancel_all();
+        self.begin_shutdown();
     }
 }
 
 impl IndependentRuns {
+    pub(crate) fn begin_shutdown(&self) {
+        self.tasks.seal();
+        self.cancel_all();
+    }
+
+    #[allow(dead_code)] // Staged until the CLI's complete resource owner is wired.
+    pub(crate) async fn wait_shutdown(&self) -> Result<(), String> {
+        self.tasks.wait().await
+    }
+
     pub(crate) fn cancel_owner(&self, owner: u64) {
         self.revoked
             .lock()
@@ -325,6 +349,32 @@ impl IndependentRuns {
         owner: u64,
         request: Start,
     ) -> Result<Value, String> {
+        let preparation = RunPreparation {
+            jobs: self.jobs.clone(),
+            revoked: self.revoked.clone(),
+            active: self.active.clone(),
+            admission: self.tasks.admit()?,
+            signal: self.tasks.signal(),
+        };
+        self.tasks
+            .call(Self::prepare_start(
+                preparation,
+                parent.clone(),
+                owner,
+                request,
+            ))
+            .await?
+    }
+
+    async fn prepare_start(
+        preparation: RunPreparation,
+        parent: AgentHarness,
+        owner: u64,
+        request: Start,
+    ) -> Result<Value, String> {
+        if preparation.signal.is_cancelled() {
+            return Err("native auxiliary resources are retiring".into());
+        }
         let invocation_signal = rpi_agent::tool_execution_scope::invocation_signal();
         if invocation_signal
             .as_ref()
@@ -342,7 +392,7 @@ impl IndependentRuns {
         let id = parent.session().id_generator().next();
         let job = Arc::new(Job {
             owner,
-            cancel: CancellationToken::new(),
+            cancel: preparation.signal.child_token(),
             invocation_signal,
             state: Mutex::new(State {
                 started_ms: now_ms(),
@@ -353,20 +403,27 @@ impl IndependentRuns {
         // Reserve before awaiting construction so concurrent starts cannot exceed the cap.
         let permit;
         {
-            let revoked = self.revoked.lock().unwrap_or_else(|e| e.into_inner());
+            let revoked = preparation
+                .revoked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if revoked.contains(&owner) {
                 return Err("owning plugin unloaded".into());
             }
-            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut jobs = preparation.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            // Serialize publication with shutdown's cancellation sweep.
+            if preparation.signal.is_cancelled() {
+                return Err("native auxiliary resources are retiring".into());
+            }
             if jobs.len() >= MAX_JOBS {
                 return Err("child capacity reached; dispose finished children".into());
             }
-            let mut active = self.active.load(Ordering::Acquire);
+            let mut active = preparation.active.load(Ordering::Acquire);
             loop {
                 if active >= MAX_JOBS {
                     return Err("child cleanup still in progress; retry later".into());
                 }
-                match self.active.compare_exchange_weak(
+                match preparation.active.compare_exchange_weak(
                     active,
                     active + 1,
                     Ordering::AcqRel,
@@ -376,7 +433,7 @@ impl IndependentRuns {
                     Err(current) => active = current,
                 }
             }
-            permit = Permit(self.active.clone());
+            permit = Permit(preparation.active.clone());
             jobs.insert(id.clone(), job.clone());
         }
         let session = Session::new(
@@ -402,7 +459,8 @@ impl IndependentRuns {
         let child = match created {
             Ok(child) => child,
             Err(error) => {
-                self.jobs
+                preparation
+                    .jobs
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&id);
@@ -412,20 +470,33 @@ impl IndependentRuns {
         let worker = job.clone();
         let execution_scope = child.execution_scope.clone();
         let cleanup_harness = child.harness.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if std::panic::AssertUnwindSafe(run_child(child, worker.clone(), input, turns, timeout))
+        let settlement = preparation.admission.clone();
+        preparation
+            .admission
+            .spawn(&tokio::runtime::Handle::current(), async move {
+                let _permit = permit;
+                match std::panic::AssertUnwindSafe(run_child(
+                    child,
+                    worker.clone(),
+                    input,
+                    turns,
+                    timeout,
+                ))
                 .catch_unwind()
                 .await
-                .is_err()
-            {
-                worker.fail("child runner panicked");
-                let _ = cleanup_harness.close().await;
-            }
-            // Also retain capacity when run_child unwinds after starting a
-            // background driver; catch_unwind is not a cleanup completion.
-            execution_scope.wait_idle().await;
-        });
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => settlement.mark_unknown(),
+                    Err(_) => {
+                        worker.fail("child runner panicked");
+                        if cleanup_harness.close().await.is_err() {
+                            settlement.mark_unknown();
+                        }
+                    }
+                }
+                // Keep the permit until any background driver has exited.
+                execution_scope.wait_idle().await;
+            });
         Ok(json!({"runId":id,"sessionId":id,"status":"running"}))
     }
 }
@@ -467,7 +538,13 @@ fn parse_tools(args: &Value) -> Result<Option<Vec<String>>, String> {
         .map_err(str::to_owned)
 }
 
-async fn run_child(child: ChildHarness, job: Arc<Job>, prompt: String, turns: u32, timeout: u64) {
+async fn run_child(
+    child: ChildHarness,
+    job: Arc<Job>,
+    prompt: String,
+    turns: u32,
+    timeout: u64,
+) -> Result<(), String> {
     let lane = child.harness.lane("main");
     let run = lane.prompt_text(&prompt, Vec::new());
     tokio::pin!(run);
@@ -523,7 +600,11 @@ async fn run_child(child: ChildHarness, job: Arc<Job>, prompt: String, turns: u3
         let _ = child.harness.close().await;
         let _ = tokio::time::timeout(Duration::from_secs(2), &mut run).await;
     }
-    let _ = child.harness.close().await;
+    child
+        .harness
+        .close()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
