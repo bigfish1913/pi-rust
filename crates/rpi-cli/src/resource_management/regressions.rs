@@ -157,6 +157,7 @@ fn oversized_success_is_rejected_before_commit_with_previous_state_intact() {
         kind: Kind::Skill,
         name: "demo".into(),
         source: fs::canonicalize(&source).unwrap(),
+        release: None,
         version: None,
         target: Kind::Skill.target("demo"),
         inventory: inv.clone(),

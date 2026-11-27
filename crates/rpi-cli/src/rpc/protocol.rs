@@ -56,6 +56,11 @@ pub enum Command {
         #[serde(rename = "requestId")]
         request_id: String,
     },
+    ListPackageCommands,
+    InvokePackageCommand {
+        command: String,
+        args: Option<serde_json::Map<String, Value>>,
+    },
     /// List extension slash commands (name and description).
     GetCommands,
     /// Invoke an extension handler and return its JSON result as response data.
@@ -296,6 +301,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_durable_runs",
     "get_state",
     "get_commands",
+    "list_package_commands",
+    "invoke_package_command",
     "execute_command",
     "get_tool_program_branch",
     "get_messages",

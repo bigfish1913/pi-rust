@@ -727,6 +727,7 @@ where
             return 1;
         }
     };
+    let package_commands = crate::resource_selection::package_commands(harness);
     let mut ready = rpc_protocol::ready(message_updates);
     // Advertise active semantics, not merely support. Legacy clients must not
     // receive autonomous settlements that can clear another request's admission.
@@ -1021,7 +1022,22 @@ where
                 .await;
                 break;
             }
-            "prompt" | "resume_pending" | "compact" => {
+            "prompt" | "resume_pending" | "compact" | "invoke_package_command" => {
+                let msg = if kind == "invoke_package_command" {
+                    match package_commands.render(&msg) {
+                        Ok(prompt) => serde_json::json!({"type":"prompt", "message":prompt}),
+                        Err(error) => {
+                            write_line(
+                                &stdout,
+                                &rpc_protocol::response(Some(id), &kind, Err(error)),
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                } else {
+                    msg
+                };
                 let resume = kind == "resume_pending";
                 let compact = kind == "compact";
                 if run_active.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -1317,6 +1333,7 @@ where
                 }
             }
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
+            "list_package_commands" => Ok(package_commands.list()),
             "get_commands" => {
                 let mut data = rpc_get_commands(oauth_snapshot.as_deref());
                 if native_durable {

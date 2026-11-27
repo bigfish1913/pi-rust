@@ -280,6 +280,7 @@ fn bounded_input_depth_width_receipts_and_next_state_do_not_publish_invalid_inst
             target: Kind::Skill.target(&name),
             name,
             source: source.clone(),
+            release: None,
             version: None,
             inventory: inv.clone(),
         });
