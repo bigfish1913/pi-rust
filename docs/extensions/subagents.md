@@ -1,8 +1,28 @@
 # 宿主管理的子 agent
 
-扩展通过 `RuntimeActionId::GetExecutionContext` 和 `ChildAgent` 创建独立任务。
-这两个 action 追加在现有 ABI 后面，不改变 `PluginApi` vtable 的布局。
-旧宿主对未知 action 返回明确错误；不要静默改为使用默认配置的子进程。
+扩展可通过 `IndependentRun`（33）在独立的内存会话中运行输入，并消费进度和结果。
+`ChildAgent`（24）保留为已发布扩展的兼容入口。两种 action 共用宿主运行和清理机制，
+无需修改 `PluginApi` vtable。
+
+## IndependentRun
+
+```json
+{"op":"start","input":"检查 parser 并汇报结果。","maxTurns":8,"timeoutSeconds":300,"tools":["read"]}
+{"op":"poll","runId":"opaque-id"}
+{"op":"cancel","runId":"opaque-id"}
+{"op":"dispose","runId":"opaque-id"}
+```
+
+- `input` 为提交给独立会话的文本，限 1–24,000 UTF-8 bytes。调用方负责组装内容。
+- `maxTurns`（1–32）和 `timeoutSeconds`（10–1800）必填。可选的 `tools` 只能缩小
+  父会话的活动工具集合，省略时继承该集合。`[]` 表示无工具。
+- `start` 返回 `runId`、独立 `sessionId` 和 `status: running`。`poll` 消费有界的文本
+  `deltas`，并返回 `running`、`done` 或 `failed`。`done` 时检查 `result.status`、
+  `result.text` 和 `result.turnLimited`。所有终态都应调用 `dispose`。
+- 通过当前顶层工具调用认证。父调用结束或取消会触发清理，子运行不能启动嵌套运行。
+  新版 `delegate_task` 在扩展端从工具集合中排除自己，并负责提示词和报告格式。
+- 新扩展可以在宿主返回 ABI 状态码 `2` 并报告未知 action ID 时使用旧入口。
+  其他错误可能来自已接收的运行，不能据此重试启动。
 
 ## 有效执行上下文
 
@@ -14,18 +34,17 @@
   "thinkingLevel":"high",
   "tools":["read","bash","delegate_task"],
   "cwd":"D:/Projects/example",
-  "sessionId":"parent-session-id",
-  "childAgent":true
+  "sessionId":"parent-session-id"
 }
 ```
 
 这不是 CLI flags 的副本。交互切换模型或 thinking 后，读取的是有效状态。
 公开对象不包含 API key、认证头、endpoint、原始 Model 或 provider binding。
-`childAgent` 表示当前 harness 是否允许创建子任务；并非资源可用性探测或启动保证。
+宿主基于当前工具调用的身份检查委派权限。
 
-## 生命周期
+## 调用与清理
 
-`ChildAgent`（24）使用 `op` 分派。插件应从工作线程调用同步 ABI，不能在
+两个 action 均使用 `op` 分派。插件应从工作线程调用同步 ABI，不能在
 单线程 Tokio executor 内同步等待宿主 action。所有结果字符串由宿主的
 `free_string` 释放。
 
@@ -39,14 +58,14 @@
 - 同步 execute/poll/cancel/destroy 内调用 action 时，宿主自动使用当前 driver 的
   invocation，插件不能通过注册时缓存的上下文把 child 调用冒充为父调用。
 - 插件自行创建的工作线程必须用该次 `runtimeHandle` 作为 runtime_action 的
-  `user_data`，并在每个 ChildAgent 参数对象中添加 `__rpiRuntimeKey: runtimeKey`。
+  `user_data`，并在每个运行 action 的参数对象中添加 `__rpiRuntimeKey: runtimeKey`。
   以下 op 示例省略此字段；宿主校验后将它移除，不传递给业务 action。
-- ChildAgent 拒绝仅注册级、已取消、失效或 child-originated invocation，
+- 两种入口拒绝仅注册级、已取消、失效或 child-originated invocation，
   无论工具叫 `delegate_task` 还是其他别名。缺少这些能力时明确提示升级，不回退。
 - 注册实例的裸指针不能保存在插件全局状态中。可缓存进程级函数指针，但每次
   工作线程必须绑定本次调用的 handle；候选 reload 回退不影响旧会话的绑定。
 
-### start
+### 旧 `ChildAgent` 的 start
 
 ```json
 {"op":"start","task":"检查 parser","role":"reviewer","maxTurns":8,"timeoutSeconds":300,"tools":["read"]}
@@ -63,7 +82,7 @@
 立即返回 `{"childId":"opaque-id","sessionId":"child-session-id","status":"running"}`。
 父 lane 正在执行工具时也能启动，不会重入父 lane。
 
-### poll
+### 旧 `ChildAgent` 的 poll
 
 ```json
 {"op":"poll","childId":"opaque-id"}
@@ -79,7 +98,7 @@
 `done` 只表示生命周期结束，不等于任务成功。`turnLimited` 表示到达回合预算，
 报告可能不完整。运行失败、取消、超时和输出超限都有明确诊断。
 
-### cancel / dispose
+### 旧 `ChildAgent` 的 cancel / dispose
 
 ```json
 {"op":"cancel","childId":"opaque-id"}

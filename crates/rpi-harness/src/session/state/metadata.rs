@@ -1,14 +1,17 @@
 //! Small, typed facts derived from a validated entry; never a placeholder Entry.
 use crate::session::types::{is_tool_program_body_type, Entry, EntryOrder, EntryQuery};
 use rpi_agent::message::{AgentMessage, AgentMessageRole};
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct EntryMeta {
-    pub(crate) kind: &'static str,
+    pub(crate) kind: Cow<'static, str>,
     pub(crate) id: String,
     pub(crate) parent_id: Option<String>,
     pub(crate) seq: u64,
     pub(crate) timestamp: i64,
+    #[serde(with = "checkpoint_role")]
     pub(crate) role: Option<AgentMessageRole>,
     pub(crate) custom_type: Option<String>,
     pub(crate) message_timestamp: Option<i64>,
@@ -27,7 +30,7 @@ pub(crate) struct EntryMeta {
 impl EntryMeta {
     pub(crate) fn from_entry(entry: &Entry) -> Self {
         let mut meta = Self {
-            kind: entry.entry_type(),
+            kind: Cow::Borrowed(entry.entry_type()),
             id: entry.id().into(),
             parent_id: entry.parent_id().map(str::to_owned),
             seq: entry.seq(),
@@ -91,7 +94,7 @@ impl EntryMeta {
         matches!(self.role, Some(AgentMessageRole::User))
     }
     pub(crate) fn is_transcript(&self) -> bool {
-        matches!(self.kind, "message" | "compaction")
+        matches!(self.kind.as_ref(), "message" | "compaction")
     }
 
     /// Only reject using facts actually in the index. Tool/outbox predicates
@@ -119,5 +122,45 @@ impl EntryMeta {
                     self.role,
                     Some(AgentMessageRole::User | AgentMessageRole::Assistant)
                 ))
+    }
+}
+
+mod checkpoint_role {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    #[derive(Deserialize, Serialize)]
+    enum Role<'a> {
+        User,
+        Assistant,
+        ToolResult,
+        Custom(Cow<'a, str>),
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        role: &Option<AgentMessageRole>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        role.as_ref()
+            .map(|role| match role {
+                AgentMessageRole::User => Role::User,
+                AgentMessageRole::Assistant => Role::Assistant,
+                AgentMessageRole::ToolResult => Role::ToolResult,
+                AgentMessageRole::Custom(name) => Role::Custom(Cow::Borrowed(name)),
+            })
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<AgentMessageRole>, D::Error> {
+        Ok(
+            Option::<Role>::deserialize(deserializer)?.map(|role| match role {
+                Role::User => AgentMessageRole::User,
+                Role::Assistant => AgentMessageRole::Assistant,
+                Role::ToolResult => AgentMessageRole::ToolResult,
+                Role::Custom(name) => AgentMessageRole::Custom(name.into_owned()),
+            }),
+        )
     }
 }

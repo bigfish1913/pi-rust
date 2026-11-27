@@ -52,6 +52,8 @@ use tokio::runtime::Handle;
 
 use crate::session::{default_session_dir, open_session_by_id_in_dir};
 
+mod independent_runs;
+
 /// Merge built-in / extension / prompt-template commands into the
 /// `ListCommands` payload.
 ///
@@ -155,7 +157,7 @@ pub struct HarnessActionHost {
     /// tool state keyed off the old id would otherwise keep serving the session
     /// it named before the swap.
     tool_context: rpi_extensions::ToolCallContext,
-    children: crate::child_agents::ChildAgents,
+    independent_runs: independent_runs::IndependentRuns,
     side_questions: crate::side_questions::SideQuestions,
     #[allow(dead_code)]
     runtime: Handle,
@@ -195,7 +197,7 @@ impl HarnessActionHost {
                 cwd,
                 cli_flags,
                 tool_context,
-                children: crate::child_agents::ChildAgents::default(),
+                independent_runs: independent_runs::IndependentRuns::default(),
                 side_questions: crate::side_questions::SideQuestions::default(),
                 runtime,
                 registry: std::sync::RwLock::new(None),
@@ -208,14 +210,14 @@ impl HarnessActionHost {
     // This is the native auxiliary domain, NOT an OS process cleanup receipt.
     #[allow(dead_code)] // Default CLI Host factory is not wired yet.
     pub(crate) fn begin_auxiliary_shutdown(&self) {
-        self.children.begin_shutdown();
+        self.independent_runs.begin_shutdown();
         self.side_questions.begin_shutdown();
     }
 
     #[allow(dead_code)]
     pub(crate) async fn wait_auxiliary_shutdown(&self) -> Result<(), String> {
         let (children, questions) = tokio::join!(
-            self.children.wait_shutdown(),
+            self.independent_runs.wait_shutdown(),
             self.side_questions.wait_shutdown(),
         );
         children.and(questions)
@@ -587,13 +589,13 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     fn cancel_child_agents(&self, owner: u64) {
-        self.children.cancel_owner(owner);
+        self.independent_runs.cancel_owner(owner);
     }
     fn child_agent_roster(&self) -> Vec<serde_json::Value> {
-        self.children.roster()
+        self.independent_runs.roster()
     }
     fn stop_child_agent(&self, child_id: &str) -> Result<serde_json::Value, String> {
-        self.children.stop(child_id)
+        self.independent_runs.stop(child_id)
     }
     fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
         self.set_catalog(models);
@@ -703,7 +705,7 @@ impl RuntimeActionHost for HarnessActionHost {
         let harness = self.harness()?;
         let mut context = harness.execution_context().map_err(|e| e.to_string())?;
         if let Some(serde_json::Value::Object(child)) =
-            rpi_agent::tool_execution_scope::execution_context()
+            rpi_agent::tool_execution_scope::public_execution_context()
         {
             context
                 .as_object_mut()
@@ -724,10 +726,29 @@ impl RuntimeActionHost for HarnessActionHost {
             return Err("recursive child agents are not allowed".into());
         }
         if args.get("op").and_then(serde_json::Value::as_str) == Some("start") {
-            self.children.handle(&self.harness()?, owner, args).await
+            self.independent_runs
+                .start_child(&self.harness()?, owner, &args)
+                .await
         } else {
             // Reclamation must remain possible after the parent was dropped.
-            self.children.handle_existing(owner, args)
+            self.independent_runs.handle_child(owner, &args)
+        }
+    }
+
+    async fn independent_run(
+        &self,
+        owner: u64,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        if rpi_agent::tool_execution_scope::is_child_execution() {
+            return Err("nested independent runs are not allowed".into());
+        }
+        if args.get("op").and_then(serde_json::Value::as_str) == Some("start") {
+            self.independent_runs
+                .start_run(&self.harness()?, owner, &args)
+                .await
+        } else {
+            self.independent_runs.handle_run(owner, &args)
         }
     }
 

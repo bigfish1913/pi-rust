@@ -17,6 +17,11 @@ use thiserror::Error;
 
 use rpi_plugin_sdk::{RpiPluginRegisterUnified, RPI_PLUGIN_ABI_VERSION_UNIFIED};
 
+#[cfg(unix)]
+mod shared_images;
+#[cfg(unix)]
+pub use shared_images::SharedPluginImages;
+
 use crate::cleanup::PluginCleanupReporter;
 use crate::registry::{ExtensionRegistry, RegistrationInventory, RegistrySnapshot};
 use crate::{
@@ -37,6 +42,12 @@ pub enum PluginLoadError {
         path: PathBuf,
         #[source]
         source: libloading::Error,
+    },
+    #[error("could not stage plugin {path}: {source}")]
+    Stage {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
     #[error("`rpi_plugin_register` was not found in {path}: {error}")]
     Symbol { path: PathBuf, error: String },
@@ -261,13 +272,25 @@ fn load_one_owned(
     action_bridge: Option<Arc<ActionBridge>>,
     host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> Result<LoadedPlugin, OwnedLoadFailure> {
-    let path = path.to_path_buf();
-    // 1. Open the cdylib.
-    let library = unsafe { Library::new(module) }.map_err(|e| PluginLoadError::Open {
-        path: path.clone(),
-        source: e,
-    })?;
+    let library = open_library(path, module)?;
+    register_library(path, library, diagnostics, action_bridge, host_guard)
+}
 
+fn open_library(path: &Path, module: &Path) -> Result<Library, PluginLoadError> {
+    unsafe { Library::new(module) }.map_err(|source| PluginLoadError::Open {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn register_library(
+    path: &Path,
+    library: Library,
+    diagnostics: Arc<dyn PluginDiagnostics>,
+    action_bridge: Option<Arc<ActionBridge>>,
+    host_guard: Option<Arc<dyn Send + Sync>>,
+) -> Result<LoadedPlugin, OwnedLoadFailure> {
+    let path = path.to_path_buf();
     // Track ownership immediately after opening, INCLUDING symbol lookup
     // failure. OS library close errors must not bypass cleanup evidence.
     let abi_version = RPI_PLUGIN_ABI_VERSION_UNIFIED;
@@ -722,7 +745,14 @@ pub fn load_session_mixed_guarded(
     action_bridge: Option<Arc<ActionBridge>>,
     host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> ExtensionSession {
-    load_session_mixed_impl(dirs, files, diagnostics, action_bridge, host_guard, None)
+    load_session_mixed_impl(
+        dirs,
+        files,
+        diagnostics,
+        action_bridge,
+        host_guard,
+        SessionImages::Original,
+    )
 }
 
 /// Register separate library images so sessions in a shared process have
@@ -742,8 +772,38 @@ pub fn load_session_mixed_staged(
         diagnostics,
         action_bridge,
         Some(host_guard),
-        Some(stage),
+        SessionImages::Staged(stage),
     )
+}
+
+#[cfg(unix)]
+impl SharedPluginImages {
+    /// Register a session from shared images for opted-in plugins and private
+    /// images for all other plugins. Each registration has its own cleanup.
+    pub fn load_session(
+        &self,
+        dirs: &[PathBuf],
+        files: &[PathBuf],
+        diagnostics: Arc<dyn PluginDiagnostics>,
+        action_bridge: Option<Arc<ActionBridge>>,
+        host_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> ExtensionSession {
+        load_session_mixed_impl(
+            dirs,
+            files,
+            diagnostics,
+            action_bridge,
+            host_guard,
+            SessionImages::Shared(self),
+        )
+    }
+}
+
+enum SessionImages<'a> {
+    Original,
+    Staged(&'a Path),
+    #[cfg(unix)]
+    Shared(&'a SharedPluginImages),
 }
 
 fn load_session_mixed_impl(
@@ -752,7 +812,7 @@ fn load_session_mixed_impl(
     diagnostics: Arc<dyn PluginDiagnostics>,
     action_bridge: Option<Arc<ActionBridge>>,
     host_guard: Option<Arc<dyn Send + Sync>>,
-    stage: Option<&Path>,
+    images: SessionImages<'_>,
 ) -> ExtensionSession {
     let mut loaded: Vec<LoadedPlugin> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -763,35 +823,48 @@ fn load_session_mixed_impl(
     for path in paths {
         // Repeated configured dirs, explicit files and aliases must register once.
         let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if !seen.insert(identity) {
+        if !seen.insert(identity.clone()) {
             continue;
         }
-        let module = if let Some(stage) = stage {
-            let destination = stage.join(seen.len().to_string());
-            let Some(name) = path.file_name() else {
-                continue;
-            };
-            let module = destination.join(name);
-            if let Err(error) =
-                std::fs::create_dir(&destination).and_then(|()| std::fs::copy(&path, &module))
-            {
-                diagnostics.warn(&format!(
-                    "could not stage plugin {}: {error}",
-                    path.display()
-                ));
-                continue;
+        let result = match images {
+            SessionImages::Original => {
+                open_library(&path, &path).map(|library| (library, None::<Arc<dyn Send + Sync>>))
             }
-            module
-        } else {
-            path.clone()
+            SessionImages::Staged(stage) => {
+                let Some(name) = path.file_name() else {
+                    continue;
+                };
+                let destination = stage.join(seen.len().to_string());
+                let module = destination.join(name);
+                std::fs::create_dir(&destination)
+                    .and_then(|()| std::fs::copy(&path, &module))
+                    .map_err(|source| PluginLoadError::Stage {
+                        path: path.clone(),
+                        source,
+                    })
+                    .and_then(|_| open_library(&path, &module))
+                    .map(|library| (library, None))
+            }
+            #[cfg(unix)]
+            SessionImages::Shared(cache) => cache
+                .open(&path, &identity)
+                .map(|(library, image)| (library, Some(image))),
         };
-        match load_one_guarded(
-            &path,
-            &module,
-            Arc::clone(&diagnostics),
-            action_bridge.clone(),
-            host_guard.clone(),
-        ) {
+        let registered = result.and_then(|(library, image)| {
+            let guard = match image {
+                Some(image) => Some(Arc::new((host_guard.clone(), image)) as Arc<dyn Send + Sync>),
+                None => host_guard.clone(),
+            };
+            register_library(
+                &path,
+                library,
+                diagnostics.clone(),
+                action_bridge.clone(),
+                guard,
+            )
+            .map_err(|failure| failure.error)
+        });
+        match registered {
             Ok(plugin) => loaded.push(plugin),
             Err(error) => diagnostics.warn(&format!("skipped plugin {}: {error}", path.display())),
         }
@@ -1016,6 +1089,8 @@ pub fn load_explicit_session_owned_checked(
 #[cfg(test)]
 mod tests {
     mod owned_tests;
+    #[cfg(unix)]
+    mod shared_image_tests;
 
     use super::*;
     use crate::OAuthExtensionError;

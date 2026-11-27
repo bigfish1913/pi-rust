@@ -934,6 +934,7 @@ pub fn print_help() {
   --fork-position <at|before>    With --fork-entry: keep the selected message in the
                                  new branch (at) or drop it (before). Default: before
   --session-dir <dir>            Directory for session storage
+  --session-preview <uuid>       Read the recent saved transcript (standalone with --session-dir)
   --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
   --tools, -t <list>             Comma-separated allowlist of tool names to enable
@@ -964,7 +965,8 @@ pub fn print_help() {
                                 inspect; submit/receipt; optional profiles and
                                 administrative-* (Unix; authenticated IPC;
                                 see `rpi host --help`)
-  update                       Update the rpi CLI from crates.io
+  update                       Update the rpi CLI from GitHub releases
+                                (Homebrew installs use `brew upgrade rpi`)
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
   events path|tail               Inspect the extension event journal (needs

@@ -1,6 +1,7 @@
 //! Run a one-shot Mini prompt through the local Host's Agent harness.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use rpi_ai::types::ImageContent;
 use rpi_harness::agent_harness::HarnessRunOutcome;
@@ -30,6 +31,7 @@ pub(crate) async fn execute(
     home: &AgentHome,
     mut args: Args,
     cwd: &Path,
+    plugin_images: Arc<rpi_extensions::SharedPluginImages>,
     input: Input,
     signal: CancellationToken,
     mut report: impl FnMut(String),
@@ -60,10 +62,12 @@ pub(crate) async fn execute(
     }
     let debug_system_prompt = std::mem::take(&mut args.debug_system_prompt);
     let prepared =
-        crate::session::prepare_host_extensions(home, &args, cwd, trusted).map_err(|error| {
-            report(format!("error: {error}"));
-            EXIT_RUNTIME
-        })?;
+        crate::session::prepare_host_extensions(home, &args, cwd, trusted, plugin_images).map_err(
+            |error| {
+                report(format!("error: {error}"));
+                EXIT_RUNTIME
+            },
+        )?;
     let (harness, events, _context) =
         crate::session::build_prepared(home, &resolved, &args, cwd, trusted, prepared)
             .await

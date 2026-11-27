@@ -51,7 +51,7 @@
 //! `append_entry` receives a [`ProvisionedEntry`] and stamps via the state +
 //! a [`Clock`], then encodes the resulting full `Entry`.
 
-use super::cold_frames::ResidentState;
+use super::cold_frames::{preview, recovery_batch, ResidentState};
 #[cfg(test)]
 #[path = "storage_compat_tests.rs"]
 mod compatibility_tests;
@@ -61,6 +61,12 @@ mod exclusive_create_tests;
 #[cfg(all(test, unix))]
 #[path = "history_sync_tests.rs"]
 mod history_sync_tests;
+#[path = "startup_checkpoint.rs"]
+pub(super) mod startup_checkpoint;
+#[cfg(unix)]
+#[cfg(test)]
+#[path = "storage/startup_tests.rs"]
+mod startup_tests;
 #[path = "streaming.rs"]
 mod streaming;
 use std::collections::{HashMap, HashSet};
@@ -88,8 +94,8 @@ use crate::session::state::ApplyOutcome;
 use crate::session::types::{
     provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, HistoryCheckpoint,
     HistoryIdentity, HistoryReplacement, IdGenerator, LanePointer, LaneRecord, LogItem, LogOptions,
-    OperationStartedRecord, ProvisionedEntry, RecordQuery, SessionMetadata, SessionMutation,
-    SessionStats, SessionStorage, TranscriptPage, TranscriptPageQuery,
+    OperationStartedRecord, ProvisionedEntry, RecordQuery, RecoveryEntryCheck, SessionMetadata,
+    SessionMutation, SessionStats, SessionStorage, TranscriptPage, TranscriptPageQuery,
 };
 
 /// Read-only native facts for startup preflight. No storage/file capability is
@@ -172,6 +178,8 @@ impl PreparedJsonlRestore {
         let repair = crate::session::diagnostics::RecoveryPhase::start("prepared_repair");
         storage.commit_pending_repair().await?;
         repair.finish(0, 0);
+        storage.publish_preview().await;
+        storage.publish_startup_checkpoint().await;
         Ok(storage)
     }
 }
@@ -283,6 +291,8 @@ pub struct JsonlSessionStorage {
     /// Any detected size/mtime difference falls back to the digest.
     loaded_history_identity: Arc<StdMutex<Option<ReplaySourceIdentity>>>,
     pending_repair: Arc<StdMutex<Option<PendingRepair>>>,
+    startup_checkpoint: Option<startup_checkpoint::Update>,
+    preview_source: Arc<StdMutex<Option<preview::Source>>>,
 }
 
 impl Clone for JsonlSessionStorage {
@@ -305,6 +315,8 @@ impl Clone for JsonlSessionStorage {
             loaded_history_digest: self.loaded_history_digest.clone(),
             loaded_history_identity: self.loaded_history_identity.clone(),
             pending_repair: self.pending_repair.clone(),
+            startup_checkpoint: None,
+            preview_source: self.preview_source.clone(),
         }
     }
 }
@@ -346,7 +358,17 @@ impl JsonlSessionStorage {
             if let Err(error) = worker.reconcile_if_needed().await {
                 return Err(error);
             }
-            op(worker).await
+            let result = op(worker.clone()).await;
+            if result.is_ok() {
+                worker.publish_preview().await;
+            } else {
+                // A failed reducer commit cannot publish newly written bytes.
+                let mut source = worker.preview_source.lock().unwrap();
+                if source.as_ref().is_some_and(|source| !source.attempted) {
+                    *source = None;
+                }
+            }
+            result
         })
         .await
         .map_err(|e| SessionError::storage(format!("JSONL mutation task failed: {e}")))?
@@ -384,6 +406,8 @@ impl JsonlSessionStorage {
             loaded_history_digest: Arc::new(StdMutex::new(None)),
             loaded_history_identity: Arc::new(StdMutex::new(None)),
             pending_repair: Arc::new(StdMutex::new(None)),
+            startup_checkpoint: None,
+            preview_source: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -512,6 +536,7 @@ impl JsonlSessionStorage {
         }
         let progress =
             super::progress::JsonlProgressStore::new(fs.clone(), path, &header.id, clock.clone());
+        let encoded_header = encode_header(&header);
         if exclusive {
             // Claim an EMPTY primary path before touching the companion. Do
             // not advertise a readable header until exclusive companion creation
@@ -524,7 +549,7 @@ impl JsonlSessionStorage {
             )?;
             progress.initialize_new().await?;
             file_result(
-                fs.append_file(path, FileContent::Text(encode_header(&header)), None)
+                fs.append_file(path, FileContent::Text(encoded_header.clone()), None)
                     .await,
                 &format!("Failed to publish new session header {path}"),
             )?;
@@ -535,7 +560,7 @@ impl JsonlSessionStorage {
         } else {
             progress.initialize().await?;
             file_result(
-                fs.write_file(path, FileContent::Text(encode_header(&header)), None)
+                fs.write_file(path, FileContent::Text(encoded_header.clone()), None)
                     .await,
                 &format!("Failed to initialize session {path}"),
             )?;
@@ -568,6 +593,18 @@ impl JsonlSessionStorage {
                 .map_err(|_| SessionError::storage("JSONL writer lease lock poisoned"))?
                 .replace(lease);
         }
+        if storage.writer_lease_held() {
+            if let Some(path) = preview::native_path(storage.fs.as_ref(), path) {
+                let source = tokio::task::spawn_blocking(move || {
+                    preview::Source::created(path, encoded_header.as_bytes())
+                })
+                .await
+                .ok()
+                .flatten();
+                *storage.preview_source.lock().unwrap() = source;
+                storage.publish_preview().await;
+            }
+        }
         Ok(storage)
     }
 
@@ -580,6 +617,69 @@ impl JsonlSessionStorage {
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
         Self::load_impl(fs, path, clock, ids, ReadPolicy::Restore).await
+    }
+
+    /// Read the native recent transcript for the given project without replay,
+    /// writer ownership, or disk changes. An absent or stale index is a miss.
+    pub fn read_preview(
+        root: &std::path::Path,
+        cwd: &std::path::Path,
+        id: &str,
+    ) -> std::io::Result<(Vec<Entry>, bool)> {
+        preview::read(root, cwd, id)
+    }
+
+    async fn publish_startup_checkpoint(&mut self) {
+        let Some(update) = self.startup_checkpoint.take() else {
+            return;
+        };
+        if !self.writer_lease_held() || !update.should_publish() {
+            return;
+        }
+        let phase = crate::session::diagnostics::RecoveryPhase::start("startup_checkpoint_publish");
+        let image = self.state.lock().await.startup_image();
+        if let Some(image) = image {
+            startup_checkpoint::publish(&self.fs, &self.metadata.path, update.boundary, image)
+                .await;
+        }
+        phase.finish(update.boundary.lines, 0);
+    }
+
+    async fn publish_preview(&self) {
+        let source = self.preview_source.lock().unwrap().clone();
+        let Some(source) = source.filter(|source| !source.attempted) else {
+            return;
+        };
+        if !self.writer_lease_held() {
+            return;
+        }
+        if let Some(current) = self.preview_source.lock().unwrap().as_mut() {
+            // An unchanged generation needs at most one attempt. A future
+            // append or reopen gets a fresh publication opportunity.
+            current.attempted = true;
+        }
+        let Some(index) = self
+            .state
+            .lock()
+            .await
+            .preview_index(&self.metadata.id, source.stamp.clone())
+        else {
+            return;
+        };
+        // Keep the writer lease through the rename, including when a binding
+        // is released concurrently with a publication.
+        let storage = self.clone();
+        let published = tokio::task::spawn_blocking(move || {
+            let held = storage.writer_lease.lock().unwrap();
+            held.is_some()
+                && !storage.writer_lease_revoked.load(Ordering::Acquire)
+                && source.publish(index).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        if !published {
+            tracing::debug!("session preview unavailable after publication attempt");
+        }
     }
 
     /// Fork reads never repair their source. Use the ordinary cold replay and
@@ -827,11 +927,21 @@ impl JsonlSessionStorage {
             if let Some(length) =
                 file_result(source.byte_len().await, "stat session history reader")?
             {
+                let preview_source =
+                    matches!(policy, ReadPolicy::Restore | ReadPolicy::PreparedRestore)
+                        .then(|| preview::native_path(fs.as_ref(), path))
+                        .flatten()
+                        .and_then(|path| preview::Source::replay(path, source.as_ref(), length));
                 let mut storage =
                     Self::load_streaming(fs, path, clock, ids, source.clone(), length, policy)
                         .await?;
                 if let Some(info) = &info_before_read {
                     storage.record_replay_identity(info, length);
+                }
+                if let Some(preview_source) =
+                    preview_source.filter(|stamp| stamp.matches(source.as_ref()))
+                {
+                    *storage.preview_source.lock().unwrap() = Some(preview_source);
                 }
                 return Ok(storage);
             }
@@ -1200,6 +1310,7 @@ impl JsonlSessionStorage {
             let mut storage = self;
             storage.ensure_writer_lease().await?;
             if storage.progress.required {
+                storage.publish_preview().await;
                 return Ok(storage);
             }
             if storage.metadata.source_format != super::types::JsonlSourceFormat::V4 {
@@ -1377,7 +1488,7 @@ impl JsonlSessionStorage {
         // The target lease must precede creation of the progress companion and
         // the staged replacement, otherwise a competing fork can leave a
         // partially initialized target behind a failed ownership check.
-        let _target_lease = file_result(
+        let target_lease = file_result(
             self.fs.try_acquire_writer_lease(path).await,
             &format!("Failed to acquire writer lease for fork {path}"),
         )?;
@@ -1512,7 +1623,13 @@ impl JsonlSessionStorage {
             })
         })
         .await?;
-        JsonlSessionStorage::load(self.fs.clone(), path, clock, ids).await
+        let storage = Self::load(self.fs.clone(), path, clock, ids).await?;
+        // Publish the destination's index under the creation lease, then
+        // return the handle with the same ownership semantics as a plain load.
+        *storage.writer_lease.lock().unwrap() = target_lease;
+        storage.publish_preview().await;
+        storage.writer_lease.lock().unwrap().take();
+        Ok(storage)
     }
 
     /// Wait for all in-flight appends to settle. Mirrors TS `drain`.
@@ -1765,6 +1882,7 @@ impl JsonlSessionStorage {
         .await?;
         let recovered_state = recovered.state.lock().await.clone();
         *self.state.lock().await = recovered_state;
+        *self.preview_source.lock().unwrap() = recovered.preview_source.lock().unwrap().clone();
         self.needs_reconcile.store(false, Ordering::Release);
         Ok(())
     }
@@ -1774,6 +1892,7 @@ impl JsonlSessionStorage {
         if lines.is_empty() {
             return Ok(());
         }
+        let preview_before = self.preview_source.lock().unwrap().clone();
         let mut append = self.append.lock().await;
         if append.is_none() {
             *append = file_result(
@@ -1782,7 +1901,14 @@ impl JsonlSessionStorage {
             )?;
         }
         let result = if let Some(writer) = append.as_mut() {
-            let result = writer.append_with_receipt(&lines).await;
+            let result = if preview_before.is_some() {
+                writer.append_with_native_metadata(&lines).await
+            } else {
+                writer
+                    .append_with_receipt(&lines)
+                    .await
+                    .map(|receipt| (receipt, None))
+            };
             if result.is_err() {
                 *append = None;
             }
@@ -1791,7 +1917,7 @@ impl JsonlSessionStorage {
             self.fs
                 .append_file(&self.metadata.path, FileContent::Bytes(lines.clone()), None)
                 .await
-                .map(|_| None)
+                .map(|_| (None, None))
         };
         // Treat a sync failure like any post-write uncertainty: the bytes may
         // already be visible, so the existing conservative tail recovery must
@@ -1806,8 +1932,8 @@ impl JsonlSessionStorage {
             },
             Err(error) => Err(error),
         };
-        let receipt = match result {
-            Ok(receipt) => receipt,
+        let (receipt, metadata) = match result {
+            Ok(result) => result,
             Err(error) => {
                 // The reducer has not seen this batch. Remove the whole batch,
                 // including any complete lines before a torn final line.
@@ -1825,7 +1951,15 @@ impl JsonlSessionStorage {
         drop(append);
         // A missing (or malformed custom) receipt is a compatibility fallback,
         // never an error after bytes have already been acknowledged.
-        if let Some(receipt) = receipt.filter(|receipt| receipt.length == lines.len()) {
+        let receipt = receipt.filter(|receipt| receipt.length == lines.len());
+        if let Some(before) = preview_before {
+            let next = receipt
+                .as_ref()
+                .zip(metadata.as_ref())
+                .and_then(|(receipt, metadata)| before.appended(receipt, metadata));
+            *self.preview_source.lock().unwrap() = next;
+        }
+        if let Some(receipt) = receipt {
             self.state.lock().await.bind_append(receipt, &lines);
         }
         Ok(())
@@ -2402,6 +2536,20 @@ impl SessionStorage for JsonlSessionStorage {
             Some(payload) => payload.tool_result_identity().await,
             None => Ok(None),
         }
+    }
+
+    async fn recovery_entries_settled(
+        &self,
+        checks: &[RecoveryEntryCheck<'_>],
+    ) -> SessionResult<Vec<bool>> {
+        let selected: Vec<_> = {
+            let state = self.state.lock().await;
+            checks
+                .iter()
+                .map(|check| check.id().and_then(|id| state.entry_ref(id)))
+                .collect()
+        };
+        recovery_batch::read(checks, &selected).await
     }
 
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {

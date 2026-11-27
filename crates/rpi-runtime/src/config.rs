@@ -9,6 +9,10 @@ pub enum ConfigError {
     NoHomeDir { env: &'static str },
     #[error("config dir override {env}={val:?} is not an absolute path")]
     RelativeOverride { env: &'static str, val: String },
+    /// Explicit agent homes are absolute by contract; a relative value cannot
+    /// be resolved against the process working directory safely.
+    #[error("agent home {val:?} is not an absolute path")]
+    InvalidAgentHome { val: String },
     #[error("could not read {path}: {source}")]
     Read {
         path: PathBuf,

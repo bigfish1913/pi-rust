@@ -10,7 +10,8 @@ from pathlib import Path
 import re
 
 
-README = Path(__file__).resolve().parent.parent / "README.md"
+ROOT = Path(__file__).resolve().parent.parent
+READMES = (ROOT / "README.md", ROOT / "README.zh-CN.md")
 WECHAT_URL = "https://assets.bigfisharc.cn/images/support/weixin.png"
 DATED_URL = re.compile(re.escape(WECHAT_URL) + r"\?date=\d{4}-\d{2}-\d{2}")
 CHINA_TIME = timezone(timedelta(hours=8))
@@ -33,8 +34,9 @@ def refresh(readme: Path, day: str) -> bool:
 
 def main() -> None:
     day = datetime.now(CHINA_TIME).date().isoformat()
-    changed = refresh(README, day)
-    print(f"README WeChat image date: {day} ({'updated' if changed else 'unchanged'})")
+    for readme in READMES:
+        changed = refresh(readme, day)
+        print(f"{readme.name} WeChat image date: {day} ({'updated' if changed else 'unchanged'})")
 
 
 if __name__ == "__main__":

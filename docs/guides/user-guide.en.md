@@ -420,4 +420,6 @@ When the online site and an installed binary differ, use the documentation shipp
 
 ### CLI self-update distribution
 
-`rpi update` resolves the released version through crates.io and downloads the matching GitHub `rpi-release.json` distribution. It verifies the exact target, archive size, archive and executable SHA-256, and the executable’s version before transactional replacement. Windows applies the staged update after the running process exits. Missing manifests and failed downloads/checks do not silently invoke Cargo; use `--build` explicitly. `--force` reinstalls the resolved version and `--offline` only reports cached information. See [the CLI distribution protocol](../distribution/prebuilt-cli.md).
+`rpi update` resolves the stable release version through GitHub and downloads the matching GitHub `rpi-release.json` distribution. It verifies the exact target, archive size, archive and executable SHA-256, and the executable’s version before transactional replacement. Windows applies the staged update after the running process exits. Missing manifests and failed downloads/checks do not silently invoke Cargo; use `--build` explicitly. `--force` reinstalls the resolved version and `--offline` only reports cached information. See [the CLI distribution protocol](../distribution/prebuilt-cli.md).
+
+For Homebrew installations, use `brew upgrade rpi`. Startup update notices show that command.

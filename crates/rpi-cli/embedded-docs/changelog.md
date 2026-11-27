@@ -11,6 +11,71 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/bigfish1913/pi-rust/compare/v0.30.0...v0.31.0) - 2026-11-27
+
+### Added
+
+- *(host)* configure daemon recovery and reattach persistent agents
+- *(cli)* run Mini prompts in shared local Host areas
+- *(cli)* add a low-memory mini mode ([#424](https://github.com/bigfish1913/pi-rust/pull/424))
+- *(cli)* run independent agents in shared local Host areas
+- *(host)* share native area sessions across clients
+- *(host)* recover persistent members and supervise macOS workers
+- *(host)* integrate explicit shared Host daemon and controls
+- *(host)* add shared host catalog and ordinary backend
+- *(host)* add native admission and owned resource primitives
+
+### Fixed
+
+- *(host)* retire RPC session writers before closing the transport
+- *(cli)* preserve agent capabilities in mini mode ([#432](https://github.com/bigfish1913/pi-rust/pull/432))
+- *(host)* load ordinary tools and native extensions by default
+- *(cli)* run the native interactive TUI in local Host areas
+- *(host)* include in-flight forks in Darwin session cleanup
+- *(host)* compile Unix-only administration resources only on supported platforms
+- *(ai)* avoid retry false positive in transport diagnostics
+- *(extensions)* preserve Goal restrictions after the main merge
+- *(extensions)* type image guards on non-Unix targets
+- *(preview)* resolve session paths through the scoped environment
+
+### Other
+
+- Merge current main into the preview promotion candidate
+- Merge remote-tracking branch 'origin/main' into local/preview-main-host-20261127
+- *(extensions)* document shared Host plugin images
+- Accelerate native cold session restore and index recent history ([#436](https://github.com/bigfish1913/pi-rust/pull/436))
+- Merge v0.29.0 into preview for the 0.29 series
+- *(host)* reuse images for multi-session plugins
+- Merge preview with native Host recovery and Web RPC sessions
+- Merge remote-tracking branch 'origin/preview' into feat/host-multi-agent-loop
+- Merge main into preview for the 0.28 series
+- *(host)* preserve staged validation and document preview boundaries
+- Add SDK adapters for extensions that forbid unsafe Rust ([#441](https://github.com/bigfish1913/pi-rust/pull/441))
+- *(extensions)* isolate delayed suggestion buffer reclamation
+- *(extensions)* avoid Unix-only mutation in portable owned-load fixture
+
+## [0.30.0](https://github.com/bigfish1913/pi-rust/compare/v0.29.0...v0.30.0) - 2026-11-27
+
+### Fixed
+
+- *(tools)* kill owned shell groups when exec is dropped ([#428](https://github.com/bigfish1913/pi-rust/pull/428))
+
+### Other
+
+- *(cli)* [**breaking**] keep child identity out of execution context ([#435](https://github.com/bigfish1913/pi-rust/pull/435))
+
+## [0.29.0](https://github.com/bigfish1913/pi-rust/compare/v0.28.0...v0.29.0) - 2026-11-26
+
+### Added
+
+- *(cli)* add a low-memory mini mode ([#424](https://github.com/bigfish1913/pi-rust/pull/424))
+- *(fork)* allow branching at a selected message ([#411](https://github.com/bigfish1913/pi-rust/pull/411))
+
+### Fixed
+
+- *(cli)* [**breaking**] validate AgentHome eagerly and drop stale --agent-dir wording ([#414](https://github.com/bigfish1913/pi-rust/pull/414))
+- *(cli)* defer Homebrew updates to brew ([#423](https://github.com/bigfish1913/pi-rust/pull/423))
+
 ## [0.28.0](https://github.com/bigfish1913/pi-rust/compare/v0.27.1...v0.28.0) - 2026-11-25
 
 ### Added
