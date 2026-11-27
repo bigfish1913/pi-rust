@@ -102,12 +102,15 @@ extern "C" fn emit(raw: sdk::StbString, data: *mut c_void) -> i32 {
     });
     0
 }
+fn request_json(key: &str) -> String {
+    let model = Model::new("m", "M", Api::Faux, "context-test", "http://localhost");
+    serde_json::json!({"model":model,"context":Context::new(vec![]),"options":{"apiKey":key}})
+        .to_string()
+}
+
 fn call(registration: Registered, key: &str) -> AssistantMessage {
     let (request, free, data) = registration;
-    let model = Model::new("m", "M", Api::Faux, "context-test", "http://localhost");
-    let json =
-        serde_json::json!({"model":model,"context":Context::new(vec![]),"options":{"apiKey":key}})
-            .to_string();
+    let json = request_json(key);
     let mut out = sdk::StbString::empty();
     let mut thread_id = std::thread::current().id();
     assert_eq!(
@@ -153,5 +156,80 @@ fn exported_context_handles_concurrent_credentials_errors_shutdown_and_old_hosts
             assert_eq!(rejected.stop_reason, rpi_ai::StopReason::Error);
             assert_eq!(finish(data as *mut c_void), 0);
         }
+    }
+}
+
+mod selected_callbacks {
+    #![deny(unsafe_code)]
+
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static SELECTOR_PANICS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn legacy_factory(
+        _: &sdk::provider::ProviderContext,
+        _: &Model,
+        _: &SimpleStreamOptions,
+    ) -> Result<Arc<dyn Provider>, String> {
+        Err("legacy factory".into())
+    }
+
+    fn select_factory(context: *mut c_void) -> sdk::provider::ContextFactory {
+        assert!(!SELECTOR_PANICS.get(), "factory selection failed");
+        if context.is_null() {
+            legacy_factory
+        } else {
+            factory
+        }
+    }
+
+    sdk::provider_callbacks!(select_factory = select_factory);
+
+    #[test]
+    fn request_and_stream_select_and_guard_the_factory() {
+        let request: sdk::ProviderRequestFn = request;
+        let stream: sdk::ProviderStreamRequestFn = stream;
+        let mut context = sdk::provider::ProviderContext::new();
+        let context_ptr = ptr::from_mut(&mut context).cast();
+        let json = request_json("secret");
+        let input = sdk::StbStringRef::from_str(&json);
+        let mut out = sdk::StbString::empty();
+        let call_stream = |context| {
+            let mut result = sdk::StbString::empty();
+            let rc = stream(
+                input,
+                None,
+                ptr::null_mut(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
+                &mut result,
+                context,
+            );
+            (rc, result)
+        };
+
+        assert_eq!(request(input, &mut out, ptr::null_mut()), 0);
+        let free = Some(sdk::callbacks::free_string as sdk::FreeStringFn);
+        let message: AssistantMessage = serde_json::from_str(&sdk::stb_take!(out, free)).unwrap();
+        assert_eq!(message.error_message.as_deref(), Some("legacy factory"));
+        let (rc, result) = call_stream(context_ptr);
+        assert_eq!(rc, 0);
+        let message: AssistantMessage =
+            serde_json::from_str(&sdk::stb_take!(result, free)).unwrap();
+        assert!(
+            matches!(message.content.as_slice(), [rpi_ai::Content::Text(text)] if text.text == "secret")
+        );
+
+        SELECTOR_PANICS.set(true);
+        out = sdk::StbString::empty();
+        assert_eq!(request(input, &mut out, context_ptr), 1);
+        assert!(out.is_empty());
+        let (rc, result) = call_stream(context_ptr);
+        assert_eq!(rc, 1);
+        assert!(result.is_empty());
     }
 }
