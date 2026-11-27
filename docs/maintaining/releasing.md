@@ -151,11 +151,10 @@ A hosted runner can also be cancelled before it executes its first step, especia
 
 The daily README image refresh updates `automation/readme-images` and creates or
 reuses a restricted upstream PR. The workflow verifies that the branch is rebuilt
-from `main` and that the only changed path is `README.md`, then administrator-merges
-that exact PR with squash without waiting for normal CI. This is intentionally a
-narrow bypass for the automated WeChat image cache-key update; ordinary and fork PRs
-remain subject to normal review and required checks. Missing token or API/push/merge
-failure fails visibly.
+from `main` and that changes are limited to `README.md` and `README.zh-CN.md`, then
+administrator-merges that exact PR with squash without waiting for normal CI.
+Ordinary and fork PRs remain subject to normal review and required checks.
+Missing token or API/push/merge failure fails visibly.
 
 ### Recovery and release records
 
