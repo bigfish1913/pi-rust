@@ -109,15 +109,22 @@ impl RuntimeActionHost for Host {
         );
         Ok(json!({"owner":owner}))
     }
+    async fn independent_run(&self, owner: u64, args: Value) -> Result<Value, String> {
+        self.child_agent(owner, args).await
+    }
     fn cancel_child_agents(&self, _: u64) {
         self.revoked.fetch_add(1, Ordering::SeqCst);
     }
 }
 fn call(id: usize, args: Value) -> (i32, Value) {
+    call_action(RuntimeActionId::ChildAgent, id, args)
+}
+
+fn call_action(action: RuntimeActionId, id: usize, args: Value) -> (i32, Value) {
     let mut out = StbString::empty();
     let text = args.to_string();
     let rc = trampoline_runtime_action(
-        RuntimeActionId::ChildAgent.into(),
+        action.into(),
         StbStringRef::from_str(&text),
         &mut out,
         id as *mut c_void,
@@ -134,35 +141,58 @@ async fn child_actions_require_a_live_parent_invocation_and_its_capability() {
     let host = Arc::new(Host::default());
     let root = ActionBridge::new(Handle::current(), host.clone());
     let plugin = root.for_plugin("research");
-    let parent = plugin.for_invocation(false, CancellationToken::new());
     let child = plugin.for_invocation(true, CancellationToken::new());
-    assert_eq!(
-        call(plugin.user_data() as usize, json!({"op":"start"})).0,
-        1
-    );
-    assert_eq!(
-        call(parent.user_data() as usize, json!({"op":"start"})).0,
-        1
-    );
-    assert_eq!(
-        call(
+    for action in [RuntimeActionId::ChildAgent, RuntimeActionId::IndependentRun] {
+        host.calls.store(0, Ordering::SeqCst);
+        let parent = plugin.for_invocation(false, CancellationToken::new());
+        let call = |id, args| call_action(action, id, args);
+        assert_eq!(
+            call(plugin.user_data() as usize, json!({"op":"start"})).0,
+            1
+        );
+        assert_eq!(
+            call(parent.user_data() as usize, json!({"op":"start"})).0,
+            1
+        );
+        assert_eq!(
+            call(
+                parent.user_data() as usize,
+                json!({"op":"start","__rpiRuntimeKey":"guessed"})
+            )
+            .0,
+            1
+        );
+        assert_eq!(
+            call(
+                child.user_data() as usize,
+                json!({"op":"start","__rpiRuntimeKey":child.invocation_key()})
+            )
+            .0,
+            1
+        );
+        // A child synchronous callback cannot spoof another invocation's ID/key.
+        {
+            let _guard = child.enter_invocation();
+            assert_eq!(
+                call(
+                    parent.user_data() as usize,
+                    json!({"op":"start","__rpiRuntimeKey":parent.invocation_key()})
+                )
+                .0,
+                1
+            );
+        }
+        let accepted = call(
             parent.user_data() as usize,
-            json!({"op":"start","__rpiRuntimeKey":"guessed"})
-        )
-        .0,
-        1
-    );
-    assert_eq!(
-        call(
-            child.user_data() as usize,
-            json!({"op":"start","__rpiRuntimeKey":child.invocation_key()})
-        )
-        .0,
-        1
-    );
-    // A child synchronous callback cannot spoof another invocation's ID/key.
-    {
-        let _guard = child.enter_invocation();
+            json!({"op":"start","__rpiRuntimeKey":parent.invocation_key()}),
+        );
+        assert_eq!(accepted.0, 0);
+        assert_eq!(
+            accepted.1["owner"],
+            plugin.plugin_identity.as_ref().unwrap().0
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        parent.invocation.as_ref().unwrap().2.cancel();
         assert_eq!(
             call(
                 parent.user_data() as usize,
@@ -172,25 +202,6 @@ async fn child_actions_require_a_live_parent_invocation_and_its_capability() {
             1
         );
     }
-    let accepted = call(
-        parent.user_data() as usize,
-        json!({"op":"start","__rpiRuntimeKey":parent.invocation_key()}),
-    );
-    assert_eq!(accepted.0, 0);
-    assert_eq!(
-        accepted.1["owner"],
-        plugin.plugin_identity.as_ref().unwrap().0
-    );
-    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
-    parent.invocation.as_ref().unwrap().2.cancel();
-    assert_eq!(
-        call(
-            parent.user_data() as usize,
-            json!({"op":"start","__rpiRuntimeKey":parent.invocation_key()})
-        )
-        .0,
-        1
-    );
 }
 
 #[tokio::test]

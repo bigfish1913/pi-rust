@@ -387,12 +387,12 @@ pub struct StableToolSchema {
 /// project-scoped fallback when `sessionId` is missing rather than refusing to
 /// work.
 ///
-/// Plugins using host-managed child actions additionally receive per-call
+/// Plugins using invocation-bound run actions additionally receive per-call
 /// `runtimeHandle` (opaque integer) and `runtimeKey` (capability string). Worker
 /// threads use that handle as runtime_action's opaque user_data and include
-/// `__rpiRuntimeKey` in ChildAgent arguments. Never log, persist, expose to the
+/// `__rpiRuntimeKey` in action arguments. Never log, persist, expose to the
 /// model, or reuse these values across tool calls. Missing values mean the
-/// host cannot support worker-originated ChildAgent safely; fail closed.
+/// host cannot authenticate worker-originated run actions; fail closed.
 ///
 /// **Consequence for plugin parameter types:** a plugin must tolerate unknown
 /// top-level keys in its arguments. Reading them out of a `serde_json::Value`
@@ -1201,7 +1201,7 @@ pub enum RuntimeActionId {
     /// Safe live execution metadata (no credentials, endpoints or headers).
     /// Args: `{}`; result: model identity, thinkingLevel, tools, cwd, sessionId.
     GetExecutionContext = 23,
-    /// Host-owned independent child run. `op`: start/poll/cancel/dispose.
+    /// Compatibility action for existing delegation extensions. `op`: start/poll/cancel/dispose.
     /// Start: task, optional role/maxTurns/timeoutSeconds/tools/toolCallId.
     /// Others: childId. Poll drains text deltas and returns status/result.
     /// Handles are scoped to the calling plugin and must be disposed.
@@ -1304,6 +1304,11 @@ pub enum RuntimeActionId {
     /// that wants to contribute candidates registers an autocomplete provider
     /// through [`PluginApi::register_autocomplete_provider`].
     GetEditorText = 32,
+    /// Start or control an independent, invocation-bound, in-memory run.
+    /// Start takes `input`, `maxTurns`, `timeoutSeconds`, and optional `tools`.
+    /// Poll, cancel and dispose take `runId`. The caller must dispose finished
+    /// runs. Tool selection can only narrow the parent's active tools.
+    IndependentRun = 33,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1357,6 +1362,7 @@ impl TryFrom<u32> for RuntimeActionId {
             30 => Ok(Self::ToolProgram),
             31 => Ok(Self::ReloadModels),
             32 => Ok(Self::GetEditorText),
+            33 => Ok(Self::IndependentRun),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1403,6 +1409,7 @@ impl RuntimeActionId {
         Self::ToolProgram,
         Self::ReloadModels,
         Self::GetEditorText,
+        Self::IndependentRun,
     ];
 
     /// The highest defined action id.
@@ -2814,6 +2821,7 @@ mod tests {
             RuntimeActionId::ToolProgram,
             RuntimeActionId::ReloadModels,
             RuntimeActionId::GetEditorText,
+            RuntimeActionId::IndependentRun,
         ];
 
         // Stable wire ids must not depend on which proposal was merged first.
@@ -2835,7 +2843,8 @@ mod tests {
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::StopRound));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ReloadModels));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::GetEditorText));
-        assert_eq!(RuntimeActionId::MAX, 32);
+        assert_eq!(u32::from(RuntimeActionId::IndependentRun), 33);
+        assert_eq!(RuntimeActionId::MAX, 33);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         let one_past_last = RuntimeActionId::MAX + 1;

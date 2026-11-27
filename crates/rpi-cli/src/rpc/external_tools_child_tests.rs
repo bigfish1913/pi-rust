@@ -35,15 +35,12 @@ async fn child_scope_rejects_external_tools_without_emitting_even_with_spoofed_a
     let (writer, task, _) = start_rpc_writer(ExternalEventCapture(tx), Default::default());
     let backend = ExternalTools::detached(writer);
     let tool = external_test_tool(backend.clone());
-    // Real host scope, including a hostile false childAgent in the context.
-    // Neither that value nor the caller's JSON may override host provenance.
-    let scope = Arc::new(ToolExecutionScope::with_context(
-        json!({"childAgent":false}),
-    ));
+    // Caller-supplied metadata cannot override the invocation's host scope.
+    let scope = Arc::new(ToolExecutionScope::with_context(json!({"tools":[]})));
     let result = scope
         .run(tool.execute(
             "child-call",
-            json!({"childAgent":false,"sessionId":"root"}),
+            json!({"sessionId":"root","tools":["external_test"]}),
             CancellationToken::new(),
             Arc::new(|_| {}),
         ))
@@ -73,7 +70,7 @@ async fn root_external_tool_still_emits_and_settles_with_structured_content() {
     let raw = json!({"content":[{"type":"text","text":"answer"}],"structuredContent":{"x":2},"_meta":{"private":true}});
     let run = tool.execute(
         "root-call",
-        json!({"childAgent":false}),
+        json!({"query":"lookup"}),
         CancellationToken::new(),
         Arc::new(|_| {}),
     );
@@ -81,7 +78,7 @@ async fn root_external_tool_still_emits_and_settles_with_structured_content() {
         let request = events.recv().await.unwrap();
         assert_eq!(request["type"], "external_tool_request");
         assert_eq!(request["toolName"], "external_test");
-        assert_eq!(request["arguments"], json!({"childAgent":false}));
+        assert_eq!(request["arguments"], json!({"query":"lookup"}));
         assert!(backend
             .respond(&json!({"requestId":request["requestId"],"result":raw}))
             .unwrap());

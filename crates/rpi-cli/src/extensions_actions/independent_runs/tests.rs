@@ -3,6 +3,21 @@ use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript};
 use rpi_ai::types::StopReason;
 use rpi_harness::types::AgentHarnessOptions;
 
+impl IndependentRuns {
+    async fn handle(
+        &self,
+        parent: &AgentHarness,
+        owner: u64,
+        args: Value,
+    ) -> Result<Value, String> {
+        if args["op"] == "start" {
+            self.start_child(parent, owner, &args).await
+        } else {
+            self.handle_child(owner, &args)
+        }
+    }
+}
+
 async fn parent(script: FauxScript) -> AgentHarness {
     let provider = FauxProvider::new(script);
     let session = Session::new(
@@ -32,6 +47,7 @@ fn job(owner: u64) -> Arc<Job> {
         cancel: CancellationToken::new(),
         invocation_signal: None,
         state: Mutex::new(State::default()),
+        legacy: None,
     })
 }
 fn delta(text: String) -> AgentEvent {
@@ -46,7 +62,7 @@ fn delta(text: String) -> AgentEvent {
         }),
     }
 }
-async fn wait(manager: &ChildAgents, parent: &AgentHarness, id: &str) -> Value {
+async fn wait(manager: &IndependentRuns, parent: &AgentHarness, id: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let value = manager
@@ -66,7 +82,7 @@ async fn wait(manager: &ChildAgents, parent: &AgentHarness, id: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn child_reports_and_owner_scoped_disposal_are_independent_of_parent_transcript() {
     let parent = parent(FauxScript::new().with_text("child report")).await;
-    let manager = ChildAgents::default();
+    let manager = IndependentRuns::default();
     let started = manager
         .handle(&parent, 7, json!({"op":"start","task":"report"}))
         .await
@@ -98,7 +114,7 @@ async fn cancellation_and_unload_stop_pending_children_and_reject_stale_starts()
             .with_tokens_per_second(0.1),
     )
     .await;
-    let manager = ChildAgents::default();
+    let manager = IndependentRuns::default();
     let started = manager
         .handle(&parent, 7, json!({"op":"start","task":"report"}))
         .await
@@ -186,7 +202,7 @@ fn text_and_event_budgets_are_enforced_before_queue_growth() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn poll_drains_bounded_batches_before_delivering_a_terminal_result() {
     let parent = parent(FauxScript::new()).await;
-    let manager = ChildAgents::default();
+    let manager = IndependentRuns::default();
     let job = job(7);
     for _ in 0..4 {
         job.observe(delta("x".repeat(32 * 1024)));
@@ -211,7 +227,7 @@ async fn poll_drains_bounded_batches_before_delivering_a_terminal_result() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_is_bounded_even_while_disposed_children_are_cleaning_up() {
     let parent = parent(FauxScript::new()).await;
-    let manager = ChildAgents::default();
+    let manager = IndependentRuns::default();
     manager.active.store(MAX_JOBS, Ordering::Release);
     assert!(manager
         .handle(&parent, 7, json!({"op":"start","task":"report"}))
@@ -238,7 +254,7 @@ async fn roster_reports_live_children_and_stop_terminates_by_id() {
             .with_tokens_per_second(0.1),
     )
     .await;
-    let manager = ChildAgents::default();
+    let manager = IndependentRuns::default();
     let started = manager
         .handle(
             &parent,
@@ -291,7 +307,7 @@ async fn roster_reports_live_children_and_stop_terminates_by_id() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stop_on_a_finished_child_reports_already_finished_without_rewriting_it() {
     let parent = parent(FauxScript::new().with_text("child report")).await;
-    let manager = ChildAgents::default();
+    let manager = IndependentRuns::default();
     let started = manager
         .handle(&parent, 7, json!({"op":"start","task":"report"}))
         .await
@@ -374,7 +390,7 @@ async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
             .with_tokens_per_second(0.1),
     )
     .await;
-    let manager = ChildAgents::default();
+    let manager = IndependentRuns::default();
     let started = manager
         .handle(&parent, 7, json!({"op":"start","task":"report"}))
         .await
@@ -411,9 +427,75 @@ async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
 #[test]
 fn child_limits_reject_wrong_types_and_out_of_range_values() {
     for value in [json!(-1), json!(0), json!(33), json!("8"), Value::Null] {
-        assert!(bounded_number(&json!({"maxTurns":value}), "maxTurns", 8, 1, 32).is_err());
+        assert!(bounded_number(&json!({"maxTurns":value}), "maxTurns", Some(8), 1, 32).is_err());
     }
-    assert_eq!(bounded_number(&json!({}), "maxTurns", 8, 1, 32).unwrap(), 8);
+    assert_eq!(
+        bounded_number(&json!({}), "maxTurns", Some(8), 1, 32).unwrap(),
+        8
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_run_uses_the_input_and_generic_handle() {
+    use rpi_ai::providers::faux::FauxStep;
+
+    const INPUT: &str = "Read the independent run input verbatim";
+    let script = FauxScript::new();
+    script.set_responses(vec![FauxStep::factory(|context| {
+        let payload = serde_json::to_string(context).unwrap();
+        assert!(payload.contains(INPUT));
+        assert!(!payload.contains("You are a delegated"));
+        faux_assistant_message("report", StopReason::Stop)
+    })]);
+    let parent = parent(script).await;
+    let manager = IndependentRuns::default();
+    for invalid in [
+        json!({"input":INPUT,"timeoutSeconds":10}),
+        json!({"input":INPUT,"maxTurns":1}),
+        json!({"input":INPUT,"maxTurns":0,"timeoutSeconds":10}),
+        json!({"input":"x".repeat(24_001),"maxTurns":1,"timeoutSeconds":10}),
+        json!({"input":INPUT,"maxTurns":1,"timeoutSeconds":10,"tools":["not_registered"]}),
+    ] {
+        assert!(manager.start_run(&parent, 7, &invalid).await.is_err());
+    }
+    assert!(manager.roster().is_empty());
+    let started = manager
+        .start_run(
+            &parent,
+            7,
+            &json!({
+                "input":INPUT,"maxTurns":1,"timeoutSeconds":10,"tools":[]
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["runId"].as_str().unwrap();
+    assert!(started.get("childId").is_none());
+    assert_ne!(id, parent.session().storage().metadata().id);
+    assert!(parent.get_tip_id().await.unwrap().is_none());
+    let poll = json!({"op":"poll","runId":id});
+    assert!(manager.handle_run(8, &poll).is_err());
+    let settled = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let result = manager.handle_run(7, &poll).unwrap();
+            if result["status"] != "running" {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(settled["runId"], id);
+    assert_eq!(settled["result"]["text"], "report");
+    assert_eq!(settled["result"]["turnLimited"], true);
+    let row = manager.roster().pop().unwrap();
+    assert!(row.get("role").is_none());
+    assert!(row.get("taskPreview").is_none());
+    manager
+        .handle_run(7, &json!({"op":"dispose","runId":id}))
+        .unwrap();
+    assert!(manager.handle_run(7, &poll).is_err());
 }
 
 mod invocation;

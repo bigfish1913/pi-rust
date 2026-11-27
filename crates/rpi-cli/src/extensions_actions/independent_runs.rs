@@ -1,4 +1,4 @@
-//! Bounded, plugin-owned child runs. Execution bindings stay inside the host.
+//! Bounded independent runs owned by plugin invocations.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,9 @@ use rpi_harness::session::Session;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+mod legacy;
+use legacy::LegacyRoster;
+
 const MAX_JOBS: usize = 16;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
@@ -27,15 +30,15 @@ fn now_ms() -> u64 {
 }
 
 #[derive(Default)]
-pub(crate) struct ChildAgents {
+pub(super) struct IndependentRuns {
     jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
     revoked: Arc<Mutex<HashSet<u64>>>,
     active: Arc<AtomicUsize>,
     tasks: crate::host::cli_tasks::CliTaskScope,
 }
 
-// The owned preparation shares only state, not the parent service's Drop owner.
-struct ChildPreparation {
+// Owned preparation holds the shared registry state and its own admission.
+struct RunPreparation {
     jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
     revoked: Arc<Mutex<HashSet<u64>>>,
     active: Arc<AtomicUsize>,
@@ -55,6 +58,7 @@ struct Job {
     cancel: CancellationToken,
     invocation_signal: Option<CancellationToken>,
     state: Mutex<State>,
+    legacy: Option<LegacyRoster>,
 }
 
 #[derive(Default)]
@@ -66,15 +70,20 @@ struct State {
     result: Option<Value>,
     error: Option<String>,
     /// Supervisory metadata (host UI roster): when the child started/finished
-    /// (unix ms) and what it was asked to do. Written once at start; timing
-    /// fields are set by `mark_finished`.
+    /// (unix ms). The finish timestamp is recorded when the run settles.
     ///
     /// `u64` (not `u128`): the roster serializes these into JSON and reads them
     /// back with `as_u64`, so the type must not be able to exceed that range.
     started_ms: u64,
     finished_ms: Option<u64>,
-    role: String,
-    task_preview: String,
+}
+
+struct Start {
+    input: String,
+    turns: u32,
+    timeout: u64,
+    tools: Option<Vec<String>>,
+    legacy: Option<LegacyRoster>,
 }
 
 impl Job {
@@ -146,13 +155,13 @@ impl AgentEmitter for Emitter {
     }
 }
 
-impl Drop for ChildAgents {
+impl Drop for IndependentRuns {
     fn drop(&mut self) {
         self.begin_shutdown();
     }
 }
 
-impl ChildAgents {
+impl IndependentRuns {
     pub(crate) fn begin_shutdown(&self) {
         self.tasks.seal();
         self.cancel_all();
@@ -190,7 +199,8 @@ impl ChildAgents {
     /// Supervisory roster for the host UI: every child this host still holds
     /// (running **and** terminated-but-not-disposed), newest first. Each row is
     /// self-contained — `childId`/`status`/`turns`/`startedMs`/`finishedMs`/
-    /// `role`/`taskPreview` — so a panel can render without polling each child.
+    /// `error` — so a panel can render without polling each run. Legacy
+    /// delegation rows also include their compatibility labels.
     ///
     /// Status vocabulary matches `poll`: `running` / `done` / `failed`.
     pub(crate) fn roster(&self) -> Vec<Value> {
@@ -206,16 +216,18 @@ impl ChildAgents {
                 } else {
                     "running"
                 };
-                json!({
+                let mut row = json!({
                     "childId": id,
                     "status": status,
                     "turns": state.turns,
                     "startedMs": state.started_ms,
                     "finishedMs": state.finished_ms,
-                    "role": state.role,
-                    "taskPreview": state.task_preview,
                     "error": state.error,
-                })
+                });
+                if let Some(legacy) = &job.legacy {
+                    legacy.populate_row(&mut row);
+                }
+                row
             })
             .collect();
         rows.sort_by_key(|row| std::cmp::Reverse(row["startedMs"].as_u64()));
@@ -244,47 +256,50 @@ impl ChildAgents {
         }))
     }
 
-    pub(crate) async fn handle(
+    pub(super) async fn start_run(
         &self,
         parent: &AgentHarness,
         owner: u64,
-        args: Value,
+        args: &Value,
     ) -> Result<Value, String> {
-        let op = args
-            .get("op")
+        let input = args
+            .get("input")
             .and_then(Value::as_str)
-            .ok_or("missing child op")?;
-        if op == "start" {
-            let preparation = ChildPreparation {
-                jobs: self.jobs.clone(),
-                revoked: self.revoked.clone(),
-                active: self.active.clone(),
-                admission: self.tasks.admit()?,
-                signal: self.tasks.signal(),
-            };
-            return self
-                .tasks
-                .call(Self::start(preparation, parent.clone(), owner, args))
-                .await?;
-        }
-        self.handle_existing(owner, args)
+            .filter(|text| !text.trim().is_empty() && text.len() <= 24_000)
+            .ok_or("run input must contain 1-24000 bytes")?;
+        self.start(
+            parent,
+            owner,
+            Start {
+                input: input.into(),
+                turns: bounded_number(args, "maxTurns", None, 1, 32)? as u32,
+                timeout: bounded_number(args, "timeoutSeconds", None, 10, 1800)?,
+                tools: parse_tools(args)?,
+                legacy: None,
+            },
+        )
+        .await
     }
 
-    pub(crate) fn handle_existing(&self, owner: u64, args: Value) -> Result<Value, String> {
+    pub(super) fn handle_run(&self, owner: u64, args: &Value) -> Result<Value, String> {
         let op = args
             .get("op")
             .and_then(Value::as_str)
-            .ok_or("missing child op")?;
+            .ok_or("missing run op")?;
         let id = args
-            .get("childId")
+            .get("runId")
             .and_then(Value::as_str)
-            .ok_or("missing childId")?;
+            .ok_or("missing runId")?;
+        self.handle_existing(owner, op, id)
+    }
+
+    fn handle_existing(&self, owner: u64, op: &str, id: &str) -> Result<Value, String> {
         let job = {
             let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
             jobs.get(id)
                 .filter(|job| job.owner == owner)
                 .cloned()
-                .ok_or("unknown childId for this plugin")?
+                .ok_or("unknown runId for this plugin")?
         };
         match op {
             "poll" => {
@@ -309,7 +324,7 @@ impl ChildAgents {
                 // Terminal result is delivered only after queued deltas drain.
                 let drained = state.deltas.is_empty();
                 Ok(
-                    json!({"childId":id, "status":if drained {status} else {"running"}, "deltas":deltas,
+                    json!({"runId":id, "status":if drained {status} else {"running"}, "deltas":deltas,
                     "turns":state.turns, "result":if drained {state.result.clone()} else {None},
                     "error":if drained {state.error.clone()} else {None}}),
                 )
@@ -322,19 +337,40 @@ impl ChildAgents {
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(id);
                 }
-                Ok(
-                    json!({"childId":id,"status":if op == "dispose" {"disposed"} else {"cancelled"}}),
-                )
+                Ok(json!({"runId":id,"status":if op == "dispose" {"disposed"} else {"cancelled"}}))
             }
-            _ => Err(format!("unknown child op `{op}`")),
+            _ => Err(format!("unknown run op `{op}`")),
         }
     }
 
     async fn start(
-        preparation: ChildPreparation,
+        &self,
+        parent: &AgentHarness,
+        owner: u64,
+        request: Start,
+    ) -> Result<Value, String> {
+        let preparation = RunPreparation {
+            jobs: self.jobs.clone(),
+            revoked: self.revoked.clone(),
+            active: self.active.clone(),
+            admission: self.tasks.admit()?,
+            signal: self.tasks.signal(),
+        };
+        self.tasks
+            .call(Self::prepare_start(
+                preparation,
+                parent.clone(),
+                owner,
+                request,
+            ))
+            .await?
+    }
+
+    async fn prepare_start(
+        preparation: RunPreparation,
         parent: AgentHarness,
         owner: u64,
-        args: Value,
+        request: Start,
     ) -> Result<Value, String> {
         if preparation.signal.is_cancelled() {
             return Err("native auxiliary resources are retiring".into());
@@ -346,38 +382,13 @@ impl ChildAgents {
         {
             return Err("parent tool invocation cancelled".into());
         }
-        let task = args
-            .get("task")
-            .and_then(Value::as_str)
-            .ok_or("missing child task")?;
-        let role = args
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("worker")
-            .trim();
-        if task.trim().is_empty() || task.len() > 20_000 || role.is_empty() || role.len() > 200 {
-            return Err("child task must contain 1-20000 bytes and role 1-200 bytes".into());
-        }
-        let turns = bounded_number(&args, "maxTurns", 8, 1, 32)? as u32;
-        let timeout = bounded_number(&args, "timeoutSeconds", 300, 10, 1800)?;
-        let tools = args
-            .get("tools")
-            .map(|value| {
-                value
-                    .as_array()
-                    .ok_or("child tools must be a string array")
-                    .and_then(|values| {
-                        values
-                            .iter()
-                            .map(|v| {
-                                v.as_str()
-                                    .map(str::to_owned)
-                                    .ok_or("child tools must be a string array")
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-            })
-            .transpose()?;
+        let Start {
+            input,
+            turns,
+            timeout,
+            tools,
+            legacy,
+        } = request;
         let id = parent.session().id_generator().next();
         let job = Arc::new(Job {
             owner,
@@ -385,10 +396,9 @@ impl ChildAgents {
             invocation_signal,
             state: Mutex::new(State {
                 started_ms: now_ms(),
-                role: role.to_string(),
-                task_preview: task.chars().take(200).collect(),
                 ..State::default()
             }),
+            legacy,
         });
         // Reserve before awaiting construction so concurrent starts cannot exceed the cap.
         let permit;
@@ -401,6 +411,10 @@ impl ChildAgents {
                 return Err("owning plugin unloaded".into());
             }
             let mut jobs = preparation.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            // Serialize publication with shutdown's cancellation sweep.
+            if preparation.signal.is_cancelled() {
+                return Err("native auxiliary resources are retiring".into());
+            }
             if jobs.len() >= MAX_JOBS {
                 return Err("child capacity reached; dispose finished children".into());
             }
@@ -434,10 +448,15 @@ impl ChildAgents {
             )),
             None,
         );
-        let child = match parent
-            .create_child(session, Arc::new(Emitter(job.clone())), turns, tools)
-            .await
-        {
+        let emitter = Arc::new(Emitter(job.clone()));
+        let created = if job.legacy.is_some() {
+            parent.create_child(session, emitter, turns, tools).await
+        } else {
+            parent
+                .create_independent_run(session, emitter, turns, tools)
+                .await
+        };
+        let child = match created {
             Ok(child) => child,
             Err(error) => {
                 preparation
@@ -448,7 +467,6 @@ impl ChildAgents {
                 return Err(error.to_string());
             }
         };
-        let prompt = format!("You are a delegated {role} subagent. Complete the task in at most {turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
         let worker = job.clone();
         let execution_scope = child.execution_scope.clone();
         let cleanup_harness = child.harness.clone();
@@ -460,7 +478,7 @@ impl ChildAgents {
                 match std::panic::AssertUnwindSafe(run_child(
                     child,
                     worker.clone(),
-                    prompt,
+                    input,
                     turns,
                     timeout,
                 ))
@@ -476,23 +494,22 @@ impl ChildAgents {
                         }
                     }
                 }
-                // Also retain capacity when run_child unwinds after starting a
-                // background driver; catch_unwind is not a cleanup completion.
+                // Keep the permit until any background driver has exited.
                 execution_scope.wait_idle().await;
             });
-        Ok(json!({"childId":id,"sessionId":id,"status":"running"}))
+        Ok(json!({"runId":id,"sessionId":id,"status":"running"}))
     }
 }
 
 fn bounded_number(
     args: &Value,
     key: &str,
-    default: u64,
+    default: Option<u64>,
     min: u64,
     max: u64,
 ) -> Result<u64, String> {
     let value = match args.get(key) {
-        None => default,
+        None => default.ok_or_else(|| format!("missing {key}"))?,
         Some(value) => value
             .as_u64()
             .ok_or_else(|| format!("{key} must be an integer"))?,
@@ -501,6 +518,24 @@ fn bounded_number(
         return Err(format!("{key} must be between {min} and {max}"));
     }
     Ok(value)
+}
+
+fn parse_tools(args: &Value) -> Result<Option<Vec<String>>, String> {
+    args.get("tools")
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or("tools must be a string array")?
+                .iter()
+                .map(|tool| {
+                    tool.as_str()
+                        .map(str::to_owned)
+                        .ok_or("tools must be a string array")
+                })
+                .collect()
+        })
+        .transpose()
+        .map_err(str::to_owned)
 }
 
 async fn run_child(
