@@ -1389,9 +1389,9 @@ dependencies = [
 
 [[package]]
 name = "libredox"
-version = "0.1.24"
+version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6480ccc157a1389bb2e4891b24751b0f798ba640d22386f23143fbcc89da195a"
+checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
 dependencies = [
  "libc",
 ]
@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-agent"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2159,11 +2159,12 @@ dependencies = [
 
 [[package]]
 name = "rpi-cli"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "arboard",
  "async-trait",
  "base64",
+ "cc",
  "criterion",
  "crossterm",
  "dirs",
@@ -2186,6 +2187,7 @@ dependencies = [
  "rpi-telemetry",
  "rpi-tools",
  "rpi-tui",
+ "rusqlite",
  "schemars",
  "semver",
  "serde",
@@ -2204,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-durable"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "fs2",
  "rusqlite",
@@ -2216,11 +2218,12 @@ dependencies = [
 
 [[package]]
 name = "rpi-extensions"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "async-trait",
  "dirs",
  "futures",
+ "libc",
  "libloading",
  "rpi-agent",
  "rpi-ai",
@@ -2237,18 +2240,20 @@ dependencies = [
 
 [[package]]
 name = "rpi-harness"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "async-trait",
  "base64",
  "fs2",
  "futures",
+ "reqwest",
  "ring",
  "rpi-agent",
  "rpi-ai",
  "rpi-durable",
  "rpi-telemetry",
  "rpi-tools",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",
@@ -2264,12 +2269,13 @@ dependencies = [
 
 [[package]]
 name = "rpi-plugin-sdk"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "ciborium",
  "libc",
  "reqwest",
  "rpi-ai",
+ "rquickjs",
  "serde",
  "serde_json",
  "tokio",
@@ -2278,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-runtime"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "async-trait",
  "indexmap 2.11.4",
@@ -2293,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-telemetry"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -2303,7 +2309,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tools"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2339,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tui"
-version = "0.29.0"
+version = "0.31.0"
 dependencies = [
  "base64",
  "crossterm",
@@ -2354,6 +2360,33 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "winapi",
+]
+
+[[package]]
+name = "rquickjs"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d16661bff09e9ed8e01094a188b463de45ec0693ade55b92ed54027d7ba7c40c"
+dependencies = [
+ "rquickjs-core",
+]
+
+[[package]]
+name = "rquickjs-core"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c8db6379e204ef84c0811e90e7cc3e3e4d7688701db68a00d14a6db6849087b"
+dependencies = [
+ "rquickjs-sys",
+]
+
+[[package]]
+name = "rquickjs-sys"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bc352c6b663604c3c186c000cfcc6c271f4b50bc135a285dd6d4f2a42f9790a"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

@@ -90,8 +90,37 @@ pub fn emit_tool_result_with_status(
     is_error: bool,
     snapshot: &RegistrySnapshot,
 ) -> Result<Option<AgentToolResult>, ()> {
+    emit_tool_result_with_context(
+        tool_call_id,
+        tool_name,
+        input,
+        result,
+        is_error,
+        snapshot,
+        None,
+    )
+    .map_err(|_| ())
+}
+
+/// The registry was retired before a tool-result transform could dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("tool-result registry is inactive")]
+pub struct InactiveToolResultRegistry;
+
+/// Explicit per-Agent metadata for shared Hosts. The frozen context decorates
+/// only the plugin envelope under `__rpi`, never the tool input or result. None
+/// preserves the legacy CLI payload; no ambient identity is read here.
+pub fn emit_tool_result_with_context(
+    tool_call_id: &str,
+    tool_name: &str,
+    input: &Value,
+    result: &AgentToolResult,
+    is_error: bool,
+    snapshot: &RegistrySnapshot,
+    context: Option<&crate::ToolCallContext>,
+) -> Result<Option<AgentToolResult>, InactiveToolResultRegistry> {
     if !assert_active(snapshot.active_flag()) {
-        return Err(());
+        return Err(InactiveToolResultRegistry);
     }
     let handlers = snapshot.tool_result();
     if handlers.is_empty() {
@@ -102,15 +131,18 @@ pub fn emit_tool_result_with_status(
     let mut changed = false;
     let mut content_replaced = false;
     for h in handlers {
-        let envelope = json!({
+        let mut envelope = json!({
             "toolCallId": tool_call_id,
             "toolName": tool_name,
             "input": input,
             "content": content,
             "details": details,
             "isError": is_error,
-        })
-        .to_string();
+        });
+        if let Some(metadata) = context.and_then(crate::ToolCallContext::to_json) {
+            envelope[rpi_plugin_sdk::HOST_CONTEXT_KEY] = metadata;
+        }
+        let envelope = envelope.to_string();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             call_one_handler(*h, StbStringRef::from_str(&envelope))
         }));
@@ -389,6 +421,55 @@ mod tests {
                     .unwrap();
             assert_eq!(changed.details, json!({"isError": is_error}));
         }
+    }
+
+    #[test]
+    fn explicit_tool_result_context_is_frozen_and_does_not_rewrite_input() {
+        extern "C" fn echo_context(
+            event: StbStringRef,
+            out: *mut StbString,
+            _: *mut std::ffi::c_void,
+        ) -> i32 {
+            // SAFETY: the host retains this envelope and output slot for the call.
+            let event: Value = serde_json::from_str(unsafe { event.as_str() }).unwrap();
+            let patch = json!({"details": {"context": event["__rpi"], "input": event["input"]}});
+            // SAFETY: the host owns the live output slot; free_string reclaims it.
+            unsafe { *out = StbString::from_string(patch.to_string()) };
+            0
+        }
+        let snap = snapshot(&[echo_context]);
+        let input = json!({"__rpi":{"agentId":"forged"},"path":"file.txt"});
+        let contexts = [
+            crate::ToolCallContext::for_agent("/agent/a", "agent-a", Some("session-a".into())),
+            crate::ToolCallContext::for_agent("/agent/b", "agent-b", None),
+        ];
+        std::thread::scope(|scope| {
+            for context in &contexts {
+                let snap = &snap;
+                let input = &input;
+                scope.spawn(move || {
+                    context.set_session_id("late-cli-must-not-retarget");
+                    let changed = emit_tool_result_with_context(
+                        "same-call",
+                        "read",
+                        input,
+                        &result(),
+                        false,
+                        snap,
+                        Some(context),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(changed.details["context"], context.to_json().unwrap());
+                    assert_eq!(changed.details["input"], *input);
+                });
+            }
+        });
+        let legacy = emit_tool_result_with_status("call", "read", &input, &result(), false, &snap)
+            .unwrap()
+            .unwrap();
+        assert!(legacy.details["context"].is_null());
+        assert_eq!(input["__rpi"]["agentId"], "forged");
     }
 
     #[test]

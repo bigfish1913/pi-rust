@@ -1160,8 +1160,9 @@ async fn queued_stored_assistant_keeps_its_reserved_entry_id() {
 async fn retry_frames_are_salvaged_after_generation_has_started() {
     let mut emitter = AppendDuringEvent::new(|event| {
         matches!(event,
-        AgentEvent::MessageUpdate { assistant_message_event: rpi_ai::types::AssistantMessageEvent::TextDelta { partial, .. }, .. }
-            if partial.content.iter().any(|content| matches!(content, Content::Text(text) if text.text == "retry partial")))
+        AgentEvent::MessageUpdate { assistant_message_event, .. } if matches!(assistant_message_event.as_ref(),
+            rpi_ai::types::AssistantMessageEvent::TextDelta { partial, .. }
+            if partial.content.iter().any(|content| matches!(content, Content::Text(text) if text.text == "retry partial"))))
     });
     emitter.send = Some(SendMessageOptions {
         trigger_turn: Some(false),

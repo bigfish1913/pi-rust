@@ -1364,6 +1364,13 @@ mod tests {
     ];
 
     fn object(target: &str) -> Vec<u8> {
+        // Header-only objects suffice for format validation on other platforms,
+        // but Darwin installation actually re-signs the DLL. Use a real linked,
+        // deterministically signed fixture there, never bypass the signer.
+        #[cfg(target_os = "macos")]
+        if target.ends_with("-apple-darwin") {
+            return signed_mach_o_fixture(target);
+        }
         let mut bytes = vec![0u8; 128];
         if target.contains("windows") {
             bytes[..2].copy_from_slice(b"MZ");
@@ -1395,6 +1402,84 @@ mod tests {
             bytes[12..16].copy_from_slice(&6u32.to_le_bytes());
         }
         bytes
+    }
+
+    #[cfg(target_os = "macos")]
+    fn signed_mach_o_fixture(target: &str) -> Vec<u8> {
+        use std::sync::OnceLock;
+        static ARM: OnceLock<Vec<u8>> = OnceLock::new();
+        static X86: OnceLock<Vec<u8>> = OnceLock::new();
+        let (cache, arch) = if target.starts_with("aarch64") {
+            (&ARM, "arm64")
+        } else {
+            (&X86, "x86_64")
+        };
+        cache
+            .get_or_init(|| {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("libcustom_runtime.dylib");
+                let mut child = std::process::Command::new("/usr/bin/clang")
+                    .args([
+                        "-dynamiclib",
+                        "-arch",
+                        arch,
+                        "-mmacosx-version-min=11.0",
+                        "-Wl,-no_uuid",
+                        "-Wl,-install_name,@rpath/libcustom_runtime.dylib",
+                        "-x",
+                        "c",
+                        "-",
+                        "-o",
+                    ])
+                    .arg(&path)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("Darwin signing tests require the system C toolchain");
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"int rpi_prebuilt_fixture(void) { return 42; }\n")
+                    .unwrap();
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "could not link {arch} Mach-O fixture: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                // Match the production identifier before archiving: re-signing
+                // under a randomized staging filename must preserve exact bytes
+                // and all existing provenance/content assertions.
+                crate::install::resign_staged_native(&path).unwrap();
+                std::fs::read(path).unwrap()
+            })
+            .clone()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_mach_o_fixtures_verify_and_remain_identical_after_resigning() {
+        for target in &TARGETS[4..] {
+            let bytes = object(target);
+            assert!(bytes.len() > 128);
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("different-staging-name.dylib");
+            std::fs::write(&path, &bytes).unwrap();
+            crate::install::resign_staged_native(&path).unwrap();
+            let verified = std::process::Command::new("/usr/bin/codesign")
+                .args(["--verify", "--strict"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                verified.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&verified.stderr)
+            );
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
     }
 
     fn zip(files: &[(&str, &[u8])]) -> Vec<u8> {

@@ -1,0 +1,156 @@
+{
+  "stage": "Explicit Mini profile and raw native binding implementation; owner/wire not yet integrated",
+  "production_mini_complete": false,
+  "host_goal_complete": false,
+  "before_profile_snapshot": "/tmp/rpi-host-integration-checks/host-mini-production-profile-before/inputs.json",
+  "snapshot_timing": "After initial raw binding implementation, before explicit mode changes; not a before-raw snapshot",
+  "preservation": {
+    "core": {
+      "root": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host",
+      "head": "699b73d036138e0fe10bbf9b14e29af4119d6fad",
+      "branch": "feat/shared-host-integration",
+      "index_sha256": "19a457bbc5ef45dca355a0c0f53b2bf56d4d8be72c0aee100423114c407a7c6d",
+      "snapshot_files": 1171,
+      "unchanged_snapshot_files": 1166,
+      "changed_files": [
+        "crates/rpi-cli/src/host/README.md",
+        "crates/rpi-cli/src/host/bindings_tests.rs",
+        "crates/rpi-cli/src/host/daemon.rs",
+        "crates/rpi-cli/src/host/daemon_administration_tests.rs",
+        "crates/rpi-cli/src/host/profile.rs"
+      ],
+      "added_files_before_validation": [
+        "docs/host-mini-raw-binding.md"
+      ]
+    },
+    "extension": {
+      "root": "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host",
+      "head": "607c00d3915d16cf26129979766bcd65ec58b059",
+      "branch": "feat/shared-host-management",
+      "index_sha256": "120574b7497ced744dec434e2158a41548381e64ef18bee0550d61baabb4f875",
+      "snapshot_files": 823,
+      "unchanged_snapshot_files": 823,
+      "changed_files": [],
+      "added_files_before_validation": []
+    }
+  },
+  "previous_closing_snapshot": "/tmp/rpi-host-integration-checks/host-mini-native-assembly-final-before/inputs.json",
+  "raw_binding_and_profile_delta_from_previous_snapshot": {
+    "core": [
+      "crates/rpi-cli/src/host/README.md",
+      "crates/rpi-cli/src/host/bindings.rs",
+      "crates/rpi-cli/src/host/bindings_tests.rs",
+      "crates/rpi-cli/src/host/daemon.rs",
+      "crates/rpi-cli/src/host/daemon_administration_tests.rs",
+      "crates/rpi-cli/src/host/profile.rs"
+    ],
+    "extension": []
+  },
+  "prior_evidence_files_unchanged": 2350,
+  "contracts_unchanged_sha256": {
+    "protocol.rs": "920a93636c7e87c5a9c7053557e9f044f6030327c0be9466ec274e34ce4721e0",
+    "client.rs": "55cb9897c61594dc554baddcc06dc80dcf88d11458b1a14fff1bc137c5d9e97a",
+    "client_tests.rs": "8df4c991962ddf635b34e7dd67d9821ee3b59f411104b42e1898d2f6433759ae",
+    "fixtures/control-v1.json": "33560f0b5d074b7822710493f7bcb16bec21c63ba5237629db4765bb25dab320"
+  },
+  "gates": {
+    "focused": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-production-profile-focused-1.log",
+      "log_sha256": "f9139b805f6935d08ab84fa306bff71850c33340c4bc56f60260ce2305837a66",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-production-profile-focused-1.exit",
+      "exit": 0,
+      "test_result": [
+        23,
+        0,
+        0
+      ],
+      "all_test_summaries": [
+        [
+          23,
+          0,
+          0
+        ]
+      ]
+    },
+    "cli_lib_two_threads": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-production-profile-cli-lib.log",
+      "log_sha256": "4e818e6ddcbfc47aa15485bb8c88322ab1d08ca7490491538dc109b2bf42e4aa",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-production-profile-cli-lib.exit",
+      "exit": 0,
+      "test_result": [
+        1544,
+        0,
+        3
+      ],
+      "all_test_summaries": [
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1544,
+          0,
+          3
+        ]
+      ]
+    },
+    "ordinary_binary_two_threads": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-production-profile-binary.log",
+      "log_sha256": "0139264521826fb0679f0dc1d6bdae08a0be84a06b852b4b92694d51907e2f9b",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-production-profile-binary.exit",
+      "exit": 0,
+      "test_result": [
+        39,
+        0,
+        0
+      ],
+      "all_test_summaries": [
+        [
+          39,
+          0,
+          0
+        ]
+      ]
+    },
+    "cli_strict_scoped_clippy": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-production-profile-clippy.log",
+      "log_sha256": "7e704ce96f436c48df005ff5c4f5db96a0156b5eb5473d66f7cbcd0d03593625",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-production-profile-clippy.exit",
+      "exit": 0,
+      "test_result": null,
+      "all_test_summaries": []
+    },
+    "targeted_format_and_both_tree_diff": {
+      "log": "/tmp/rpi-host-integration-checks/host-mini-production-profile-format.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit_file": "/tmp/rpi-host-integration-checks/host-mini-production-profile-format.exit",
+      "exit": 0,
+      "test_result": null,
+      "all_test_summaries": []
+    }
+  },
+  "production_source_sha256": {
+    "crates/rpi-cli/src/host/bindings.rs": "6a202eaaccecce1669341b26a619470ca69e6fc76e8cd7ba6f00eaf5dc04085d",
+    "crates/rpi-cli/src/host/daemon.rs": "5e521503759fddfd1a9a34eb6e0786dd8b63dcbc5e1b936d56a00c322eb80f09",
+    "crates/rpi-cli/src/host/profile.rs": "ee06d4ac0e81b1c7611dd5c519138bfa7b7003e12027a1624299a64dd518d059"
+  },
+  "post_test_source_change": "profile.rs module documentation only; production logic unchanged after gates",
+  "timeout_provenance": {
+    "not_used_as_gate": "/tmp/rpi-host-integration-checks/host-mini-raw-agent-focused-2.exit",
+    "reason": "Manually reconstructed from completed successful test log after tool timeout; not an observed cargo exit code",
+    "real_exit_retest": "/tmp/rpi-host-integration-checks/host-mini-raw-agent-focused-final.exit"
+  },
+  "not_claimed": [
+    "Mini authoritative owner/resident lifecycle",
+    "Mini volatile admission/result",
+    "Mini daemon/wire/control enablement",
+    "Mini actual management DLL plus binary plus HTTP E2E",
+    "Mini sessionId null native callback verification",
+    "Mini cancel/disconnect/late callback/finish/unload lifecycle",
+    "Mini restart Lost and no replay E2E",
+    "Agent/SDK strict Clippy green",
+    "default parallel CLI issue fixed",
+    "workspace/all-targets/MSRV/cross-platform green"
+  ]
+}

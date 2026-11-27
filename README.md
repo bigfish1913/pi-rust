@@ -1,5 +1,7 @@
 # rpi — a Rust-native coding-agent runtime
 
+**English** | [简体中文](README.zh-CN.md)
+
 <p align="center">
   <img src="docs/images/rpi-logo.jpg" width="240" alt="rpi project logo">
 </p>
@@ -25,13 +27,24 @@ by Mario Zechner. It now includes its own Rust-native plugin ABI and execution
 infrastructure. See [Acknowledgements](#acknowledgements) and [NOTICE](NOTICE)
 for upstream attribution.
 
-[Website](https://rpi.bigfisharc.cn/) · [Docs](https://rpi.bigfisharc.cn/docs.html) · [Extension catalog](https://rpi.bigfisharc.cn/packages.html) · [Submit an extension](https://rpi.bigfisharc.cn/submit.html) · [rpi-extension](https://github.com/pi-rust/rpi-extension)
+[Quick start](#quick-start) · [Website](https://rpi.bigfisharc.cn/) · [Docs](https://rpi.bigfisharc.cn/docs.html) · [Extension catalog and submissions](https://rpi.bigfisharc.cn/packages.html?lang=en) · [rpi-extension](https://github.com/pi-rust/rpi-extension)
 
 ## See it in action
 
-![rpi interactive session](docs/images/rpi-interactive.png)
+![rpi TUI reading a project README and displaying the run and test commands](docs/images/rpi-interactive.png)
 
-<sub>Interactive TUI, recorded with an isolated configuration. See the [user guide](docs/guides/user-guide.md) for the full command surface.</sub>
+**Terminal.** Run `rpi` in a project directory. The screenshot shows an isolated sample session and a `read` tool call. [User guide](docs/guides/user-guide.md)
+
+![rpi-web with a project sidebar, tool activity and a Markdown reply](docs/images/rpi-web.png)
+
+**Web.** Install with `rpi install rpi-web`, then run `rpi --webserver` in your project directory and open the address it prints. [Web setup guide](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-web)
+
+![RPI Work desktop preview with a conversation and a Git diff side by side](docs/images/rpi-work-desktop.png)
+
+**Desktop.** RPI Work’s GPUI preview shows project sessions, conversation and Git diffs in a native window. [RPI Work](https://github.com/pi-rust/rpi-work)
+
+<details>
+<summary>Terminal and SDK recordings</summary>
 
 ![rpi terminal demo — opening the built-in help without a model request](docs/images/rpi-tui-demo.gif)
 
@@ -40,6 +53,8 @@ for upstream attribution.
 ![rpi SDK demo — an agent loop and a real tool round-trip, offline with the faux provider](docs/images/rpi-sdk-demo.gif)
 
 <sub>The agent loop and a real `write` tool round-trip, recorded with no API key and no network — the same path the tests take. Source of truth is [`demo/sdk.tape`](demo/sdk.tape); regenerate with `task demo`.</sub>
+
+</details>
 
 ## Three ways to use it
 
@@ -136,22 +151,62 @@ AgentEnd observed; tool ran against OsExecutionEnv.
 ### The CLI
 
 ```bash
-export ANTHROPIC_API_KEY=...          # or OPENAI_API_KEY, or ~/.rpi/agent/models.json
+export ANTHROPIC_API_KEY=...          # or OPENAI_API_KEY for OpenAI
 rpi                                   # interactive TUI
 rpi -p "summarize the README"         # one-shot
 rpi --mode json -p "list the crates"  # machine-readable event stream
-rpi --mini "explain this error"       # low-memory text run
+rpi --mini -p "explain this error"    # one-shot without saving the session
 ```
 
-`--mini` accepts prompts from arguments or piped input and prints the final
-reply. It keeps conversation context only for the current invocation and skips
-session storage, durable workflows, extension loading, and prompt resource
-discovery. Add `--tools read` to enable the built-in `read` tool.
+`--mini` uses in-memory sessions and disables native durable execution. The
+conversation ends with the process, and session import, export, fork, and
+resume are unavailable. Context compaction, tools, and resource discovery work
+as usual. Use `--tools read` to limit the tool set to `read`, or `-p` for a
+one-shot reply.
 
 Sessions persist as JSONL and survive a crash mid-run; `rpi` resumes from the
-last committed frame rather than replaying the turn. Custom Anthropic or
-OpenAI-compatible gateways are declared in `~/.rpi/agent/models.json` and
-selected with `--model <provider>/<model>`.
+last committed frame rather than replaying the turn.
+
+### Model configuration
+
+For a custom OpenAI-compatible gateway, save the [example JSON](examples/models.example.json)
+as `models.json` in your agent directory. Create the directory if needed. If
+`models.json` already exists, add the `gateway` entry under its `providers` object.
+
+| Environment | `models.json` path |
+| --- | --- |
+| macOS / Linux | `~/.rpi/agent/models.json` |
+| Windows | `%USERPROFILE%\.rpi\agent\models.json` |
+| Custom agent directory | `models.json` inside the absolute directory set by `RPI_CODING_AGENT_DIR` |
+
+```json
+{
+  "providers": {
+    "gateway": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.example.com/v1",
+      "apiKey": "$RPI_GATEWAY_API_KEY",
+      "models": [
+        { "id": "your-model-id", "name": "My Gateway Model" }
+      ]
+    }
+  }
+}
+```
+
+Replace `baseUrl` and `your-model-id` with the values from your provider. Set the
+key in the shell where you launch rpi.
+
+- macOS / Linux — `export RPI_GATEWAY_API_KEY='your-api-key'`
+- Windows PowerShell — `$env:RPI_GATEWAY_API_KEY = 'your-api-key'`
+
+```bash
+rpi auth check --provider gateway
+rpi --model gateway/your-model-id
+```
+
+Use the same model ID in the launch command and in the JSON file. The user guide
+also covers [Anthropic-compatible gateways](docs/guides/user-guide.md#自定义-provider).
 
 ### Runtime diagnostics
 
@@ -403,7 +458,7 @@ unnecessarily.
 
 Ready-to-install extensions live in the companion
 [`pi-rust/rpi-extension`](https://github.com/pi-rust/rpi-extension) repository, with
-an [online catalog](https://rpi.bigfisharc.cn/packages.html).
+an [online catalog](https://rpi.bigfisharc.cn/packages.html?lang=en).
 
 The catalog moved from `pi-rust/rpi-package` to `pi-rust/rpi-extension`. Both
 spellings identify the same publisher: existing installs (including records that
@@ -449,10 +504,11 @@ and parent completion or cancellation stops the child. This is capability
 inheritance and session isolation, not an OS sandbox.
 
 Use a compatible host and subagent extension; unsupported hosts fail explicitly
-rather than falling back to a differently configured subprocess. The SDK entry
-point is `AgentHarness::create_child`; extensions use `GetExecutionContext` and
-`ChildAgent` runtime actions. See the [subagent protocol](docs/extensions/subagents.md)
-for lifecycle, limits and compatibility details.
+rather than falling back to a differently configured subprocess. Rust callers use
+`AgentHarness::create_child`. Extensions read the active bindings with
+`GetExecutionContext` and manage runs with `IndependentRun`. `ChildAgent` remains
+available for compatibility with released extensions. See the
+[subagent protocol](docs/extensions/subagents.md) for lifecycle and limits.
 
 ### Authoring an extension
 
@@ -473,6 +529,43 @@ with the full `execute`→`poll`→`cancel`→`destroy` lifecycle — and read
 [`docs/extensions/authoring.md`](docs/extensions/authoring.md) for the safety
 rules, which are load-bearing rather than stylistic.
 
+## Shared local Host on Unix
+
+`rpi --host [area]` runs independent Agent Sessions in one local Host process per
+area. It supports the ordinary interactive TUI, stdio RPC, and one-shot Mini
+with `rpi --host [area] --mini "prompt"`. The `default` area uses ordinary Session
+storage. Other areas use `local-host-v1/area-<name>/sessions` under the agent home
+unless an explicit Session directory is supplied. A named area can set `maxAgents`
+(default 32, range 1–256) and `idleTimeoutSeconds` (default 0, disabled).
+
+## Persistent Shared Host areas on macOS
+
+```bash
+rpi --native-host                 # Open the default area's Session in the terminal
+rpi --native-host work            # Open a separate area and Session
+rpi --native-host --mode json     # Inspect the selected area, Host and Session IDs
+```
+
+First entry creates `$RPI_CODING_AGENT_DIR/host.json` (normally `~/.rpi/agent/host.json`) and starts a detached Host. With the default settings, it starts one Persistent Agent. Clients that select the same Agent share its Session. Start each client from the workspace configured for its Agent.
+
+The settings file starts with `{"defaultArea":"default","areas":{"default":{}}}`. Each area can set `provider`, `model`, `tools`, and `maxAgents`. The optional `recovery` object accepts `restore_on_start` and `restart_on_crash`, for example `{"restore_on_start":true,"restart_on_crash":false}`. Omitting `recovery` enables both for a named area. Within an explicit object, omitted switches default to `false`. The capacity and recovery settings are written when the private area configuration is first generated. The initial profile uses global model settings and available non-OAuth credentials. Its tool list defaults to `read`. The generated private profile and Host configuration live under `hosts/<area>/` and are reused on restart. `--mode json` prints the configuration path for [the Host control commands](crates/rpi-cli/src/host/cli.rs), including `status` and `administrative-stop`.
+
+Set an area's `runTimeoutMs` before first entry to give each Persistent operation an execution deadline in milliseconds. The deadline starts after admission. The daemon signals cancellation at the deadline, then waits for the operation and its Session writes to settle. The generated private Host configuration stores the value at `host.default_timeouts.run_ms` and accepts an optional `host.hard_timeout_limits.run_ms`. Set `shutdownGraceMs` before first entry to report a Persistent Agent that is still closing after that many milliseconds during signal or administrative shutdown. The daemon continues waiting for settlement before completing shutdown. The private Host configuration stores the value at `host.default_timeouts.shutdown_grace_ms` and accepts an optional `host.hard_timeout_limits.shutdown_grace_ms`. A daemon with Mini control enabled requires shared Agent timer defaults to be unset.
+
+Set `idleTimeoutMs` or `disconnectedTimeoutMs` in an area before first entry. The generated private configuration stores these values as `host.default_timeouts.idle_ms` and `host.default_timeouts.disconnected_ms`. On expiry, the idle timer can release a Persistent Agent's Session writer and capacity slot after settlement. An authenticated area Session connection keeps its Agent loaded. Set `host.default_timeouts.disconnected_ms` for an Agent with an area Session route to start a separate deadline when its last authenticated Session connection leaves. A new connection clears that deadline. If both timers are set, the first expired deadline applies once the Agent has settled and no Session peers remain. Running work and pending Session work retain the owner. Optional caps use the corresponding `host.hard_timeout_limits` fields.
+
+The timers and `restoreOnAttach` require `restore` permission. When any of these area settings is enabled, the generated administrative policy grants `restore` and `cancel` to all declared members. Use `host inspect` and `host profiles` to get the current `Unloaded` revision and frozen profile reference, then run `host administrative-restore` to reopen the original Agent and Session. Area terminal and stdio RPC clients can then reconnect to that Session in the same daemon. Set `restoreOnAttach: true` before first entry to let an authenticated Session connection restore an `Unloaded` member directly from its frozen profile. This option is off by default. It uses the same capacity and Session writer checks as explicit Restore and leaves the administrative receipt journal for explicit requests. An administratively `Closed` member still requires explicit Restore. Administrative Close accepts an `Unloaded` revision, ends any Session connections on a loaded owner, and removes the member from configured recovery.
+
+For a daemon that can run without loaded Agents, set `host.host_idle_timeout_ms` in its private configuration. It shuts down after that many consecutive milliseconds with zero resident Agents and zero control or Session connections. An in-progress lifecycle transaction can delay shutdown.
+
+To configure more Persistent Agents in one area, add `"agentProfiles":[{"name":"review","path":"/absolute/private/review.json"}]` to its settings before first entry. Each [private Agent profile](crates/rpi-cli/src/host/profile.rs) supplies its own Agent ID, Session ID and path, and workspace. The default Agent counts toward `maxAgents`. Initialize the area from the default Agent's workspace. Open a declared member from its own workspace with `rpi --native-host work --agent review`, adding `--mode json` or `--mode rpc` as needed. The private area configuration stores those profile references and starts the declared Agents with the default member.
+
+Set `"restoreAreas":["default","work"]` in the top-level `host.json` and declare each listed area under `areas`. Run `rpi --native-host --restore-areas` to bring the listed daemons up together from any workspace. Each area must already have a private daemon configuration with `restore_on_start` enabled. The command validates all listed configurations before starting any daemon, reuses running areas, and reports each result as JSON. The list is an explicit recovery policy. An area stopped with `administrative-stop` starts again on the next group restore if it is still listed.
+
+Set `"defaultTerminal":true` in the top-level `host.json` to open the default area's Agent when you run bare `rpi` from that Agent's workspace in a terminal. Initialize the area with `rpi --native-host` first. Calls with arguments, redirected input or output, and other workspaces continue through the ordinary CLI. The Host terminal provides shared chat, history, and cancellation. Use the ordinary CLI entry points for the local session picker and extension UI.
+
+The terminal supports shared text prompts, live responses, saved history, and cancellation. Use `/thinking <level>` while the Agent is idle to change the thinking level for subsequent prompts. All connected terminals for that Agent show the new level. Stdio RPC clients can use `set_thinking_level` and receive `thinking_level_changed`. The setting lasts while the Agent stays loaded. Restoring the Agent uses its frozen profile again. Closing a terminal disconnects its view.
+
 ## Remote mode
 
 ```bash
@@ -488,7 +581,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.29.0](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
+| Current release | **[0.31.0](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.88 |
 | Platforms | Linux (GNU and musl), macOS, Windows (CI runs the suite on Linux) |
@@ -519,8 +612,8 @@ build/test commands and the repository layout, and the
 [roadmap](ROADMAP.md) for what is already planned. Security problems should go
 through [SECURITY.md](SECURITY.md), not a public issue.
 
-Built an extension? [Submit it to the extension catalog](https://rpi.bigfisharc.cn/submit.html).
-欢迎[自主贡献扩展](https://rpi.bigfisharc.cn/submit.html)，与社区分享你的作品。
+To submit a Rust extension from your own GitHub repository, open the
+[extension catalog](https://rpi.bigfisharc.cn/packages.html?lang=en) and select **Get listed**.
 
 The whole test suite runs offline: `cargo test --workspace --locked`.
 
@@ -539,22 +632,20 @@ MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 The `rpi-*` crates are a Rust-native coding-agent stack.
 
-## Support / 赞赏支持
+## Support
 
 If rpi helps you, consider buying the author a coffee. Donations support
 continued development and maintenance. Thank you!
 
-如果 rpi 帮到了你，欢迎请作者喝杯咖啡，支持持续开发与维护。感谢每一份支持！
-
 <table>
   <tr>
-    <th>微信支付 / WeChat Pay</th>
-    <th>支付宝 / Alipay</th>
+    <th>WeChat Pay</th>
+    <th>Alipay</th>
     <th>Binance Pay</th>
   </tr>
   <tr>
-    <td align="center"><a href="https://assets.bigfisharc.cn/images/support/wechat.png"><img src="https://assets.bigfisharc.cn/images/support/wechat.png" width="200" alt="微信支付赞赏码 / WeChat Pay donation QR code"></a></td>
-    <td align="center"><a href="https://assets.bigfisharc.cn/images/support/alipay.jpg"><img src="https://assets.bigfisharc.cn/images/support/alipay.jpg" width="200" alt="支付宝赞赏码 / Alipay donation QR code"></a></td>
+    <td align="center"><a href="https://assets.bigfisharc.cn/images/support/wechat.png"><img src="https://assets.bigfisharc.cn/images/support/wechat.png" width="200" alt="WeChat Pay donation QR code"></a></td>
+    <td align="center"><a href="https://assets.bigfisharc.cn/images/support/alipay.jpg"><img src="https://assets.bigfisharc.cn/images/support/alipay.jpg" width="200" alt="Alipay donation QR code"></a></td>
     <td align="center"><a href="https://assets.bigfisharc.cn/images/support/binance.png"><img src="https://assets.bigfisharc.cn/images/support/binance.png" width="200" alt="Binance Pay donation QR code"></a></td>
   </tr>
 </table>
@@ -562,18 +653,15 @@ continued development and maintenance. Thank you!
 Scan a code or click an image to view the original. On mobile, save the image
 and scan it from the matching app’s photo library.
 
-扫码或点击图片查看原图；手机上可保存图片后，在对应 App 中识别。
-
-## Community / 交流群
+## Community
 
 Join us to ask questions, share ideas and try early builds.
-欢迎交流使用问题、分享想法和体验新功能。
 
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-26"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-26" width="230" alt="微信交流群二维码 / WeChat group QR code"></a><br>
-      <sub><b>WeChat / 微信交流群</b> — 扫码加入 / Scan to join</sub>
+      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-27"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-27" width="230" alt="WeChat group QR code"></a><br>
+      <sub><b>WeChat</b> — Scan to join</sub>
     </td>
     <td align="center" width="50%">
       <a href="https://t.me/+7YfN4TZPP7Y0M2Q1"><img src="https://assets.bigfisharc.cn/images/support/tg.png" width="230" alt="Telegram group QR code"></a><br>
@@ -582,10 +670,9 @@ Join us to ask questions, share ideas and try early builds.
   </tr>
 </table>
 
-<sub>The WeChat image URL is refreshed daily with a date parameter (UTC+8) by
-<a href=".github/workflows/readme-images.yml">README image refresh</a> to avoid stale cached
-images. This does not renew the group invitation itself; if it expires, please
-open an issue. / 微信群图片链接每日更新日期参数以刷新缓存；若入群邀请失效，请提 issue。</sub>
+<sub>The <a href=".github/workflows/readme-images.yml">README image refresh workflow</a>
+updates the WeChat image URL daily (UTC+8) to keep the cached image current.
+Please open an issue if the group invitation expires.</sub>
 
 ## Star history
 
@@ -594,7 +681,6 @@ open an issue. / 微信群图片链接每日更新日期参数以刷新缓存；
 ## Contributors
 
 Thank you to everyone who contributes code, documentation, bug reports and ideas.
-感谢所有参与代码、文档、问题反馈和建议的贡献者！
 
 [![Contributors to pi-rust](https://contrib.rocks/image?repo=bigfish1913/pi-rust)](https://github.com/bigfish1913/pi-rust/graphs/contributors)
 

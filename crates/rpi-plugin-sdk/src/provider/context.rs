@@ -324,26 +324,39 @@ pub unsafe fn drive_with_context(
     })
 }
 
-/// Export a provider whose factory uses registration-scoped runtime/HTTP resources.
+/// Define `request` and `stream` callbacks for a registration-scoped provider.
+/// Pass a [`ContextFactory`] directly, or use `select_factory = path` with a
+/// safe `fn(*mut c_void) -> ContextFactory` that treats the context as an opaque
+/// pointer (null on legacy registrations).
 #[macro_export]
-macro_rules! export_provider_with_context {
-    ($id:expr, $base:expr, $api:expr, $manifest:expr, $factory:path) => {
+macro_rules! provider_callbacks {
+    (select_factory = $factory:path) => {
+        $crate::provider_callbacks!(@impl $factory);
+    };
+    ($factory:path) => {
+        $crate::provider_callbacks!(@impl |_: *mut std::ffi::c_void| $factory);
+    };
+    (@impl $select:expr) => {
         extern "C" fn request(
             req: $crate::StbStringRef,
             out: *mut $crate::StbString,
             context: *mut std::ffi::c_void,
         ) -> i32 {
-            unsafe {
-                $crate::provider::drive_with_context(
-                    $factory,
-                    context,
-                    req,
-                    None,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    out,
-                )
-            }
+            $crate::guard_or(1, || {
+                let factory: $crate::provider::ContextFactory = ($select)(context);
+                // SAFETY: the host supplies the registered context and live ABI arguments.
+                unsafe {
+                    $crate::provider::drive_with_context(
+                        factory,
+                        context,
+                        req,
+                        None,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        out,
+                    )
+                }
+            })
         }
         extern "C" fn stream(
             req: $crate::StbStringRef,
@@ -355,12 +368,24 @@ macro_rules! export_provider_with_context {
             out: *mut $crate::StbString,
             context: *mut std::ffi::c_void,
         ) -> i32 {
-            unsafe {
-                $crate::provider::drive_with_context(
-                    $factory, context, req, emit, data, control, out,
-                )
-            }
+            $crate::guard_or(1, || {
+                let factory: $crate::provider::ContextFactory = ($select)(context);
+                // SAFETY: the host supplies the registered context and live ABI arguments.
+                unsafe {
+                    $crate::provider::drive_with_context(
+                        factory, context, req, emit, data, control, out,
+                    )
+                }
+            })
         }
+    };
+}
+
+/// Export a provider whose factory uses registration-scoped runtime/HTTP resources.
+#[macro_export]
+macro_rules! export_provider_with_context {
+    ($id:expr, $base:expr, $api:expr, $manifest:expr, $factory:path) => {
+        $crate::provider_callbacks!($factory);
         $crate::export_plugin!(|api| $crate::provider::register_with_context(
             api, $id, $base, $api, $manifest, request, stream
         ));

@@ -1255,6 +1255,36 @@ pub struct EntryQuery {
     pub cursor: Option<EntryCursor>,
 }
 
+/// A session-wide reserved entry lookup for lane recovery.
+#[derive(Debug, Clone, Copy)]
+pub enum RecoveryEntryCheck<'a> {
+    DeferredWrite(Option<&'a str>),
+    ToolResult {
+        id: &'a str,
+        call_id: &'a str,
+        tool_name: &'a str,
+    },
+}
+
+impl<'a> RecoveryEntryCheck<'a> {
+    pub(crate) fn id(self) -> Option<&'a str> {
+        match self {
+            Self::DeferredWrite(id) => id,
+            Self::ToolResult { id, .. } => Some(id),
+        }
+    }
+
+    pub(crate) fn matches_tool(self, identity: Option<(String, String)>) -> bool {
+        let Self::ToolResult {
+            call_id, tool_name, ..
+        } = self
+        else {
+            return false;
+        };
+        identity.is_some_and(|(call, name)| call == call_id && name == tool_name)
+    }
+}
+
 /// Real entry identity and parent link, without a transcript payload.
 /// Ancestry includes all entry kinds, including archival custom entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1946,6 +1976,25 @@ pub trait SessionStorage: Send + Sync {
         Ok(Some((result.tool_call_id, result.tool_name)))
     }
 
+    /// Return one settlement flag per check, in order. The first error in
+    /// that order aborts the sweep.
+    async fn recovery_entries_settled(
+        &self,
+        checks: &[RecoveryEntryCheck<'_>],
+    ) -> SessionResult<Vec<bool>> {
+        let mut settled = Vec::with_capacity(checks.len());
+        for check in checks {
+            settled.push(match *check {
+                RecoveryEntryCheck::DeferredWrite(Some(id)) => self.get_entry(id).await?.is_some(),
+                RecoveryEntryCheck::DeferredWrite(None) => false,
+                RecoveryEntryCheck::ToolResult { id, .. } => {
+                    check.matches_tool(self.tool_result_identity(id).await?)
+                }
+            });
+        }
+        Ok(settled)
+    }
+
     async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>>;
     async fn find_entries_on_branch(
         &self,
@@ -2024,6 +2073,22 @@ pub trait SessionStorage: Send + Sync {
     async fn get_label(&self, id: &str) -> SessionResult<Option<String>>;
     async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()>;
     async fn get_stats(&self) -> SessionResult<SessionStats>;
+
+    /// Synchronize committed history through an explicit physical persistence
+    /// boundary and return the identity covered by that barrier. Implementations
+    /// must serialize it with history mutations/replacement, fail on unsettled
+    /// writes or lost ownership, and keep an admitted barrier alive if its caller
+    /// stops waiting. Unsupported/ephemeral backends must not return success.
+    ///
+    /// This covers history only, not transient progress, other databases, or a
+    /// request receipt. Later mutations can advance or replace the returned
+    /// identity. A caller still needs a journal-linked request/admission proof;
+    /// neither `drain` nor a successful submit is such a proof.
+    async fn sync_history(&self) -> SessionResult<HistoryIdentity> {
+        Err(SessionError::storage(
+            "physical history synchronization is unsupported",
+        ))
+    }
 
     /// Wait for any in-flight durable write to settle.
     ///

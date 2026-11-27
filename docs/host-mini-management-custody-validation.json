@@ -1,0 +1,235 @@
+{
+  "audit_passed": true,
+  "mini_management_native_custody_chain_passed": true,
+  "full_regressions_passed": false,
+  "production_mini_qualification_complete": false,
+  "stage": "mini_management_native_dll_custody_single_chain",
+  "core_head": "fabb8294eff1fafcbed5e085b59f7f96cca924b5",
+  "extension_head": "bf86b1b8c61a779ef9f211cecfc93ce0bce067f5",
+  "stage_delta_paths": {
+    "core": [
+      "crates/rpi-cli/src/host/README.md",
+      "docs/host-mini-management-custody-validation.json",
+      "docs/host-mini-management-custody.md"
+    ],
+    "extension": [
+      "packages/rpi-host/README.md",
+      "packages/rpi-host/tests/native_mini.py",
+      "packages/rpi-host/tests/native_mini_custody.py"
+    ]
+  },
+  "production_rust_unchanged": true,
+  "contracts_unchanged_byte_identical": true,
+  "contract_sha256": {
+    "protocol.rs": "aa41f7dbf4613a8348127491c3e0df3f461135b88d88ad2637b92f26fea2cc10",
+    "client.rs": "55cb9897c61594dc554baddcc06dc80dcf88d11458b1a14fff1bc137c5d9e97a",
+    "client_tests.rs": "5c3be31231940f5b4e934cc66f9559eb33129fa8ee5df6ab54d6689efc1b20de",
+    "fixtures/control-v1.json": "a312686a2824051bde0f7c2febd4f687ec206773ca6a032c39fcc1439e13169f"
+  },
+  "binary_sha256": "026cc40a77061d006e36f43a3911455a6c791b83929e77bb58a5495ad2015d07",
+  "plugin_sha256": "39cb5fd04d2b998fcb032d1b6dda40d62e282080691ce5957a3f0caed5f3f281",
+  "cases": {
+    "lost_close_reply": {
+      "checks": [
+        "actual_binary_native_hook_sessionless_identity",
+        "second_mini_builtin_tool_progresses_during_late_callback",
+        "cancel_after_response_keeps_run_running_until_native_callback_returns",
+        "real_close_reply_lost_exact_volatile_reconciliation_without_implicit_retry",
+        "disconnected_close_retains_owner_and_mapped_dll_during_finish_gate",
+        "finish_then_unload_then_lost_close_publication_exact_RABEFU",
+        "restart_lost_old_close_unknown_no_dll_reload_or_provider_replay",
+        "no_workspace_file_effects_or_jsonl"
+      ],
+      "management_tool_calls": 30,
+      "native_provider_calls": 4,
+      "hook_events": "RABEFU",
+      "hook_sha256": "ef17423c0091b238e0468a26a11085360e4f55269eb46170e24bbf269cce66eb",
+      "sdk_abi_layout": {
+        "abi": 4,
+        "api_size": 216,
+        "payload_size": 56,
+        "event_size": 64,
+        "event_offset": 8,
+        "lifecycle": 160,
+        "register_event": 80,
+        "after": 14
+      },
+      "native_settlement_proven": true,
+      "hook_staging_empty": true,
+      "all_fixture_resources_joined": true,
+      "proxy_joined": true,
+      "mini_workspace_unchanged": true,
+      "evidence_file": "native-mini-custody-final-6.json"
+    },
+    "crash_at_callback": {
+      "checks": [
+        "actual_binary_native_hook_sessionless_identity",
+        "second_mini_builtin_tool_progresses_during_late_callback",
+        "cancel_after_response_keeps_run_running_until_native_callback_returns",
+        "crash_inside_native_callback_reaped_then_restart_lost_unknown_no_reload_or_replay",
+        "crash_retains_staging_residue_without_false_native_settlement_or_unload_event",
+        "no_workspace_file_effects_or_jsonl"
+      ],
+      "management_tool_calls": 18,
+      "native_provider_calls": 3,
+      "hook_events": "RA",
+      "hook_sha256": "5368ee16c1c51b3247ce47277ea797ae01a3a0d33be70c65fc5e09885ea18e96",
+      "sdk_abi_layout": {
+        "abi": 4,
+        "api_size": 216,
+        "payload_size": 56,
+        "event_size": 64,
+        "event_offset": 8,
+        "lifecycle": 160,
+        "register_event": 80,
+        "after": 14
+      },
+      "native_settlement_proven": false,
+      "hook_staging_empty": false,
+      "all_fixture_resources_joined": true,
+      "proxy_joined": true,
+      "mini_workspace_unchanged": true,
+      "evidence_file": "native-mini-custody-crash-7.json"
+    },
+    "drain_at_callback": {
+      "checks": [
+        "actual_binary_native_hook_sessionless_identity",
+        "second_mini_builtin_tool_progresses_during_late_callback",
+        "cancel_after_response_keeps_run_running_until_native_callback_returns",
+        "actual_sigterm_drain_keeps_process_owner_and_custody_during_callback",
+        "actual_sigterm_drain_waits_for_native_finish_before_exit",
+        "graceful_drain_reaped_restart_lost_without_dll_reload_or_replay",
+        "no_workspace_file_effects_or_jsonl"
+      ],
+      "management_tool_calls": 17,
+      "native_provider_calls": 3,
+      "hook_events": "RABEFU",
+      "hook_sha256": "beab6a2df3a178c6f29e060058a26868ce579d399b6ba7a30676d04f66546487",
+      "sdk_abi_layout": {
+        "abi": 4,
+        "api_size": 216,
+        "payload_size": 56,
+        "event_size": 64,
+        "event_offset": 8,
+        "lifecycle": 160,
+        "register_event": 80,
+        "after": 14
+      },
+      "native_settlement_proven": true,
+      "hook_staging_empty": true,
+      "all_fixture_resources_joined": true,
+      "proxy_joined": true,
+      "mini_workspace_unchanged": true,
+      "evidence_file": "native-mini-custody-drain-5.json"
+    }
+  },
+  "basic_mini_regression": {
+    "management_calls": 43,
+    "http_requests": 7,
+    "scenarios": 9
+  },
+  "persistent_regression": {
+    "basic": [
+      7,
+      1
+    ],
+    "administrative": [
+      21,
+      1
+    ],
+    "error_cases": 10,
+    "results": [
+      31,
+      6
+    ],
+    "result_scenarios": 9
+  },
+  "management_unit_tests": {
+    "passed": 20,
+    "failed": 0
+  },
+  "remaining_failed_gates": {
+    "agent_strict_scoped_clippy": {
+      "passed": false,
+      "exit_code": 101,
+      "diagnostics": [
+        {
+          "message": "use of `unwrap_or_else` to construct default value",
+          "path": "crates/rpi-agent/src/agent.rs",
+          "line": 563,
+          "source_unchanged_vs_stage_start": true
+        },
+        {
+          "message": "doc list item without indentation",
+          "path": "crates/rpi-agent/src/agent_loop.rs",
+          "line": 958,
+          "source_unchanged_vs_stage_start": true
+        },
+        {
+          "message": "you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`",
+          "path": "crates/rpi-agent/src/agent_loop.rs",
+          "line": 1749,
+          "source_unchanged_vs_stage_start": true
+        },
+        {
+          "message": "large size difference between variants",
+          "path": "crates/rpi-agent/src/events.rs",
+          "line": 23,
+          "source_unchanged_vs_stage_start": true
+        }
+      ]
+    },
+    "unfiltered_extcore_tests": {
+      "passed": 406,
+      "failed": 1,
+      "ignored": 2,
+      "exit_code": 101,
+      "failed_test": "host::startup::tests::unix::early_exit_reports_native_stderr_and_releases_launch_ownership",
+      "path": "packages/rpi-extcore/src/host/startup_tests.rs",
+      "line": 219,
+      "message": "native session is already owned or its cleanup is still in progress",
+      "source_unchanged_vs_stage_start": true,
+      "failed_target_retried": false
+    },
+    "baseline_failure_reproduced": false,
+    "flaky_cause_proven": false,
+    "source_lint_exemptions_added": false,
+    "management_package_test_pass_does_not_override_extcore_failure": true
+  },
+  "cli_scoped_strict_clippy_passed": true,
+  "management_all_targets_scoped_strict_clippy_passed": true,
+  "existing_sdk_macro_command_line_exception": "-A clippy::not_unsafe_ptr_arg_deref",
+  "new_source_lint_exemptions": false,
+  "new_workspace_crates_dependencies_lockfile_changes": false,
+  "prior_evidence_unchanged": true,
+  "prior_full_cli_tests_rerun_this_stage": false,
+  "all_platforms_claimed": false,
+  "memory_benchmark_run": false,
+  "tasks_14_65_66_completed": false,
+  "committed_pushed_merged_installed_deployed_released": false,
+  "passing_log_stems": [
+    "native-mini-custody-2",
+    "native-mini-custody-final-3",
+    "native-mini-custody-crash-4",
+    "native-mini-custody-drain-5",
+    "native-mini-custody-final-6",
+    "native-mini-custody-crash-7",
+    "native-mini-basic-regression-1",
+    "core-format-1",
+    "core-scoped-clippy-1",
+    "management-unit-regression-1",
+    "management-scoped-clippy-1",
+    "extension-format-1",
+    "persistent-basic-1",
+    "persistent-administrative-1",
+    "persistent-errors-1",
+    "persistent-results-1"
+  ],
+  "preserved_failures": {
+    "native-mini-custody-1": 1,
+    "agent-hooks-strict-scoped-clippy-1": 101,
+    "extension-unit-regression-1": 101
+  },
+  "evidence_directory": "/private/tmp/rpi-host-integration-checks/mini-custody-chain-20261125T005911692076Z",
+  "source_snapshot": "final-mini-custody-source-snapshot.json"
+}

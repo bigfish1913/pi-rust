@@ -89,10 +89,42 @@ impl PreparedJsonRequest {
             .client
             .execute(request)
             .await
-            .map_err(|error| crate::AiError::Http {
-                status: None,
-                message: format!("http transport error: {error}"),
-            })
+            .map_err(transport_error)
+    }
+}
+
+/// Keep actionable transport diagnostics without copying endpoint credentials,
+/// query strings, request headers, or arbitrary source-error text into events.
+fn transport_error(error: reqwest::Error) -> crate::AiError {
+    use std::error::Error;
+    use std::fmt::Write;
+
+    let error = error.without_url();
+    let mut message = format!(
+        "http transport error (connect={}, timed_out={}, request={}, body={}): {}",
+        error.is_connect(),
+        error.is_timeout(),
+        error.is_request(),
+        error.is_body(),
+        error,
+    );
+    let mut source = error.source();
+    // Only typed OS causes are retained. Generic source Display/Debug can
+    // contain arbitrary provider/proxy URLs or credentials; do not stringify it.
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            let _ = write!(
+                message,
+                "; io_kind={:?}, os_error={:?}",
+                io.kind(),
+                io.raw_os_error()
+            );
+        }
+        source = cause.source();
+    }
+    crate::AiError::Http {
+        status: None,
+        message,
     }
 }
 
@@ -100,6 +132,61 @@ impl PreparedJsonRequest {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn connection_failure_keeps_os_cause_but_not_request_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let request = PreparedJsonRequest::new(
+            client
+                .post(format!(
+                    "http://user:fixture-sentinel@{address}/private-path?key=fixture-query"
+                ))
+                .timeout(std::time::Duration::from_secs(2)),
+            &(),
+        )
+        .unwrap();
+        let error = request.send().await.unwrap_err();
+        assert!(error.is_retryable());
+        let text = error.to_string();
+        assert!(text.contains("connect=true"), "{text}");
+        assert!(text.contains("io_kind=ConnectionRefused"), "{text}");
+        assert!(text.contains("os_error=Some("), "{text}");
+        for sensitive in [
+            "fixture-sentinel",
+            "fixture-query",
+            "private-path",
+            &address.to_string(),
+        ] {
+            assert!(!text.contains(sensitive), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_is_classified_without_changing_retryability() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let request = PreparedJsonRequest::new(
+            client
+                .post(format!("http://{address}/"))
+                .timeout(std::time::Duration::from_millis(100)),
+            &(),
+        )
+        .unwrap();
+        let error = request.send().await.unwrap_err();
+        server.abort();
+        let _ = server.await;
+        assert!(error.is_retryable());
+        assert!(error.to_string().contains("timed_out=true"), "{error}");
+        assert!(!error.to_string().contains(&address.to_string()), "{error}");
+    }
 
     struct Counted<'a>(&'a AtomicUsize);
     impl serde::Serialize for Counted<'_> {

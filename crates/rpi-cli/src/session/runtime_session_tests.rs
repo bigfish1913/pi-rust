@@ -387,3 +387,43 @@ async fn fork_takes_a_session_file_outside_the_session_directory() {
     assert_eq!(forked.get_name().await.unwrap().as_deref(), Some("parent"));
     assert_eq!(list_session_files_sync(&root).len(), 1);
 }
+
+#[tokio::test]
+async fn launch_fork_cuts_at_or_before_a_historical_message() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path().to_string_lossy();
+    let root = temporary.path().join("sessions");
+    let source = create_jsonl_session(&root, &cwd).await.unwrap();
+    let mut entries = Vec::new();
+    for content in ["first", "target", "later"] {
+        let message = rpi_ai::types::UserMessage::new(content, 42);
+        entries.push(source.append_message(message.into()).await.unwrap());
+    }
+    let custom = source.append_custom_entry("test", None).await.unwrap();
+    let path = list_session_files_sync(&root).remove(0);
+    let original = std::fs::read(&path).unwrap();
+    let launch = |entry: &str, position: &str| {
+        let args = crate::args::parse_args(&[
+            "--fork".into(),
+            path.to_string_lossy().into_owned(),
+            format!("--fork-entry={entry}"),
+            format!("--fork-position={position}"),
+        ]);
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        args
+    };
+    for (position, leaf) in [("at", &entries[1]), ("before", &entries[0])] {
+        let args = launch(&entries[1], position);
+        let selection = select_session_in_dir(&args, root.clone());
+        let forked = build_session(&selection, &cwd, None, None).await.unwrap();
+        assert_eq!(forked.get_leaf_id().await.unwrap().as_ref(), Some(leaf));
+        assert!(forked.get_entry(&entries[2]).await.unwrap().is_none());
+    }
+    for entry in ["missing", &custom] {
+        let args = launch(entry, "at");
+        let selection = select_session_in_dir(&args, root.clone());
+        assert!(build_session(&selection, &cwd, None, None).await.is_err());
+    }
+    assert_eq!(list_session_files_sync(&root).len(), 3);
+    assert_eq!(std::fs::read(path).unwrap(), original);
+}

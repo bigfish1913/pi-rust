@@ -32,7 +32,7 @@ pub(crate) fn declaration(
         requires_auth: manifest.requires_auth,
     }
 }
-fn runtime_settings(settings: settings::Settings) -> rpi_runtime::RuntimeSettings {
+pub(crate) fn runtime_settings(settings: settings::Settings) -> rpi_runtime::RuntimeSettings {
     let timeout = settings.http_idle_timeout_ms();
     rpi_runtime::RuntimeSettings {
         default_provider: settings.default_provider,

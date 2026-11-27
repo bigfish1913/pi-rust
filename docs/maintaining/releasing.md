@@ -61,12 +61,14 @@ Do not use `pull_request_target` to execute contribution code with release secre
 
 ### Preview releases
 
-A preview merge on the `preview` branch runs only the prebuilt binary workflow. It creates a
-GitHub prerelease with a `vX.Y.Z-preview.N` tag and does **not** run release-plz, publish any
-crate to crates.io, publish to npm, or update Homebrew/Scoop/winget channels. The preview binary is available
-through the explicit `rpi update preview` command; normal stable update checks never select a
-prerelease. A preview binary still checks crates.io for the stable line and therefore tells the
-user to run `rpi update` when a formal release is available.
+Preview publication is manual. A push or merge to `preview` runs validation only; dispatch
+the CI workflow on `preview` with `publish_preview=true` to build and publish the prebuilt
+binaries. It creates a GitHub prerelease with a `vX.Y.Z-preview.N` tag and does **not** run
+release-plz, publish any crate to crates.io, publish to npm, or update
+Homebrew/Scoop/winget channels. The preview binary is available through the explicit
+`rpi update preview` command; normal stable update checks never select a prerelease. A
+preview binary still checks crates.io for the stable line and therefore tells the user to
+run `rpi update` when a formal release is available.
 
 
 A documentation update does not require a version bump. Keep `Cargo.toml`,
@@ -149,11 +151,10 @@ A hosted runner can also be cancelled before it executes its first step, especia
 
 The daily README image refresh updates `automation/readme-images` and creates or
 reuses a restricted upstream PR. The workflow verifies that the branch is rebuilt
-from `main` and that the only changed path is `README.md`, then administrator-merges
-that exact PR with squash without waiting for normal CI. This is intentionally a
-narrow bypass for the automated WeChat image cache-key update; ordinary and fork PRs
-remain subject to normal review and required checks. Missing token or API/push/merge
-failure fails visibly.
+from `main` and that changes are limited to `README.md` and `README.zh-CN.md`, then
+administrator-merges that exact PR with squash without waiting for normal CI.
+Ordinary and fork PRs remain subject to normal review and required checks.
+Missing token or API/push/merge failure fails visibly.
 
 ### Recovery and release records
 

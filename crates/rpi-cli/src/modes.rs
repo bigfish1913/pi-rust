@@ -356,41 +356,30 @@ pub async fn rpc(
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
     message_updates: crate::args::RpcMessageUpdates,
 ) -> i32 {
-    rpc_with_durable(
+    rpc_with_durable_home(
         harness,
         agent_events.take(),
         model_catalog,
-        ui_dialog,
-        oauth_snapshot,
-        None,
-        message_updates,
-        false,
+        RpcOptions {
+            ui_dialog,
+            oauth_snapshot,
+            extension_session: None,
+            message_updates,
+            native_durable: false,
+            home: crate::config::AgentHome::process(),
+        },
     )
     .await
 }
 
-pub async fn rpc_with_durable(
-    harness: &AgentHarness,
-    agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
-    model_catalog: Vec<rpi_ai::Model>,
-    ui_dialog: rpi_extensions::UiDialogMailbox,
-    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
-    extension_session: Option<crate::session::ExtensionSessionCell>,
-    message_updates: crate::args::RpcMessageUpdates,
-    native_durable: bool,
-) -> i32 {
-    rpc_with_durable_home(
-        harness,
-        agent_events,
-        model_catalog,
-        ui_dialog,
-        oauth_snapshot,
-        extension_session,
-        message_updates,
-        native_durable,
-        crate::config::AgentHome::process(),
-    )
-    .await
+/// Runtime integrations and policy shared by the stdio and test RPC loops.
+pub struct RpcOptions {
+    pub ui_dialog: rpi_extensions::UiDialogMailbox,
+    pub oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    pub extension_session: Option<crate::session::ExtensionSessionCell>,
+    pub message_updates: crate::args::RpcMessageUpdates,
+    pub native_durable: bool,
+    pub home: crate::config::AgentHome,
 }
 
 /// [`rpc_with_durable`] with the session's explicit agent home, so RPC
@@ -400,30 +389,74 @@ pub async fn rpc_with_durable_home(
     harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
-    ui_dialog: rpi_extensions::UiDialogMailbox,
-    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
-    extension_session: Option<crate::session::ExtensionSessionCell>,
-    message_updates: crate::args::RpcMessageUpdates,
-    native_durable: bool,
-    home: crate::config::AgentHome,
+    options: RpcOptions,
 ) -> i32 {
     rpc_with_native_durable_io(
         harness,
         agent_events.take(),
         model_catalog,
-        ui_dialog,
-        oauth_snapshot,
-        extension_session,
-        message_updates,
-        native_durable,
+        options,
         crate::rpc::execution::lifecycle_enabled(
             std::env::var_os(crate::rpc::execution::LIFECYCLE_ENV).as_deref(),
         ),
-        home,
+        RpcLifetime::default(),
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
     )
     .await
+}
+
+#[cfg(unix)]
+pub(crate) async fn rpc_host_session<R, W>(
+    harness: &AgentHarness,
+    events: tokio::sync::broadcast::Receiver<AgentEvent>,
+    models: Vec<rpi_ai::Model>,
+    context: &crate::session::ReloadContext,
+    home: crate::config::AgentHome,
+    idle_timeout: Option<std::time::Duration>,
+    (input, output): (R, W),
+) where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: Write + Send + 'static,
+{
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        context,
+        rpi_plugin_sdk::EventTag::SessionStart,
+    )
+    .await
+    {
+        tracing::warn!("extension vetoed Host RPC SessionStart (advisory): {reason}");
+    }
+    let oauth_snapshot = context.extension_session.lock().unwrap().snapshot_arc();
+    rpc_with_native_durable_io(
+        harness,
+        Some(events),
+        models,
+        RpcOptions {
+            ui_dialog: context.ui_dialog.clone(),
+            oauth_snapshot,
+            extension_session: Some(context.extension_session.clone()),
+            message_updates: context.args.rpc_message_updates,
+            native_durable: context.args.native_durable,
+            home,
+        },
+        true,
+        RpcLifetime {
+            cancel_on_eof: true,
+            idle_timeout,
+        },
+        input,
+        output,
+    )
+    .await;
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        context,
+        rpi_plugin_sdk::EventTag::SessionShutdown,
+    )
+    .await
+    {
+        tracing::warn!("extension vetoed Host RPC SessionShutdown (ignored, closing): {reason}");
+    }
 }
 
 /// Opt-in, payload-free stage markers. An unmatched begin identifies an
@@ -539,30 +572,35 @@ where
         harness,
         agent_events,
         model_catalog,
-        ui_dialog,
-        oauth_snapshot,
-        extension_session,
-        message_updates,
-        false,
+        RpcOptions {
+            ui_dialog,
+            oauth_snapshot,
+            extension_session,
+            message_updates,
+            native_durable: false,
+            home: crate::config::AgentHome::process(),
+        },
         true,
-        crate::config::AgentHome::process(),
+        RpcLifetime::default(),
         input,
         output,
     )
     .await
 }
 
+#[derive(Default)]
+struct RpcLifetime {
+    cancel_on_eof: bool,
+    idle_timeout: Option<std::time::Duration>,
+}
+
 async fn rpc_with_native_durable_io<R, W>(
     harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
-    ui_dialog: rpi_extensions::UiDialogMailbox,
-    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
-    extension_session: Option<crate::session::ExtensionSessionCell>,
-    message_updates: crate::args::RpcMessageUpdates,
-    native_durable: bool,
+    options: RpcOptions,
     correlated_execution: bool,
-    home: crate::config::AgentHome,
+    lifetime: RpcLifetime,
     mut input: R,
     output: W,
 ) -> i32
@@ -570,6 +608,14 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
     W: Write + Send + 'static,
 {
+    let RpcOptions {
+        ui_dialog,
+        oauth_snapshot,
+        extension_session,
+        message_updates,
+        native_durable,
+        home,
+    } = options;
     let phase_diagnostics =
         std::env::var_os("RPI_RPC_DIAGNOSTICS").is_some_and(|value| value != "0");
     let setup_timing = RpcPhaseTiming::start(phase_diagnostics, "setup_to_ready_enqueue");
@@ -717,8 +763,9 @@ where
     let run_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut run_task: Option<OwnedRpcRun> = None;
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
-    let mut cancel_on_exit = false;
+    let mut cancel_on_exit = lifetime.cancel_on_eof;
     let mut native_shutdown_reconciled = false;
+    let mut exit_code = 0;
 
     let binding = match rpi_harness::session::SessionValues::load(harness.session()).await {
         Ok(values) => crate::resource_selection::binding_state(&values),
@@ -772,15 +819,41 @@ where
     events_ready.cancel();
     setup_timing.finish();
 
-    loop {
-        let incoming = tokio::select! {
-            _ = writer_failed.cancelled() => {
-                cancel_on_exit = true;
-                break;
+    'requests: loop {
+        // Keep the frame reader pinned while reaping tasks. A partial frame has
+        // already consumed bytes and must survive a settlement notification.
+        let incoming = crate::rpc::framing::read_frame(&mut input);
+        tokio::pin!(incoming);
+        let idle_timeout = lifetime.idle_timeout;
+        let line = loop {
+            let idle = run_task.is_none() && command_tasks.is_empty();
+            tokio::select! {
+                biased;
+                _ = writer_failed.cancelled() => {
+                    cancel_on_exit = true;
+                    break 'requests;
+                }
+                line = &mut incoming => break line,
+                result = async { run_task.as_mut().unwrap().await }, if idle_timeout.is_some() && run_task.is_some() => {
+                    run_task = None;
+                    if let Err(error) = result {
+                        eprintln!("[rpi] rpc prompt task failed: {error}");
+                        exit_code = 1;
+                    }
+                }
+                _ = async { command_tasks.last_mut().unwrap().await }, if idle_timeout.is_some() && !command_tasks.is_empty() => {
+                    command_tasks.pop();
+                }
+                _ = async { tokio::time::sleep(idle_timeout.unwrap()).await }, if idle_timeout.is_some() && idle => {
+                    write_line(&stdout, &serde_json::json!({
+                        "type": "host_idle_timeout",
+                        "idleTimeoutSeconds": idle_timeout.unwrap().as_secs(),
+                    })).await;
+                    break 'requests;
+                }
             }
-            line = crate::rpc::framing::read_frame(&mut input) => line,
         };
-        let line = match incoming {
+        let line = match line {
             Ok(Some(line)) => line,
             Ok(None) => break, // EOF
             Err(error) => {
@@ -1074,6 +1147,7 @@ where
                     continue;
                 }
                 let lane_task = Arc::clone(&lane);
+                let harness_task = harness.clone();
                 let out_task = stdout.clone();
                 let active_task = Arc::clone(&run_active);
                 let flush_events = execution_observer.clone();
@@ -1150,6 +1224,7 @@ where
                             }
                             let result = execution_request
                                 .scope(rpc_compact_cancellable(
+                                    &harness_task,
                                     &lane_task,
                                     instructions,
                                     cancel_task,
@@ -1180,11 +1255,20 @@ where
                             result
                         } else if resume {
                             execution_request
-                                .scope(rpc_resume_cancellable(&lane_task, cancel_task))
+                                .scope(rpc_resume_cancellable(
+                                    &harness_task,
+                                    &lane_task,
+                                    cancel_task,
+                                ))
                                 .await
                         } else {
                             execution_request
-                                .scope(rpc_prompt_cancellable(&lane_task, content, cancel_task))
+                                .scope(rpc_prompt_cancellable(
+                                    &harness_task,
+                                    &lane_task,
+                                    content,
+                                    cancel_task,
+                                ))
                                 .await
                         };
                         execute_timing.finish();
@@ -1396,9 +1480,9 @@ where
         write_line(&stdout, &response).await;
     }
 
-    // EOF closes the input half of the protocol, not an accepted prompt.
-    // There can be no more dialog answers, so release approvals, then await the
-    // run before SessionShutdown can unload plugins or the runtime exits.
+    // Stdio supports draining an accepted prompt after EOF. A Host socket
+    // belongs to one TUI, so disconnect cancels that session's run.
+    // Release approvals and await settlement before tearing down the session.
     ui_dialog.detach();
     if cancel_on_exit && !(native_durable && native_shutdown_reconciled) {
         run_cancel.cancel();
@@ -1413,7 +1497,6 @@ where
     for task in command_tasks {
         let _ = task.await;
     }
-    let mut exit_code = 0;
     // A broken transport during healthy EOF waiting must still cancel the run.
     if let Some(mut task) = run_task {
         let result = tokio::select! {
@@ -1706,39 +1789,51 @@ async fn rpc_configure_file_io(
     Ok(serde_json::json!({"readText": read_text, "writeText": write_text}))
 }
 
-/// Cancellation is delivered even if abort/stop arrives before prompt_text has
-/// registered a run. Once active, await its normal aborted outcome and cleanup.
+/// Stop an unadmitted RPC operation or keep driving an admitted one to settlement.
+async fn rpc_run_cancellable(
+    harness: &AgentHarness,
+    lane: &Arc<dyn AgentLane>,
+    cancel: tokio_util::sync::CancellationToken,
+    operation: impl std::future::Future<Output = Result<serde_json::Value, String>>,
+) -> Result<
+    (
+        serde_json::Value,
+        Option<rpi_harness::agent_harness::AbortResult>,
+    ),
+    String,
+> {
+    if cancel.is_cancelled() {
+        return Err("Operation aborted".into());
+    }
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            if !harness.active_operation_snapshot().is_some_and(|run| run.lane == "main") {
+                return Err("Operation aborted".into());
+            }
+            // The operation can hold the message-write gate across storage I/O.
+            // Keep polling it while abort waits to acquire that same gate.
+            let (abort, result) = tokio::join!(biased; lane.abort(), &mut operation);
+            Ok((result?, abort.ok()))
+        }
+        result = &mut operation => result.map(|value| (value, None)),
+    }
+}
+
 async fn rpc_prompt_cancellable(
+    harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
     content: crate::rpc::prompt_content::ParsedPrompt,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<serde_json::Value, String> {
-    if cancel.is_cancelled() {
-        return Err("Operation aborted".into());
+    let (mut value, reclaimed) =
+        rpc_run_cancellable(harness, lane, cancel, rpc_prompt_content(lane, content)).await?;
+    // Return the atomically reclaimed queue so the client can restore it.
+    if let (Some(reclaimed), Some(object)) = (reclaimed, value.as_object_mut()) {
+        object.insert("reclaimed".to_string(), reclaimed_payload(&reclaimed));
     }
-    let prompt = rpc_prompt_content(lane, content);
-    tokio::pin!(prompt);
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            // `abort()` reclaims the queue atomically. The entries are not
-            // dropped: they ride back on the settlement so the client can
-            // restore what the user staged while the run was in flight.
-            match lane.abort().await {
-                Ok(reclaimed) => prompt.await.map(|mut value| {
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert(
-                            "reclaimed".to_string(),
-                            reclaimed_payload(&reclaimed),
-                        );
-                    }
-                    value
-                }),
-                Err(_) => Err("Operation aborted".to_string()),
-            }
-        }
-        result = &mut prompt => result,
-    }
+    Ok(value)
 }
 
 /// Reclaimed queue entries from an abort, for replies that also settle a run.
@@ -1755,6 +1850,7 @@ fn reclaimed_payload(result: &rpi_harness::agent_harness::AbortResult) -> serde_
 /// call on the summary, so it takes the same single-run slot and reports the
 /// same settlement shape a prompt does.
 async fn rpc_compact_cancellable(
+    harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
     instructions: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
@@ -1765,15 +1861,9 @@ async fn rpc_compact_cancellable(
             Err(error) => Err(error.to_string()),
         }
     };
-    tokio::pin!(compact);
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            let _ = lane.abort().await;
-            compact.await
-        }
-        result = &mut compact => result,
-    }
+    rpc_run_cancellable(harness, lane, cancel, compact)
+        .await
+        .map(|(value, _)| value)
 }
 
 /// Reduce a compaction result to what a client needs: the verdict, and a line
@@ -1824,6 +1914,7 @@ pub(crate) fn compaction_json(result: &CompactionResult) -> serde_json::Value {
 /// `Ok(None)` from the lane means there was nothing to resume: the run is
 /// reported as `skipped` so the client can settle without inventing an outcome.
 async fn rpc_resume_cancellable(
+    harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<serde_json::Value, String> {
@@ -1843,15 +1934,9 @@ async fn rpc_resume_cancellable(
             Err(error) => Err(error.to_string()),
         }
     };
-    tokio::pin!(resume);
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            let _ = lane.abort().await;
-            resume.await
-        }
-        result = &mut resume => result,
-    }
+    rpc_run_cancellable(harness, lane, cancel, resume)
+        .await
+        .map(|(value, _)| value)
 }
 
 pub(crate) fn rpc_outcome_str(
@@ -1901,7 +1986,10 @@ async fn rpc_prompt_content(
     )
 }
 
-async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> serde_json::Value {
+pub(crate) async fn rpc_get_state(
+    lane: &Arc<dyn AgentLane>,
+    harness: &AgentHarness,
+) -> serde_json::Value {
     let model = lane.get_model().await.ok();
     let thinking = lane
         .get_thinking_level()
@@ -1959,7 +2047,7 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
     })
 }
 
-fn rpc_now_ms() -> i64 {
+pub(crate) fn rpc_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -1982,7 +2070,7 @@ fn rpc_message_text(value: &serde_json::Value) -> String {
         .join("\n")
 }
 
-async fn rpc_get_history(
+pub(crate) async fn rpc_get_history(
     lane: &Arc<dyn AgentLane>,
     harness: &AgentHarness,
     msg: &serde_json::Value,
@@ -2623,7 +2711,7 @@ fn page_window(
 /// Read-only snapshot of the current branch, oldest first. Messages are
 /// projected with the same `AgentMessage` encoding the event stream uses, so a
 /// client can render a transcript without understanding session entries.
-async fn rpc_get_messages(
+pub(crate) async fn rpc_get_messages(
     lane: &Arc<dyn AgentLane>,
     harness: &AgentHarness,
     msg: &serde_json::Value,
@@ -2714,7 +2802,7 @@ async fn rpc_get_messages(
     }))
 }
 
-fn rpc_project_transcript(
+pub(crate) fn rpc_project_transcript(
     entries: Vec<rpi_harness::session::types::Entry>,
 ) -> Result<Vec<(String, serde_json::Value)>, String> {
     use rpi_harness::session::types::Entry;
@@ -2910,7 +2998,7 @@ async fn rpc_test_provider_config(msg: &serde_json::Value) -> Result<serde_json:
         required("apiKey")?,
     )
     .await?;
-    Ok(serde_json::to_value(result).map_err(|error| error.to_string())?)
+    serde_json::to_value(result).map_err(|error| error.to_string())
 }
 
 fn rpc_set_provider_config(
@@ -2948,10 +3036,12 @@ fn rpc_set_provider_config(
         api,
         base_url,
         api_key,
-        model_id,
-        model_name,
-        context_window,
-        max_tokens,
+        crate::config::ProviderModelConfig {
+            id: model_id,
+            name: model_name,
+            context_window,
+            max_tokens,
+        },
         supports_images,
     )?;
     Ok(serde_json::json!({
@@ -2990,10 +3080,12 @@ fn rpc_update_provider_config(
         api,
         base_url,
         msg.get("apiKey").and_then(serde_json::Value::as_str),
-        model_id,
-        msg.get("modelName").and_then(serde_json::Value::as_str),
-        positive_integer("contextWindow")?,
-        positive_integer("maxOutputTokens")?,
+        crate::config::ProviderModelConfig {
+            id: model_id,
+            name: msg.get("modelName").and_then(serde_json::Value::as_str),
+            context_window: positive_integer("contextWindow")?,
+            max_tokens: positive_integer("maxOutputTokens")?,
+        },
         msg.get("supportsImages")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
@@ -3054,7 +3146,7 @@ async fn rpc_set_api_key(
     }))
 }
 
-fn rpc_get_available_models(catalog: &[rpi_ai::Model]) -> serde_json::Value {
+pub(crate) fn rpc_get_available_models(catalog: &[rpi_ai::Model]) -> serde_json::Value {
     let models = catalog
         .iter()
         .map(crate::rpc::protocol::model_descriptor)
@@ -3062,7 +3154,9 @@ fn rpc_get_available_models(catalog: &[rpi_ai::Model]) -> serde_json::Value {
     serde_json::json!({"models": models})
 }
 
-async fn rpc_get_available_thinking_levels(lane: &Arc<dyn AgentLane>) -> serde_json::Value {
+pub(crate) async fn rpc_get_available_thinking_levels(
+    lane: &Arc<dyn AgentLane>,
+) -> serde_json::Value {
     let levels = lane
         .get_model()
         .await
@@ -3181,7 +3275,7 @@ async fn rpc_set_model(
         .iter()
         .find(|m| {
             m.id.eq_ignore_ascii_case(id)
-                && provider.map_or(true, |provider| m.provider.eq_ignore_ascii_case(provider))
+                && provider.is_none_or(|provider| m.provider.eq_ignore_ascii_case(provider))
         })
         .cloned()
         .ok_or_else(|| format!("unknown model: {id}"))?;
@@ -3189,7 +3283,7 @@ async fn rpc_set_model(
     Ok(serde_json::json!({"modelId": id, "provider": provider}))
 }
 
-async fn rpc_set_thinking_level(
+pub(crate) async fn rpc_set_thinking_level(
     lane: &Arc<dyn AgentLane>,
     msg: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -3270,6 +3364,15 @@ fn run_end_outcome_str(o: RunEndOutcome) -> &'static str {
     }
 }
 
+/// Initial input and appearance for an interactive session.
+pub struct InteractiveStartup<'a> {
+    pub initial: Option<String>,
+    pub extra_messages: &'a [String],
+    pub initial_images: Vec<ImageContent>,
+    pub theme: Option<&'a str>,
+    pub no_themes: bool,
+}
+
 /// `interactive` mode: uses TUI if terminal supports it, falls back to minimal REPL.
 ///
 /// `event_rx` carries the live `AgentEvent` stream (drained by the TUI to
@@ -3283,12 +3386,29 @@ pub async fn interactive(
     event_rx: Option<tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>>,
     args: &Args,
     model_catalog: Vec<rpi_ai::Model>,
-    initial: Option<String>,
-    extra_messages: &[String],
-    initial_images: Vec<ImageContent>,
-    theme: Option<&str>,
-    no_themes: bool,
+    startup: InteractiveStartup<'_>,
     reload_context: &crate::session::ReloadContext,
+) -> i32 {
+    Box::pin(interactive_with_terminal(
+        harness,
+        event_rx,
+        args,
+        model_catalog,
+        startup,
+        reload_context,
+        crate::interactive_tui::InteractiveTerminal::Process,
+    ))
+    .await
+}
+
+pub(crate) async fn interactive_with_terminal(
+    harness: &AgentHarness,
+    event_rx: Option<tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>>,
+    args: &Args,
+    model_catalog: Vec<rpi_ai::Model>,
+    startup: InteractiveStartup<'_>,
+    reload_context: &crate::session::ReloadContext,
+    terminal: crate::interactive_tui::InteractiveTerminal,
 ) -> i32 {
     // ---- Session lifecycle (P1): BeforeTuiStart ----
     // `BeforeTuiStart`: extensions may prepare (connect a server, load a
@@ -3302,7 +3422,10 @@ pub async fn interactive(
     )
     .await
     {
-        eprintln!("[rpi] startup vetoed by extension: {reason}");
+        terminal.report(
+            &format!("[rpi] startup vetoed by extension: {reason}"),
+            true,
+        );
         return crate::app::EXIT_VETOED;
     }
 
@@ -3310,21 +3433,18 @@ pub async fn interactive(
     let force_tui = std::env::var("RPI_FORCE_TUI")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let code = if force_tui || crate::interactive_tui::is_tui_supported() {
+    let code = if terminal.is_host() || force_tui || crate::interactive_tui::is_tui_supported() {
         // Use TUI-based interactive mode. The TUI future is intentionally
         // heap-allocated: its large state machine otherwise overflows the
         // default Windows main-thread stack before its body starts polling.
-        Box::pin(crate::interactive_tui::interactive_tui(
+        Box::pin(crate::interactive_tui::interactive_tui_with_terminal(
             harness,
             event_rx,
             args,
             model_catalog,
-            initial,
-            extra_messages,
-            initial_images,
-            theme,
-            no_themes,
+            startup,
             reload_context,
+            terminal,
         ))
         .await
     } else {
@@ -3333,7 +3453,14 @@ pub async fn interactive(
         for notice in &reload_context.startup_notices {
             eprintln!("note: {notice}");
         }
-        interactive_repl(harness, args, initial, extra_messages, initial_images).await
+        interactive_repl(
+            harness,
+            args,
+            startup.initial,
+            startup.extra_messages,
+            startup.initial_images,
+        )
+        .await
     };
 
     // `SessionShutdown`: the interactive session closed (TUI/REPL returned) —
@@ -4317,13 +4444,16 @@ mod tests {
                 &harness,
                 None,
                 vec![],
-                ui,
-                None,
-                extension_session,
-                crate::args::RpcMessageUpdates::default(),
-                false,
+                RpcOptions {
+                    ui_dialog: ui,
+                    oauth_snapshot: None,
+                    extension_session,
+                    message_updates: crate::args::RpcMessageUpdates::default(),
+                    native_durable: false,
+                    home: crate::config::AgentHome::process(),
+                },
                 correlated_execution,
-                crate::config::AgentHome::process(),
+                RpcLifetime::default(),
                 tokio::io::BufReader::new(input),
                 captured,
             )
@@ -4903,7 +5033,7 @@ mod tests {
                 let event = AgentEvent::MessageUpdate {
                     message_id: None,
                     message: message.clone(),
-                    assistant_message_event,
+                    assistant_message_event: Box::new(assistant_message_event),
                 };
                 write_agent_event(&writer, &event).await;
                 tx.send(event).unwrap();
@@ -4936,11 +5066,13 @@ mod tests {
                     tx.send(AgentEvent::MessageUpdate {
                         message_id: None,
                         message: message.clone(),
-                        assistant_message_event: rpi_ai::AssistantMessageEvent::TextDelta {
-                            content_index: 0,
-                            delta: "x".into(),
-                            partial: message.clone(),
-                        },
+                        assistant_message_event: Box::new(
+                            rpi_ai::AssistantMessageEvent::TextDelta {
+                                content_index: 0,
+                                delta: "x".into(),
+                                partial: message.clone(),
+                            },
+                        ),
                     })
                     .unwrap();
                 }

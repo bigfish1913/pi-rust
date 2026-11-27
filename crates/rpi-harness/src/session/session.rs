@@ -28,8 +28,8 @@ use crate::session::durable_adapter::SessionDurableWriter;
 use crate::session::types::{
     BranchBounds, BranchEntryPage, BranchEntryPageQuery, BranchOverview, Entry, EntryQuery,
     IdGenerator, JsonValue, LanePointer, LaneRecord, LogItem, LogOptions, OperationStartedRecord,
-    ProvisionedEntry, ProvisionedKind, RecordQuery, SessionLaneBranch, SessionMetadata,
-    SessionStats, SessionStorage, SessionTree,
+    ProvisionedEntry, ProvisionedKind, RecordQuery, RecoveryEntryCheck, SessionLaneBranch,
+    SessionMetadata, SessionStats, SessionStorage, SessionTree,
 };
 use rpi_durable::storage::JournalFrame;
 
@@ -617,6 +617,20 @@ impl Session {
         self.storage_arc().tool_result_identity(id).await
     }
 
+    pub(crate) async fn recovery_entries_settled(
+        &self,
+        checks: &[RecoveryEntryCheck<'_>],
+    ) -> SessionResult<Vec<bool>> {
+        if checks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let settled = self.storage_arc().recovery_entries_settled(checks).await?;
+        if settled.len() != checks.len() {
+            return Err(SessionError::storage("recovery settlement count mismatch"));
+        }
+        Ok(settled)
+    }
+
     /// Estimate the main lane's default context, if supported by storage.
     pub async fn context_usage(
         &self,
@@ -1012,6 +1026,17 @@ impl Session {
         self.query_log(options).await
     }
 
+    /// Synchronize the history of the binding captured before waiting. Reuse
+    /// the facade's mutation gate so journal transactions can invoke this on
+    /// their pinned target without being redirected by a concurrent rebind.
+    /// This returns a storage identity, not a request/admission receipt.
+    pub async fn sync_history(&self) -> SessionResult<crate::session::types::HistoryIdentity> {
+        self.with_shared_mutation(
+            |session| async move { session.storage_arc().sync_history().await },
+        )
+        .await
+    }
+
     /// Wait for any in-flight durable write to settle.
     ///
     /// The facade forwards to the backend. Only the JSONL backend has a write
@@ -1191,10 +1216,11 @@ impl Session {
         // Generic extension/runtime append APIs cannot mint journal authority.
         // The native writer uses the crate-private conditional append path.
         if matches!(&entry.kind, ProvisionedKind::Custom { custom_type, .. }
-            if crate::tool_program_journal::is_reserved_custom_type(custom_type))
+            if crate::tool_program_journal::is_reserved_custom_type(custom_type)
+                || crate::durable::reserved_host_admission_type(custom_type))
         {
             return Err(SessionError::invalid_payload(
-                "reserved native child journal type",
+                "reserved native journal type",
             ));
         }
         self.commit_entry_checked(entry, lane, None).await
@@ -2011,6 +2037,78 @@ mod tests {
             assert!(target.get_entry("new").await.unwrap().is_some());
             assert!(old.get_entry("new").await.unwrap().is_none());
         }
+    }
+
+    #[cfg(unix)]
+    async fn physical_sync_fixture(root: &std::path::Path, path: &str) -> Session {
+        use crate::session::jsonl::{JsonlSessionStorage, JsonlV4Header};
+        let storage = JsonlSessionStorage::create(
+            Arc::new(rpi_tools::OsExecutionEnv::with_cwd(root.to_path_buf())),
+            path,
+            JsonlV4Header::new(path.into(), 1, "/cwd".into(), None, None, None),
+            Arc::new(crate::session::memory::FakeClock::new()),
+            Arc::new(crate::session::memory::CounterIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        Session::new(Arc::new(storage), None)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn physical_history_sync_keeps_original_binding_while_waiting_on_facade_gate() {
+        for use_rebind in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let facade = physical_sync_fixture(root.path(), "old.jsonl").await;
+            facade
+                .append_entry(mutation_entry("old"), "main")
+                .await
+                .unwrap();
+            let old = facade.pin(facade.id_generator().clone());
+            let target = physical_sync_fixture(root.path(), "target.jsonl").await;
+            target
+                .append_entry(mutation_entry("new-1"), "main")
+                .await
+                .unwrap();
+            target
+                .append_entry(mutation_entry("new-2"), "main")
+                .await
+                .unwrap();
+            let gate = old.binding.read().unwrap().mutation_gate.clone();
+            let held = gate.write().await;
+            let mut sync = Box::pin(facade.sync_history());
+            assert!(futures::poll!(sync.as_mut()).is_pending());
+            if use_rebind {
+                facade.rebind_to(&target);
+            } else {
+                facade.set_storage(target.storage());
+            }
+            assert_eq!(facade.sync_history().await.unwrap().revision, 2);
+            drop(held);
+            assert_eq!(sync.await.unwrap().revision, 1);
+            assert_eq!(old.storage().history_revision().await.unwrap(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn physical_history_sync_reuses_exclusive_journal_gate_without_deadlock() {
+        let root = tempfile::tempdir().unwrap();
+        let session = physical_sync_fixture(root.path(), "journal.jsonl").await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.with_mutation(|pinned| async move {
+                pinned
+                    .append_entry(mutation_entry("accepted"), "main")
+                    .await
+                    .unwrap();
+                let identity = pinned.sync_history().await.unwrap();
+                assert_eq!(identity.revision, 1);
+                assert_eq!(identity.generation, 0);
+            }),
+        )
+        .await
+        .expect("physical sync within native journal admission must not deadlock");
     }
 
     #[tokio::test]

@@ -255,8 +255,10 @@ async fn actual_tui_new_and_switch_restore_same_epoch_jsonl_notice_without_rewri
     enqueue(&h, "new-session-v2").await;
     assert!(
         switch_to_session(
-            &h,
-            &lane,
+            SessionLane {
+                harness: &h,
+                lane: &lane,
+            },
             &id,
             &cwd,
             &s.chat_container,
@@ -329,8 +331,10 @@ async fn actual_tui_switch_refuses_other_epoch_and_v1_without_replacing_scope_or
         let bytes = std::fs::read(path).unwrap();
         assert!(
             !switch_to_session(
-                &h,
-                &lane,
+                SessionLane {
+                    harness: &h,
+                    lane: &lane,
+                },
                 &id,
                 &cwd,
                 &s.chat_container,

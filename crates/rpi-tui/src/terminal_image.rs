@@ -94,12 +94,25 @@ static CAPABILITIES_CACHE: std::sync::OnceLock<Mutex<TerminalCapabilities>> =
 
 /// Get cached capabilities.
 pub fn get_capabilities() -> TerminalCapabilities {
+    if let Some(context) = crate::display_context::current() {
+        return context
+            .images
+            .lock()
+            .map(|caps| caps.clone())
+            .unwrap_or_default();
+    }
     let cache = CAPABILITIES_CACHE.get_or_init(|| Mutex::new(detect_capabilities()));
     cache.lock().map(|c| c.clone()).unwrap_or_default()
 }
 
 /// Set capabilities.
 pub fn set_capabilities(capabilities: TerminalCapabilities) {
+    if let Some(context) = crate::display_context::current() {
+        if let Ok(mut images) = context.images.lock() {
+            *images = capabilities;
+        }
+        return;
+    }
     let cache = CAPABILITIES_CACHE.get_or_init(|| Mutex::new(detect_capabilities()));
     if let Ok(mut c) = cache.lock() {
         *c = capabilities;

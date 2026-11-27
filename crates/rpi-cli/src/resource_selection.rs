@@ -267,6 +267,9 @@ impl ResolvedSelection {
         else {
             return Ok(None);
         };
+        if let Some(error) = args.fork_cut_errors().first() {
+            return Err((*error).to_owned());
+        }
         if (args.resource_config.is_some() && args.resource_transition.is_some())
             || (args.resource_transition.is_some()
                 && (args.name.is_some()
@@ -420,6 +423,51 @@ impl ResolvedSelection {
             package_commands,
             validated_skills: None,
         }))
+    }
+
+    /// Host-only instruction subset of v1. No Args, ambient package scope,
+    /// discovery, skills or executable code. Text is frozen from bounded reads.
+    pub(crate) fn host_instructions(selection: ResourceSelection) -> Result<Self, String> {
+        if selection.version != 1
+            || selection.main_package.is_some()
+            || !selection.skills.is_empty()
+            || !selection.extensions.is_empty()
+            || selection.instructions.len() > 32
+            || matches!(selection.tools, ToolSelection::Default {})
+        {
+            return Err("unsupported Host instruction resource selection".into());
+        }
+        let mut instructions = Vec::new();
+        let mut total = 0usize;
+        for path in &selection.instructions {
+            if !path.is_absolute() {
+                return Err("Host instruction path must be absolute".into());
+            }
+            let path = file(path)?;
+            let text = String::from_utf8(read_limited(&path)?)
+                .map_err(|_| "Host instruction must be UTF-8")?;
+            total = total
+                .checked_add(text.len())
+                .ok_or("instruction size overflow")?;
+            if total > MAX_SELECTION_BYTES {
+                return Err("Host instructions exceed 64 KiB".into());
+            }
+            instructions.push((path, "explicit".into(), text));
+        }
+        unique_paths(&instructions.iter().map(|i| i.0.clone()).collect::<Vec<_>>())?;
+        Ok(Self {
+            selection,
+            package: None,
+            skills: Vec::new(),
+            extensions: Vec::new(),
+            instructions,
+            transition: None,
+            package_commands: Default::default(),
+            validated_skills: Some(ValidatedSkills {
+                skills: Vec::new(),
+                inventory: json!([]),
+            }),
+        })
     }
 
     /// Resolve once, before code or native writers. Hash the very bytes parsed
@@ -834,7 +882,6 @@ pub(crate) async fn bind_inventory(
     harness: &AgentHarness,
     selected: &ResolvedSelection,
 ) -> Result<(), String> {
-    use rpi_harness::session::{SessionValueWriter, SessionValues};
     let resources = harness.get_resources().await.map_err(|e| e.to_string())?;
     let mut skills = Vec::new();
     for skill in resources.skills.unwrap_or_default() {
@@ -860,7 +907,42 @@ pub(crate) async fn bind_inventory(
     if let Some(digest) = selected.package_commands.digest() {
         inventory["packageCommandsSha256"] = json!(digest);
     }
-    let session = harness.session();
+    bind_inventory_to_session(harness.session(), selected, inventory).await
+}
+
+/// Pure inventory validation, including tool schemas, before a Host claims its
+/// writer or repairs a torn journal. No new binding is written during preflight.
+pub(crate) fn validate_exact_inventory(
+    values: &rpi_harness::session::SessionValues,
+    selected: &ResolvedSelection,
+    inventory: &Value,
+) -> Result<(), String> {
+    validate_session_binding(values, Some(selected))?;
+    let candidate = json!({"declaration":declaration(selected),"inventory":inventory,"revision":1});
+    if serde_json::to_vec(&candidate)
+        .map_err(|e| e.to_string())?
+        .len()
+        > MAX_STATE_BYTES
+    {
+        return Err("resource binding exceeds 256 KiB".into());
+    }
+    if values
+        .get(SESSION_KEY)
+        .is_some_and(|old| old.get("inventory") != Some(inventory))
+    {
+        return Err("session resource inventory changed".into());
+    }
+    Ok(())
+}
+
+/// Shared atomic native-value append, also usable before Harness creation. The
+/// caller owns writer custody and must establish its required sync barrier.
+pub(crate) async fn bind_inventory_to_session(
+    session: &rpi_harness::session::Session,
+    selected: &ResolvedSelection,
+    inventory: Value,
+) -> Result<(), String> {
+    use rpi_harness::session::{SessionValueWriter, SessionValues};
     let values = SessionValues::load(session)
         .await
         .map_err(|e| e.to_string())?;

@@ -248,8 +248,10 @@ async fn jsonl_new_switch_import_and_unadopted_fork_use_the_current_view_only() 
     assert_eq!(count(&state), 0);
     assert!(
         switch_to_session(
-            &h,
-            &lane,
+            SessionLane {
+                harness: &h,
+                lane: &lane,
+            },
             &id,
             &cwd,
             &state.chat_container,
@@ -265,8 +267,10 @@ async fn jsonl_new_switch_import_and_unadopted_fork_use_the_current_view_only() 
     let snapshot = service(&h).snapshot().await.unwrap();
     assert!(
         !switch_to_session(
-            &h,
-            &lane,
+            SessionLane {
+                harness: &h,
+                lane: &lane,
+            },
             "missing-synthetic-session",
             &cwd,
             &state.chat_container,
@@ -322,8 +326,10 @@ async fn jsonl_new_switch_import_and_unadopted_fork_use_the_current_view_only() 
     let import_path = &rows.iter().find(|r| r.id == imported_id).unwrap().path;
     let import_bytes = std::fs::read(import_path).unwrap();
     import_session(
-        &h,
-        &lane,
+        SessionLane {
+            harness: &h,
+            lane: &lane,
+        },
         import_path,
         &cwd,
         &state.chat_container,

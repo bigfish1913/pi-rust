@@ -44,9 +44,9 @@ impl AgentEmitter for GateEmitter {
             matches!(
                 &event,
                 AgentEvent::MessageUpdate {
-                    assistant_message_event: AssistantMessageEvent::TextDelta { .. },
+                    assistant_message_event,
                     ..
-                }
+                } if matches!(assistant_message_event.as_ref(), AssistantMessageEvent::TextDelta { .. })
             )
         };
         self.tx.send(event).unwrap();
@@ -209,9 +209,13 @@ async fn crash_stream(volatile: bool, injected: bool) {
             }
             AgentEvent::MessageUpdate {
                 message_id,
-                assistant_message_event: AssistantMessageEvent::TextDelta { .. },
+                assistant_message_event,
                 ..
-            } => {
+            } if matches!(
+                assistant_message_event.as_ref(),
+                AssistantMessageEvent::TextDelta { .. }
+            ) =>
+            {
                 assert_eq!(message_id, current, "generated slot owns its updates");
                 break message_id.unwrap();
             }

@@ -126,7 +126,7 @@ fn safe_archive_filename(value: &str) -> Result<String, String> {
     let filename = url
         .path_segments()
         .ok_or("archive URL has no path")?
-        .last()
+        .next_back()
         .ok_or("archive URL has no filename")?;
     safe_path_segment(filename, "archive filename")
 }
@@ -147,7 +147,7 @@ pub(crate) fn archive_urls(
     let filename = safe_archive_filename(github_archive_url)?;
     let scoped = base
         .path_segments()
-        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
         .and_then(|segment| prefixes.iter().find(|prefix| **prefix == segment))
         .copied();
     // A base that already ends in a CDN namespace stays inside that one; the

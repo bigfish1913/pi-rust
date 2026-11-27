@@ -31,6 +31,14 @@ use dialogs::ShellDialogs;
 /// Drive the generic shell against `driver` until the user exits (or the
 /// driver's event stream ends). `addr` is a display label for the banner.
 pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<(), String> {
+    run_driver_tui_with_echo(driver, addr, true).await
+}
+
+pub(crate) async fn run_driver_tui_with_echo<D: SessionDriver>(
+    driver: &D,
+    addr: &str,
+    echo_prompt: bool,
+) -> Result<(), String> {
     let mut events = driver
         .events()
         .ok_or("driver did not yield an event stream")?;
@@ -133,6 +141,7 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
         &view,
         &keybindings,
         addr,
+        echo_prompt,
     )
     .await;
 
@@ -156,6 +165,7 @@ async fn run_loop<D: SessionDriver>(
     view: &TranscriptView,
     keybindings: &rpi_tui::Keybindings,
     addr: &str,
+    echo_prompt: bool,
 ) -> Result<(), String> {
     // Repaint cadence while a run is in flight so the in-editor spinner and the
     // retry countdown animate between streamed tokens (mirrors the local render
@@ -240,7 +250,7 @@ async fn run_loop<D: SessionDriver>(
                 // A normal editor submission queued before a question arrived
                 // must not bypass the active approval UI.
                 if dialogs.has_active() { continue; }
-                match handle_submit(driver, status, view, &text).await {
+                match handle_submit(driver, status, view, &text, echo_prompt).await {
                     Ok(SubmitAction::Continue) => {}
                     Ok(SubmitAction::Quit) => break,
                     Err(error) => view.add_notice(&format!("error: {error}")),
@@ -285,6 +295,7 @@ async fn handle_submit<D: SessionDriver>(
     status: &DriverStatus,
     view: &TranscriptView,
     text: &str,
+    echo_prompt: bool,
 ) -> Result<SubmitAction, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -328,7 +339,9 @@ async fn handle_submit<D: SessionDriver>(
         return Ok(SubmitAction::Continue);
     }
 
-    view.add_user(trimmed);
+    if echo_prompt {
+        view.add_user(trimmed);
+    }
     driver
         .send(DriverCommand::Prompt(trimmed.to_string()))
         .await?;

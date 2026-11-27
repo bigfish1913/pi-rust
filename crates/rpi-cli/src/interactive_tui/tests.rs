@@ -448,6 +448,7 @@ fn markdown_flag_only_comes_from_an_explicit_true() {
 /// the explicit literals other tests build, but keeps one copy in sync.
 pub(super) fn test_tui_state() -> Arc<TuiState> {
     Arc::new(TuiState {
+        publish_process_identity: true,
         session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
@@ -1870,6 +1871,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
     };
 
     let state = Arc::new(TuiState {
+        publish_process_identity: true,
         session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
@@ -2424,10 +2426,12 @@ fn a_cancelled_provider_login_never_saves_a_late_credential() {
         };
         finish_provider_login(&state, &editor_container, &editor, &tui);
         handle_provider_oauth_result(
-            &state,
-            &editor_container,
-            &editor,
-            &tui,
+            EditorUi {
+                state: &state,
+                editor_container: &editor_container,
+                editor: &editor,
+                tui: &tui,
+            },
             &tx,
             "acme",
             "exchange",
@@ -2439,10 +2443,12 @@ fn a_cancelled_provider_login_never_saves_a_late_credential() {
 
         begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
         handle_provider_oauth_result(
-            &state,
-            &editor_container,
-            &editor,
-            &tui,
+            EditorUi {
+                state: &state,
+                editor_container: &editor_container,
+                editor: &editor,
+                tui: &tui,
+            },
             &tx,
             "acme",
             "exchange",
@@ -2511,10 +2517,12 @@ fn provider_oauth_escape_cancels_the_in_flight_call() {
         "display": {"title": "Authorize", "url": "https://example.test/auth"}
     });
     begin_provider_oauth_input(
-        &state,
-        &editor_container,
-        &editor,
-        &tui,
+        EditorUi {
+            state: &state,
+            editor_container: &editor_container,
+            editor: &editor,
+            tui: &tui,
+        },
         &tx,
         "acme",
         payload,
@@ -2632,10 +2640,12 @@ fn escape_during_logout_initialization_never_revokes_or_sticks() {
             "the queued revoke must observe the cancel"
         );
         handle_provider_oauth_result(
-            &state,
-            &editor_container,
-            &editor,
-            &tui,
+            EditorUi {
+                state: &state,
+                editor_container: &editor_container,
+                editor: &editor,
+                tui: &tui,
+            },
             &tx,
             "acme",
             "revoke",
@@ -2766,10 +2776,12 @@ fn an_interaction_form_for_an_ended_flow_restores_the_editor() {
         &tui
     ));
     begin_provider_oauth_input(
-        &state,
-        &editor_container,
-        &editor,
-        &tui,
+        EditorUi {
+            state: &state,
+            editor_container: &editor_container,
+            editor: &editor,
+            tui: &tui,
+        },
         &tx,
         "acme",
         serde_json::json!({"display": {"title": "Authorize"}}),
@@ -2822,10 +2834,12 @@ fn a_stale_failed_result_leaves_a_newer_flow_running() {
     });
     let messages_before = state.chat_container.child_count();
     handle_provider_oauth_result(
-        &state,
-        &editor_container,
-        &editor,
-        &tui,
+        EditorUi {
+            state: &state,
+            editor_container: &editor_container,
+            editor: &editor,
+            tui: &tui,
+        },
         &tx,
         "acme",
         "begin",
@@ -2892,10 +2906,12 @@ fn escape_between_the_flow_check_and_the_write_keeps_the_store_unchanged() {
         };
         let result = |flow_id, purpose, value| {
             handle_provider_oauth_result(
-                &state,
-                &editor_container,
-                &editor,
-                &tui,
+                EditorUi {
+                    state: &state,
+                    editor_container: &editor_container,
+                    editor: &editor,
+                    tui: &tui,
+                },
                 &tx,
                 "acme",
                 "exchange",
@@ -3519,6 +3535,7 @@ fn test_autocomplete_slash_suggestions_render() {
     // The autocomplete container should render at least one suggestion
     // line when the editor holds a `/` prefix, and clear when it doesn't.
     let state = Arc::new(TuiState {
+        publish_process_identity: true,
         session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
@@ -3622,6 +3639,7 @@ fn test_select_list_swap_restores_editor() {
     // child; closing restores it. Verify the container child count + the
     // active_selector flag round-trip.
     let state = Arc::new(TuiState {
+        publish_process_identity: true,
         session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
@@ -3728,6 +3746,7 @@ fn test_message_history_browse_restores_draft() {
     // messages, browse older → newer → back past the newest restores the
     // draft the user was typing.
     let state = Arc::new(TuiState {
+        publish_process_identity: true,
         session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
@@ -3837,6 +3856,7 @@ fn test_message_history_browse_restores_draft() {
 fn test_accept_top_suggestion_replaces_prefix() {
     // `/he` + Tab → `/help ` (slash command provider inserts a space).
     let state = Arc::new(TuiState {
+        publish_process_identity: true,
         session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),
@@ -3932,6 +3952,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
 /// installed by each test).
 fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
     Arc::new(TuiState {
+        publish_process_identity: true,
         session_write_tasks: settlement::SessionWriteTasks::default(),
         history_page: history::HistoryUi::default(),
         session_dir: std::path::PathBuf::from("unused-session-root"),

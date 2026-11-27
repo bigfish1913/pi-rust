@@ -61,6 +61,8 @@ pub enum UiEvent {
     },
     /// The assistant message finished.
     AssistantEnd { blocks: Vec<AssistantBlock> },
+    /// A completed message loaded from the saved transcript.
+    SavedAssistant { blocks: Vec<AssistantBlock> },
     /// Tool lifecycle (args/result carry the stable wire `Value` shape).
     ToolStart {
         id: String,
@@ -239,6 +241,9 @@ impl TranscriptView {
                     comp.update_blocks(blocks);
                     comp.set_streaming(false);
                 }
+            }
+            UiEvent::SavedAssistant { blocks } => {
+                self.append_assistant(blocks, false);
             }
             UiEvent::ToolStart { id, name, args } => self.tool_start(id, name, args, width),
             UiEvent::ToolUpdate {
@@ -429,6 +434,15 @@ impl TranscriptView {
     }
 
     fn start_assistant(&self, blocks: &[AssistantBlock]) {
+        let component = self.append_assistant(blocks, true);
+        *self.current_assistant.lock().unwrap() = Some(component);
+    }
+
+    fn append_assistant(
+        &self,
+        blocks: &[AssistantBlock],
+        streaming: bool,
+    ) -> Arc<AssistantMessageComponent> {
         let comp = Arc::new(AssistantMessageComponent::new(
             AssistantMessageOptions::default(),
         ));
@@ -439,10 +453,10 @@ impl TranscriptView {
         if let Some(transformer) = self.markdown_transformer.lock().unwrap().clone() {
             comp.set_markdown_transformer(Some(transformer));
         }
-        comp.set_streaming(true);
+        comp.set_streaming(streaming);
         comp.update_blocks(blocks);
         self.chat.add_child(comp.clone());
-        *self.current_assistant.lock().unwrap() = Some(comp);
+        comp
     }
 
     /// Create the streaming assistant component if a delta arrives before
@@ -450,19 +464,7 @@ impl TranscriptView {
     fn ensure_assistant(&self) {
         let mut current = self.current_assistant.lock().unwrap();
         if current.is_none() {
-            let comp = Arc::new(AssistantMessageComponent::new(
-                AssistantMessageOptions::default(),
-            ));
-            self.assign_message_id(&comp);
-            comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
-            comp.set_show_images(self.show_images);
-            comp.set_trailing_spacing(1);
-            if let Some(transformer) = self.markdown_transformer.lock().unwrap().clone() {
-                comp.set_markdown_transformer(Some(transformer));
-            }
-            comp.set_streaming(true);
-            self.chat.add_child(comp.clone());
-            *current = Some(comp);
+            *current = Some(self.append_assistant(&[], true));
         }
     }
 
@@ -1282,6 +1284,33 @@ mod tests {
             view.apply(&UiEvent::AssistantStart { blocks: vec![] }, 80);
             assert_eq!(view.chat.render(80), before);
         }
+    }
+
+    #[test]
+    fn saved_assistant_is_rendered_without_replacing_the_live_message() {
+        let view = view();
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Text("pending".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::SavedAssistant {
+                blocks: vec![AssistantBlock::Text("previous reply".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::AssistantEnd {
+                blocks: vec![AssistantBlock::Text("complete reply".into())],
+            },
+            80,
+        );
+        let lines = view.chat.render(80);
+        assert!(lines.iter().any(|line| line.contains("previous reply")));
+        assert!(lines.iter().any(|line| line.contains("complete reply")));
+        assert!(lines.iter().all(|line| !line.contains("pending")));
     }
 
     #[test]

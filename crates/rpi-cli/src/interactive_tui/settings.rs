@@ -500,10 +500,12 @@ pub(super) fn open_settings_model_selector(
     }));
 
     open_searchable_selector(
-        state,
-        editor_container,
-        editor,
-        tui,
+        EditorUi {
+            state,
+            editor_container,
+            editor,
+            tui,
+        },
         Some("Default model"),
         Some("Type to filter by name, provider, or id"),
         list,
@@ -577,7 +579,7 @@ pub(super) fn find_model_selector_match(
         .map_or((None, input), |(provider, id)| (Some(provider), id));
     let mut matches = catalog.iter().filter(|model| {
         model.id.eq_ignore_ascii_case(id)
-            && provider.map_or(true, |provider| {
+            && provider.is_none_or(|provider| {
                 model.provider.eq_ignore_ascii_case(provider)
                     || (provider.eq_ignore_ascii_case("anthropic")
                         && matches!(model.api, rpi_ai::Api::AnthropicMessages))
@@ -963,10 +965,7 @@ pub(super) fn show_provider_auth_status(
 }
 
 pub(super) fn handle_provider_oauth_result(
-    state: &Arc<TuiState>,
-    editor_container: &Arc<Container>,
-    editor: &Arc<Editor>,
-    tui: &Arc<TuiAltScreen>,
+    ui: EditorUi<'_>,
     tx: &mpsc::UnboundedSender<TuiMessage>,
     provider: &str,
     action: &str,
@@ -974,6 +973,12 @@ pub(super) fn handle_provider_oauth_result(
     purpose: ProviderOAuthPurpose,
     flow_id: u64,
 ) {
+    let EditorUi {
+        state,
+        editor_container,
+        editor,
+        tui,
+    } = ui;
     // A result from a flow that already ended (Esc, or a newer flow) must not
     // act, so a login cancelled while its call ran can never save a credential.
     if state
@@ -1013,16 +1018,7 @@ pub(super) fn handle_provider_oauth_result(
 
     match (purpose, response.kind) {
         (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Interaction) => {
-            begin_provider_oauth_input(
-                state,
-                editor_container,
-                editor,
-                tui,
-                tx,
-                provider,
-                response.payload,
-                flow_id,
-            );
+            begin_provider_oauth_input(ui, tx, provider, response.payload, flow_id);
         }
         (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Credential) => {
             match response.credential() {
@@ -1104,15 +1100,18 @@ pub(super) fn handle_provider_oauth_result(
 }
 
 pub(super) fn begin_provider_oauth_input(
-    state: &Arc<TuiState>,
-    editor_container: &Arc<Container>,
-    editor: &Arc<Editor>,
-    tui: &Arc<TuiAltScreen>,
+    ui: EditorUi<'_>,
     tx: &mpsc::UnboundedSender<TuiMessage>,
     provider: &str,
     payload: serde_json::Value,
     flow_id: u64,
 ) {
+    let EditorUi {
+        state,
+        editor_container,
+        editor,
+        tui,
+    } = ui;
     let display = payload.get("display").unwrap_or(&payload);
     let title = display
         .get("title")
@@ -1386,7 +1385,7 @@ pub(super) async fn switch_provider(
     let matches_api = |model: &&rpi_ai::Model| {
         configured
             .and_then(|config| config.api.as_deref())
-            .map_or(true, |api| model.api.as_str() == api)
+            .is_none_or(|api| model.api.as_str() == api)
     };
     let current = lane.get_model().await.map_err(|error| error.to_string())?;
     let saved: Vec<_> = candidates
@@ -1792,10 +1791,12 @@ pub(super) fn save_provider_from_form(form: &ProviderFormState) -> Result<String
         &form.api,
         &form.base_url,
         &form.api_key,
-        &form.model_id,
-        Some(&form.model_name),
-        None,
-        None,
+        crate::config::ProviderModelConfig {
+            id: &form.model_id,
+            name: Some(&form.model_name),
+            context_window: None,
+            max_tokens: None,
+        },
         None,
     )?;
     Ok(format!(
