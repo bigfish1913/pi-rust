@@ -551,7 +551,7 @@ async fn kill_process_tree(pid: u32) {
 impl FileSystem for OsExecutionEnv {
     fn native_file_path(&self, path: &str) -> Option<PathBuf> {
         #[cfg(unix)]
-        return Some(Self::resolve_path(&self.cwd, path));
+        return Some(self.resolve_path(path));
         #[cfg(not(unix))]
         {
             let _ = path;
