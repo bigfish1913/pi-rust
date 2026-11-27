@@ -78,6 +78,8 @@ pub mod handles;
 pub mod process;
 #[cfg(feature = "provider")]
 pub mod provider;
+#[cfg(feature = "quickjs-allocator")]
+pub mod quickjs;
 #[cfg(feature = "stdio")]
 pub mod stdio;
 
@@ -2289,6 +2291,8 @@ pub fn guard_or<R>(fallback: R, body: impl FnOnce() -> R) -> R {
 #[macro_export]
 macro_rules! export_plugin {
     ($body:expr) => {
+        // The loader calls this ABI entrypoint with a live vtable pointer.
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         #[no_mangle]
         pub extern "C" fn rpi_plugin_register(api: *const $crate::PluginApi) -> i32 {
             // SAFETY: host guarantees `api` is valid for this call.

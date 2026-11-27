@@ -178,6 +178,11 @@ let name = rpi_plugin_sdk::stb_text!(schema.name);           // read only
 let params = rpi_plugin_sdk::stb_take!(params, free);        // read + reclaim
 ```
 
+To discard an owned string without copying it, drop the `callbacks::OwnedString`
+that owns it. For a raw `StbString` received at an ABI boundary, `free_with` and
+`OwnedString::from_raw` require the caller to establish unique ownership and
+supply the producer's deallocator in an explicit `unsafe` call.
+
 Together with `string_handler!`, `execute_handler!` and `event_handler!` these
 cover the tool, command, event, renderer and runtime-action shapes, so that code
 compiles under `#![deny(unsafe_code)]` — `crates/rpi-plugin-sdk/tests/safe_macros.rs`
@@ -467,6 +472,11 @@ streams through its handle, and emit callbacks stay on those request threads.
 using a bounded cache of 16 HTTP clients keyed by origin and effective proxy.
 Client construction keeps the existing proxy and idle-timeout rules and
 propagates errors. API keys and request headers stay on each request.
+
+For custom registration, `provider_callbacks!(factory)` defines `request` and
+`stream` without exporting an entrypoint. `provider_callbacks!(select_factory = selector)`
+lets a safe selector choose a `ContextFactory` using the opaque registration pointer.
+The pointer is null on legacy registrations.
 
 The optional `PluginApi::register_plugin_lifecycle` slot follows the tool wake
 slot without changing earlier offsets or the ABI version. Rust `PluginApi`
