@@ -86,7 +86,7 @@ use tokio_util::sync::CancellationToken;
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, UserMessage};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
-use rpi_harness::session::types::{BranchBounds, Entry, EntryOrder, EntryQuery};
+use rpi_harness::session::types::{Entry, EntryOrder, EntryQuery};
 use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 #[cfg(test)]
 use rpi_tui::strip_ansi;
@@ -282,7 +282,8 @@ fn transform_markdown_chain(
 /// `*_for_cb` clones the old submit closure used to make individually.
 #[derive(Clone)]
 struct CommandContext {
-    chat: Arc<Container>,
+    // Ordinary output uses state.notice_container(). Do not expose the
+    // assembled root: appending there places output after the live slot.
     tui: Arc<TuiAltScreen>,
     tx: mpsc::UnboundedSender<TuiMessage>,
     state: Arc<TuiState>,
@@ -672,11 +673,7 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
     comp.set_expanded(*ctx.state.tool_outputs_expanded.lock().unwrap());
     // Reserve/invalidate before exposing the component to a paging worker.
     let cancel = ctx.state.begin_user_bash();
-    if ctx.state.history_page.is_bound() {
-        ctx.state.history_page.active.add_child(comp.clone());
-    } else {
-        ctx.chat.add_child(comp.clone());
-    }
+    ctx.state.transcript_container().add_child(comp.clone());
     ctx.tui.request_render(false);
 
     let env: Arc<dyn rpi_tools::ExecutionEnv> =
@@ -1640,7 +1637,6 @@ pub(crate) async fn interactive_tui_with_terminal(
     ));
     let streaming = event_rx.is_some();
     let ctx = CommandContext {
-        chat: chat_container.clone(),
         tui: tui.clone(),
         tx: tx.clone(),
         state: state.clone(),
@@ -1794,12 +1790,11 @@ pub(crate) async fn interactive_tui_with_terminal(
     let drain_handle = if let Some(rx) = event_rx {
         let tui_drain = tui.clone();
         let state_drain = state.clone();
-        let chat_drain = chat_container.clone();
         let lane_drain = lane.clone();
         Some(tokio::spawn(rpi_tui::display_context::scope(
             rpi_tui::display_context::current(),
             async move {
-                drain_agent_events(rx, tui_drain, state_drain, chat_drain, lane_drain).await;
+                drain_agent_events(rx, tui_drain, state_drain, lane_drain).await;
             },
         )))
     } else {

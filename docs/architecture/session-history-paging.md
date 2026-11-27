@@ -31,7 +31,8 @@ append ACK 仍是现有写入可见性边界，**不新增 power-loss fsync 承�
 - 页边界的 PageUp/PageDown 和回到底部绑定复用现有可配置键位；不会抢非空 editor、selector、search 或 extension dialog 的输入。
 - 独立异步 worker 不经过等待完整 prompt 的主 mailbox。请求绑定 storage、leaf 与 UI generation；切换/分支/新操作使旧请求失效。读取失败保留当前页，错误提示只保留单槽。
 - 成功翻页替换而非累加旧页，并清理组件映射、搜索、selection 与滚动缓存引用。当前操作的 active slot 与历史页分离；旧页不会持续追加新流式或 blocking assistant 输出，settlement 后回到有界历史。写入失败时保留未保存内容并阻止会丢失它的翻页。
-- 当前 plan/todo 面板独立于所见旧页恢复，按 seq 合并新旧 custom kind；翻旧页不回滚面板。当前 capabilities header 也独立保留。
+- plan/todo 是转录内容：在首次出现的位置更新，按所见页的 entry 顺序恢复（兼容 `todo` / `todo-state`），不会挂在实时消息区后面，也不会跟随到不含对应条目的历史页。这只改变展示，不改变工具的持久化状态或模型上下文。当前 capabilities header 仍独立保留。
+- 布局由宿主控制：普通工具结果进入实时 active slot；斜杠命令和扩展 `kind: message` 输出（包括 Markdown）通过 `notice_container()` 进入当前可见页。旧页上的命令输出随页退休，不写聊天根容器。明确的状态栏、更新提示和临时对话框仍使用专用 UI 区域。
 - 模型恢复和 footer 使用 branch overview，而不是为显示信息构造全量 provider context。现有 RPC `message_window` 契约及完整导出不变。
 
 ## 资源边界与未作出的保证
