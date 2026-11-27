@@ -32,10 +32,13 @@ async fn expired_reverse_bindings_fail_closed_but_still_reclaim_their_children()
     HarnessActionHost::set_harness(&cell, Arc::new(parent.clone()));
     assert!(host.get_execution_context(json!({})).await.is_ok());
     let child = host
-        .child_agent(7, json!({"op":"start","task":"report"}))
+        .independent_run(
+            7,
+            json!({"op":"start","input":"report","maxTurns":8,"timeoutSeconds":300}),
+        )
         .await
         .unwrap();
-    let id = &child["childId"];
+    let id = &child["runId"];
     drop(parent);
     assert!(host
         .get_execution_context(json!({}))
@@ -43,14 +46,17 @@ async fn expired_reverse_bindings_fail_closed_but_still_reclaim_their_children()
         .unwrap_err()
         .contains("after harness"));
     assert!(host
-        .child_agent(7, json!({"op":"start","task":"stale"}))
+        .independent_run(
+            7,
+            json!({"op":"start","input":"stale","maxTurns":8,"timeoutSeconds":300})
+        )
         .await
         .unwrap_err()
         .contains("after harness"));
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let value = host
-                .child_agent(7, json!({"op":"poll","childId":id}))
+                .independent_run(7, json!({"op":"poll","runId":id}))
                 .await
                 .unwrap();
             if value["status"] == "failed" {
@@ -62,14 +68,14 @@ async fn expired_reverse_bindings_fail_closed_but_still_reclaim_their_children()
     .await
     .unwrap();
     assert!(host
-        .child_agent(8, json!({"op":"dispose","childId":id}))
+        .independent_run(8, json!({"op":"dispose","runId":id}))
         .await
         .is_err());
-    host.child_agent(7, json!({"op":"dispose","childId":id}))
+    host.independent_run(7, json!({"op":"dispose","runId":id}))
         .await
         .unwrap();
     assert!(host
-        .child_agent(7, json!({"op":"poll","childId":id}))
+        .independent_run(7, json!({"op":"poll","runId":id}))
         .await
         .is_err());
 }

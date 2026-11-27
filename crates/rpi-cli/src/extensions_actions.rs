@@ -717,24 +717,6 @@ impl RuntimeActionHost for HarnessActionHost {
         Ok(context)
     }
 
-    async fn child_agent(
-        &self,
-        owner: u64,
-        args: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        if rpi_agent::tool_execution_scope::is_child_execution() {
-            return Err("recursive child agents are not allowed".into());
-        }
-        if args.get("op").and_then(serde_json::Value::as_str) == Some("start") {
-            self.independent_runs
-                .start_child(&self.harness()?, owner, &args)
-                .await
-        } else {
-            // Reclamation must remain possible after the parent was dropped.
-            self.independent_runs.handle_child(owner, &args)
-        }
-    }
-
     async fn independent_run(
         &self,
         owner: u64,
@@ -748,6 +730,7 @@ impl RuntimeActionHost for HarnessActionHost {
                 .start_run(&self.harness()?, owner, &args)
                 .await
         } else {
+            // Reclamation must remain possible after the parent was dropped.
             self.independent_runs.handle_run(owner, &args)
         }
     }
