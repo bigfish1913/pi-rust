@@ -112,6 +112,9 @@ impl RuntimeActionHost for Host {
     async fn independent_run(&self, owner: u64, args: Value) -> Result<Value, String> {
         self.child_agent(owner, args).await
     }
+    async fn get_execution_context(&self, _: Value) -> Result<Value, String> {
+        Ok(json!({"tools":["goal"]}))
+    }
     fn cancel_child_agents(&self, _: u64) {
         self.revoked.fetch_add(1, Ordering::SeqCst);
     }
@@ -134,6 +137,36 @@ fn call_action(action: RuntimeActionId, id: usize, args: Value) -> (i32, Value) 
         rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
     };
     (rc, serde_json::from_str(&owned.to_string_lossy()).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_goal_observes_child_restriction() {
+    let root = ActionBridge::new(Handle::current(), Arc::new(Host::default()));
+    for (name, child, expected) in [
+        (
+            "librpi_goal",
+            true,
+            json!({"tools":["goal"],"childAgent":false}),
+        ),
+        (
+            "librpi_goal-v0.3.0-staged",
+            true,
+            json!({"tools":["goal"],"childAgent":false}),
+        ),
+        ("librpi_goal", false, json!({"tools":["goal"]})),
+        ("librpi_other", true, json!({"tools":["goal"]})),
+    ] {
+        let plugin = root.for_plugin(name);
+        let invocation = plugin.for_invocation(child, CancellationToken::new());
+        assert_eq!(
+            call_action(
+                RuntimeActionId::GetExecutionContext,
+                invocation.user_data() as usize,
+                json!({}),
+            ),
+            (0, expected)
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

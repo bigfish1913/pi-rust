@@ -993,9 +993,22 @@ impl ActionBridge {
         if let Some(program) = &tool_program {
             program.bind_signal(signal.clone());
         }
+        let mut execution_context = rpi_agent::tool_execution_scope::public_execution_context();
+        // Released Goal plugins use this field to reject mutations of the
+        // parent goal from child tools. Keep the compatibility field scoped
+        // to Goal; other plugins still receive the public execution metadata.
+        if child
+            && self
+                .plugin_identity
+                .as_ref()
+                .is_some_and(|(_, name)| name == "librpi_goal" || name.starts_with("librpi_goal-v"))
+        {
+            execution_context.get_or_insert_with(|| serde_json::json!({}))["childAgent"] =
+                serde_json::Value::Bool(false);
+        }
         Arc::new(Self {
             invocation: Some((child, uuid::Uuid::new_v4().to_string(), signal)),
-            execution_context: rpi_agent::tool_execution_scope::public_execution_context(),
+            execution_context,
             tool_program,
             stdio: self.stdio.clone(),
             plugin_identity: self.plugin_identity.clone(),
