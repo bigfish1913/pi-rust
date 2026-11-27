@@ -1,0 +1,12 @@
+{
+  "providers": {
+    "gateway": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.example.com/v1",
+      "apiKey": "$RPI_GATEWAY_API_KEY",
+      "models": [
+        { "id": "your-model-id", "name": "My Gateway Model" }
+      ]
+    }
+  }
+}

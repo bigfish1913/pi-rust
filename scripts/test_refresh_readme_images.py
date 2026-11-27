@@ -60,20 +60,37 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(before.astimezone(images.CHINA_TIME).date().isoformat(), "2026-10-31")
         self.assertEqual(after.astimezone(images.CHINA_TIME).date().isoformat(), "2026-11-01")
 
+    def test_main_refreshes_both_readmes(self):
+        chinese_readme = self.readme.with_name("README.zh-CN.md")
+        chinese_readme.write_bytes(self.original)
+        now = datetime(2026, 11, 1, tzinfo=images.CHINA_TIME)
+        with mock.patch.object(images, "READMES", (self.readme, chinese_readme)), \
+                mock.patch.object(images, "datetime", wraps=datetime) as clock, \
+                mock.patch("builtins.print"):
+            clock.now.return_value = now
+            images.main()
+        for path in (self.readme, chinese_readme):
+            self.assertEqual(path.read_bytes(), self.original.replace(b"2026-10-31", b"2026-11-01"))
+
     def test_repository_readme_layout_and_image_sources(self):
-        text = images.README.read_text(encoding="utf-8")
-        self.assertLess(text.index("## Support /"), text.index("## Community /"))
-        self.assertLess(text.index("## Community /"), text.index("## Star history"))
-        self.assertLess(text.index("## Star history"), text.index("## Contributors"))
-        self.assertEqual(text.rsplit("\n## ", 1)[1].splitlines()[0], "Contributors")
-        for name in ("alipay.jpg", "wechat.png", "binance.png"):
-            self.assertEqual(text.count(f"https://assets.bigfisharc.cn/images/support/{name}"), 2)
-        self.assertEqual(len(images.DATED_URL.findall(text)), 2)
-        self.assertNotIn("{date}", text)
-        self.assertIn('src="https://assets.bigfisharc.cn/images/support/tg.png"', text)
-        self.assertNotIn('src="docs/images/tg.png"', text)
-        self.assertIn("https://contrib.rocks/image?repo=bigfish1913/pi-rust", text)
-        self.assertIn("https://github.com/bigfish1913/pi-rust/graphs/contributors", text)
+        sections = {
+            "README.md": ["Support", "Community", "Star history", "Contributors"],
+            "README.zh-CN.md": ["赞赏支持", "交流群", "Star 趋势", "贡献者"],
+        }
+        self.assertEqual({path.name for path in images.READMES}, set(sections))
+        for path in images.READMES:
+            with self.subTest(readme=path.name):
+                text = path.read_text(encoding="utf-8")
+                headings = [line[3:] for line in text.splitlines() if line.startswith("## ")]
+                self.assertEqual(headings[-4:], sections[path.name])
+                for name in ("alipay.jpg", "wechat.png", "binance.png"):
+                    self.assertEqual(text.count(f"https://assets.bigfisharc.cn/images/support/{name}"), 2)
+                self.assertEqual(len(images.DATED_URL.findall(text)), 2)
+                self.assertNotIn("{date}", text)
+                self.assertIn('src="https://assets.bigfisharc.cn/images/support/tg.png"', text)
+                self.assertNotIn('src="docs/images/tg.png"', text)
+                self.assertIn("https://contrib.rocks/image?repo=bigfish1913/pi-rust", text)
+                self.assertIn("https://github.com/bigfish1913/pi-rust/graphs/contributors", text)
 
 
 pr_spec = importlib.util.spec_from_file_location(
@@ -98,8 +115,10 @@ class ImagePRTests(unittest.TestCase):
         self.git("config", "user.name", "Offline Test")
         self.git("config", "user.email", "test@example.invalid")
         self.git("config", "core.autocrlf", "false")
-        (self.work / "README.md").write_text("old date\n", encoding="utf-8")
-        self.git("add", "README.md")
+        self.readmes = ("README.md", "README.zh-CN.md")
+        for name in self.readmes:
+            (self.work / name).write_text("old date\n", encoding="utf-8")
+        self.git("add", *self.readmes)
         self.git("commit", "-m", "initial")
         self.git("remote", "add", "origin", str(self.origin))
         self.git("push", "-u", "origin", "main")
@@ -138,7 +157,8 @@ class ImagePRTests(unittest.TestCase):
 
     def refresh(self, text="new date\n"):
         self.git("reset", "--hard", "origin/main")
-        (self.work / "README.md").write_text(text, encoding="utf-8")
+        for name in self.readmes:
+            (self.work / name).write_text(text, encoding="utf-8")
 
     def branch_head(self):
         return self.real_run("git", "--git-dir", str(self.origin), "rev-parse",
@@ -161,9 +181,17 @@ class ImagePRTests(unittest.TestCase):
         self.assertEqual(len(pushes), 1)
         self.assertIn(f"--force-with-lease={image_pr.REF}:", pushes[0])
         self.assertNotIn("[skip ci]", self.git("log", "-1", "--format=%B"))
-        self.assertEqual(self.git("diff", "--name-only", "origin/main", "HEAD"), "README.md")
+        self.assertEqual(set(self.git("diff", "--name-only", "origin/main", "HEAD").splitlines()),
+                         set(self.readmes))
         for command in self.calls:
             self.assertNotIn("offline-placeholder", " ".join(command))
+
+    def test_only_the_readme_with_a_stale_date_is_committed(self):
+        chinese_readme = "README.zh-CN.md"
+        (self.work / chinese_readme).write_text("new date\n", encoding="utf-8")
+        image_pr.prepare(self.work)
+        self.assertEqual(self.git("diff", "--name-only", "origin/main", "HEAD"), chinese_readme)
+        self.assert_main_untouched()
 
     def test_same_day_reuses_branch_sha_and_pr(self):
         self.refresh()
@@ -254,7 +282,8 @@ class ImagePRTests(unittest.TestCase):
         image_pr.prepare(self.work)
         self.assertEqual(self.git("rev-parse", "HEAD^"), self.main)
         self.assertEqual(self.git("show", "HEAD:new-main.txt"), "upstream change")
-        self.assertEqual(self.git("diff", "--name-only", "origin/main", "HEAD"), "README.md")
+        self.assertEqual(set(self.git("diff", "--name-only", "origin/main", "HEAD").splitlines()),
+                         set(self.readmes))
         self.assert_main_untouched()
 
     def test_api_failure_is_not_silent_success(self):
@@ -288,11 +317,20 @@ class ImagePRTests(unittest.TestCase):
         self.assert_main_untouched()
 
     def test_other_dirty_files_are_rejected(self):
+        other = self.work / "other.txt"
+        other.write_text("original\n", encoding="utf-8")
+        self.git("add", "other.txt")
+        self.git("commit", "-m", "add unrelated file")
+        self.git("push", "origin", "HEAD:main")
+        self.main = self.git("rev-parse", "HEAD")
         self.refresh()
-        (self.work / "other.txt").write_text("untracked", encoding="utf-8")
+        other.write_text("changed\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Only README.md and README.zh-CN.md"):
+            image_pr.prepare(self.work)
         self.git("add", "other.txt")
         with self.assertRaisesRegex(ValueError, "staging"):
             image_pr.prepare(self.work)
+        self.assertFalse(any(command[0] == "gh" for command in self.calls))
         self.assert_main_untouched()
 
 
