@@ -11,6 +11,16 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.30.0](https://github.com/bigfish1913/pi-rust/compare/v0.29.0...v0.30.0) - 2026-11-27
+
+### Fixed
+
+- *(tools)* kill owned shell groups when exec is dropped ([#428](https://github.com/bigfish1913/pi-rust/pull/428))
+
+### Other
+
+- *(cli)* [**breaking**] keep child identity out of execution context ([#435](https://github.com/bigfish1913/pi-rust/pull/435))
+
 ## [0.29.0](https://github.com/bigfish1913/pi-rust/compare/v0.28.0...v0.29.0) - 2026-11-26
 
 ### Added
