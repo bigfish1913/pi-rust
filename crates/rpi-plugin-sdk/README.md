@@ -176,13 +176,12 @@ reclaims an owned string with its producer's deallocator in one step:
 ```rust
 let name = rpi_plugin_sdk::stb_text!(schema.name);           // read only
 let params = rpi_plugin_sdk::stb_take!(params, free);        // read + reclaim
-rpi_plugin_sdk::stb_drop!(unused_result, free);             // reclaim without copying
 ```
 
-A fake host can hand its `register_tool` slot a callback defined by
-`tool_schema_handler!(callback, |schema, execute, (poll, cancel, destroy), free| { ... })`.
-The schema borrow lasts for the callback. Pass `Some(free)` to `stb_take!` or
-`stb_drop!` to reclaim the schema strings through the plugin's deallocator.
+To discard an owned string without copying it, drop the `callbacks::OwnedString`
+that owns it. For a raw `StbString` received at an ABI boundary, `free_with` and
+`OwnedString::from_raw` require the caller to establish unique ownership and
+supply the producer's deallocator in an explicit `unsafe` call.
 
 Together with `string_handler!`, `execute_handler!` and `event_handler!` these
 cover the tool, command, event, renderer and runtime-action shapes, so that code

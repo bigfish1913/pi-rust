@@ -106,65 +106,6 @@ fn outbound_macros_need_no_unsafe_in_plugin_code() {
         "still mine"
     );
     assert_eq!(host::frees(), 2);
-
-    let discarded = StbString::from_string("discarded".into());
-    sdk::stb_drop!(discarded, Some(host::counting_free_for_tests()));
-    sdk::stb_drop!(StbString::empty(), Some(host::counting_free_for_tests()));
-    assert_eq!(host::frees(), 3);
-}
-
-#[test]
-fn fake_host_tool_registration_needs_no_unsafe() {
-    sdk::tool_schema_handler!(capture, |schema, execute, (poll, cancel, destroy), free| {
-        assert_eq!(sdk::stb_take!(schema.name, Some(free)), "test-tool");
-        sdk::stb_drop!(schema.description, Some(free));
-        sdk::stb_drop!(schema.parameters, Some(free));
-        let handle = execute(StbStringRef::from_str("call-1"), StbString::empty(), None);
-        cancel(handle);
-        assert_eq!(
-            sdk::take_step!(poll(handle, None, std::ptr::null_mut())),
-            sdk::callbacks::Step::Done("output".into())
-        );
-        destroy(handle);
-        17
-    });
-    sdk::tool_schema_handler!(panics, |_schema, _execute, _data| {
-        panic!("fake host failed");
-    });
-    sdk::execute_handler! {
-        fn execute(id, _params) {
-            assert_eq!(id, "call-1");
-            std::ptr::null_mut()
-        }
-    }
-    extern "C" fn poll(
-        _: sdk::StepHandle,
-        _: Option<sdk::ToolPartialCb>,
-        _: *mut c_void,
-    ) -> sdk::StepResult {
-        sdk::StepResult::done(StbString::from_string("output".into()))
-    }
-    extern "C" fn cleanup(_: sdk::StepHandle) {}
-
-    host::reset();
-    let free = host::counting_free_for_tests();
-    let schema = sdk::StableToolSchema {
-        name: StbString::from_string("test-tool".into()),
-        description: StbString::from_string("test description".into()),
-        parameters: StbString::from_string("{}".into()),
-    };
-    assert_eq!(capture(&schema, execute, poll, cleanup, cleanup, free), 17);
-    assert_eq!(host::frees(), 3);
-    assert_eq!(
-        capture(std::ptr::null(), execute, poll, cleanup, cleanup, free),
-        1
-    );
-    let empty = sdk::StableToolSchema {
-        name: StbString::empty(),
-        description: StbString::empty(),
-        parameters: StbString::empty(),
-    };
-    assert_eq!(panics(&empty, execute, poll, cleanup, cleanup, free), 1);
 }
 
 #[test]

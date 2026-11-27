@@ -396,52 +396,6 @@ macro_rules! stb_take {
     }};
 }
 
-/// Discard an owning ABI string using its producer's deallocator without reading it.
-/// The arguments follow [`stb_take!`](crate::stb_take): pass the owned value and
-/// the producer's `Option<FreeStringFn>`, and do not use the raw value again.
-#[macro_export]
-macro_rules! stb_drop {
-    ($string:expr, $free:expr) => {{
-        let string: $crate::StbString = $string;
-        let free: Option<$crate::FreeStringFn> = $free;
-        // SAFETY: the caller transfers ownership and supplies its producer's free function.
-        unsafe { string.free_with(free) };
-    }};
-}
-
-/// Define a fake host's `register_tool` callback. The body receives a borrowed
-/// [`StableToolSchema`](crate::StableToolSchema), the execute callback, and a
-/// `(poll, cancel, destroy)` tuple. Bind a fourth argument for the plugin's
-/// deallocator when the body needs to reclaim the schema strings.
-///
-/// The ABI caller must supply a live schema for the duration of the call. The
-/// trampoline returns `1` for a null schema or a panic in the body.
-#[macro_export]
-macro_rules! tool_schema_handler {
-    ($name:ident, |$schema:ident, $execute:ident, $data:pat_param| $body:block) => {
-        $crate::tool_schema_handler!($name, |$schema, $execute, $data, _free| $body);
-    };
-    ($name:ident, |$schema:ident, $execute:ident, $data:pat_param, $free:ident| $body:block) => {
-        extern "C" fn $name(
-            raw: *const $crate::StableToolSchema,
-            $execute: $crate::ToolExecuteFn,
-            poll: $crate::ToolPollFn,
-            cancel: $crate::ToolCancelFn,
-            destroy: $crate::ToolDestroyFn,
-            $free: $crate::FreeStringFn,
-        ) -> i32 {
-            $crate::guard_or(1, || {
-                // SAFETY: the ABI caller keeps the schema live during this call.
-                let Some($schema) = (unsafe { raw.as_ref() }) else {
-                    return 1;
-                };
-                let $data = (poll, cancel, destroy);
-                $body
-            })
-        }
-    };
-}
-
 /// Define a command or prompt callback with a `&str` input and `&mut Output`.
 /// The four-argument form also supports runtime-action trampolines. A tuple
 /// input `(cwd, reason)` supports resource-discovery callbacks. All forms copy
