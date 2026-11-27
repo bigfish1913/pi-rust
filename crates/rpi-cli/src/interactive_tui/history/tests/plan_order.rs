@@ -114,7 +114,19 @@ async fn restored_plan_stays_in_history_and_does_not_follow_every_page() {
     assert_order(&output, "after-plan-0", "after-plan-2");
     assert_eq!(output.matches("Plan · Ready").count(), 1);
     assistant(&state, "next live reply");
-    assert_order(&text(&state), "after-plan-2", "next live reply");
+    state.apply_tool_end(&plan_event(true), 100);
+    let output = text(&state);
+    assert_eq!(output.matches("Plan · Planning").count(), 1);
+    assert!(!output.contains("Plan · Ready"));
+    assert_order(&output, "Plan · Planning", "after-plan-0");
+    assert_order(&output, "after-plan-2", "next live reply");
+    assert!(state.history_page.update_command_plan(
+        &state.chat_container,
+        &serde_json::json!({"details":{"kind":"plan","active":false,"plan":"approved plan"}}),
+    ));
+    let output = text(&state);
+    assert_eq!(output.matches("Plan · Ready").count(), 1);
+    assert_order(&output, "Plan · Ready", "after-plan-0");
 
     // Once the plan has left the bounded history page, it must not remain as
     // a ready-state footer. Its persisted entry is still available on older pages.
@@ -142,4 +154,32 @@ async fn restored_plan_stays_in_history_and_does_not_follow_every_page() {
     request(state.clone(), tui, Direction::Latest);
     finish_request(&state).await;
     assert!(!text(&state).contains("Plan · Ready"));
+}
+
+#[tokio::test]
+async fn latest_page_folds_in_plan_updated_while_viewing_older_history() {
+    let (storage, state, tui) = fixture(60).await;
+    append(
+        &storage,
+        60,
+        ProvisionedKind::Custom {
+            custom_type: "plan-mode".into(),
+            data: Some(serde_json::json!({"active":true})),
+        },
+    )
+    .await;
+    restore_bound(&state, &state.chat_container).await;
+    state.set_status(RunStatus::Working);
+    request(state.clone(), tui.clone(), Direction::Older);
+    finish_request(&state).await;
+    state.apply_tool_end(&plan_event(false), 100);
+    assistant(&state, "reply after plan update");
+    assert!(!text(&state).contains("Plan · Ready"));
+
+    request(state.clone(), tui, Direction::Latest);
+    finish_request(&state).await;
+    let output = text(&state);
+    assert_eq!(output.matches("Plan · Ready").count(), 1);
+    assert!(!output.contains("Plan · Planning"));
+    assert_order(&output, "Plan · Ready", "reply after plan update");
 }

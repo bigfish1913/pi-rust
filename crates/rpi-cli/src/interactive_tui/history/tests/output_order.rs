@@ -121,7 +121,12 @@ async fn restored_todos_use_entry_order_and_retire_with_their_page() {
     assert_order(&restored, "new task body", "after-task-0");
     assert_order(&restored, "after-task-0", "after-task-2");
     assistant(&state, "live after restored tasks");
-    assert_order(&text(&state), "new task body", "live after restored tasks");
+    state.apply_tool_end(&todo(true, false), 100);
+    let updated = text(&state);
+    assert!(!updated.contains("new task body"));
+    assert_eq!(updated.matches("ordered task body").count(), 1);
+    assert_order(&updated, "1/1 completed", "after-task-0");
+    assert_order(&updated, "after-task-2", "live after restored tasks");
     for index in 4..65 {
         append(
             &storage,

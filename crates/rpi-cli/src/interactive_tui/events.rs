@@ -486,7 +486,7 @@ pub(super) async fn handle_agent_event(
             result,
             is_error,
         } => {
-            state.transcript_view().apply(
+            state.apply_tool_end(
                 &UiEvent::ToolEnd {
                     id: tool_call_id,
                     name: tool_name,

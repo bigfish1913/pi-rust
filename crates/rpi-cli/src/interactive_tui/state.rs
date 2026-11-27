@@ -2119,6 +2119,13 @@ impl TuiState {
         .with_show_images(self.images_visible())
     }
 
+    pub(super) fn apply_tool_end(&self, event: &UiEvent, width: usize) {
+        let view = self.transcript_view();
+        self.history_page.with_latest_page(|page| {
+            view.with_restored_page(page).apply(event, width);
+        });
+    }
+
     /// B5e: swap the live transformer. Used at startup (install the first
     /// closure built from the initial `RegistrySnapshot`) and on `/reload`
     /// (rebuild from the fresh snapshot). On a reload the reloaded plugin's

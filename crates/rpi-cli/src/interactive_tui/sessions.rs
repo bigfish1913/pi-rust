@@ -673,6 +673,7 @@ pub(super) fn render_history_entries(
                     }
                     crate::transcript_view::update_plan_panel(
                         chat,
+                        None,
                         &serde_json::json!({"details": details}),
                     );
                     continue;
@@ -681,6 +682,7 @@ pub(super) fn render_history_entries(
                     let details = custom.data.unwrap_or(serde_json::Value::Null);
                     crate::transcript_view::update_todo_list(
                         chat,
+                        None,
                         &serde_json::json!({"details": details}),
                     );
                     continue;
