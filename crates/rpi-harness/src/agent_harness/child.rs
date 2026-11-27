@@ -66,16 +66,45 @@ impl AgentHarness {
         }))
     }
 
-    /// Snapshot the *effective* parent execution binding, not CLI defaults.
-    /// Tools retain the parent's project environment, extension owner/context and
-    /// approval hooks. Only transcript, emitter, admission and turn budget differ.
-    /// Requested tools may narrow, never expand, the parent's current capabilities.
+    /// Compatibility constructor for the original ChildAgent action.
     pub async fn create_child(
         &self,
         session: Session,
         emitter: Arc<dyn AgentEmitter>,
         max_turns: u32,
         requested_tools: Option<Vec<String>>,
+    ) -> HarnessResult<ChildHarness> {
+        self.create_scoped_run(
+            session,
+            emitter,
+            max_turns,
+            requested_tools,
+            Some("delegate_task"),
+        )
+        .await
+    }
+
+    /// Create an independent run with the effective parent execution bindings.
+    /// The caller can narrow tool selection. Runtime provenance still prevents
+    /// nested runs regardless of which tool names are present.
+    pub async fn create_independent_run(
+        &self,
+        session: Session,
+        emitter: Arc<dyn AgentEmitter>,
+        max_turns: u32,
+        requested_tools: Option<Vec<String>>,
+    ) -> HarnessResult<ChildHarness> {
+        self.create_scoped_run(session, emitter, max_turns, requested_tools, None)
+            .await
+    }
+
+    async fn create_scoped_run(
+        &self,
+        session: Session,
+        emitter: Arc<dyn AgentEmitter>,
+        max_turns: u32,
+        requested_tools: Option<Vec<String>>,
+        excluded_tool: Option<&str>,
     ) -> HarnessResult<ChildHarness> {
         if self.is_child || rpi_agent::tool_execution_scope::is_child_execution() {
             return Err(HarnessError::io("recursive child agents are not allowed"));
@@ -94,7 +123,7 @@ impl AgentHarness {
             .iter()
             .filter(|tool| {
                 let name = &tool.tool.schema().name;
-                name != "delegate_task" && snap.active_tool_names.contains(name)
+                excluded_tool != Some(name.as_str()) && snap.active_tool_names.contains(name)
             })
             .cloned()
             .collect();
@@ -104,7 +133,7 @@ impl AgentHarness {
                 .any(|name| !tools.iter().any(|tool| tool.tool.schema().name == *name))
             {
                 return Err(HarnessError::io(
-                    "child tools must be a subset of active parent tools (delegation excluded)",
+                    "child tools must be a subset of the allowed active parent tools",
                 ));
             }
             tools.retain(|tool| names.contains(&tool.tool.schema().name));

@@ -24,7 +24,13 @@ use tokio_util::sync::CancellationToken;
 struct ObservedReader {
     bytes: Vec<u8>,
     ranges: Mutex<Vec<(u64, usize)>>,
-    fault: Mutex<Option<(u64, usize, bool)>>,
+    faults: Mutex<Vec<(u64, usize, ReadFault)>>,
+}
+#[derive(Clone, Copy)]
+enum ReadFault {
+    Io,
+    Corrupt,
+    Short,
 }
 #[async_trait]
 impl ReadFile for ObservedReader {
@@ -36,18 +42,27 @@ impl ReadFile for ObservedReader {
     }
     async fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>, FileError> {
         self.ranges.lock().unwrap().push((offset, length));
-        if let Some((start, len, corrupt)) = *self.fault.lock().unwrap() {
-            if offset < start + len as u64 && start < offset + length as u64 {
-                if corrupt {
-                    return Ok(vec![b'!'; length]);
+        let mut bytes = self.bytes[offset as usize..offset as usize + length].to_vec();
+        for &(start, len, fault) in self.faults.lock().unwrap().iter() {
+            let from = start.max(offset);
+            let to = (start + len as u64).min(offset + bytes.len() as u64);
+            if from >= to {
+                continue;
+            }
+            match fault {
+                ReadFault::Io => {
+                    return Err(FileError::new(
+                        FileErrorCode::NotSupported,
+                        "injected selected payload failure",
+                    ))
                 }
-                return Err(FileError::new(
-                    FileErrorCode::NotSupported,
-                    "injected selected payload failure",
-                ));
+                ReadFault::Corrupt => {
+                    bytes[(from - offset) as usize..(to - offset) as usize].fill(b'!')
+                }
+                ReadFault::Short => bytes.truncate((from - offset) as usize),
             }
         }
-        Ok(self.bytes[offset as usize..offset as usize + length].to_vec())
+        Ok(bytes)
     }
 }
 struct ObservedFs {
@@ -324,7 +339,7 @@ async fn fixture(log: Log) -> Fixture {
     let reader = Arc::new(ObservedReader {
         bytes: bytes.as_bytes().to_vec(),
         ranges: Mutex::new(vec![]),
-        fault: Mutex::new(None),
+        faults: Mutex::new(vec![]),
     });
     let temp = tempfile::tempdir().unwrap();
     let inner: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
@@ -386,7 +401,11 @@ fn basic_log() -> Log {
 async fn no_recovery_records_read_zero_payloads_but_report_orphans_and_multiple_open() {
     let f = fixture(basic_log()).await;
     let (start, len) = f.spans["unrelated-huge"];
-    *f.reader.fault.lock().unwrap() = Some((start, len, true));
+    f.reader
+        .faults
+        .lock()
+        .unwrap()
+        .push((start, len, ReadFault::Corrupt));
     for lane in ["main", "orphan"] {
         let report = f.cold.recover_lane(lane).await.unwrap();
         assert_eq!(report, f.memory.recover_lane(lane).await.unwrap());
@@ -407,6 +426,7 @@ fn selected_log() -> Log {
     log.entry("assistant", "main", user("placeholder"));
     log.lane("side", None);
     log.entry("cross-write", "side", user("landed write"));
+    log.entry("in-window-unselected", "side", result("call", "read"));
     log.entry("cross-tool", "side", result("call", "read"));
     log.entry("abandoned-tool", "main", result("call", "read"));
     log.entry(
@@ -441,10 +461,16 @@ fn selected_log() -> Log {
     log
 }
 #[tokio::test]
-async fn cold_full_report_matches_memory_and_reads_only_selected_payloads() {
+async fn cold_full_report_matches_memory_and_only_validates_selected_payloads() {
     let f = fixture(selected_log()).await;
-    let (start, len) = f.spans["unrelated-huge"];
-    *f.reader.fault.lock().unwrap() = Some((start, len, true));
+    for id in ["unrelated-huge", "in-window-unselected"] {
+        let (start, len) = f.spans[id];
+        f.reader
+            .faults
+            .lock()
+            .unwrap()
+            .push((start, len, ReadFault::Corrupt));
+    }
     let expected = f.memory.recover_lane("main").await.unwrap();
     assert_eq!(expected.pending_writes.len(), 3);
     assert_eq!(
@@ -464,52 +490,159 @@ async fn cold_full_report_matches_memory_and_reads_only_selected_payloads() {
         vec!["wrong-call", "wrong-name", "not-tool", "missing-tool"]
     );
     assert_eq!(expected.findings.len(), 8); // Seven dangling frames + multiple-open.
-    let selected = [
-        "cross-write",
-        "abandoned-write",
-        "cross-tool",
-        "abandoned-tool",
-        "wrong-call",
-        "wrong-name",
-        "not-tool",
-    ];
-    // A second recovery must read again: no long-lived payload cache.
+    let (start, _) = f.spans["cross-write"];
+    let (last, len) = f.spans["not-tool"];
+    let window = (start, (last - start) as usize + len);
+    // All selected rows fit in one window, even with missing lookups and
+    // record order differing from physical row order. Every sweep rereads it.
     for _ in 0..2 {
         f.reader.ranges.lock().unwrap().clear();
         assert_eq!(f.cold.recover_lane("main").await.unwrap(), expected);
-        let ranges = f.reader.ranges.lock().unwrap().clone();
-        assert_eq!(ranges.len(), selected.len());
-        for id in selected {
-            assert!(
-                ranges.contains(&f.spans[id]),
-                "missing selected range for {id}: {ranges:?}"
-            );
-        }
-        assert!(ranges.iter().map(|(_, len)| len).sum::<usize>() < 10_000);
+        assert_eq!(*f.reader.ranges.lock().unwrap(), [window]);
     }
+
+    // Changing a selected row after successful sweeps must be observable.
+    let (start, len) = f.spans["cross-tool"];
+    f.reader
+        .faults
+        .lock()
+        .unwrap()
+        .push((start, len, ReadFault::Corrupt));
+    let error = f.cold.recover_lane("main").await.unwrap_err();
+    assert_eq!(error.code, crate::error::SessionErrorCode::InvalidEntry);
+    assert!(error.message.contains("cold history source changed"));
 }
 #[tokio::test]
-async fn selected_write_and_tool_payload_io_and_decode_errors_propagate() {
+async fn selected_write_and_tool_payload_errors_propagate() {
+    use crate::error::SessionErrorCode;
+
     for selected in ["cross-write", "cross-tool"] {
-        for corrupt in [false, true] {
+        for (fault, code, message, retries) in [
+            (
+                ReadFault::Io,
+                SessionErrorCode::Storage,
+                "injected selected payload failure",
+                true,
+            ),
+            (
+                ReadFault::Short,
+                SessionErrorCode::Storage,
+                "short cold history read",
+                true,
+            ),
+            (
+                ReadFault::Corrupt,
+                SessionErrorCode::InvalidEntry,
+                "cold history source changed",
+                false,
+            ),
+        ] {
             let f = fixture(selected_log()).await;
             let (start, len) = f.spans[selected];
-            *f.reader.fault.lock().unwrap() = Some((start, len, corrupt));
+            f.reader.faults.lock().unwrap().push((start, len, fault));
             let error = f.cold.recover_lane("main").await.unwrap_err();
-            if corrupt {
-                assert_eq!(error.code, crate::error::SessionErrorCode::InvalidEntry);
-                assert!(
-                    error.message.contains("cold history source changed"),
-                    "{error}"
-                );
-            } else {
-                assert_eq!(error.code, crate::error::SessionErrorCode::Storage);
-                assert!(
-                    error.message.contains("injected selected payload failure"),
-                    "{error}"
-                );
-            }
-            assert!(f.reader.ranges.lock().unwrap().contains(&(start, len)));
+            assert_eq!(error.code, code);
+            assert!(error.message.contains(message), "{error}");
+            let ranges = f.reader.ranges.lock().unwrap();
+            assert_eq!(ranges.contains(&(start, len)), retries);
         }
     }
+}
+
+#[tokio::test]
+async fn coalesced_io_or_short_read_in_gap_falls_back_to_selected_rows() {
+    let f = fixture(selected_log()).await;
+    let expected = f.memory.recover_lane("main").await.unwrap();
+    let (start, _) = f.spans["cross-write"];
+    let (last, len) = f.spans["not-tool"];
+    let (gap, gap_len) = f.spans["in-window-unselected"];
+    for fault in [ReadFault::Io, ReadFault::Short] {
+        *f.reader.faults.lock().unwrap() = vec![(gap, gap_len, fault)];
+        f.reader.ranges.lock().unwrap().clear();
+        assert_eq!(f.cold.recover_lane("main").await.unwrap(), expected);
+        assert_eq!(
+            *f.reader.ranges.lock().unwrap(),
+            [
+                (start, (last - start) as usize + len),
+                f.spans["cross-write"],
+                f.spans["abandoned-write"],
+                f.spans["cross-tool"],
+                f.spans["abandoned-tool"],
+                f.spans["wrong-call"],
+                f.spans["wrong-name"],
+                f.spans["not-tool"],
+            ],
+        );
+    }
+}
+
+#[tokio::test]
+async fn coalesced_failure_preserves_first_error_in_record_order() {
+    let f = fixture(selected_log()).await;
+    let (later_offset, later_len) = f.spans["cross-tool"];
+    let (earlier_offset, earlier_len) = f.spans["abandoned-write"];
+    assert!(later_offset < earlier_offset);
+    *f.reader.faults.lock().unwrap() = vec![
+        (later_offset, later_len, ReadFault::Io),
+        (earlier_offset, earlier_len, ReadFault::Corrupt),
+    ];
+    let error = f.cold.recover_lane("main").await.unwrap_err();
+    assert_eq!(error.code, crate::error::SessionErrorCode::InvalidEntry);
+    assert!(error.message.contains("cold history source changed"));
+    let ranges = f.reader.ranges.lock().unwrap();
+    assert_eq!(
+        &ranges[1..],
+        &[f.spans["cross-write"], f.spans["abandoned-write"]]
+    );
+}
+
+#[tokio::test]
+async fn recovery_reads_respect_window_span_gap_and_large_row_chunk_limits() {
+    const CHUNK: usize = 1024 * 1024;
+    let mut log = Log::default();
+    for (id, size) in [
+        ("first", 100 * 1024),
+        ("second", 100 * 1024),
+        ("third", 100 * 1024),
+        ("unselected", 12 * 1024),
+        ("fourth", 100 * 1024),
+        ("fifth", 100 * 1024),
+        ("large", CHUNK + 1024),
+    ] {
+        log.entry(id, "main", user(&"x".repeat(size)));
+    }
+    for id in ["first", "second", "third", "fourth", "fifth", "large"] {
+        log.write(
+            &format!("write-{id}"),
+            "closed",
+            serde_json::json!({"id": id}),
+        );
+    }
+    let f = fixture(log).await;
+    let (start, len) = f.spans["unselected"];
+    f.reader
+        .faults
+        .lock()
+        .unwrap()
+        .push((start, len, ReadFault::Io));
+    assert_eq!(
+        f.cold.recover_lane("main").await.unwrap(),
+        f.memory.recover_lane("main").await.unwrap()
+    );
+    let window = |start: &str, end: &str| {
+        let (start, _) = f.spans[start];
+        let (end, len) = f.spans[end];
+        (start, (end - start) as usize + len)
+    };
+    let (large_start, large_len) = f.spans["large"];
+    assert_eq!(
+        *f.reader.ranges.lock().unwrap(),
+        [
+            window("first", "second"),
+            f.spans["third"],
+            window("fourth", "fifth"),
+            (large_start, CHUNK),
+            (large_start + CHUNK as u64, large_len - CHUNK),
+        ],
+    );
 }

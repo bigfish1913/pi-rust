@@ -2,7 +2,15 @@
 
 //! JSONL-private payload references. Query plans own only selected sources; no
 //! warm cache and no published plan holds or clones the resident history index.
+#[path = "recovery_batch.rs"]
+pub(super) mod recovery_batch;
+#[path = "startup_image.rs"]
+pub(super) mod startup_image;
+
 use super::digest::Sha256;
+
+#[path = "storage/preview.rs"]
+pub(super) mod preview;
 use super::{codec::parse_mutation, errors::file_result};
 use crate::{
     error::{SessionError, SessionResult},
@@ -178,7 +186,10 @@ impl Location {
     }
     async fn read_tool_result_identity(&self) -> SessionResult<Option<(String, String)>> {
         let raw = self.read_raw().await?;
-        let line = self.validate_raw(&raw)?;
+        self.decode_tool_result_identity(&raw)
+    }
+    fn decode_tool_result_identity(&self, raw: &[u8]) -> SessionResult<Option<(String, String)>> {
+        let line = self.validate_raw(raw)?;
 
         // Never probe before verifying the digest: discarding fields is safe
         // only because these exact bytes were already fully validated. Keep
@@ -196,7 +207,7 @@ impl Location {
             }
         }
 
-        let SessionMutation::Entry { entry, .. } = self.decode(&raw)? else {
+        let SessionMutation::Entry { entry, .. } = self.decode(raw)? else {
             return Err(SessionError::invalid_entry("cold entry identity mismatch"));
         };
         Ok(tool_result_identity(&entry))
@@ -225,7 +236,7 @@ impl Location {
 /// Live entries can distinguish `Some(Null)` from `None`, whereas the legacy
 /// message decoder intentionally cannot. Keep only typed presence corrections,
 /// never message bodies or raw JSON, until this live generation is dropped.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, Deserialize)]
 enum MessageNull {
     ToolDetails,
     DeferredData,
@@ -266,7 +277,7 @@ impl MessageNull {
         }
     }
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, Deserialize)]
 pub(super) struct LiveNulls {
     message: Option<MessageNull>,
     retained_tail: Vec<(usize, MessageNull)>,
@@ -558,16 +569,8 @@ impl ResidentState {
         // Cold frames still consume the journal sequence even though their
         // discarded payload is not reduced into a resident record.
         self.reducer.resync_sequence(metadata.seq);
-        fn symbol(slot: &mut Option<Arc<str>>, value: &str) -> Arc<str> {
-            if let Some(current) = slot.as_ref().filter(|current| current.as_ref() == value) {
-                return current.clone();
-            }
-            let current = Arc::<str>::from(value);
-            *slot = Some(current.clone());
-            current
-        }
-        let lane = symbol(&mut self.last_frame_lane, &metadata.lane);
-        let run = symbol(&mut self.last_frame_run, &metadata.run_id);
+        let lane = frame_symbol(&mut self.last_frame_lane, &metadata.lane);
+        let run = frame_symbol(&mut self.last_frame_run, &metadata.run_id);
         self.cold.push(Arc::new(Location {
             reader: reader.clone(),
             seq: metadata.seq,
@@ -1436,9 +1439,18 @@ impl ResidentState {
     }
 }
 
+fn frame_symbol(slot: &mut Option<Arc<str>>, value: &str) -> Arc<str> {
+    if let Some(current) = slot.as_ref().filter(|current| current.as_ref() == value) {
+        return current.clone();
+    }
+    let current = Arc::<str>::from(value);
+    *slot = Some(current.clone());
+    current
+}
+
 impl ColdFrames {
     fn push(&mut self, location: Arc<Location>) {
-        if location.append {
+        if location.append && !location.retired {
             if !self.active.contains_key(location.run.as_ref()) {
                 self.active.insert(location.run.to_string(), HashMap::new());
             }

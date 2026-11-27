@@ -2249,6 +2249,7 @@ dependencies = [
  "rpi-durable",
  "rpi-telemetry",
  "rpi-tools",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",

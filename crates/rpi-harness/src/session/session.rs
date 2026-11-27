@@ -28,8 +28,8 @@ use crate::session::durable_adapter::SessionDurableWriter;
 use crate::session::types::{
     BranchBounds, BranchEntryPage, BranchEntryPageQuery, BranchOverview, Entry, EntryQuery,
     IdGenerator, JsonValue, LanePointer, LaneRecord, LogItem, LogOptions, OperationStartedRecord,
-    ProvisionedEntry, ProvisionedKind, RecordQuery, SessionLaneBranch, SessionMetadata,
-    SessionStats, SessionStorage, SessionTree,
+    ProvisionedEntry, ProvisionedKind, RecordQuery, RecoveryEntryCheck, SessionLaneBranch,
+    SessionMetadata, SessionStats, SessionStorage, SessionTree,
 };
 use rpi_durable::storage::JournalFrame;
 
@@ -615,6 +615,20 @@ impl Session {
     /// Read one reserved result while retaining only its tool-call identity.
     pub async fn tool_result_identity(&self, id: &str) -> SessionResult<Option<(String, String)>> {
         self.storage_arc().tool_result_identity(id).await
+    }
+
+    pub(crate) async fn recovery_entries_settled(
+        &self,
+        checks: &[RecoveryEntryCheck<'_>],
+    ) -> SessionResult<Vec<bool>> {
+        if checks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let settled = self.storage_arc().recovery_entries_settled(checks).await?;
+        if settled.len() != checks.len() {
+            return Err(SessionError::storage("recovery settlement count mismatch"));
+        }
+        Ok(settled)
     }
 
     /// Estimate the main lane's default context, if supported by storage.
