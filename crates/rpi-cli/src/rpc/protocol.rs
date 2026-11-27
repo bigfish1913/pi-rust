@@ -26,6 +26,10 @@ pub enum Command {
         content: PromptPayload,
     },
     Abort,
+    /// Cancel the active run without reclaiming queued steering/follow-up
+    /// messages. `stop_run` is advertised in `SUPPORTED_COMMANDS`; the generic
+    /// dispatcher validates it against this enum before reaching its handler.
+    StopRun,
     GetState,
     /// Strict bounded host-only delegated-child query/control envelopes.
     GetChildAgents,
@@ -625,6 +629,15 @@ mod tests {
         let request: Request =
             serde_json::from_value(json!({"type": "resume_pending", "id": 4})).unwrap();
         assert!(matches!(request.command, Command::ResumePending));
+    }
+
+    #[test]
+    fn stop_run_is_a_bare_advertised_command() {
+        assert!(SUPPORTED_COMMANDS.contains(&"stop_run"));
+        let request: Request =
+            serde_json::from_value(json!({"type": "stop_run", "id": 7})).unwrap();
+        assert_eq!(request.id, Some(json!(7)));
+        assert!(matches!(request.command, Command::StopRun));
     }
 
     #[test]
