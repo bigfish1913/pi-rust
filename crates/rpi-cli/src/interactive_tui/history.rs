@@ -316,7 +316,7 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
     let page_chat = render_page(state, &page.entries);
     resident.notices = Arc::new(Container::new());
     page_chat.add_child(resident.notices.clone());
-    let publish = || {
+    let mut publish = || {
         clear_settled_active(state);
         crate::transcript_view::merge_transcript_panels(&page_chat, &state.history_page.active);
         chat.clear();

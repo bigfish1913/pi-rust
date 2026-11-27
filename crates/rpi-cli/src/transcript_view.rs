@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 use base64::Engine;
 use rpi_tui::{
     render_diff, AssistantBlock, AssistantMessageComponent, AssistantMessageOptions,
-    BashExecutionComponent, BashTruncation, Container, Spacer, ToolExecutionComponent, ToolStatus,
-    UserMessageComponent,
+    BashExecutionComponent, BashTruncation, Component, Container, Spacer, ToolExecutionComponent,
+    ToolStatus, UserMessageComponent,
 };
 use serde_json::Value;
 
