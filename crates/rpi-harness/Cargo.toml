@@ -40,6 +40,9 @@ sha2 = "0.10.9"
 # Already used by reqwest/rustls; use its runtime-dispatched SHA-256 backend.
 ring = "0.17.14"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "process"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
