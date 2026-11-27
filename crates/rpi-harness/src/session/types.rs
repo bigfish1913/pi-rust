@@ -1255,6 +1255,36 @@ pub struct EntryQuery {
     pub cursor: Option<EntryCursor>,
 }
 
+/// A session-wide reserved entry lookup for lane recovery.
+#[derive(Debug, Clone, Copy)]
+pub enum RecoveryEntryCheck<'a> {
+    DeferredWrite(Option<&'a str>),
+    ToolResult {
+        id: &'a str,
+        call_id: &'a str,
+        tool_name: &'a str,
+    },
+}
+
+impl<'a> RecoveryEntryCheck<'a> {
+    pub(crate) fn id(self) -> Option<&'a str> {
+        match self {
+            Self::DeferredWrite(id) => id,
+            Self::ToolResult { id, .. } => Some(id),
+        }
+    }
+
+    pub(crate) fn matches_tool(self, identity: Option<(String, String)>) -> bool {
+        let Self::ToolResult {
+            call_id, tool_name, ..
+        } = self
+        else {
+            return false;
+        };
+        identity.is_some_and(|(call, name)| call == call_id && name == tool_name)
+    }
+}
+
 /// Real entry identity and parent link, without a transcript payload.
 /// Ancestry includes all entry kinds, including archival custom entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1944,6 +1974,25 @@ pub trait SessionStorage: Send + Sync {
             return Ok(None);
         };
         Ok(Some((result.tool_call_id, result.tool_name)))
+    }
+
+    /// Return one settlement flag per check, in order. The first error in
+    /// that order aborts the sweep.
+    async fn recovery_entries_settled(
+        &self,
+        checks: &[RecoveryEntryCheck<'_>],
+    ) -> SessionResult<Vec<bool>> {
+        let mut settled = Vec::with_capacity(checks.len());
+        for check in checks {
+            settled.push(match *check {
+                RecoveryEntryCheck::DeferredWrite(Some(id)) => self.get_entry(id).await?.is_some(),
+                RecoveryEntryCheck::DeferredWrite(None) => false,
+                RecoveryEntryCheck::ToolResult { id, .. } => {
+                    check.matches_tool(self.tool_result_identity(id).await?)
+                }
+            });
+        }
+        Ok(settled)
     }
 
     async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>>;

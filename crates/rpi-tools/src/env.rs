@@ -11,6 +11,7 @@
 //! cancellation during blocking ops via `tokio::select!`.
 
 use std::collections::HashMap;
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -156,6 +157,13 @@ pub struct AppendReceipt {
     pub length: usize,
 }
 
+/// Physical file metadata captured on the same native handle immediately
+/// before and after a successful append.
+pub struct NativeAppendMetadata {
+    pub before: Metadata,
+    pub after: Metadata,
+}
+
 /// An optional, single-owner append capability for a journal.
 #[async_trait]
 pub trait AppendFile: Send + Sync {
@@ -172,6 +180,14 @@ pub trait AppendFile: Send + Sync {
         self.append(bytes).await?;
         Ok(None)
     }
+
+    /// Append with optional native handle metadata for a derived index.
+    async fn append_with_native_metadata(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(Option<AppendReceipt>, Option<NativeAppendMetadata>), FileError> {
+        Ok((self.append_with_receipt(bytes).await?, None))
+    }
 }
 
 /// Read capability bound to one opened file, even if its path is replaced.
@@ -180,6 +196,11 @@ pub trait AppendFile: Send + Sync {
 pub trait ReadFile: Send + Sync {
     async fn read_all(&self) -> Result<Vec<u8>, FileError>;
     async fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>, FileError>;
+
+    /// Metadata of the opened native handle, when available.
+    fn native_metadata(&self) -> Option<Metadata> {
+        None
+    }
 
     /// Current byte length of this opened generation, when supported. This is
     /// not a snapshot: later appends or truncation may change the length.
@@ -194,6 +215,12 @@ pub trait ReadFile: Send + Sync {
 pub trait FileSystem: Send + Sync {
     /// The environment's working directory (absolute).
     fn cwd(&self) -> &Path;
+
+    /// Resolve a host path when this backend explicitly permits native I/O.
+    /// Abstract and restricted backends do not grant this capability.
+    fn native_file_path(&self, _path: &str) -> Option<PathBuf> {
+        None
+    }
 
     /// Resolve `path` (relative-to-cwd, `~`, `file://`, absolute) to an absolute
     /// addressed path. Pure — no FS access, no abort. Mirrors TS `absolutePath`.

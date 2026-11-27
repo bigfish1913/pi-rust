@@ -12,6 +12,7 @@ struct Scanner {
     buffer: Vec<u8>,
     cursor: usize,
     hash: Sha256,
+    hash_before_buffer: Sha256,
     policy: ReadPolicy,
 }
 impl Scanner {
@@ -24,6 +25,7 @@ impl Scanner {
             buffer: Vec::new(),
             cursor: 0,
             hash: Sha256::new(),
+            hash_before_buffer: Sha256::new(),
             policy: ReadPolicy::Restore,
         }
     }
@@ -57,11 +59,82 @@ impl Scanner {
             if self.buffer.len() != count {
                 return Err(SessionError::storage("short session history scan"));
             }
+            self.hash_before_buffer = self.hash.clone();
             self.hash.update(&self.buffer);
             self.fetched += count as u64;
             self.cursor = 0;
         }
     }
+
+    async fn resume(&self, prefix: startup_checkpoint::Boundary) -> Option<Self> {
+        if prefix.bytes < self.offset || prefix.bytes > self.length {
+            return None;
+        }
+        // The initial header read may already contain some of the prefix or
+        // even some of the suffix. Reuse those exact bytes and hash context.
+        if prefix.bytes < self.fetched {
+            let cursor = self.buffer.len() - (self.fetched - prefix.bytes) as usize;
+            let prior = &self.buffer[..cursor];
+            let mut hash = self.hash_before_buffer.clone();
+            hash.update(prior);
+            if prior.last() != Some(&b'\n') || hash.finalize() != prefix.digest {
+                return None;
+            }
+            return Some(Self {
+                reader: self.reader.clone(),
+                length: self.length,
+                fetched: self.fetched,
+                offset: prefix.bytes,
+                buffer: self.buffer.clone(),
+                cursor,
+                hash: self.hash.clone(),
+                hash_before_buffer: self.hash_before_buffer.clone(),
+                policy: self.policy,
+            });
+        }
+        let mut hash = self.hash.clone();
+        let mut last = self.buffer.last().copied();
+        let mut offset = self.fetched;
+        while offset < prefix.bytes {
+            let count = (prefix.bytes - offset).min(CHUNK as u64) as usize;
+            let bytes = self.reader.read_range(offset, count).await.ok()?;
+            if bytes.len() != count {
+                return None;
+            }
+            hash.update(&bytes);
+            last = bytes.last().copied();
+            offset += count as u64;
+        }
+        if last != Some(b'\n') || hash.clone().finalize() != prefix.digest {
+            return None;
+        }
+        Some(Self {
+            reader: self.reader.clone(),
+            length: self.length,
+            fetched: prefix.bytes,
+            offset: prefix.bytes,
+            buffer: Vec::new(),
+            cursor: 0,
+            hash_before_buffer: hash.clone(),
+            hash,
+            policy: self.policy,
+        })
+    }
+}
+
+async fn load_checkpoint(
+    fs: &Arc<dyn FileSystem>,
+    path: &str,
+    scan: &Scanner,
+) -> Option<(startup_checkpoint::Boundary, Scanner, ResidentState)> {
+    let saved = startup_checkpoint::Checkpoint::open(fs, path).await?;
+    let boundary = saved.boundary;
+    let resumed = scan.resume(boundary).await?;
+    let state = saved
+        .image()
+        .await?
+        .bind(&scan.reader, scan.offset, boundary.bytes)?;
+    Some((boundary, resumed, state))
 }
 
 async fn copy_range(
@@ -123,12 +196,45 @@ impl JsonlSessionStorage {
         length: u64,
         policy: ReadPolicy,
     ) -> SessionResult<Self> {
+        let scanner = || {
+            let mut scan = Scanner::new(reader.clone(), length);
+            scan.policy = policy;
+            scan
+        };
+        if let Some(storage) = Self::load_streaming_impl(
+            fs.clone(),
+            path,
+            clock.clone(),
+            ids.clone(),
+            scanner(),
+            true,
+        )
+        .await?
+        {
+            return Ok(storage);
+        }
+        Self::load_streaming_impl(fs, path, clock, ids, scanner(), false)
+            .await?
+            .ok_or_else(|| SessionError::storage("unexpected fallback from full history replay"))
+    }
+
+    /// `None` restarts replay from the header because the suffix needs physical
+    /// offsets from the verified prefix to preserve canonical recovery.
+    async fn load_streaming_impl(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+        mut scan: Scanner,
+        allow_checkpoint: bool,
+    ) -> SessionResult<Option<Self>> {
+        let policy = scan.policy;
         policy.check(0)?;
+        let reader = scan.reader.clone();
+        let length = scan.length;
         let allow_repair = policy.repairs();
         let defer_repair = policy.defers_repairs();
         let strict = policy.strict();
-        let mut scan = Scanner::new(reader.clone(), length);
-        scan.policy = policy;
         let Some((_, header_raw, _, header_newline)) = scan.next().await? else {
             return Err(invalid_file(path, 1, &"is missing a header"));
         };
@@ -180,17 +286,36 @@ impl JsonlSessionStorage {
             }
         }
         storage.progress.required = header.progress_format.is_some();
-        if let Some(checkpoint) =
-            history_checkpoint(&header).map_err(|error| invalid_file(path, 1, &error))?
-        {
+        let embedded =
+            history_checkpoint(&header).map_err(|error| invalid_file(path, 1, &error))?;
+        let mut cacheable = cfg!(unix)
+            && defer_repair
+            && header_newline
+            && embedded.is_none()
+            && length >= 4 * 1024 * 1024
+            && fs.native_file_path(path).is_some()
+            && info.kind == rpi_tools::env::FileKind::File;
+        if let Some(checkpoint) = embedded {
             let resident = ResidentState::from_checkpoint(checkpoint.state)?;
             *storage.state.lock().await = resident;
+        }
+        let mut reused = None;
+        if allow_checkpoint && cacheable {
+            let phase =
+                crate::session::diagnostics::RecoveryPhase::start("startup_checkpoint_load");
+            if let Some((prefix, resumed, resident)) = load_checkpoint(&fs, path, &scan).await {
+                reused = Some(prefix);
+                scan = resumed;
+                *storage.state.lock().await = resident;
+            }
+            phase.finish(0, reused.map_or(0, |prefix| prefix.lines));
         }
         let mut spans = vec![(0u64, header_raw.len() as u64)];
         let mut seen: HashMap<u64, (u64, usize)> = HashMap::new();
         let mut repair = false;
         let mut terminated = header_newline;
-        let mut line_no = 1;
+        let first_line = reused.map_or(1, |prefix| prefix.lines);
+        let mut line_no = first_line;
         use crate::session::diagnostics::RecoveryAccumulator;
         let mut scan_time = RecoveryAccumulator::new("replay_scan");
         let mut probe_time = RecoveryAccumulator::new("replay_classify");
@@ -203,7 +328,10 @@ impl JsonlSessionStorage {
             row
         } {
             line_no += 1;
-            policy.check((line_no - 1) as usize)?;
+            policy.check(line_no - 1)?;
+            if reused.is_some() && !newline {
+                return Ok(None);
+            }
             terminated = newline;
             if strict && !newline {
                 return Err(SessionError::invalid_entry(
@@ -234,8 +362,10 @@ impl JsonlSessionStorage {
                         // semantics without allocating a retained location.
                         state.reserve_loaded_frame(metadata)?;
                     }
-                    seen.insert(seq, (offset, raw.len()));
-                    spans.push((offset, raw.len() as u64));
+                    if reused.is_none() {
+                        seen.insert(seq, (offset, raw.len()));
+                        spans.push((offset, raw.len() as u64));
+                    }
                     apply_time.record(apply_started);
                     continue;
                 }
@@ -249,6 +379,9 @@ impl JsonlSessionStorage {
                     let apply_started = apply_time.start();
                     let mut state = storage.state.lock().await;
                     if mutation.seq() <= state.sequence() {
+                        if reused.is_some() {
+                            return Ok(None);
+                        }
                         let duplicate = if let Some(&(previous, count)) = seen.get(&mutation.seq())
                         {
                             let bytes = file_result(
@@ -274,7 +407,7 @@ impl JsonlSessionStorage {
                         }
                         return Err(invalid_file(
                             path,
-                            line_no,
+                            line_no.try_into().unwrap_or(u32::MAX),
                             &format!("conflicting mutations share sequence {}", mutation.seq()),
                         ));
                     }
@@ -287,13 +420,15 @@ impl JsonlSessionStorage {
                         .apply_loaded(mutation, &reader, offset, &raw)
                         .map_err(|error| {
                             if error.code == SessionErrorCode::InvalidEntry {
-                                invalid_file(path, line_no, &error)
+                                invalid_file(path, line_no.try_into().unwrap_or(u32::MAX), &error)
                             } else {
                                 error
                             }
                         })?;
-                    seen.insert(seq, (offset, raw.len()));
-                    spans.push((offset, raw.len() as u64));
+                    if reused.is_none() {
+                        seen.insert(seq, (offset, raw.len()));
+                        spans.push((offset, raw.len() as u64));
+                    }
                     apply_time.record(apply_started);
                 }
                 Err(error)
@@ -301,17 +436,40 @@ impl JsonlSessionStorage {
                         && error.kind == JsonlDecodeErrorKind::Schema
                         && is_assistant_frame_append(line) =>
                 {
+                    if reused.is_some() {
+                        return Ok(None);
+                    }
+                    cacheable = false;
                     tracing::warn!(line = line_no, "skipping undecodable assistant frame");
                     spans.push((offset, raw.len() as u64));
                 }
                 Err(error) if !strict && last && error.kind == JsonlDecodeErrorKind::Syntax => {
+                    if reused.is_some() {
+                        return Ok(None);
+                    }
                     repair = true;
                     break;
                 }
-                Err(error) => return Err(invalid_file(path, line_no, &error)),
+                Err(error) => {
+                    return Err(invalid_file(
+                        path,
+                        line_no.try_into().unwrap_or(u32::MAX),
+                        &error,
+                    ))
+                }
             }
         }
         let source_digest = scan.hash.clone().finalize();
+        if cacheable && !repair && terminated {
+            storage.startup_checkpoint = Some(startup_checkpoint::Update {
+                boundary: startup_checkpoint::Boundary {
+                    bytes: length,
+                    lines: line_no,
+                    digest: source_digest,
+                },
+                reused,
+            });
+        }
         *storage.loaded_history_digest.lock().unwrap() = Some(source_digest);
         if !storage.progress.required {
             *storage.legacy_history_digest.lock().unwrap() = Some(source_digest);
@@ -372,16 +530,15 @@ impl JsonlSessionStorage {
                 *storage.legacy_history_digest.lock().unwrap() = Some(scan.hash.finalize());
             }
         }
-        policy.check((line_no - 1) as usize)?;
+        policy.check(line_no - 1)?;
         // These are disjoint accumulated timings, not per-row stderr events.
-        // Scan includes bounded I/O, whole-source hashing and row copying;
-        // index apply includes reducer updates and cold-location digests.
-        let rows = (line_no - 1) as usize;
+        // A checkpoint hit counts only replayed suffix rows in these phases.
+        let rows = line_no - first_line;
         scan_time.finish(rows);
         probe_time.finish(rows);
         decode_time.finish(rows);
         apply_time.finish(rows);
-        Ok(storage)
+        Ok(Some(storage))
     }
 
     pub(super) async fn commit_pending_repair_impl(

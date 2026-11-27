@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::read::OsReadFile;
-use crate::env::{AppendFile, AppendReceipt, ReadFile};
+use crate::env::{AppendFile, AppendReceipt, NativeAppendMetadata, ReadFile};
 use crate::error::{io_to_file_error, FileError, FileErrorCode};
 
 #[cfg(unix)]
@@ -39,11 +39,8 @@ struct AppendState {
     identity: Option<FileIdentity>,
 }
 
-type AppendOutcome = (
-    Option<AppendState>,
-    Vec<u8>,
-    io::Result<Option<AppendReceipt>>,
-);
+type Receipt = (Option<AppendReceipt>, Option<NativeAppendMetadata>);
+type AppendOutcome = (Option<AppendState>, Vec<u8>, io::Result<Receipt>);
 
 fn open_current(path: &Path) -> io::Result<AppendState> {
     if let Some(parent) = path.parent() {
@@ -94,9 +91,9 @@ impl OsAppendFile {
         })
     }
 
-    async fn finish_pending(&mut self) -> Result<Option<AppendReceipt>, FileError> {
+    async fn finish_pending(&mut self) -> Result<Receipt, FileError> {
         let Some(pending) = self.pending.as_mut() else {
-            return Ok(None);
+            return Ok((None, None));
         };
         // Await by reference: cancellation must leave the task owned by this
         // writer. The next append joins it before starting another write.
@@ -113,22 +110,12 @@ impl OsAppendFile {
         self.state = if result.is_ok() { state } else { None };
         result.map_err(|error| io_to_file_error(error, Some(&self.path.to_string_lossy())))
     }
-}
 
-fn join_error(error: tokio::task::JoinError) -> FileError {
-    FileError::new(FileErrorCode::Unknown, error.to_string()).with_source(Box::new(error))
-}
-
-#[async_trait]
-impl AppendFile for OsAppendFile {
-    async fn append(&mut self, bytes: &[u8]) -> Result<(), FileError> {
-        self.append_with_receipt(bytes).await.map(|_| ())
-    }
-
-    async fn append_with_receipt(
+    async fn append_impl(
         &mut self,
         bytes: &[u8],
-    ) -> Result<Option<AppendReceipt>, FileError> {
+        track_native: bool,
+    ) -> Result<Receipt, FileError> {
         // A cancelled caller's receipt is discarded, but its write must finish
         // (and any real error propagate) before a subsequent append can start.
         self.finish_pending().await?;
@@ -150,8 +137,19 @@ impl AppendFile for OsAppendFile {
                     .file
                     .lock()
                     .map_err(|_| io::Error::other("append mutex poisoned"))?;
+                let before = if track_native {
+                    file.metadata().ok()
+                } else {
+                    None
+                };
                 file.write_all(&buffer)?;
                 file.flush()?;
+                let metadata = before.and_then(|before| {
+                    Some(NativeAppendMetadata {
+                        before,
+                        after: file.metadata().ok()?,
+                    })
+                });
                 // Locate the range using the written handle, never its path.
                 // Seeking to the end also handles empty appends and platforms
                 // whose append writes do not advance the readable cursor.
@@ -159,7 +157,7 @@ impl AppendFile for OsAppendFile {
                 // writer interleaving the write_all calls. Receipt discovery
                 // is best effort AFTER commit; a seek failure is not a failed
                 // append and must never invite a duplicate retry.
-                Ok(state.reader.as_ref().and_then(|reader| {
+                let receipt = state.reader.as_ref().and_then(|reader| {
                     let length = u64::try_from(buffer.len()).ok()?;
                     let offset = file.seek(SeekFrom::End(0)).ok()?.checked_sub(length)?;
                     Some(AppendReceipt {
@@ -167,11 +165,36 @@ impl AppendFile for OsAppendFile {
                         offset,
                         length: buffer.len(),
                     })
-                }))
+                });
+                Ok((receipt, metadata))
             })();
             (state, buffer, result)
         }));
         self.finish_pending().await
+    }
+}
+
+fn join_error(error: tokio::task::JoinError) -> FileError {
+    FileError::new(FileErrorCode::Unknown, error.to_string()).with_source(Box::new(error))
+}
+
+#[async_trait]
+impl AppendFile for OsAppendFile {
+    async fn append(&mut self, bytes: &[u8]) -> Result<(), FileError> {
+        self.append_with_receipt(bytes).await.map(|_| ())
+    }
+
+    async fn append_with_receipt(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Option<AppendReceipt>, FileError> {
+        self.append_impl(bytes, false)
+            .await
+            .map(|(receipt, _)| receipt)
+    }
+
+    async fn append_with_native_metadata(&mut self, bytes: &[u8]) -> Result<Receipt, FileError> {
+        self.append_impl(bytes, true).await
     }
 }
 
@@ -314,7 +337,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .write_all(b"pending\n")
-                .map(|_| None);
+                .map(|_| (None, None));
             (Some(state), Vec::new(), result)
         }));
         assert!(tokio::time::timeout(
