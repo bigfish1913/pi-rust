@@ -2,6 +2,7 @@
 
 pub(crate) mod client_requests;
 pub(crate) mod events;
+pub(crate) mod execution;
 pub(crate) mod external_tools;
 pub(crate) mod file_io;
 pub(crate) mod framing;

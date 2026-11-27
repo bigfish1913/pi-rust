@@ -70,7 +70,7 @@ rpi --connect 127.0.0.1:9899        # 无需再传 --token
 |---|---|---|
 | 协议（单一真源） | `crates/rpi-cli/src/remote/protocol.rs` | `RemoteEvent` / `RemoteCommand` / `RemoteResponse` / `SessionState`，服务端与客户端**共用**这些类型 |
 | 无头 agent 循环 | `crates/rpi-cli/src/modes.rs`（`modes::rpc`） | 读 stdin 命令、驱动 `main` lane、把 `AgentEvent` 投影成线协议输出 |
-| 服务端适配 | `rpi-package/packages/rpi-server` | TCP JSON-RPC、会话管理、token 校验、把子进程 stdout 转发为事件 |
+| 服务端适配 | `rpi-extension/packages/rpi-server` | TCP JSON-RPC、会话管理、token 校验、把子进程 stdout 转发为事件 |
 | 客户端连接 | `crates/rpi-cli/src/remote/client.rs` | TCP 握手、`authenticate`、事件泵、发送命令 |
 | 客户端会话模型 | `crates/rpi-cli/src/remote/session.rs` | 把事件流折叠成 `Transcript`（用户/助手/思考/工具/通知）+ `SessionState` |
 | 客户端 TUI | `crates/rpi-cli/src/remote/tui.rs` | 基于 `pi-tui` 渲染 transcript + 输入编辑器 + 状态栏 |
@@ -148,7 +148,7 @@ Responses 的第一个工具参数 delta 会包含 `output_item.added` 中已有
 后续 delta 仅包含新后缀；这一前缀修正也适用于非 RPC 的 provider 事件消费者。
 
 内置远程 TUI 同时支持两种格式；其他消费者必须先适配再升级 native host。
-推荐部署顺序：先升级兼容两种模式的客户端和 `rpi-package` 适配器，再升级默认
+推荐部署顺序：先升级兼容两种模式的客户端和 `rpi-extension` 适配器，再升级默认
 compact 的 CLI。`rpi-server` 工具可显式传入 `rpcMessageUpdates`，例如：
 
 ```json

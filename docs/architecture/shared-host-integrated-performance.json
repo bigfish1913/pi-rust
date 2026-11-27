@@ -1,0 +1,441 @@
+{
+  "scope": "0.27.0 integrated shared Harness execution probe; NOT the new ordinary Host backend, production Host or mini",
+  "recordedAt": "2026-11-21T03:01:48.013390+00:00",
+  "worktree": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host",
+  "branch": "feat/shared-host",
+  "baseCommit": "59f985a998c9e2297b24d2675d720f43a9824d96",
+  "uncommittedSource": true,
+  "trackedPatchSha256": "196eec8516d8ed2a70b0872d2e39b33f6c2127be17d423fa699846eafc1d9915",
+  "binarySha256": "f1a121c546d9843a137922e53bf5145ebdfd76f60c501010ae5d12b3b2c6f3ae",
+  "profile": "release; thin LTO; 16 codegen units",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "logs": "/tmp/rpi-host-validation-ySxC1W",
+  "regressions": {
+    "host": {
+      "passesPerRound": 56,
+      "rounds": 5
+    },
+    "harnessLibrary": {
+      "passed": 509,
+      "ignored": 4
+    },
+    "harnessIntegrationPassed": 88,
+    "pythonFixture": {
+      "passed": 19,
+      "skipped": 0,
+      "releaseBinarySmokeEnabled": true
+    }
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "artifacts": "/tmp/rpi-host-validation-ySxC1W/tool-600-1",
+      "configuration": {
+        "binary": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/release/examples/shared_host_probe",
+        "output_root": "/tmp/rpi-host-validation-ySxC1W/tool-600-1",
+        "agents": 600,
+        "mode": "tool",
+        "tool_kind": "async",
+        "context_bytes": 1024,
+        "history_entries": 0,
+        "workers": 4,
+        "max_blocking_threads": 32,
+        "stagger_ms": 0,
+        "hold_seconds": 2,
+        "timeout": 180,
+        "cgroup": null
+      },
+      "environment": "macOS-27.0-arm64-arm-64bit",
+      "resourceLimits": {
+        "nofile": [
+          8192,
+          8192
+        ],
+        "nproc": [
+          2666,
+          4000
+        ]
+      },
+      "fixtureServer": {
+        "requests": 1200,
+        "firstRequests": 600,
+        "finalResponses": 600,
+        "toolResults": 600,
+        "peakInFlight": 600,
+        "errors": [],
+        "protocol": "HTTP/1.1, loopback, no TLS, Connection: close",
+        "measurementBoundary": "fixture server excluded; separate controller process"
+      },
+      "phases": [
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 100,
+          "setupMs": 1192,
+          "sessionCreateMs": 1186,
+          "harnessCreateMs": 6,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 200,
+          "setupMs": 2506,
+          "sessionCreateMs": 2494,
+          "harnessCreateMs": 11,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 300,
+          "setupMs": 3844,
+          "sessionCreateMs": 3827,
+          "harnessCreateMs": 17,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 400,
+          "setupMs": 5266,
+          "sessionCreateMs": 5243,
+          "harnessCreateMs": 22,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 500,
+          "setupMs": 6785,
+          "sessionCreateMs": 6756,
+          "harnessCreateMs": 29,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 600,
+          "setupMs": 8436,
+          "sessionCreateMs": 8397,
+          "harnessCreateMs": 38,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "ready",
+          "agents": 600,
+          "mode": "tool",
+          "toolKind": "async",
+          "contextBytes": 1024,
+          "historyEntries": 0,
+          "workers": 4,
+          "maxBlockingThreads": 32,
+          "staggerMs": 0,
+          "setupMs": 8436,
+          "sessions": "independent-jsonl",
+          "sessionCreateMs": 8397,
+          "harnessCreateMs": 38,
+          "historyAppendMs": 0,
+          "extensions": false,
+          "tls": false
+        },
+        {
+          "phase": "requests_held",
+          "requests": 600,
+          "live": 600
+        },
+        {
+          "phase": "tools_held",
+          "entered": 600,
+          "live": 600
+        },
+        {
+          "phase": "settled",
+          "agents": 600,
+          "completed": 600,
+          "toolEntered": 600,
+          "toolPeak": 600,
+          "runMs": 21415
+        },
+        {
+          "phase": "closed",
+          "agents": 600,
+          "runMs": 23539
+        },
+        {
+          "phase": "complete",
+          "success": true
+        }
+      ],
+      "peaks": {
+        "sampledPeakHostRssBytes": 208502784,
+        "sampledPeakGroupRssSumBytes": 208502784,
+        "sampledPeakGroupProcesses": 1,
+        "sampledPeakHostFootprintBytes": 166429272,
+        "sampledPeakHostThreads": 38,
+        "sampledPeakHostFds": 1809
+      },
+      "heldSamples": [
+        {
+          "hostRssBytes": 13336576,
+          "processGroupRssSumBytes": 13336576,
+          "processGroupProcesses": 1,
+          "hostThreads": 7,
+          "hostFootprintBytes": 8815000,
+          "hostFds": 609,
+          "phase": "ready",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 0,
+          "fixtureRequests": 0
+        },
+        {
+          "hostRssBytes": 139771904,
+          "processGroupRssSumBytes": 139771904,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 132563520,
+          "hostFds": 1809,
+          "phase": "requests_held",
+          "fixtureInFlight": 600,
+          "fixtureFirstRequests": 600,
+          "fixtureRequests": 600
+        },
+        {
+          "hostRssBytes": 180895744,
+          "processGroupRssSumBytes": 180895744,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 116720216,
+          "hostFds": 1209,
+          "phase": "tools_held",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 600,
+          "fixtureRequests": 600
+        },
+        {
+          "hostRssBytes": 208502784,
+          "processGroupRssSumBytes": 208502784,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 96191064,
+          "hostFds": 1209,
+          "phase": "settled",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 600,
+          "fixtureRequests": 1200
+        },
+        {
+          "hostRssBytes": 208502784,
+          "processGroupRssSumBytes": 208502784,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 96191064,
+          "hostFds": 9,
+          "phase": "closed",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 600,
+          "fixtureRequests": 1200
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "artifacts": "/tmp/rpi-host-validation-ySxC1W/tool-600-2",
+      "configuration": {
+        "binary": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/release/examples/shared_host_probe",
+        "output_root": "/tmp/rpi-host-validation-ySxC1W/tool-600-2",
+        "agents": 600,
+        "mode": "tool",
+        "tool_kind": "async",
+        "context_bytes": 1024,
+        "history_entries": 0,
+        "workers": 4,
+        "max_blocking_threads": 32,
+        "stagger_ms": 0,
+        "hold_seconds": 2,
+        "timeout": 180,
+        "cgroup": null
+      },
+      "environment": "macOS-27.0-arm64-arm-64bit",
+      "resourceLimits": {
+        "nofile": [
+          8192,
+          8192
+        ],
+        "nproc": [
+          2666,
+          4000
+        ]
+      },
+      "fixtureServer": {
+        "requests": 1200,
+        "firstRequests": 600,
+        "finalResponses": 600,
+        "toolResults": 600,
+        "peakInFlight": 600,
+        "errors": [],
+        "protocol": "HTTP/1.1, loopback, no TLS, Connection: close",
+        "measurementBoundary": "fixture server excluded; separate controller process"
+      },
+      "phases": [
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 100,
+          "setupMs": 1295,
+          "sessionCreateMs": 1285,
+          "harnessCreateMs": 9,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 200,
+          "setupMs": 2655,
+          "sessionCreateMs": 2637,
+          "harnessCreateMs": 17,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 300,
+          "setupMs": 4138,
+          "sessionCreateMs": 4110,
+          "harnessCreateMs": 27,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 400,
+          "setupMs": 5652,
+          "sessionCreateMs": 5614,
+          "harnessCreateMs": 37,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 500,
+          "setupMs": 7324,
+          "sessionCreateMs": 7274,
+          "harnessCreateMs": 48,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 600,
+          "setupMs": 9045,
+          "sessionCreateMs": 8987,
+          "harnessCreateMs": 56,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "ready",
+          "agents": 600,
+          "mode": "tool",
+          "toolKind": "async",
+          "contextBytes": 1024,
+          "historyEntries": 0,
+          "workers": 4,
+          "maxBlockingThreads": 32,
+          "staggerMs": 0,
+          "setupMs": 9045,
+          "sessions": "independent-jsonl",
+          "sessionCreateMs": 8987,
+          "harnessCreateMs": 56,
+          "historyAppendMs": 0,
+          "extensions": false,
+          "tls": false
+        },
+        {
+          "phase": "requests_held",
+          "requests": 600,
+          "live": 600
+        },
+        {
+          "phase": "tools_held",
+          "entered": 600,
+          "live": 600
+        },
+        {
+          "phase": "settled",
+          "agents": 600,
+          "completed": 600,
+          "toolEntered": 600,
+          "toolPeak": 600,
+          "runMs": 24055
+        },
+        {
+          "phase": "closed",
+          "agents": 600,
+          "runMs": 26155
+        },
+        {
+          "phase": "complete",
+          "success": true
+        }
+      ],
+      "peaks": {
+        "sampledPeakHostRssBytes": 214073344,
+        "sampledPeakGroupRssSumBytes": 214073344,
+        "sampledPeakGroupProcesses": 1,
+        "sampledPeakHostFootprintBytes": 166593112,
+        "sampledPeakHostThreads": 38,
+        "sampledPeakHostFds": 1809
+      },
+      "heldSamples": [
+        {
+          "hostRssBytes": 13418496,
+          "processGroupRssSumBytes": 13418496,
+          "processGroupProcesses": 1,
+          "hostThreads": 8,
+          "hostFootprintBytes": 8896920,
+          "hostFds": 609,
+          "phase": "ready",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 0,
+          "fixtureRequests": 0
+        },
+        {
+          "hostRssBytes": 142524416,
+          "processGroupRssSumBytes": 142524416,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 134988352,
+          "hostFds": 1809,
+          "phase": "requests_held",
+          "fixtureInFlight": 600,
+          "fixtureFirstRequests": 600,
+          "fixtureRequests": 600
+        },
+        {
+          "hostRssBytes": 184795136,
+          "processGroupRssSumBytes": 184795136,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 116834904,
+          "hostFds": 1209,
+          "phase": "tools_held",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 600,
+          "fixtureRequests": 600
+        },
+        {
+          "hostRssBytes": 214073344,
+          "processGroupRssSumBytes": 214073344,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 97665648,
+          "hostFds": 1209,
+          "phase": "settled",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 600,
+          "fixtureRequests": 1200
+        },
+        {
+          "hostRssBytes": 214073344,
+          "processGroupRssSumBytes": 214073344,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 97665648,
+          "hostFds": 9,
+          "phase": "closed",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 600,
+          "fixtureRequests": 1200
+        }
+      ]
+    }
+  ]
+}

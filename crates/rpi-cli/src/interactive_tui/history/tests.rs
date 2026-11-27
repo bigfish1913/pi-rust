@@ -3,6 +3,8 @@ use super::*;
 use rpi_harness::session::types::{ProvisionedEntry, ProvisionedKind, SessionMetadata};
 use rpi_harness::session::{CounterIdGenerator, FakeClock, InMemorySessionStorage};
 
+#[path = "tests/entry_visibility.rs"]
+mod entry_visibility;
 #[path = "tests/output_order.rs"]
 mod output_order;
 #[path = "tests/plan_order.rs"]

@@ -60,7 +60,8 @@ pub enum Command {
     GetCommands,
     /// Invoke an extension handler and return its JSON result as response data.
     /// `command` accepts a registered name with or without a leading slash.
-    ExecuteCommand {
+    #[serde(rename = "execute_command")]
+    ExecuteExtension {
         command: String,
         #[serde(default)]
         args: String,
@@ -408,6 +409,11 @@ pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
             "messageIds": "sessionEntryId-v1",
             "promptResponse": "accepted",
             "settlementEvent": "agent_settled",
+            "executionLifecycle": "correlated-v1",
+            "executionLifecycleOptIn": {
+                "environment": super::execution::LIFECYCLE_ENV,
+                "value": super::execution::LIFECYCLE_VERSION
+            },
             "agentEndIsTerminal": false
         },
         "limits": {"frameBytes": MAX_FRAME_BYTES, "maxConcurrentPrompts": 1},
@@ -534,7 +540,7 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            matches!(request.command, Command::ExecuteCommand { command, args }
+            matches!(request.command, Command::ExecuteExtension { command, args }
             if command == "/example" && args.is_empty())
         );
         assert!(serde_json::from_value::<Request>(json!({

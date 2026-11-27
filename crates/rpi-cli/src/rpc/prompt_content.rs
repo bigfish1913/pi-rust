@@ -216,7 +216,7 @@ fn validate_command_size(command: &Value) -> Result<(), String> {
             self.0 = self
                 .0
                 .checked_add(bytes.len())
-                .filter(|n| *n <= MAX_PROMPT_BYTES - 1)
+                .filter(|n| *n < MAX_PROMPT_BYTES)
                 .ok_or_else(|| io::Error::other("prompt frame budget exceeded"))?;
             Ok(bytes.len())
         }
@@ -229,7 +229,6 @@ fn validate_command_size(command: &Value) -> Result<(), String> {
             "serialized contentBlocks command plus LF exceeds {} bytes",
             MAX_PROMPT_BYTES
         )
-        .into()
     })
 }
 

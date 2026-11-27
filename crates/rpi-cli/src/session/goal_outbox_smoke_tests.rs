@@ -42,6 +42,7 @@ async fn native_goal_outbox_smoke() {
         ..Default::default()
     };
     let resolved = crate::provider::resolve(
+        &crate::config::AgentHome::process(),
         Some("anthropic"),
         Some(crate::provider::DEFAULT_MODEL_ID),
         None,
@@ -49,9 +50,15 @@ async fn native_goal_outbox_smoke() {
         None,
     )
     .unwrap();
-    let (harness, _events, context) = build(&resolved, &args, temporary.path(), false)
-        .await
-        .unwrap();
+    let (harness, _events, context) = build(
+        &crate::config::AgentHome::process(),
+        &resolved,
+        &args,
+        temporary.path(),
+        false,
+    )
+    .await
+    .unwrap();
 
     // The plugin registers the command tool plus the three explicit stopping
     // reasons. `goal start` would arm automatic work, so the state is seeded.

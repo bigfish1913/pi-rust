@@ -239,7 +239,10 @@ mod linked_scope_roots {
     fn selected_root(prefix: &Path, style: &str) -> Result<PathBuf> {
         let logical = addressed_root(prefix, style);
         if style == "project" {
-            Scope::Project.root(logical.parent().unwrap())
+            Scope::Project.root(
+                &crate::config::AgentHome::process(),
+                logical.parent().unwrap(),
+            )
         } else {
             // Exercise the same resolver as Scope::Global with synthetic home
             // and explicit-agent-dir shapes, without changing process env.
@@ -394,7 +397,9 @@ mod linked_scope_roots {
             );
         }
         assert_eq!(
-            Scope::Project.root(Path::new("relative")).unwrap_err(),
+            Scope::Project
+                .root(&crate::config::AgentHome::process(), Path::new("relative"))
+                .unwrap_err(),
             "resource root must be absolute"
         );
         assert!(!base.join("absent").exists());

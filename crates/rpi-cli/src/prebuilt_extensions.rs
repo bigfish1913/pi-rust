@@ -155,20 +155,26 @@ struct GitReference {
     reference: String,
 }
 
-fn stable_tag_version(refs: &[GitReference], name: &str) -> Result<String, String> {
+fn best_tag_version(refs: &[GitReference], name: &str) -> Option<semver::Version> {
     let prefix = format!("refs/tags/{name}-v");
-    refs.iter().filter_map(|r| r.reference.strip_prefix(&prefix))
-        .filter_map(|v| semver::Version::parse(v).ok()).filter(|v| v.pre.is_empty())
-        .max().map(|v| v.to_string()).ok_or_else(|| format!("no stable {name}-v<version> tag exists in this repository; specify --version explicitly"))
+    refs.iter()
+        .filter_map(|reference| reference.reference.strip_prefix(&prefix))
+        .filter_map(|version| semver::Version::parse(version).ok())
+        .filter(|version| version.pre.is_empty())
+        .max()
 }
 
-async fn repository_version(
+fn tag_published(refs: &[GitReference], name: &str, version: &str) -> bool {
+    let expected = format!("refs/tags/{name}-v{version}");
+    refs.iter().any(|reference| reference.reference == expected)
+}
+
+async fn repository_tags(
     client: &reqwest::Client,
     api: &str,
     name: &str,
     repository: &str,
-) -> Result<String, String> {
-    let repository = canonical_repository(repository)?;
+) -> Result<Vec<GitReference>, String> {
     let repo = repository
         .strip_prefix("https://github.com/")
         .ok_or("invalid GitHub repository")?;
@@ -183,10 +189,55 @@ async fn repository_version(
     if !response.status().is_success() {
         return Err(format!("GitHub tag lookup returned {}", response.status()));
     }
-    let refs: Vec<GitReference> =
-        serde_json::from_slice(&body_limited(response, MAX_METADATA).await?)
-            .map_err(|e| format!("invalid GitHub tag metadata: {e}"))?;
-    stable_tag_version(&refs, name)
+    serde_json::from_slice(&body_limited(response, MAX_METADATA).await?)
+        .map_err(|e| format!("invalid GitHub tag metadata: {e}"))
+}
+
+/// Highest stable release across the requested repository and, after a
+/// repository move, its current home. The winning repository is returned with
+/// the version because its release assets are the ones that must be verified
+/// and recorded; this is what migrates an installed extension to the new
+/// location instead of freezing it on the old, no-longer-published tags.
+async fn repository_version(
+    client: &reqwest::Client,
+    api: &str,
+    name: &str,
+    repository: &str,
+) -> Result<(String, String), String> {
+    let requested = canonical_repository(repository)?;
+    let current = moved_repository(&requested).to_string();
+    let mut candidates = vec![requested.clone()];
+    if current != requested {
+        candidates.push(current);
+    }
+    let mut best: Option<(semver::Version, String)> = None;
+    let mut failure = None;
+    for candidate in candidates {
+        match repository_tags(client, api, name, &candidate).await {
+            Ok(refs) => {
+                let Some(version) = best_tag_version(&refs, name) else {
+                    continue;
+                };
+                // Ties prefer the later candidate, which is the current home
+                // of a moved repository: a release that both locations still
+                // publish records the new location instead of pinning the
+                // install to the previous one.
+                if best.as_ref().is_none_or(|(best, _)| version >= *best) {
+                    best = Some((version, candidate));
+                }
+            }
+            Err(error) => failure = failure.or(Some(error)),
+        }
+    }
+    match best {
+        Some((version, repository)) => Ok((version.to_string(), repository)),
+        None => Err(match failure {
+            Some(error) => format!("{}: {error}", short_repository(&requested)),
+            None => format!(
+                "no stable {name}-v<version> tag exists in this repository; specify --version explicitly"
+            ),
+        }),
+    }
 }
 
 /// Supported triples are deliberately exact: GNU/musl and MSVC/GNU are
@@ -255,6 +306,42 @@ pub(crate) fn canonical_repository(value: &str) -> Result<String, String> {
     ))
 }
 
+/// Repositories that moved to a new home, as `(previous, current)` canonical
+/// URLs. The previous location keeps serving the releases and CDN objects it
+/// already published, so pinned versions and already-installed extensions keep
+/// working; version discovery, upgrade detection and new releases follow the
+/// move.
+const MOVED_REPOSITORIES: &[(&str, &str)] = &[(
+    "https://github.com/pi-rust/rpi-package",
+    "https://github.com/pi-rust/rpi-extension",
+)];
+
+/// The current home of a moved repository, else `repository` unchanged.
+///
+/// Callers pass canonical URLs (see [`canonical_repository`]).
+fn moved_repository(repository: &str) -> &str {
+    MOVED_REPOSITORIES
+        .iter()
+        .find(|(previous, _)| *previous == repository)
+        .map(|(_, current)| *current)
+        .unwrap_or(repository)
+}
+
+/// Whether two canonical repository URLs identify the same extension project,
+/// including the previous and current spelling of a moved repository.
+///
+/// Provenance records written before a move must not be treated as a different
+/// publisher: that would both hide updates and refuse to install them.
+pub(crate) fn same_repository_project(one: &str, other: &str) -> bool {
+    moved_repository(one) == moved_repository(other)
+}
+
+pub(crate) fn short_repository(repository: &str) -> &str {
+    repository
+        .strip_prefix("https://github.com/")
+        .unwrap_or(repository)
+}
+
 fn release_url(repository: &str, name: &str, version: &str, file: &str) -> Result<String, String> {
     let mut url = reqwest::Url::parse(repository).map_err(|e| e.to_string())?;
     url.path_segments_mut()
@@ -317,10 +404,24 @@ async fn resolve_package(
     // An explicit repository + version also supports unpublished third-party extensions.
     if let Some(repository) = repository {
         let repository = canonical_repository(repository)?;
-        let version = match version {
-            Some(version) => semver::Version::parse(version)
-                .map_err(|_| "--version requires an exact semantic version".to_string())?
-                .to_string(),
+        let (version, repository) = match version {
+            Some(version) => {
+                let version = semver::Version::parse(version)
+                    .map_err(|_| "--version requires an exact semantic version".to_string())?
+                    .to_string();
+                // A pinned version also follows a repository move when the
+                // current home publishes it; otherwise the previous location,
+                // which still hosts that release, keeps serving it.
+                let repository = follow_repository_move(
+                    client,
+                    "https://api.github.com",
+                    repository,
+                    name,
+                    &version,
+                )
+                .await;
+                (version, repository)
+            }
             None => repository_version(client, "https://api.github.com", name, &repository).await?,
         };
         return Ok(ResolvedPackage {
@@ -356,12 +457,53 @@ async fn resolve_package(
     let repository = repository
         .or(data.metadata.repository.as_deref())
         .ok_or("crate has no repository metadata; use --github owner/repo or --build")?;
+    let repository = canonical_repository(repository)?;
+    // `api` above is the crates.io base; repository tags live on GitHub.
+    let repository = follow_repository_move(
+        client,
+        "https://api.github.com",
+        repository,
+        &data.metadata.id,
+        &version,
+    )
+    .await;
     Ok(ResolvedPackage {
         name: data.metadata.id,
         version,
-        repository: canonical_repository(repository)?,
+        repository,
         custom_repository: false,
     })
+}
+
+/// Prefer a moved repository's current home for a version it actually
+/// publishes. Published or pinned versions that only exist in the previous
+/// location keep resolving there, so a stale crates.io `repository` field never
+/// makes an install fail and never loses an existing release.
+async fn follow_repository_move(
+    client: &reqwest::Client,
+    api: &str,
+    repository: String,
+    name: &str,
+    version: &str,
+) -> String {
+    let current = moved_repository(&repository).to_string();
+    if current == repository {
+        return repository;
+    }
+    let Ok(url) = release_url(&current, name, version, "rpi-extension.json") else {
+        return repository;
+    };
+    match client.head(url).send().await {
+        Ok(response) if response.status().is_success() => current,
+        Ok(_) => repository,
+        // The release host can be unreachable while the GitHub API still
+        // answers (proxies and restricted networks), so fall back to the tag
+        // list instead of assuming the previous location still publishes.
+        Err(_) => match repository_tags(client, api, name, &current).await {
+            Ok(refs) if tag_published(&refs, name, version) => current,
+            _ => repository,
+        },
+    }
 }
 
 pub(crate) fn hash(bytes: &[u8]) -> String {
@@ -396,7 +538,10 @@ fn validate_manifest<'a>(
     if manifest.name != package.name
         || manifest.version != package.version
         || manifest.tag != format!("{}-v{}", package.name, package.version)
-        || canonical_repository(&manifest.repository)? != package.repository
+        || !same_repository_project(
+            &canonical_repository(&manifest.repository)?,
+            &package.repository,
+        )
     {
         return Err("prebuilt manifest package, version, repository or tag does not match the requested package".into());
     }
@@ -487,10 +632,13 @@ pub(crate) fn validate_release_asset_url(
         || segments[2] != "releases"
         || segments[3] != "download"
         || segments[4] != tag
-        || canonical_repository(&format!(
-            "https://github.com/{}/{}",
-            segments[0], segments[1]
-        ))? != repository
+        || !same_repository_project(
+            &canonical_repository(&format!(
+                "https://github.com/{}/{}",
+                segments[0], segments[1]
+            ))?,
+            repository,
+        )
         || segments[5].is_empty()
         || matches!(segments[5].as_str(), "." | "..")
         || !segments[5]
@@ -553,7 +701,7 @@ pub async fn latest_compatible_version(
         .custom_repository
         .then_some(record.repository.as_str());
     let resolved = resolve_package(client, CRATES_API, &package.name, None, repository).await?;
-    if resolved.repository != record.repository {
+    if !same_repository_project(&resolved.repository, &record.repository) {
         return Err(
             "extension repository changed; reinstall explicitly to select a new publisher".into(),
         );
@@ -589,10 +737,20 @@ pub async fn install(
     });
     let package = resolve_package(&client, CRATES_API, name, version, repository).await?;
     if let Some(record) = existing.and_then(|p| p.prebuilt.as_ref()) {
-        if repository.is_none() && record.repository != package.repository {
+        if repository.is_none() && !same_repository_project(&record.repository, &package.repository)
+        {
             return Err(
                 "extension repository changed; select the new repository explicitly with --github"
                     .into(),
+            );
+        }
+        if record.repository != package.repository
+            && same_repository_project(&record.repository, &package.repository)
+        {
+            println!(
+                "publisher moved from {} to {}; recording the new location",
+                short_repository(&record.repository),
+                short_repository(&package.repository)
             );
         }
     }
@@ -611,15 +769,15 @@ pub async fn install(
     );
     let (manifest, manifest_bytes) = fetch_manifest(&client, &package).await?;
     let distribution = validate_manifest(&manifest, &package, target)?;
-    let cdn_url = cdn_base
+    let cdn_urls = cdn_base
         .map(|base| {
-            crate::cdn::archive_url(base, &package.repository, &manifest.tag, &distribution.url)
+            crate::cdn::archive_urls(base, &package.repository, &manifest.tag, &distribution.url)
         })
         .transpose()?
-        .flatten();
+        .unwrap_or_default();
     let archive = crate::cdn::download_with_fallback(
         &client,
-        cdn_url.as_ref(),
+        &cdn_urls,
         &distribution.url,
         distribution.size,
         &distribution.sha256,
@@ -627,6 +785,7 @@ pub async fn install(
     )
     .await?;
     let agent_dir = crate::config::agent_dir().map_err(|e| e.to_string())?;
+    let agent_dir_for_gc = agent_dir.clone();
     let target = target.to_string();
     let installed = tokio::task::spawn_blocking(move || {
         install_archive_at(
@@ -643,6 +802,14 @@ pub async fn install(
     .map_err(|e| format!("prebuilt installation failed: {e}"))??;
     for path in installed {
         println!("installed {}", path.display());
+    }
+    if matches!(
+        crate::install::gc_retired_native_artifacts(&agent_dir_for_gc),
+        crate::install::RetiredGcOutcome::Deferred
+    ) {
+        eprintln!(
+            "warning: stale native extension artifacts were not cleaned up because the resource lease could not be acquired (a running rpi host or lease setup failure); they will be ignored at startup and retried on a later install"
+        );
     }
     println!("rpi will validate the plugin entrypoint/SDK API size and load this extension on the next start.");
     Ok(())
@@ -1197,6 +1364,13 @@ mod tests {
     ];
 
     fn object(target: &str) -> Vec<u8> {
+        // Header-only objects suffice for format validation on other platforms,
+        // but Darwin installation actually re-signs the DLL. Use a real linked,
+        // deterministically signed fixture there, never bypass the signer.
+        #[cfg(target_os = "macos")]
+        if target.ends_with("-apple-darwin") {
+            return signed_mach_o_fixture(target);
+        }
         let mut bytes = vec![0u8; 128];
         if target.contains("windows") {
             bytes[..2].copy_from_slice(b"MZ");
@@ -1228,6 +1402,84 @@ mod tests {
             bytes[12..16].copy_from_slice(&6u32.to_le_bytes());
         }
         bytes
+    }
+
+    #[cfg(target_os = "macos")]
+    fn signed_mach_o_fixture(target: &str) -> Vec<u8> {
+        use std::sync::OnceLock;
+        static ARM: OnceLock<Vec<u8>> = OnceLock::new();
+        static X86: OnceLock<Vec<u8>> = OnceLock::new();
+        let (cache, arch) = if target.starts_with("aarch64") {
+            (&ARM, "arm64")
+        } else {
+            (&X86, "x86_64")
+        };
+        cache
+            .get_or_init(|| {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("libcustom_runtime.dylib");
+                let mut child = std::process::Command::new("/usr/bin/clang")
+                    .args([
+                        "-dynamiclib",
+                        "-arch",
+                        arch,
+                        "-mmacosx-version-min=11.0",
+                        "-Wl,-no_uuid",
+                        "-Wl,-install_name,@rpath/libcustom_runtime.dylib",
+                        "-x",
+                        "c",
+                        "-",
+                        "-o",
+                    ])
+                    .arg(&path)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("Darwin signing tests require the system C toolchain");
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"int rpi_prebuilt_fixture(void) { return 42; }\n")
+                    .unwrap();
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "could not link {arch} Mach-O fixture: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                // Match the production identifier before archiving: re-signing
+                // under a randomized staging filename must preserve exact bytes
+                // and all existing provenance/content assertions.
+                crate::install::resign_staged_native(&path).unwrap();
+                std::fs::read(path).unwrap()
+            })
+            .clone()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_mach_o_fixtures_verify_and_remain_identical_after_resigning() {
+        for target in &TARGETS[4..] {
+            let bytes = object(target);
+            assert!(bytes.len() > 128);
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("different-staging-name.dylib");
+            std::fs::write(&path, &bytes).unwrap();
+            crate::install::resign_staged_native(&path).unwrap();
+            let verified = std::process::Command::new("/usr/bin/codesign")
+                .args(["--verify", "--strict"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                verified.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&verified.stderr)
+            );
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
     }
 
     fn zip(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -2452,11 +2704,209 @@ mod tests {
             )
             .await
             .unwrap(),
-            "1.4.0"
+            (
+                "1.4.0".to_string(),
+                "https://github.com/publisher/monorepo".to_string()
+            )
         );
         assert!(server.join().unwrap().starts_with(
             "GET /repos/publisher/monorepo/git/matching-refs/tags/independent-plugin-v "
         ));
+    }
+
+    /// Serve one response per request, in request order, and return the
+    /// request heads so a test can assert which repositories were queried.
+    fn sequenced_responses(
+        responses: Vec<(&'static str, Vec<u8>)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                socket.write_all(&body).unwrap();
+                requests.push(String::from_utf8(request).unwrap());
+            }
+            requests
+        });
+        (url, thread)
+    }
+
+    #[test]
+    fn moved_repository_spellings_identify_one_project() {
+        assert!(same_repository_project(
+            "https://github.com/pi-rust/rpi-package",
+            "https://github.com/pi-rust/rpi-extension"
+        ));
+        assert!(same_repository_project(
+            "https://github.com/publisher/monorepo",
+            "https://github.com/publisher/monorepo"
+        ));
+        assert!(!same_repository_project(
+            "https://github.com/pi-rust/rpi-extension",
+            "https://github.com/publisher/monorepo"
+        ));
+    }
+
+    #[test]
+    fn tag_published_matches_the_exact_package_tag() {
+        let refs = vec![
+            GitReference {
+                reference: "refs/tags/rpi-todo-v0.3.4".into(),
+            },
+            GitReference {
+                reference: "refs/tags/rpi-todo-v0.3.10".into(),
+            },
+            GitReference {
+                reference: "refs/tags/other-v0.3.4".into(),
+            },
+        ];
+        assert!(tag_published(&refs, "rpi-todo", "0.3.4"));
+        assert!(tag_published(&refs, "rpi-todo", "0.3.10"));
+        assert!(!tag_published(&refs, "rpi-todo", "0.3"));
+        assert!(!tag_published(&refs, "other", "0.3.10"));
+        assert!(!tag_published(&[], "rpi-todo", "0.3.4"));
+    }
+
+    #[test]
+    fn released_assets_are_accepted_across_a_repository_move() {
+        validate_release_asset_url(
+            "https://github.com/pi-rust/rpi-package/releases/download/rpi-todo-v1.2.3/rpi-todo.zip",
+            "https://github.com/pi-rust/rpi-extension",
+            "rpi-todo-v1.2.3",
+        )
+        .unwrap();
+        // A different publisher is still rejected.
+        assert!(validate_release_asset_url(
+            "https://github.com/publisher/monorepo/releases/download/rpi-todo-v1.2.3/rpi-todo.zip",
+            "https://github.com/pi-rust/rpi-extension",
+            "rpi-todo-v1.2.3",
+        )
+        .is_err());
+    }
+
+    async fn version_for(
+        responses: Vec<(&'static str, Vec<u8>)>,
+        legacy: bool,
+    ) -> ((String, String), Vec<String>) {
+        let (api, server) = sequenced_responses(responses);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let repository = if legacy {
+            "https://github.com/pi-rust/rpi-package"
+        } else {
+            "https://github.com/pi-rust/rpi-extension"
+        };
+        let resolved = repository_version(&client, &api, "rpi-todo", repository)
+            .await
+            .map(|resolved| (resolved, server.join().unwrap()));
+        match resolved {
+            Ok(result) => result,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_detection_follows_a_moved_repository() {
+        let previous =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.1.0"}])).unwrap();
+        let current =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.2.0"}])).unwrap();
+        let (resolved, requests) =
+            version_for(vec![("200 OK", previous), ("200 OK", current)], true).await;
+        assert_eq!(
+            resolved,
+            (
+                "0.2.0".to_string(),
+                "https://github.com/pi-rust/rpi-extension".to_string()
+            )
+        );
+        assert!(requests[0]
+            .starts_with("GET /repos/pi-rust/rpi-package/git/matching-refs/tags/rpi-todo-v "));
+        assert!(requests[1]
+            .starts_with("GET /repos/pi-rust/rpi-extension/git/matching-refs/tags/rpi-todo-v "));
+    }
+
+    #[tokio::test]
+    async fn releases_present_in_both_locations_record_the_current_home() {
+        let previous =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.3.4"}])).unwrap();
+        let current =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.3.4"}])).unwrap();
+        let (resolved, _) =
+            version_for(vec![("200 OK", previous), ("200 OK", current)], true).await;
+        assert_eq!(
+            resolved,
+            (
+                "0.3.4".to_string(),
+                "https://github.com/pi-rust/rpi-extension".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn versions_only_the_previous_location_published_stay_installable() {
+        let previous =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.3.0"}])).unwrap();
+        let current =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.2.0"}])).unwrap();
+        let (resolved, _) =
+            version_for(vec![("200 OK", previous), ("200 OK", current)], true).await;
+        assert_eq!(
+            resolved,
+            (
+                "0.3.0".to_string(),
+                "https://github.com/pi-rust/rpi-package".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_detection_survives_a_retired_previous_location() {
+        let current =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.3.4"}])).unwrap();
+        let (resolved, _) = version_for(
+            vec![("404 Not Found", Vec::new()), ("200 OK", current)],
+            true,
+        )
+        .await;
+        assert_eq!(
+            resolved,
+            (
+                "0.3.4".to_string(),
+                "https://github.com/pi-rust/rpi-extension".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repository_without_a_move_is_queried_once() {
+        let tags =
+            serde_json::to_vec(&serde_json::json!([{"ref":"refs/tags/rpi-todo-v0.1.0"}])).unwrap();
+        let (resolved, requests) = version_for(vec![("200 OK", tags)], false).await;
+        assert_eq!(
+            resolved,
+            (
+                "0.1.0".to_string(),
+                "https://github.com/pi-rust/rpi-extension".to_string()
+            )
+        );
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]

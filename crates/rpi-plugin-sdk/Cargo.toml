@@ -27,6 +27,9 @@ rpi-ai = { workspace = true, optional = true, features = ["providers"] }
 tokio = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 
+# The allocator's accounting depends on RustAllocator's layout in this version.
+rquickjs = { version = "=0.8.1", default-features = false, features = ["allocator"], optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Pipes"] }
 
@@ -45,4 +48,5 @@ json = ["dep:serde_json"]
 binary = ["json", "dep:serde", "dep:ciborium"]
 provider = ["json", "dep:rpi-ai", "dep:tokio", "dep:serde", "dep:reqwest"]
 process = ["dep:windows-sys", "dep:libc"]
+quickjs-allocator = ["dep:rquickjs"]
 stdio = ["dep:windows-sys", "dep:libc"]

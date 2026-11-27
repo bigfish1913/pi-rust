@@ -27,10 +27,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::env::{
@@ -89,12 +88,19 @@ struct ShellConfig {
 mod append;
 mod read;
 
-/// The open lock file is the storage-level ownership capability. Keeping the
-/// file handle inside this value is essential: dropping it releases the OS
-/// advisory lock without stale-lock cleanup or a second authority.
+/// The open lock file is the storage-level ownership capability.
 struct OsWriterLease {
     file: std::fs::File,
     fence: u64,
+}
+
+#[cfg(unix)]
+impl Drop for OsWriterLease {
+    fn drop(&mut self) {
+        // A child in the fork-to-exec window can still share this open file
+        // description. Unlock even if closing our descriptor is insufficient.
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 impl WriterLease for OsWriterLease {
@@ -170,6 +176,9 @@ pub struct OsExecutionEnv {
     cwd: PathBuf,
     shell_path: Option<PathBuf>,
     shell_env: Option<HashMap<String, String>>,
+    /// None preserves legacy process inheritance. Some is a closed, immutable
+    /// per-Agent baseline (including HOME for file-path expansion).
+    environment: Option<HashMap<String, String>>,
     active_pids: Arc<Mutex<HashSet<u32>>>,
     registry: Arc<MutationQueueRegistry>,
 }
@@ -180,6 +189,7 @@ impl OsExecutionEnv {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             shell_path: None,
             shell_env: None,
+            environment: None,
             active_pids: Arc::new(Mutex::new(HashSet::new())),
             registry: Arc::new(MutationQueueRegistry::new()),
         }
@@ -190,6 +200,7 @@ impl OsExecutionEnv {
             cwd,
             shell_path: None,
             shell_env: None,
+            environment: None,
             active_pids: Arc::new(Mutex::new(HashSet::new())),
             registry: Arc::new(MutationQueueRegistry::new()),
         }
@@ -205,17 +216,51 @@ impl OsExecutionEnv {
         self
     }
 
+    /// Replace process environment inheritance with an explicit frozen baseline.
+    /// Unlike `with_shell_env`, absent keys never fall back to process globals.
+    /// Private host channels remain excluded; explicit shell/per-call overlays
+    /// retain their existing semantics. Hosts must supply an absolute shell path
+    /// as well when shell discovery must not consult ambient PATH.
+    pub fn with_environment(mut self, environment: HashMap<String, String>) -> Self {
+        self.environment = Some(environment);
+        self
+    }
+
+    /// Whether process inheritance and ambient HOME fallback are disabled.
+    pub fn has_explicit_environment(&self) -> bool {
+        self.environment.is_some()
+    }
+
     /// Resolve a path (tilde, file://, absolute/relative) against `cwd`. Pure.
-    fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
+    fn resolve_path(&self, path: &str) -> PathBuf {
+        let cwd = &self.cwd;
+        let home = || match &self.environment {
+            Some(environment) => environment
+                .get(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .cloned()
+                .unwrap_or_default(),
+            None => home_dir_string(),
+        };
         let mut p = path.to_string();
-        // Tilde expansion (literal only).
+        // Tilde expansion (literal only). A missing HOME in a closed baseline
+        // leaves the tilde literal; it must not turn `~/x` into `/x` or consult
+        // another Agent's ambient home directory.
         if p == "~" {
-            p = home_dir_string();
+            let home = home();
+            if self.environment.is_none() || !home.is_empty() {
+                p = home;
+            }
         } else if let Some(rest) = p.strip_prefix("~/") {
-            p = format!("{}/{}", home_dir_string(), rest);
+            let home = home();
+            if self.environment.is_none() || !home.is_empty() {
+                p = format!("{home}/{rest}");
+            }
         } else if cfg!(windows) {
             if let Some(rest) = p.strip_prefix("~\\") {
-                p = format!("{}\\{}", home_dir_string(), rest);
+                let home = home();
+                if self.environment.is_none() || !home.is_empty() {
+                    p = format!("{home}\\{rest}");
+                }
             }
         }
         // file:// URL → path. Parse failure silently keeps the literal.
@@ -463,6 +508,43 @@ mod shell_jobs {
     }
 }
 
+// A tool or harness can drop exec before its cancellation branch is polled.
+// Own the process group until wait() has actually reaped the shell. The guard
+// must be synchronous: Drop runs while the async execution future is unwinding.
+struct ShellProcessGuard {
+    pid: Option<u32>,
+    active: Arc<Mutex<HashSet<u32>>>,
+}
+impl ShellProcessGuard {
+    fn finish(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            #[cfg(windows)]
+            shell_jobs::forget(pid);
+            self.active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&pid);
+        }
+    }
+}
+impl Drop for ShellProcessGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                // Every shell is spawned into its own process group. No
+                // unrelated session or successful background command is killed.
+                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+            }
+            #[cfg(windows)]
+            shell_jobs::terminate(pid);
+            self.finish();
+        }
+    }
+}
+
 /// Kill a process tree. Windows: the shell's job object, else
 /// `taskkill /F /T /PID`. POSIX: `kill -PG` with fallback to `kill -PID`.
 /// Best-effort, errors swallowed.
@@ -503,11 +585,21 @@ async fn kill_process_tree(pid: u32) {
 
 #[async_trait]
 impl FileSystem for OsExecutionEnv {
+    fn native_file_path(&self, path: &str) -> Option<PathBuf> {
+        #[cfg(unix)]
+        return Some(self.resolve_path(path));
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
     async fn try_acquire_writer_lease(
         &self,
         path: &str,
     ) -> Result<Option<Box<dyn WriterLease>>, FileError> {
-        let session_path = Self::resolve_path(&self.cwd, path);
+        let session_path = self.resolve_path(path);
         let lock_path = PathBuf::from(format!("{}.lock", session_path.display()));
         let display_path = session_path.to_string_lossy().into_owned();
         tokio::task::spawn_blocking(move || {
@@ -572,7 +664,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         let error_path = abs.to_string_lossy().into_owned();
         let io_path = error_path.clone();
         tokio::task::spawn_blocking(move || {
@@ -606,7 +698,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         #[cfg(unix)]
         {
             let error_path = abs.to_string_lossy().into_owned();
@@ -636,11 +728,52 @@ impl FileSystem for OsExecutionEnv {
         Ok(())
     }
 
+    async fn sync_file_and_parent(
+        &self,
+        path: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        #[cfg(unix)]
+        {
+            let abs = self.resolve_path(path);
+            let info = self.file_info(path, cancel).await?;
+            if info.kind != FileKind::File {
+                return Err(FileError::new(
+                    FileErrorCode::NotSupported,
+                    "journal synchronization requires a regular file",
+                )
+                .with_path(path));
+            }
+            // Use the existing OS implementations, not the compatibility no-op
+            // defaults. Both errors propagate; a file-only sync is not success.
+            self.sync_file(path, false, cancel).await?;
+            let parent = abs.parent().ok_or_else(|| {
+                FileError::new(
+                    FileErrorCode::NotSupported,
+                    "journal has no parent directory",
+                )
+                .with_path(path)
+            })?;
+            self.sync_directory(&parent.to_string_lossy(), cancel).await
+        }
+        #[cfg(not(unix))]
+        {
+            // The legacy directory sync is a no-op on Windows. Do not promote
+            // that compatibility behavior into a physical persistence proof.
+            Err(FileError::new(
+                FileErrorCode::NotSupported,
+                "physical journal synchronization is unsupported on this platform",
+            )
+            .with_path(path))
+        }
+    }
+
     async fn open_append_file(
         &self,
         path: &str,
     ) -> Result<Option<Box<dyn crate::env::AppendFile>>, FileError> {
-        let path = Self::resolve_path(&self.cwd, path);
+        let path = self.resolve_path(path);
         Ok(Some(Box::new(append::OsAppendFile::open(path).await?)))
     }
 
@@ -648,7 +781,7 @@ impl FileSystem for OsExecutionEnv {
         &self,
         path: &str,
     ) -> Result<Option<Arc<dyn crate::env::ReadFile>>, FileError> {
-        let path = Self::resolve_path(&self.cwd, path);
+        let path = self.resolve_path(path);
         Ok(Some(Arc::new(read::OsReadFile::open(path).await?)))
     }
 
@@ -659,7 +792,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         let error_path = abs.to_string_lossy().into_owned();
         tokio::task::spawn_blocking(move || {
             let file = std::fs::OpenOptions::new().write(true).open(&abs)?;
@@ -691,7 +824,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<PathBuf, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        Ok(Self::resolve_path(&self.cwd, path))
+        Ok(self.resolve_path(path))
     }
 
     async fn join_path(
@@ -713,7 +846,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<String, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         let bytes = read_cancellable(&abs, cancel).await?;
         String::from_utf8(bytes).map_err(|e| {
             FileError::new(FileErrorCode::Invalid, format!("invalid utf-8: {e}"))
@@ -731,7 +864,7 @@ impl FileSystem for OsExecutionEnv {
         if max_lines.map(|m| m == 0).unwrap_or(false) {
             return Ok(Vec::new());
         }
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         read::read_text_lines(&abs, max_lines, cancel).await
     }
 
@@ -741,7 +874,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<u8>, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         read_cancellable(&abs, cancel).await
     }
 
@@ -752,7 +885,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         // mkdir parent (recursive).
         if let Some(parent) = abs.parent() {
             if !parent.as_os_str().is_empty() {
@@ -765,6 +898,48 @@ impl FileSystem for OsExecutionEnv {
         write_cancellable(&abs, content.as_bytes(), cancel).await
     }
 
+    async fn write_new_file(
+        &self,
+        path: &str,
+        content: FileContent,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let abs = self.resolve_path(path);
+        let cancel = cancel.cloned();
+        // One owned blocking operation retains the opened descriptor even if
+        // its async waiter disappears. O_EXCL/create_new is the authority: no
+        // separate metadata check, parent mkdir, truncation or cleanup unlink.
+        tokio::task::spawn_blocking(move || {
+            let display = abs.to_string_lossy();
+            check_cancel_file(cancel.as_ref(), Some(&display))?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&abs)
+                .map_err(|error| io_to_file_error(error, Some(&display)))?;
+            for chunk in content.as_bytes().chunks(64 * 1024) {
+                check_cancel_file(cancel.as_ref(), Some(&display))?;
+                file.write_all(chunk)
+                    .map_err(|error| io_to_file_error(error, Some(&display)))?;
+            }
+            file.flush()
+                .map_err(|error| io_to_file_error(error, Some(&display)))
+        })
+        .await
+        .map_err(|_| {
+            FileError::new(
+                FileErrorCode::Unknown,
+                "exclusive file creation task stopped",
+            )
+        })?
+    }
+
     async fn append_file(
         &self,
         path: &str,
@@ -772,7 +947,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         if let Some(parent) = abs.parent() {
             if !parent.as_os_str().is_empty() {
                 let _ = tokio::fs::create_dir_all(parent).await;
@@ -806,8 +981,8 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(source))?;
-        let src = Self::resolve_path(&self.cwd, source);
-        let dst = Self::resolve_path(&self.cwd, dest);
+        let src = self.resolve_path(source);
+        let dst = self.resolve_path(dest);
         tokio::fs::rename(&src, &dst)
             .await
             .map_err(|e| io_to_file_error(e, Some(&src.to_string_lossy())))
@@ -819,7 +994,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<FileInfo, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         let meta = tokio::fs::symlink_metadata(&abs)
             .await
             .map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))?;
@@ -860,7 +1035,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<FileInfo>, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         let mut entries = tokio::fs::read_dir(&abs)
             .await
             .map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))?;
@@ -914,13 +1089,68 @@ impl FileSystem for OsExecutionEnv {
         Ok(out)
     }
 
+    async fn has_file_with_suffix(
+        &self,
+        path: &str,
+        suffix: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<bool, FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let abs = self.resolve_path(path);
+        let error_path = abs.to_string_lossy().into_owned();
+        let suffix = String::from(suffix);
+        let cancel = cancel.cloned();
+        // One blocking job, not one lstat + runtime round-trip per entry. Session
+        // existence checks need names/types only, not every sidecar's metadata.
+        tokio::task::spawn_blocking(move || {
+            check_cancel_file(cancel.as_ref(), Some(&abs.to_string_lossy()))?;
+            let entries = std::fs::read_dir(&abs)
+                .map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))?;
+            for entry in entries {
+                check_cancel_file(cancel.as_ref(), Some(&abs.to_string_lossy()))?;
+                let entry = entry.map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))?;
+                if !entry.file_name().to_string_lossy().ends_with(&suffix) {
+                    continue;
+                }
+                let kind = match entry.file_type() {
+                    Ok(kind) => kind,
+                    Err(error)
+                        if crate::error::io_to_file_code(&error) == FileErrorCode::NotSupported =>
+                    {
+                        continue
+                    }
+                    Err(error) => {
+                        return Err(io_to_file_error(
+                            error,
+                            Some(&entry.path().to_string_lossy()),
+                        ))
+                    }
+                };
+                check_cancel_file(cancel.as_ref(), Some(&abs.to_string_lossy()))?;
+                if kind.is_file() || kind.is_symlink() {
+                    return Ok(true);
+                }
+            }
+            check_cancel_file(cancel.as_ref(), Some(&abs.to_string_lossy()))?;
+            Ok(false)
+        })
+        .await
+        .map_err(|error| {
+            FileError::new(
+                FileErrorCode::Unknown,
+                format!("directory scan task failed: {error}"),
+            )
+            .with_path(error_path)
+        })?
+    }
+
     async fn canonical_path(
         &self,
         path: &str,
         cancel: Option<&CancellationToken>,
     ) -> Result<PathBuf, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         tokio::fs::canonicalize(&abs)
             .await
             .map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))
@@ -932,7 +1162,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<bool, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         match tokio::fs::symlink_metadata(&abs).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -947,7 +1177,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         let res = if recursive {
             tokio::fs::create_dir_all(&abs).await
         } else {
@@ -964,7 +1194,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path);
         let res = if recursive {
             tokio::fs::remove_dir_all(&abs).await
         } else {
@@ -1024,11 +1254,20 @@ impl FileSystem for OsExecutionEnv {
     }
 
     async fn cleanup(&self) {
-        let pids: Vec<u32> = self.active_pids.lock().await.iter().copied().collect();
+        let pids: Vec<u32> = self
+            .active_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
         for pid in pids {
             kill_process_tree(pid).await;
         }
-        self.active_pids.lock().await.clear();
+        self.active_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -1095,7 +1334,7 @@ impl Shell for OsExecutionEnv {
         };
         // Resolve cwd.
         let cwd = match &options.cwd {
-            Some(c) => Self::resolve_path(&self.cwd, &c.to_string_lossy()),
+            Some(c) => self.resolve_path(&c.to_string_lossy()),
             None => self.cwd.clone(),
         };
         // Shell config. An explicit override is used by native shell tools
@@ -1136,11 +1375,22 @@ impl Shell for OsExecutionEnv {
         // value passed down can still set it explicitly through `env`/`shell_env`
         // below (those are applied after this loop and win).
         if options.inherit_env {
-            for (k, v) in std::env::vars() {
-                if is_host_private_env(&k) {
-                    continue;
+            let mut inherit = |name: &str, value: &str| {
+                if !is_host_private_env(name) {
+                    cmd.env(name, value);
                 }
-                cmd.env(k, v);
+            };
+            match &self.environment {
+                Some(environment) => {
+                    for (name, value) in environment {
+                        inherit(name, value);
+                    }
+                }
+                None => {
+                    for (name, value) in std::env::vars() {
+                        inherit(&name, &value);
+                    }
+                }
             }
         }
         if let Some(base) = &self.shell_env {
@@ -1154,6 +1404,7 @@ impl Shell for OsExecutionEnv {
             }
         }
         // stdio.
+        cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -1185,6 +1436,10 @@ impl Shell for OsExecutionEnv {
             }
         };
         let pid = child.id();
+        let mut process_guard = ShellProcessGuard {
+            pid,
+            active: self.active_pids.clone(),
+        };
         #[cfg(windows)]
         {
             let started = match (pid, child.raw_handle()) {
@@ -1203,7 +1458,10 @@ impl Shell for OsExecutionEnv {
             }
         }
         if let Some(pid) = pid {
-            self.active_pids.lock().await.insert(pid);
+            self.active_pids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pid);
         }
 
         // Stdin transport: write command then close. Closing happens on BOTH
@@ -1390,6 +1648,11 @@ impl Shell for OsExecutionEnv {
                     () = &mut stderr_task, if !stderr_done => stderr_done = true,
                 }
             };
+            // Disarm immediately after a successful wait, before any await:
+            // the shell has been reaped and its PID may now be reused.
+            if status_res.is_ok() {
+                process_guard.finish();
+            }
             // Drain what is already in the pipe — a completed write is already in
             // the pipe buffer, so this is not a race — then stop, without waiting
             // for an EOF that may never come. A command whose own process is gone
@@ -1429,13 +1692,6 @@ impl Shell for OsExecutionEnv {
         // already capped it.
         if timed_out {
             let _ = tokio::time::sleep(std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS)).await;
-        }
-
-        // Remove from tracked pids.
-        if let Some(pid) = pid {
-            #[cfg(windows)]
-            shell_jobs::forget(pid);
-            self.active_pids.lock().await.remove(&pid);
         }
 
         // Resolution priority: timedOut → cancelled → status.
@@ -1520,6 +1776,33 @@ mod durability_tests {
             std::fs::read_to_string(temp.path().join("journal.jsonl.lock")).unwrap(),
             "2"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn os_writer_lease_releases_a_shared_open_file_description() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = OsExecutionEnv::with_cwd(temp.path().to_path_buf());
+        let lock = temp.path().join("journal.jsonl.lock");
+        std::fs::write(&lock, "1").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&file).unwrap();
+        let inherited = file.try_clone().unwrap();
+        let lease = OsWriterLease { file, fence: 1 };
+        assert!(env.try_acquire_writer_lease("journal.jsonl").await.is_err());
+        drop(lease);
+        let next = env
+            .try_acquire_writer_lease("journal.jsonl")
+            .await
+            .expect("retired writer retained a lock through the shared description")
+            .unwrap();
+        next.verify_fence().unwrap();
+        assert_eq!(std::fs::read_to_string(lock).unwrap(), "2");
+        drop(inherited);
     }
 }
 

@@ -10,5 +10,5 @@ contact_links:
     url: https://rpi.laofu.online/docs.html
     about: User guide, SDK docs, and the extension authoring guide.
   - name: Extension packages
-    url: https://github.com/pi-rust/rpi-package
+    url: https://github.com/pi-rust/rpi-extension
     about: Report problems with a published extension in the package repository.

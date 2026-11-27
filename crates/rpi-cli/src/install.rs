@@ -47,8 +47,27 @@ pub struct InstalledNativePackage {
 impl InstalledNativePackage {
     /// Prebuilt provenance also uses `source`; only local development builds
     /// should be excluded from registry update discovery and commands.
+    ///
+    /// Hosts that predate exact prebuilt provenance recorded only the
+    /// `prebuilt:<repository>` source marker. Those installs are still
+    /// registry-updatable, otherwise they would silently never see an update
+    /// again — including the ones published before a repository move.
     pub(crate) fn supports_registry_update(&self) -> bool {
-        self.source.is_none() || self.prebuilt.is_some()
+        self.source.is_none()
+            || self.prebuilt.is_some()
+            || self.legacy_prebuilt_repository().is_some()
+    }
+
+    /// Repository from the `prebuilt:<repository>` marker written by hosts
+    /// without exact prebuilt provenance, when it is a usable GitHub URL.
+    pub(crate) fn legacy_prebuilt_repository(&self) -> Option<&str> {
+        if self.prebuilt.is_some() {
+            return None;
+        }
+        self.source
+            .as_deref()?
+            .strip_prefix("prebuilt:")
+            .filter(|repository| repository.starts_with("https://github.com/"))
     }
 }
 
@@ -137,6 +156,7 @@ impl NativePackageMutationLock {
         let lock_path = parent.join(NATIVE_PACKAGES_LOCK_FILE);
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -1241,23 +1261,32 @@ fn is_versioned_artifact_for_package(name: &str, normalized_package: &str) -> bo
         && normalize_name(prefix.trim_start_matches("lib")) == normalized_package
 }
 
+/// Outcome of a best-effort retired-native-artifact cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetiredGcOutcome {
+    /// Cleanup ran; surviving stale artifacts are not loadable via the registry-aware discovery.
+    Completed,
+    /// A live host or mutation held the lease, so on-disk cleanup was skipped.
+    Deferred,
+}
+
 /// Best-effort cleanup for retired native artifacts. The exclusive resource
 /// lease is the proof that no host is currently holding the old libraries; a
 /// live host therefore only causes cleanup to be deferred until a later
 /// install or explicit maintenance command.
-fn gc_retired_native_artifacts(agent_dir: &Path) {
+pub(crate) fn gc_retired_native_artifacts(agent_dir: &Path) -> RetiredGcOutcome {
     let metadata_path = agent_dir.join(NATIVE_PACKAGES_FILE);
     let lease = match crate::resource_management::mutation_lease(agent_dir) {
         Ok(lease) => lease,
-        Err(_) => return,
+        Err(_) => return RetiredGcOutcome::Deferred,
     };
     let _lock = match NativePackageMutationLock::acquire_with_lease(&metadata_path, lease) {
         Ok(lock) => lock,
-        Err(_) => return,
+        Err(_) => return RetiredGcOutcome::Deferred,
     };
     let records = match read_native_package_registry_at(&metadata_path) {
         Ok(registry) => registry.into_records(),
-        Err(_) => return,
+        Err(_) => return RetiredGcOutcome::Deferred,
     };
     let active = records
         .iter()
@@ -1266,7 +1295,7 @@ fn gc_retired_native_artifacts(agent_dir: &Path) {
         .collect::<HashSet<_>>();
     let destination = agent_dir.join("extensions");
     let Ok(entries) = std::fs::read_dir(&destination) else {
-        return;
+        return RetiredGcOutcome::Completed;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1294,6 +1323,7 @@ fn gc_retired_native_artifacts(agent_dir: &Path) {
             let _ = std::fs::remove_file(path);
         }
     }
+    RetiredGcOutcome::Completed
 }
 
 pub(crate) fn versioned_artifact_name(
@@ -1814,7 +1844,7 @@ fn help_requested() -> &'static str {
 }
 
 pub fn print_help() {
-    println!("Usage: rpi install [<crate>] [options]\n\nInstall or upgrade a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata.\nNewer versions upgrade automatically; an already installed version is skipped.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --cdn <URL>           Download release archives from this HTTPS CDN; manifests remain on GitHub\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Reinstall the same version or allow a downgrade/replacement\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
+    println!("Usage: rpi install [<crate>] [options]\n\nInstall or upgrade a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata, and a repository move is followed for version discovery while previously published releases stay installable.\nNewer versions upgrade automatically; an already installed version is skipped.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --cdn <URL>           Download release archives from this HTTPS CDN; manifests remain on GitHub\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Reinstall the same version or allow a downgrade/replacement\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
 }
 
 fn print_uninstall_help() {
@@ -2406,6 +2436,41 @@ mod tests {
     }
 
     #[test]
+    fn legacy_prebuilt_markers_remain_registry_updatable() {
+        let record: InstalledNativePackage = serde_json::from_value(serde_json::json!({
+            "name":"demo", "version":"1.2.3",
+            "source":"prebuilt:https://github.com/pi-rust/rpi-package",
+            "artifacts":["custom.so"]
+        }))
+        .unwrap();
+        assert!(record.supports_registry_update());
+        assert_eq!(
+            record.legacy_prebuilt_repository(),
+            Some("https://github.com/pi-rust/rpi-package")
+        );
+        // Exact provenance wins; local development builds stay excluded.
+        let mut exact = record.clone();
+        exact.prebuilt = Some(crate::prebuilt_extensions::PrebuiltRecord {
+            repository: "https://github.com/pi-rust/rpi-package".into(),
+            target: "x86_64-apple-darwin".into(),
+            manifest_sha256: "a".repeat(64),
+            source_commit: "b".repeat(40),
+            sdk_version: "0.4.0".into(),
+            plugin_abi: 4,
+            archive_sha256: "c".repeat(64),
+            library_sha256: "d".repeat(64),
+            custom_repository: true,
+            assets: Vec::new(),
+        });
+        assert!(exact.supports_registry_update());
+        assert_eq!(exact.legacy_prebuilt_repository(), None);
+        let mut local = record;
+        local.source = Some("../local-ext".into());
+        assert!(!local.supports_registry_update());
+        assert_eq!(local.legacy_prebuilt_repository(), None);
+    }
+
+    #[test]
     fn uninstall_prebuilt_package_uses_its_recorded_library_name() {
         let agent = TempAgent::new();
         let directory = agent.temp.path().join("extensions");
@@ -2666,6 +2731,63 @@ mod tests {
         assert!(!destination.join("new.dll").exists());
         assert_no_native_transaction_files(temp.path());
         assert_no_native_transaction_files(&destination);
+    }
+
+    #[test]
+    fn registry_aware_gc_removes_stale_versioned_cdylibs_but_keeps_active_and_legacy() {
+        let agent = TempAgent::new();
+        let extensions = agent.temp.path().join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        let active = "librpi_web_extension-v0.1.64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.so";
+        let stale = "librpi_web_extension-v0.1.64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.so";
+        let stale_old = "librpi_web_extension-v0.1.63-cccccccccccccccccccccccccccccccc.so";
+        let legacy = "legacy_custom.so";
+        for name in [active, stale, stale_old, legacy] {
+            std::fs::write(extensions.join(name), b"cdylib").unwrap();
+        }
+        write_native_packages_at(
+            &agent.metadata_path(),
+            &[InstalledNativePackage {
+                name: "rpi-web".into(),
+                version: "0.1.64".into(),
+                source: None,
+                prebuilt: None,
+                artifacts: vec![active.into()],
+            }],
+        )
+        .unwrap();
+
+        // `tempfile` hands back `/var/folders/...` on macOS, and the resource
+        // lease rejects a root reached through a symlink (`/var` -> `/private/var`),
+        // so canonicalize before asking for the lease.
+        let agent_dir = std::fs::canonicalize(agent.temp.path()).unwrap();
+        assert_eq!(
+            gc_retired_native_artifacts(&agent_dir),
+            RetiredGcOutcome::Completed
+        );
+        assert!(extensions.join(active).exists());
+        assert!(extensions.join(legacy).exists());
+        assert!(!extensions.join(stale).exists());
+        assert!(!extensions.join(stale_old).exists());
+    }
+
+    #[test]
+    fn registry_aware_gc_is_deferred_while_a_host_holds_the_lease() {
+        let agent = TempAgent::new();
+        let extensions = agent.temp.path().join("extensions");
+        let cwd = agent.temp.path().join("project");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let stale = "librpi_web_extension-v0.1.64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.so";
+        std::fs::write(extensions.join(stale), b"cdylib").unwrap();
+        let _leases = crate::resource_management::host_leases(&cwd).unwrap();
+
+        let agent_dir = std::fs::canonicalize(agent.temp.path()).unwrap();
+        assert_eq!(
+            gc_retired_native_artifacts(&agent_dir),
+            RetiredGcOutcome::Deferred
+        );
+        assert!(extensions.join(stale).exists());
     }
 
     fn assert_no_native_transaction_files(directory: &Path) {

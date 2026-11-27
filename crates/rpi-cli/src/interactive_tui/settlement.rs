@@ -100,17 +100,24 @@ impl SessionWriteTasks {
     }
 }
 
+impl SealedTasks {
+    pub(super) async fn join(self) -> bool {
+        let mut ok = !self.had_join_failure;
+        for task in self.tasks {
+            if task.await.is_err() {
+                ok = false;
+            }
+        }
+        ok
+    }
+}
+
 /// Normal shutdown only: join host producers before idle and the core barrier.
 /// The caller gates this on native enablement and owns any fixed diagnostic.
 /// No cancellation worker is installed: the runtime must remain alive, and a
 /// dropped root does not certify join, backend drain, or terminal delivery.
 pub(super) async fn settle_native(harness: &AgentHarness, batch: SealedTasks) -> bool {
-    let mut ok = !batch.had_join_failure;
-    for task in batch.tasks {
-        if task.await.is_err() {
-            ok = false;
-        }
-    }
+    let mut ok = batch.join().await;
     if harness.lane("main").wait_for_idle().await.is_err() {
         ok = false;
     }

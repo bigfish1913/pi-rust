@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "task": 56,
+  "recorded_at_utc": "2026-11-24T02:19:44.228991+00:00",
+  "status": "scoped_acceptance_passed_with_known_full_library_failures",
+  "source_integrity": {
+    "core": {
+      "baseline_omissions_verified_identical_to_HEAD": {
+        ".rpi/skills/rpi-release/SKILL.md": "d6cde689d160efa6366b3792a20888783e862ce86d50d58bfa82bf55d8bf0749"
+      },
+      "root": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host",
+      "head": "699b73d036138e0fe10bbf9b14e29af4119d6fad",
+      "branch": "feat/shared-host-integration",
+      "baseline_files": 1144,
+      "unchanged_existing_files": 1139,
+      "changes": [
+        {
+          "file": "crates/rpi-cli/src/args.rs",
+          "before_sha256": "b4ecc2f0886a74735a98a9c21da6e5deb27f73a1b75208d8d392cc8c58f56c85",
+          "after_sha256": "e69716efc3dfd9551f28b585807c29e4083a276ec420d4f30ee4c1c3954e68c4"
+        },
+        {
+          "file": "crates/rpi-cli/src/dev_extension.rs",
+          "before_sha256": "d434a31b8b7bb387fb9fe3a9b00c6a8f89347b044250003c1b344bc3adedcdaa",
+          "after_sha256": "d2dc41b7f964470235cdddd75c47e82033674b40ebf2caf60f4cda72a6d70286"
+        },
+        {
+          "file": "crates/rpi-cli/src/host/README.md",
+          "before_sha256": "3d99ab2e10f5013de8988b279e8359e15461f6ddb28fa674003b360d165c56fc",
+          "after_sha256": "61d29b3b1eb94302ce80a754916871607ab49adae9d10a91e4d6dbad69086e02"
+        },
+        {
+          "file": "crates/rpi-cli/src/host/dev_staging.rs",
+          "before_sha256": "2d1934d659a80288e31a9196769176ebf20837124c09f15ad888a6f20c6b8577",
+          "after_sha256": "7542bbb41d70c9a4d4a55f098e003e22f5cb960a77f25b400e67bc58107df4cd"
+        },
+        {
+          "file": "crates/rpi-cli/tests/host_control.rs",
+          "before_sha256": "2bfafabc344f73bcce75347b035a9d577156cd526060ed75a5f63e7bfd34e7f0",
+          "after_sha256": "5e842ef9e900a0bdf9036e23fda65346ba772da11a6f4cc00dbf6b1bfae9d0ef"
+        }
+      ],
+      "added_files": [
+        "docs/host-dev-preparation-validation.json",
+        "docs/host-dev-preparation.md"
+      ],
+      "deleted_files": [],
+      "diff_check_exit": 0
+    },
+    "extension": {
+      "baseline_omissions_verified_identical_to_HEAD": {},
+      "root": "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host",
+      "head": "607c00d3915d16cf26129979766bcd65ec58b059",
+      "branch": "feat/shared-host-management",
+      "baseline_files": 823,
+      "unchanged_existing_files": 823,
+      "changes": [],
+      "added_files": [],
+      "deleted_files": [],
+      "diff_check_exit": 0
+    }
+  },
+  "input_provenance": "Reconstructed pre-#56 hashes from frozen #61 input manifest plus #61 recorded after-hashes; only args.rs and dev_staging.rs already edited at capture. Not a before-source execution baseline.",
+  "input_manifest": "/tmp/rpi-host-integration-checks/host-56-inputs.json",
+  "input_manifest_sha256": "2bb88bf519e50e21528d2262ed35169aede6f4e632ae2d138c327bc24e4acb4e",
+  "gates": {
+    "dev": {
+      "passed": 22,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0,
+      "log": "/tmp/rpi-host-integration-checks/host-56-dev-final.log",
+      "log_sha256": "91e361ff86942b168aec99acace9f2bbf11194df58621ae2e401a009e3bf2a7b"
+    },
+    "host": {
+      "passed": 287,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0,
+      "log": "/tmp/rpi-host-integration-checks/host-56-host.log",
+      "log_sha256": "efed61beb080bf19d51dd4ad56d6d9f8cb773b11685e2666eaf52b00350ec007"
+    },
+    "actual_binary": {
+      "passed": 32,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0,
+      "log": "/tmp/rpi-host-integration-checks/host-56-binary-final.log",
+      "log_sha256": "17d6898f4c535e77a1b0532bf9797a49532e32e12ccb462c3be2e01bf576c7b2"
+    },
+    "full_library_unfiltered": {
+      "passed": 1533,
+      "failed": 4,
+      "ignored": 3,
+      "exit_code": 101,
+      "log": "/tmp/rpi-host-integration-checks/host-56-unit.log",
+      "log_sha256": "a9977c877369c5ade4820c7cfb2eefef39021d9e195b876390d818b6ac2f3373",
+      "failing_tests": [
+        "prebuilt_extensions::tests::all_six_distributions_install_and_record_exact_provenance",
+        "prebuilt_extensions::tests::downloaded_manifest_and_archive_install_into_an_isolated_profile",
+        "prebuilt_extensions::tests::legacy_archives_install_only_the_library_and_keep_their_records_unchanged",
+        "prebuilt_extensions::tests::prebuilt_packages_upgrade_without_force_and_same_version_is_unchanged"
+      ],
+      "signature_and_test_sources_unchanged_this_task": true,
+      "before_source_execution_performed": false
+    },
+    "clippy": {
+      "exit_code": 0,
+      "log": "/tmp/rpi-host-integration-checks/host-56-clippy.log",
+      "log_sha256": "7a8aef6d5f1254a1ab3fe7bb4eb81291461769d73400ebdd0adfcaa88bd929c2",
+      "scope": "rpi-cli --lib --bins --no-deps -- -D warnings; not tests/all-targets/workspace"
+    },
+    "fmt": {
+      "exit_code": 0,
+      "log": "/tmp/rpi-host-integration-checks/host-56-fmt.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "files": [
+        "crates/rpi-cli/build.rs",
+        "crates/rpi-cli/src/app.rs",
+        "crates/rpi-cli/src/args.rs",
+        "crates/rpi-cli/src/dev_extension.rs",
+        "crates/rpi-cli/src/host/dev_staging.rs",
+        "crates/rpi-cli/tests/host_control.rs"
+      ]
+    }
+  },
+  "contracts": [
+    {
+      "file": "protocol.rs",
+      "sha256": "920a93636c7e87c5a9c7053557e9f044f6030327c0be9466ec274e34ce4721e0",
+      "byte_identical": true,
+      "unchanged_since_input": true
+    },
+    {
+      "file": "client.rs",
+      "sha256": "55cb9897c61594dc554baddcc06dc80dcf88d11458b1a14fff1bc137c5d9e97a",
+      "byte_identical": true,
+      "unchanged_since_input": true
+    },
+    {
+      "file": "client_tests.rs",
+      "sha256": "8df4c991962ddf635b34e7dd67d9821ee3b59f411104b42e1898d2f6433759ae",
+      "byte_identical": true,
+      "unchanged_since_input": true
+    },
+    {
+      "file": "fixtures/control-v1.json",
+      "sha256": "33560f0b5d074b7822710493f7bcb16bec21c63ba5237629db4765bb25dab320",
+      "byte_identical": true,
+      "unchanged_since_input": true
+    }
+  ],
+  "locked_package_inventory_unchanged_vs_HEAD": true,
+  "Cargo_lock_delta_vs_HEAD": "only cc added to rpi-cli dependencies; cc 1.4.7 already locked; unchanged this task",
+  "core_artifact": {
+    "path": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/debug/rpi",
+    "sha256": "3d776138d1c5db2bf9609043eeab3a7cdb40108748ba9c0900e95602249ea64f"
+  },
+  "build_script": {
+    "script": "/Volumes/BuildCache/cargoc/workspaces/5d3216349942c3035c143af0bb3462834aa6d7ede730adb02fded7d9084772e8/debug/build/rpi-cli/cf17d644f7b48733/out/build_script_build",
+    "script_sha256": "668153c78a559f98acaad810d2e587ed9297a5d8ce98e16e70fc70bb63c2b7e6",
+    "build_rs_sha256": "fa3d5b98cb906f1b0ec305c0b3ce9a83adf59ee5e12698f72e42035eff04e209",
+    "target": "aarch64-apple-darwin",
+    "target_specific_CC_and_AR_override_poisoned_global_tools": true,
+    "multiword_custom_wrapper_invoked": true,
+    "deployment_target_14": true,
+    "archive_created": true,
+    "non_macos_early_return_no_out_dir_or_compiler_needed": true,
+    "non_macos_is_branch_test_not_linux_cross_build": true
+  },
+  "build_logs": [
+    {
+      "path": "/tmp/rpi-host-integration-checks/host-56-buildscript/build.log",
+      "sha256": "4494ebbe1b73973c4f107021631c076dff6e2f01dc0aa7beae188fb7f4d1c020"
+    },
+    {
+      "path": "/tmp/rpi-host-integration-checks/host-56-buildscript/cc-args.log",
+      "sha256": "4a832749336cfca43c710597b4628c83d3a3f3cbfca99043037d7f56f3eb4049"
+    },
+    {
+      "path": "/tmp/rpi-host-integration-checks/host-56-buildscript/ar-args.log",
+      "sha256": "1cbd37c7f0a48b2aab3f207d4493a33984e5085afedc501bbb9d4333ad47cdd6"
+    },
+    {
+      "path": "/tmp/rpi-host-integration-checks/host-56-buildscript/script-final/target-script.log",
+      "sha256": "76454f9169a70a336414c938169b25849f8670d60edd2e2af1b7db2dfb558433"
+    },
+    {
+      "path": "/tmp/rpi-host-integration-checks/host-56-buildscript/script-final/target-cc.log",
+      "sha256": "78dd5c9d649ff1bdc01cf33bd7a34e5a4e48cea8b7b6cd55b3fe01ba15beba6d"
+    },
+    {
+      "path": "/tmp/rpi-host-integration-checks/host-56-buildscript/script-final/target-ar.log",
+      "sha256": "10255e3dd5c61f7508405b569032701c9c6762610874813c565f7f0808a56024"
+    },
+    {
+      "path": "/tmp/rpi-host-integration-checks/host-56-buildscript/script-final/non-mac.log",
+      "sha256": "bcc6e82f23d64506394fe17719a8f915b585cd9598bc944175c24c4a137c4253"
+    }
+  ],
+  "excluded_attempts": [
+    {
+      "log": "/tmp/rpi-host-integration-checks/host-56-buildscript/target-script.log",
+      "reason": "direct script initially run in workspace cwd, not crate cwd; missing relative C source; final experiment uses isolated script-final"
+    },
+    {
+      "log": "/tmp/rpi-host-integration-checks/host-56-binary.log",
+      "reason": "11 passed / 21 failed: stale exact pre-results capability fixture and old help string; assertions synchronized, final 32/0/0; no filtered/skipped test"
+    }
+  ],
+  "new_report_sha256": "f230e81db208d82600b5ba01dc8e67533a676dc6ea3f15ed5117c1d5b10b5940",
+  "self_hash_omitted": true,
+  "no_owned_build_or_host_processes_remaining": true,
+  "historical_reports_rewritten": false,
+  "memory_benchmarks_run": false,
+  "limits": [
+    "No default CLI Host integration, daemon, automatic restart or group recovery",
+    "No watcher/helper custody, Cargo/tool descendants, parent death or cross-generation OS cleanup",
+    "No production Host trusted DLL hook assembly (#46)",
+    "No claim of Linux cross-build or all-target/workspace Clippy",
+    "Four prebuilt codesign test failures retained; no complete before-source execution baseline"
+  ]
+}

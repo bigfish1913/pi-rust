@@ -711,7 +711,7 @@ async fn harness_forwards_after_tool_call_option_into_loop() {
 // provider call.
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn harness_fires_provider_hooks_before_request_per_call() {
     use rpi_ai::{ProviderHooks, SimpleStreamOptions, SimpleStreamOptionsPatch};
 
@@ -854,7 +854,7 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
 ///
 /// Uses a recording provider rather than the faux one because the assertion is
 /// about what the *provider* was handed, not what the loop did with the reply.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn provider_hooks_can_replace_the_system_prompt_the_model_sees() {
     use rpi_ai::types::Context as AiContext;
     use rpi_ai::{AssistantMessageEventStream, ContextPatch, ProviderHooks};
@@ -4379,9 +4379,9 @@ async fn native_live_ids_match_history_for_text_thinking_tools_and_final_persist
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::MessageUpdate {
-            assistant_message_event: rpi_ai::AssistantMessageEvent::ThinkingDelta { .. },
+            assistant_message_event,
             ..
-        }
+        } if matches!(assistant_message_event.as_ref(), rpi_ai::AssistantMessageEvent::ThinkingDelta { .. })
     )));
 }
 

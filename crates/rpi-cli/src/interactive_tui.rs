@@ -39,7 +39,12 @@ mod history;
 mod sessions;
 use sessions::*;
 mod run;
+#[cfg(unix)]
+pub(crate) use run::edit_draft;
 use run::*;
+mod terminal;
+pub(crate) use terminal::InteractiveTerminal;
+use terminal::TerminalInput;
 mod events;
 use events::*;
 mod selectors;
@@ -104,6 +109,22 @@ use rpi_tui::BashStatus;
 use crate::args::Args;
 use crate::session_driver::{assistant_blocks, assistant_tool_calls};
 use crate::transcript_view::UiEvent;
+
+/// The editor surface temporarily replaced by a selector or OAuth prompt.
+#[derive(Clone, Copy)]
+struct EditorUi<'a> {
+    state: &'a Arc<TuiState>,
+    editor_container: &'a Arc<Container>,
+    editor: &'a Arc<Editor>,
+    tui: &'a Arc<TuiAltScreen>,
+}
+
+/// The harness and exact lane participating in a session switch.
+#[derive(Clone, Copy)]
+struct SessionLane<'a> {
+    harness: &'a AgentHarness,
+    lane: &'a Arc<dyn AgentLane>,
+}
 
 /// B5e: the markdown-transformer trait object the assistant-message render path
 /// applies to raw text BEFORE the [`Markdown`] renderer styles it. A plain
@@ -601,7 +622,7 @@ fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) 
 /// and rendering. Sampling later would let a Shift press meant for the next
 /// keystroke be attributed to an Enter that is already queued. The protocol
 /// pass in the loop deliberately does not sample again.
-fn normalize_decoded_event(event: Event) -> Event {
+pub(crate) fn normalize_decoded_event(event: Event) -> Event {
     match event {
         Event::Key(key) => Event::Key(rpi_tui::terminal::normalize_key_event(key)),
         other => other,
@@ -662,21 +683,18 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
     let cwd = ctx.cwd.clone();
     let command_owned = command.to_string();
 
-    tokio::spawn(async move {
+    let run = async move {
         let comp_chunk = comp.clone();
         let tui_chunk = tui.clone();
-        let on_chunk: Box<
-            dyn FnMut(&str, &dyn Fn() -> rpi_tools::shell_output::ShellCaptureProgress) + Send,
-        > = Box::new(move |_chunk, get_progress| {
-            // The capture layer reports the complete tail captured so far, not
-            // a delta; `append_output` replaces its snapshot accordingly.
-            comp_chunk.append_output(&get_progress().output);
-            tui_chunk.request_render(false);
-        });
         let options = rpi_tools::shell_output::ShellCaptureOptions {
             cwd: Some(cwd),
             cancel: Some(&cancel),
-            on_chunk: Some(on_chunk),
+            on_chunk: Some(Box::new(move |_chunk, get_progress| {
+                // The capture layer reports the complete tail captured so far, not
+                // a delta; `append_output` replaces its snapshot accordingly.
+                comp_chunk.append_output(&get_progress().output);
+                tui_chunk.request_render(false);
+            })),
             return_execution_errors: true,
             ..Default::default()
         };
@@ -725,7 +743,12 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
             full_output_path,
             exclude_from_context,
         }));
-    });
+    };
+    if ctx.state.publish_process_identity {
+        tokio::spawn(run);
+    } else {
+        ctx.state.session_write_tasks.spawn(run);
+    }
 }
 
 // ===========================================================================
@@ -979,13 +1002,37 @@ pub async fn interactive_tui(
     event_rx: Option<broadcast::Receiver<AgentEvent>>,
     args: &Args,
     model_catalog: Vec<rpi_ai::Model>,
-    initial: Option<String>,
-    extra_messages: &[String],
-    initial_images: Vec<rpi_ai::types::ImageContent>,
-    theme: Option<&str>,
-    no_themes: bool,
+    startup: crate::modes::InteractiveStartup<'_>,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
+    Box::pin(interactive_tui_with_terminal(
+        harness,
+        event_rx,
+        args,
+        model_catalog,
+        startup,
+        reload_context,
+        InteractiveTerminal::Process,
+    ))
+    .await
+}
+
+pub(crate) async fn interactive_tui_with_terminal(
+    harness: &AgentHarness,
+    event_rx: Option<broadcast::Receiver<AgentEvent>>,
+    args: &Args,
+    model_catalog: Vec<rpi_ai::Model>,
+    startup: crate::modes::InteractiveStartup<'_>,
+    reload_context: &crate::session::ReloadContext,
+    terminal: InteractiveTerminal,
+) -> i32 {
+    let crate::modes::InteractiveStartup {
+        initial,
+        extra_messages,
+        initial_images,
+        theme,
+        no_themes,
+    } = startup;
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     // Reuse the startup snapshot captured before provider/session setup. An
     // extension may mutate the process cwd while loading; that must not change
@@ -1081,10 +1128,23 @@ pub async fn interactive_tui(
             registry.merge_discovered(&paths);
         }
         for diagnostic in &diagnostics {
-            eprintln!("warning: {diagnostic}");
+            terminal.report(&format!("warning: {diagnostic}"), true);
         }
         registry
     };
+    let workspace_theme = if terminal.is_host() {
+        theme.and_then(
+            |spec| match crate::themes::resolve_spec_in(spec, Some(&theme_registry)) {
+                crate::themes::ThemeSpec::File(path) if path.is_relative() => {
+                    Some(cwd.join(path).to_string_lossy().into_owned())
+                }
+                _ => None,
+            },
+        )
+    } else {
+        None
+    };
+    let theme = workspace_theme.as_deref().or(theme);
     if let Some(spec) = theme {
         // `--theme` / settings: preset name, registry name, or theme file
         // path. A file that fails to load warns and falls back to the
@@ -1094,7 +1154,10 @@ pub async fn interactive_tui(
         match crate::themes::apply_startup_spec(spec, Some(&theme_registry), &theme_manager) {
             Ok(()) => {}
             Err(message) => {
-                eprintln!("warning: {message}; using the built-in default theme");
+                terminal.report(
+                    &format!("warning: {message}; using the built-in default theme"),
+                    true,
+                );
             }
         }
     }
@@ -1109,16 +1172,16 @@ pub async fn interactive_tui(
             },
         );
     // ---- TUI + containers ----
-    let terminal = Box::new(ProcessTerminal::new());
-    let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
+    let tui = Arc::new(TuiAltScreen::new(terminal.output(), true, None));
     // Plugin `ask_user` prompts (runtime action 17). Attaching marks this
     // session as interactive so a detached/headless host fails loudly instead
     // of returning a fabricated answer. The mailbox is session-scoped (held in
     // `ReloadContext`) so in-flight prompts survive a `/reload`.
     let ask_user_bridge = AskUserBridge::new(reload_context.ui_dialog.clone());
     if !ask_user_bridge.attach() {
-        eprintln!(
-            "[rpi] interactive dialog bridge attachment was rejected; refusing to start the TUI"
+        terminal.report(
+            "[rpi] interactive dialog bridge attachment was rejected; refusing to start the TUI",
+            true,
         );
         return 1;
     }
@@ -1340,8 +1403,11 @@ pub async fn interactive_tui(
         .get_as::<bool>("display.tool_outputs_expanded")
         .unwrap_or(false);
     let state = Arc::new(TuiState {
-        session_write_tasks: settlement::SessionWriteTasks::new(args.native_durable),
+        session_write_tasks: settlement::SessionWriteTasks::new(
+            args.native_durable || terminal.is_host(),
+        ),
         history_page,
+        publish_process_identity: !terminal.is_host(),
         session_dir: reload_context.session_dir(),
         session_cwd: cwd.clone(),
         session_scope: std::sync::Mutex::new(crate::session::SessionScope::Project),
@@ -1708,23 +1774,29 @@ pub async fn interactive_tui(
     let update_container = state.history_page.updates.clone();
     let update_hint = state.history_page.regular_update_hint.clone();
     let rpi_tui = tui.clone();
-    update_check_handles.push(tokio::spawn(async move {
-        let report = crate::updates::check_rpi_startup().await;
-        if !report.is_empty() {
-            add_update_notices(&update_container, &report);
-            update_hint.update(&report);
-        }
-        rpi_tui.request_render(false);
-    }));
+    update_check_handles.push(tokio::spawn(rpi_tui::display_context::scope(
+        rpi_tui::display_context::current(),
+        async move {
+            let report = crate::updates::check_rpi_startup().await;
+            if !report.is_empty() {
+                add_update_notices(&update_container, &report);
+                update_hint.update(&report);
+            }
+            rpi_tui.request_render(false);
+        },
+    )));
 
     // ---- Streaming drain task ----
     let drain_handle = if let Some(rx) = event_rx {
         let tui_drain = tui.clone();
         let state_drain = state.clone();
         let lane_drain = lane.clone();
-        Some(tokio::spawn(async move {
-            drain_agent_events(rx, tui_drain, state_drain, lane_drain).await;
-        }))
+        Some(tokio::spawn(rpi_tui::display_context::scope(
+            rpi_tui::display_context::current(),
+            async move {
+                drain_agent_events(rx, tui_drain, state_drain, lane_drain).await;
+            },
+        )))
     } else {
         None
     };
@@ -1774,7 +1846,7 @@ pub async fn interactive_tui(
     let side_context = reload_context.clone();
     let side_parent = harness.clone();
     let side_keys = keybindings.clone();
-    let tick_handle = tokio::spawn(async move {
+    let tick = async move {
         // 80ms per frame — upstream's `DEFAULT_INTERVAL_MS`, i.e. a full
         // 10-frame cycle every 800ms. The tick only *requests a repaint*; the
         // frame itself comes from elapsed wall-clock time inside the render, so
@@ -1850,7 +1922,11 @@ pub async fn interactive_tui(
                 }
             }
         }
-    });
+    };
+    let tick_handle = tokio::spawn(rpi_tui::display_context::scope(
+        rpi_tui::display_context::current(),
+        tick,
+    ));
 
     // ---- Key dispatch loop (spawn_blocking crossterm read) ----
     let running = Arc::new(std::sync::Mutex::new(true));
@@ -1876,7 +1952,15 @@ pub async fn interactive_tui(
         .unwrap_or_else(|| "tree".to_string())
         .to_ascii_lowercase();
 
+    let terminal_for_key = terminal.clone();
+    let idle_timeout = terminal.idle_timeout();
+    let idle_expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let idle_expired_for_key = idle_expired.clone();
+    let display = rpi_tui::display_context::current();
     let key_handle = tokio::task::spawn_blocking(move || {
+        let _display = rpi_tui::display_context::enter(display.as_ref());
+        let mut last_input = std::time::Instant::now();
+        let mut editing = false;
         let mut last_escape_time = None;
         // upstream's `handleCtrlC` "press twice to exit" window: the instant of
         // the last lone Ctrl+C. Shares the 500ms with Esc's double-escape.
@@ -1939,9 +2023,25 @@ pub async fn interactive_tui(
                     None
                 }
                 .unwrap_or(std::time::Duration::from_millis(50));
-                match crossterm::event::poll(idle) {
-                    Ok(true) => {}
-                    Ok(false) => {
+                match terminal_for_key.read(idle) {
+                    Ok(Some(TerminalInput::Event(event))) => {
+                        if !matches!(
+                            event,
+                            Event::Resize(..) | Event::FocusGained | Event::FocusLost
+                        ) {
+                            last_input = std::time::Instant::now();
+                        }
+                        event
+                    }
+                    #[cfg(unix)]
+                    Ok(Some(TerminalInput::Editor(result))) => {
+                        editing = false;
+                        last_input = std::time::Instant::now();
+                        tui_for_key.resume();
+                        let _ = tx_for_key.send(TuiMessage::ExternalEditorResult(result));
+                        continue;
+                    }
+                    Ok(None) => {
                         if cfg!(windows)
                             && windows_paste_run
                                 .remaining_delay(std::time::Instant::now())
@@ -1955,6 +2055,16 @@ pub async fn interactive_tui(
                             refresh_autocomplete(&state_for_key, &editor_for_key);
                             tui_for_key.request_render_reusing_scroll_content();
                         }
+                        if editing
+                            || state_for_key.user_bash_running()
+                            || *state_for_key.status.lock().unwrap() != RunStatus::Idle
+                        {
+                            last_input = std::time::Instant::now();
+                        } else if idle_timeout.is_some_and(|limit| last_input.elapsed() >= limit) {
+                            idle_expired_for_key.store(true, std::sync::atomic::Ordering::Release);
+                            let _ = tx_for_key.send(TuiMessage::Exit);
+                            break;
+                        }
                         continue;
                     }
                     Err(_) => {
@@ -1963,12 +2073,6 @@ pub async fn interactive_tui(
                         break;
                     }
                 }
-                let Ok(ev) = crossterm::event::read() else {
-                    state_for_key.cancel_js_preparation();
-                    let _ = tx_for_key.send(TuiMessage::Exit);
-                    break;
-                };
-                normalize_decoded_event(ev)
             };
             // `Event::Resize` is delivered as its own event (not a Key). With
             // `start_readerless` there is no competing terminal-reader thread to
@@ -2184,7 +2288,7 @@ pub async fn interactive_tui(
                     if *state_for_key.status.lock().unwrap() == RunStatus::Idle {
                         let _ = tx_for_key.send(TuiMessage::Exit);
                     } else {
-                        emergency_exit(&tui_for_key);
+                        terminal_for_key.exit_active(&tui_for_key, &tx_for_key);
                     }
                     continue;
                 }
@@ -2382,7 +2486,7 @@ pub async fn interactive_tui(
                             if *state_for_key.status.lock().unwrap() == RunStatus::Idle {
                                 let _ = tx_for_key.send(TuiMessage::Exit);
                             } else {
-                                emergency_exit(&tui_for_key);
+                                terminal_for_key.exit_active(&tui_for_key, &tx_for_key);
                             }
                         }
                         CtrlCAction::Clear => {
@@ -2437,7 +2541,7 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::SUSPEND,
             ) {
-                handle_suspend(&tui_for_key);
+                terminal_for_key.suspend(&tui_for_key);
                 continue;
             }
 
@@ -2497,7 +2601,7 @@ pub async fn interactive_tui(
                 if *state_for_key.status.lock().unwrap() == RunStatus::Idle {
                     let _ = tx_for_key.send(TuiMessage::Exit);
                 } else {
-                    emergency_exit(&tui_for_key);
+                    terminal_for_key.exit_active(&tui_for_key, &tx_for_key);
                 }
                 continue;
             }
@@ -2575,7 +2679,12 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::EXTERNAL_EDITOR,
             ) {
-                launch_external_editor(editor_for_key.get_expanded_text(), tx_for_key.clone());
+                editing = terminal_for_key.is_host();
+                terminal_for_key.edit(
+                    &tui_for_key,
+                    editor_for_key.get_expanded_text(),
+                    &tx_for_key,
+                );
                 continue;
             }
 
@@ -3220,10 +3329,23 @@ pub async fn interactive_tui(
 
     // ---- Main loop: process submitted input + lifecycle messages ----
     loop {
-        if !*running.lock().unwrap() {
+        if terminal.is_closing() || !*running.lock().unwrap() {
             break;
         }
         match rx.recv().await {
+            Some(
+                TuiMessage::SwitchSession(_)
+                | TuiMessage::ImportSession(_)
+                | TuiMessage::ForkSession
+                | TuiMessage::ExportSession
+                | TuiMessage::ExportSessionWithFormat(_),
+            ) if args.mini => {
+                add_error_message(
+                    &state.notice_container(),
+                    "--mini does not support saved sessions or session exports.",
+                );
+                tui.request_render(false);
+            }
             Some(TuiMessage::OpenProviderSelector) => {
                 let current = lane.get_model().await.ok();
                 open_provider_selector(
@@ -3440,8 +3562,10 @@ pub async fn interactive_tui(
                 )
                 .await;
                 switch_to_session(
-                    harness,
-                    &lane,
+                    SessionLane {
+                        harness,
+                        lane: &lane,
+                    },
                     &id,
                     &cwd,
                     &chat_container,
@@ -3459,8 +3583,10 @@ pub async fn interactive_tui(
                 )
                 .await;
                 import_session(
-                    harness,
-                    &lane,
+                    SessionLane {
+                        harness,
+                        lane: &lane,
+                    },
                     &path,
                     &cwd,
                     &chat_container,
@@ -3670,10 +3796,12 @@ pub async fn interactive_tui(
                 flow_id,
             }) => {
                 handle_provider_oauth_result(
-                    &state,
-                    &editor_container,
-                    &editor,
-                    &tui,
+                    EditorUi {
+                        state: &state,
+                        editor_container: &editor_container,
+                        editor: &editor,
+                        tui: &tui,
+                    },
                     &ctx.tx,
                     &provider,
                     &action,
@@ -3795,7 +3923,7 @@ pub async fn interactive_tui(
                             .unwrap_or_default();
                         registry.merge_discovered(&discovered);
                         for diagnostic in &diagnostics {
-                            eprintln!("warning: {diagnostic}");
+                            terminal.report(&format!("warning: {diagnostic}"), true);
                         }
                         // A reload can remove the active file theme (its package
                         // went away or no longer returns the path); fall back to
@@ -3864,30 +3992,30 @@ pub async fn interactive_tui(
     state.history_page.invalidate();
     let mut key_handle = Some(key_handle);
     let mut exit_code = 0;
-    if args.native_durable {
-        // Stop/join the built-in input producer before sealing its accepted
-        // background session writers. Dialog cancellation can unblock key work;
-        // the streaming event consumer stays live through producer settlement.
+    if args.native_durable || terminal.is_host() {
+        // Stop the input producer before sealing the writers it admitted. Dialog
+        // cancellation can unblock key work, and the streaming event consumer stays live through producer settlement.
         *running.lock().unwrap() = false;
         ask_user_bridge.shutdown();
         if key_handle.take().unwrap().await.is_err() {
             exit_code = 1;
         }
-        // Native shutdown is an explicit cooperative runtime boundary: settle
-        // an active prompt before the producer join/core barrier. Idle lanes
-        // return an error here, which is intentionally ignored just like RPC
-        // shutdown; the subsequent settlement still owns accepted writers.
+        if terminal.is_host() {
+            state.cancel_user_bash();
+            state.end_provider_auth();
+        }
+    }
+    if args.native_durable {
         let _ = lane.abort_and_reconcile().await;
         if !settlement::settle_native(harness, state.session_write_tasks.seal()).await {
-            eprintln!("[rpi] native TUI settlement failed");
+            terminal.report("[rpi] native TUI settlement failed", true);
             exit_code = 1;
         }
     } else {
-        // Let anything the lane has already committed to writing reach the disk
-        // before the tasks that carry those writes are aborted. A turn's entries are
-        // appended by the harness rather than by the drain task, but the drain task
-        // is what acknowledges them to the UI, so aborting it first can leave a turn
-        // the user saw with no durable counterpart.
+        // Wait for session writers while the event consumer is still alive.
+        if terminal.is_host() && !state.session_write_tasks.seal().join().await {
+            exit_code = 1;
+        }
         let _ = lane.wait_for_idle().await;
         lane.drain_session().await;
     }
@@ -3904,14 +4032,17 @@ pub async fn interactive_tui(
         let _ = key_handle.await;
     }
     tick_handle.abort();
+    let _ = tick_handle.await;
     if let Some(handle) = drain_handle {
         handle.abort();
+        let _ = handle.await;
     }
     // Drop the reload bridge: clearing the mailbox closes the signal channel,
     // the drain task's `recv` returns `None`, and the task exits. (Aborting is
     // redundant — the recv terminates — but cheap + makes shutdown explicit.)
     reload_context.mailbox.clear();
     reload_bridge_handle.abort();
+    let _ = reload_bridge_handle.await;
     tui.stop(Default::default());
 
     // upstream prints how to resume the session after an interactive exit so
@@ -3919,9 +4050,24 @@ pub async fn interactive_tui(
     // `formatResumeCommand` (id + `--session-dir` only when non-default).
     let session_id = harness.session().storage().metadata().id;
     if let Some(command) = format_resume_command(&session_id, &cwd, Some(&state.session_dir)) {
-        println!("\x1b[2mTo resume this session:\x1b[0m {command}");
+        terminal.report(
+            &format!("\x1b[2mTo resume this session:\x1b[0m {command}"),
+            false,
+        );
     }
-    println!("\nGoodbye!");
+    terminal.report("\nGoodbye!", false);
+    if idle_expired.load(std::sync::atomic::Ordering::Acquire) {
+        if let Some(timeout) = idle_timeout {
+            terminal.report(
+                &format!(
+                    "Host session closed after {} seconds of inactivity",
+                    timeout.as_secs()
+                ),
+                true,
+            );
+            exit_code = 1;
+        }
+    }
 
     exit_code
 }

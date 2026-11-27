@@ -313,7 +313,6 @@ async fn execute_input(
             expecting,
             expects_reply,
         } => {
-            let expects_reply = expects_reply;
             let ack = host
                 .dispatch(MessageAgentRequest {
                     source_session_id: source_session_id.to_owned(),

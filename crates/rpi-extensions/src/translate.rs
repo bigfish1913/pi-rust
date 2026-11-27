@@ -1340,9 +1340,9 @@ mod tests {
                 // `MessageUpdate` carries the shared partial snapshot, so build
                 // the same `Arc` the provider would have handed over.
                 message: std::sync::Arc::new((*am.as_assistant().unwrap()).clone()),
-                assistant_message_event: rpi_ai::types::AssistantMessageEvent::Start {
+                assistant_message_event: Box::new(rpi_ai::types::AssistantMessageEvent::Start {
                     partial: std::sync::Arc::new((*am.as_assistant().unwrap()).clone()),
-                },
+                }),
             },
             AgentEvent::MessageEnd {
                 message_id: None,
@@ -1411,11 +1411,11 @@ mod tests {
             let event = AgentEvent::MessageUpdate {
                 message_id: None,
                 message: Arc::clone(&partial),
-                assistant_message_event: AssistantMessageEvent::TextDelta {
+                assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
                     content_index: 0,
                     delta: delta.to_string(),
                     partial: Arc::clone(&partial),
-                },
+                }),
             };
             let stable = translate(&event).expect("message_update maps");
             let payload = unsafe { stable.payload.message.message.to_string_lossy() };

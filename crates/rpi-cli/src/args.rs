@@ -142,6 +142,10 @@ pub struct Args {
     pub thinking: Option<ThinkingLevel>,
 
     pub print: bool,
+    /// Select an ephemeral session and turn off native durable execution.
+    pub mini: bool,
+    /// The empty string selects the configured default area.
+    pub host: Option<String>,
     pub mode: Mode,
     pub rpc_message_updates: RpcMessageUpdates,
     /// `--tui-mode regular|fullscreen` controls the interactive terminal
@@ -171,6 +175,17 @@ pub struct Args {
     /// `--fork <path|id>`: fork the given session into a new one and start in
     /// the fork (pi `--fork`).
     pub fork: Option<String>,
+    /// `--fork-entry <entryId>`: cut the new branch at this message entry
+    /// instead of the lane leaf. The id must match exactly — unlike `--fork`'s
+    /// partial session id, no prefix or substring match is attempted.
+    /// Requires `--fork`.
+    pub fork_entry: Option<String>,
+    /// `--fork-position at|before`: whether `--fork-entry` includes (`at`) or
+    /// excludes (`before`) its message. `None` keeps the harness default for an
+    /// explicit entry, which is `before` (`ForkOptions::Branch`).
+    /// Requires `--fork` and `--fork-entry`; without an explicit entry the
+    /// harness applies the position to the implicit lane leaf and truncates it.
+    pub fork_position: Option<rpi_harness::session::types::ForkPosition>,
     /// `--models <patterns>`: comma-separated model patterns for the Ctrl+P
     /// cycle (globs/fuzzy in pi; v1 writes the matched ids to settings.json's
     /// scopedModels — the same set /scoped-models edits). Empty = all models.
@@ -257,6 +272,39 @@ pub struct Args {
     pub errors: Vec<String>,
 }
 
+impl Args {
+    pub(crate) fn fork_cut_errors(&self) -> Vec<&'static str> {
+        let mut errors = Vec::new();
+        if self.fork.is_none() {
+            if self.fork_entry.is_some() {
+                errors.push("--fork-entry requires --fork");
+            }
+            if self.fork_position.is_some() {
+                errors.push("--fork-position requires --fork");
+            }
+        } else if (self.fork_entry.is_some() || self.fork_position.is_some())
+            && (self.fork.as_deref() == Some("")
+                || self.no_session
+                || self.continue_session
+                || self.resume)
+        {
+            errors.push("--fork cut flags require an active --fork selection");
+        }
+        if self
+            .fork_entry
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            errors.push("--fork-entry requires a nonempty entry ID");
+        }
+        // An implicit leaf combined with `before` would drop that leaf.
+        if self.fork_entry.is_none() && self.fork_position.is_some() {
+            errors.push("--fork-position requires --fork-entry");
+        }
+        errors
+    }
+}
+
 /// The canonical valid `--thinking` level strings, in level order. Mirrors TS
 /// `VALID_THINKING_LEVELS`.
 pub use rpi_runtime::thinking::VALID_THINKING_LEVELS;
@@ -285,11 +333,13 @@ fn file_arg(arg: &str) -> Option<PathBuf> {
 /// handles `--name=value` for *unknown* flags; we extend it to known flags for
 /// ergonomics). Short flags use a single leading `-`.
 pub fn parse_args(args: &[String]) -> Args {
-    let mut result = Args::default();
     // Native durable is the CLI default. Keep `Args::default()` unchanged for
     // embedded/test hosts that construct programmatic options explicitly.
-    result.native_durable = true;
-    result.offline = offline_env_enabled();
+    let mut result = Args {
+        native_durable: true,
+        offline: offline_env_enabled(),
+        ..Args::default()
+    };
     // `RPI_EXTENSIONS_DIR` env: an extra list of plugin dirs prepended to any
     // `--extensions-dir` flags. Semicolon-separated on Windows, colon-separated
     // on Unix (PATH-style). Empty entries skipped. `--no-extensions` still wins.
@@ -306,6 +356,9 @@ pub fn parse_args(args: &[String]) -> Args {
         }
     }
     let mut i = 0;
+    let mut host_arg_count = 0;
+    let mut host_tui_arg_count = 0;
+    let mut unsupported_host_rpc_flag = None;
     while i < args.len() {
         let arg = args[i].clone();
         // Peel an inline `--flag=value` (long flags only — short flags never use
@@ -323,6 +376,40 @@ pub fn parse_args(args: &[String]) -> Args {
         // Take a value: prefer the inline `--flag=value`, else the next argv
         // token (when it isn't flag-shaped). Advances `i` past a consumed token.
         // (For unknown-flag diagnostics the closing arm reads `flag_key` itself.)
+        if !matches!(
+            flag_key.as_str(),
+            "--host"
+                | "--mode"
+                | "--session"
+                | "-s"
+                | "--session-id"
+                | "--session-dir"
+                | "--fork"
+                | "--fork-entry"
+                | "--fork-position"
+                | "--provider"
+                | "--model"
+                | "--resource-config"
+                | "--resource-transition"
+                | "--permission-gate"
+                | "--bypass"
+                | "--approve"
+                | "-a"
+                | "--no-approve"
+                | "-na"
+                | "--offline"
+                | "--no-native-durable"
+                | "--no-session"
+                | "--rpc-message-updates"
+                | "--help"
+                | "-h"
+                | "--version"
+                | "-v"
+        ) && flag_key.starts_with('-')
+        {
+            unsupported_host_rpc_flag.get_or_insert_with(|| flag_key.clone());
+        }
+
         let mut take_value = |result: &mut Args, _flag: &str| -> Option<String> {
             if let Some(v) = inline.clone() {
                 return Some(v);
@@ -383,6 +470,7 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--tui-mode" => {
                 if let Some(v) = take_value(&mut result, "--tui-mode") {
+                    host_tui_arg_count += if inline.is_some() { 1 } else { 2 };
                     result.tui_mode = match v.to_ascii_lowercase().as_str() {
                         "regular" => TuiMode::Regular,
                         "fullscreen" => TuiMode::Fullscreen,
@@ -397,6 +485,35 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--continue" | "-c" => result.continue_session = true,
             "--resume" | "-r" => result.resume = true,
+            "--host" => {
+                if result.host.is_some() {
+                    result
+                        .errors
+                        .push("--host may only be supplied once".into());
+                }
+                let area = if let Some(area) = inline {
+                    if area.is_empty() {
+                        result.errors.push("--host= requires an area name".into());
+                    }
+                    area
+                } else if let Some(next) = args.get(i + 1).filter(|next| {
+                    !next.starts_with('-') && !next.starts_with('@') && !next.is_empty()
+                }) {
+                    i += 1;
+                    host_arg_count += 1;
+                    next.clone()
+                } else {
+                    String::new()
+                };
+                host_arg_count += 1;
+                result.host = Some(area);
+            }
+            "--mini" => {
+                result.mini = true;
+                if inline.is_some() {
+                    result.errors.push("--mini does not take a value".into());
+                }
+            }
             "--no-session" => result.no_session = true,
             "--no-tools" | "-nt" => result.no_tools = true,
             "--no-builtin-tools" | "-nbt" => result.no_builtin_tools = true,
@@ -471,6 +588,35 @@ pub fn parse_args(args: &[String]) -> Args {
             "--session" => result.session = take_value(&mut result, "--session"),
             "--session-id" => result.session_id = take_value(&mut result, "--session-id"),
             "--fork" => result.fork = take_value(&mut result, "--fork"),
+            "--fork-entry" => {
+                if let Some(value) = take_value(&mut result, "--fork-entry") {
+                    if value.trim().is_empty() {
+                        result
+                            .errors
+                            .push("--fork-entry requires a nonempty entry ID".into());
+                    } else if result.fork_entry.replace(value).is_some() {
+                        result.errors.push("duplicate --fork-entry".into());
+                    }
+                }
+            }
+            "--fork-position" => {
+                if let Some(value) = take_value(&mut result, "--fork-position") {
+                    // Mirror `ForkPosition`'s two variants; `AT`/`BEFORE` are
+                    // accepted so the flag is not case-sensitive by accident.
+                    if result.fork_position.is_some() {
+                        result.errors.push("duplicate --fork-position".into());
+                    } else if value.eq_ignore_ascii_case("at") {
+                        result.fork_position = Some(rpi_harness::session::types::ForkPosition::At);
+                    } else if value.eq_ignore_ascii_case("before") {
+                        result.fork_position =
+                            Some(rpi_harness::session::types::ForkPosition::Before);
+                    } else {
+                        result.errors.push(format!(
+                            "Invalid --fork-position \"{value}\". Expected at or before"
+                        ));
+                    }
+                }
+            }
             "--models" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.models = Some(split_csv(&v));
@@ -565,8 +711,14 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--theme" => {
                 result.theme = take_value(&mut result, "--theme");
+                if result.theme.is_some() {
+                    host_tui_arg_count += if inline.is_some() { 1 } else { 2 };
+                }
             }
-            "--no-themes" => result.no_themes = true,
+            "--no-themes" => {
+                host_tui_arg_count += 1;
+                result.no_themes = true;
+            }
             // Unknown long flag (with or without `=`). Preserve it for an
             // extension to claim after extension registration, matching Pi's
             // `unknownFlags` behavior. A bare flag is boolean true; a following
@@ -601,8 +753,80 @@ pub fn parse_args(args: &[String]) -> Args {
         i += 1;
     }
 
-    // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
+    let fork_errors = result.fork_cut_errors();
+    result
+        .errors
+        .extend(fork_errors.into_iter().map(str::to_owned));
+
+    if result.host.is_some()
+        && !result.mini
+        && result.mode != Mode::Rpc
+        && args.len() != host_arg_count + host_tui_arg_count
+    {
+        result.errors.push(
+            "Host TUI accepts --tui-mode, --theme and --no-themes; prompt options require --mini"
+                .into(),
+        );
+    }
+
+    if result.host.is_some() && !result.mini && result.mode == Mode::Rpc {
+        if let Some(flag) = unsupported_host_rpc_flag {
+            result
+                .errors
+                .push(format!("{flag} is not supported by Host RPC"));
+        }
+    }
+
+    if result.mini {
+        result.no_session = true;
+        result.native_durable = false;
+        for (present, flag) in [
+            (result.continue_session, "--continue"),
+            (result.resume, "--resume"),
+            (result.session.is_some(), "--session"),
+            (result.session_id.is_some(), "--session-id"),
+            (result.session_dir.is_some(), "--session-dir"),
+            (result.fork.is_some(), "--fork"),
+            (result.export.is_some(), "--export"),
+        ] {
+            if present {
+                result
+                    .errors
+                    .push(format!("--mini cannot be combined with {flag}"));
+            }
+        }
+    }
+    if result.host.is_some() && result.mini {
+        for (present, flag) in [
+            (result.name.is_some(), "--name"),
+            (result.mode != Mode::Text, "--mode json/rpc"),
+            (result.list_models.is_some(), "--list-models"),
+            (result.models.is_some(), "--models"),
+            (result.resource_config.is_some(), "--resource-config"),
+            (
+                result.resource_transition.is_some(),
+                "--resource-transition",
+            ),
+            (!result.extension.is_empty(), "--extension"),
+            (!result.extensions_dir.is_empty(), "--extensions-dir"),
+            (!result.skill.is_empty(), "--skill"),
+            (!result.prompt_template.is_empty(), "--prompt-template"),
+            (result.theme.is_some(), "--theme"),
+        ] {
+            if present {
+                result
+                    .errors
+                    .push(format!("--mini cannot be combined with {flag}"));
+            }
+        }
+        for flag in result.unknown_flags.keys() {
+            result
+                .errors
+                .push(format!("--mini does not support --{flag}"));
+        }
+    }
     if result.resource_config.is_none() && result.resource_transition.is_none() {
+        // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
         env_extension_dirs.append(&mut result.extensions_dir);
         result.extensions_dir = env_extension_dirs;
     }
@@ -682,8 +906,11 @@ pub fn print_help() {
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
   --rpc-message-updates <mode>   RPC updates: compact-deltas (default) or snapshot (legacy)
+  --host [area]                  Run in a shared local Host area (Unix), in TUI, RPC, or --mini mode
+  --host[=area] --mini [prompt]   Run a one-shot text prompt in that Host
   --server [--port <n>] [--bind <ip>]
                                  Headless server: serve a remote-connectable agent (no TUI)
+  --native-host [area]          Join or start a persistent Host area (macOS)
   --connect <host:port>          Remote client: connect to a `--server` instance and run the TUI
                                  (no local provider/tools/session; all agent work is remote)
   --token <token>                Auth token for `--connect` (printed by `--server`; may also
@@ -695,10 +922,19 @@ pub fn print_help() {
   --approve, -a                  Force-enable current-project resources
   --no-approve, -na              Disable current-project resources
   --print, -p                    Non-interactive: process prompt(s) and exit
+  --mini                         Use an in-memory session and disable native durable execution
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
   --session <id|path>            Use a specific session (partial UUID or file)
+  --session-id <id>              Use the exact session id, creating it if missing
+  --fork <id|path>               Fork a session into a new one and start in the fork
+                                 (partial UUID, file name fragment, or file path)
+  --fork-entry <entryId>         With --fork: cut the new branch at this message
+                                 entry. The entry id must match exactly
+  --fork-position <at|before>    With --fork-entry: keep the selected message in the
+                                 new branch (at) or drop it (before). Default: before
   --session-dir <dir>            Directory for session storage
+  --session-preview <uuid>       Read the recent saved transcript (standalone with --session-dir)
   --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
   --tools, -t <list>             Comma-separated allowlist of tool names to enable
@@ -725,7 +961,12 @@ pub fn print_help() {
   --version, -v                  Show version
 
 {u}Subcommands:{r}
-  update                       Update the rpi CLI from crates.io
+  host <command>                 Shared Host control: foreground serve; status/list/
+                                inspect; submit/receipt; optional profiles and
+                                administrative-* (Unix; authenticated IPC;
+                                see `rpi host --help`)
+  update                       Update the rpi CLI from GitHub releases
+                                (Homebrew installs use `brew upgrade rpi`)
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
   events path|tail               Inspect the extension event journal (needs
@@ -773,7 +1014,7 @@ pub fn print_help() {
   ANTHROPIC_BASE_URL             Override the Anthropic endpoint (e.g. a compatible proxy)
   OPENAI_API_KEY                 Bearer token for openai-completions/responses
   RPI_OFFLINE                     Disable startup network operations when set to 1/true/yes
-  RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
+  RPI_CODING_AGENT_DIR           Override the ~/.rpi agent home (auth/models/settings/trust)
   RPI_SESSION_ID                 Session id served by a plugin (set by the host; also honored as an override)
 
 {u}Notes:{r}
@@ -917,6 +1158,61 @@ mod tests {
         assert!(!parse_args(&s(&["--no-native-durable"])).native_durable);
         assert!(parse_args(&s(&["--no-native-durable", "--native-durable"])).native_durable);
         assert!(!parse_args(&s(&["--native-durable", "--no-native-durable"])).native_durable);
+    }
+
+    #[test]
+    fn mini_always_disables_session_and_durable() {
+        for argv in [
+            ["--mini", "--native-durable", "hello"],
+            ["--native-durable", "--mini", "hello"],
+        ] {
+            let args = parse_args(&s(&argv));
+            assert!(args.mini && args.no_session && !args.native_durable);
+            assert!(args.errors.is_empty(), "{:?}", args.errors);
+            assert_eq!(args.messages, ["hello"]);
+            assert_eq!(resolve_mode(&args, true, true), RunMode::Interactive);
+        }
+    }
+
+    #[test]
+    fn mini_accepts_regular_modes_and_resource_flags() {
+        let args = parse_args(&s(&[
+            "--mini",
+            "--mode",
+            "rpc",
+            "--tools",
+            "read",
+            "--extension",
+            "extension.dylib",
+        ]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(resolve_mode(&args, true, true), RunMode::Rpc);
+        assert_eq!(args.tools.unwrap(), ["read"]);
+        assert_eq!(args.extension, [PathBuf::from("extension.dylib")]);
+    }
+
+    #[test]
+    fn mini_rejects_session_and_durable_epoch_flags() {
+        for (flags, expected) in [
+            (&["--resume"][..], "--resume"),
+            (&["--session-id", "saved"][..], "--session-id"),
+            (&["--export", "session.jsonl"][..], "--export"),
+            (
+                &["--experimental-durable-epoch", "epoch"][..],
+                "--experimental-durable-epoch",
+            ),
+        ] {
+            let argv = ["--mini"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .collect::<Vec<_>>();
+            let args = parse_args(&s(&argv));
+            assert!(
+                args.errors.iter().any(|error| error.contains(expected)),
+                "{:?}",
+                args.errors
+            );
+        }
     }
 
     #[test]
@@ -1097,6 +1393,31 @@ mod tests {
         assert!(a.errors.is_empty());
         assert_eq!(a.session_id.as_deref(), Some("01abc"));
         assert_eq!(a.fork.as_deref(), Some("xyz"));
+        assert_eq!(a.fork_entry, None);
+        assert_eq!(
+            a.fork_position, None,
+            "an explicit entry must keep the harness default (before), not force a position"
+        );
+        let a = parse_args(&s(&[
+            "--fork",
+            "xyz",
+            "--fork-entry",
+            "message-2",
+            "--fork-position",
+            "before",
+        ]));
+        assert!(a.errors.is_empty());
+        assert_eq!(a.fork_entry.as_deref(), Some("message-2"));
+        assert_eq!(
+            a.fork_position,
+            Some(rpi_harness::session::types::ForkPosition::Before)
+        );
+        let a = parse_args(&s(&["--fork-position", "middle"]));
+        assert_eq!(a.fork_position, None);
+        assert_eq!(
+            a.errors,
+            vec!["Invalid --fork-position \"middle\". Expected at or before".to_string()]
+        );
         let a = parse_args(&s(&[
             "-e",
             "plugin.dll",
@@ -1108,6 +1429,158 @@ mod tests {
         assert_eq!(a.extension.len(), 1);
         assert_eq!(a.skill.len(), 1);
         assert_eq!(a.prompt_template.len(), 1);
+    }
+
+    #[test]
+    fn fork_cut_flags_are_reserved_and_require_an_active_fork() {
+        let args = parse_args(&s(&[
+            "--fork-entry=entry-1",
+            "--fork",
+            "source",
+            "--fork-position",
+            "at",
+            "--extension-option=keep",
+        ]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(
+            args.unknown_flags,
+            BTreeMap::from([("extension-option".into(), serde_json::json!("keep"))])
+        );
+        for argv in [
+            &["--fork-entry", "entry-1"][..],
+            &["--fork", "source", "--fork-position", "at"],
+            &[
+                "--fork",
+                "source",
+                "--fork-entry",
+                "entry-1",
+                "--no-session",
+            ],
+            &["--fork", "source", "--fork-entry", "entry-1", "--resume"],
+            &[
+                "--fork",
+                "source",
+                "--fork-entry",
+                "entry-1",
+                "--fork-position=after",
+            ],
+            &[
+                "--fork",
+                "source",
+                "--fork-entry=entry-1",
+                "--fork-entry=entry-2",
+            ],
+            &["--fork", "source", "--fork-entry="],
+        ] {
+            assert!(!parse_args(&s(argv)).errors.is_empty(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn fork_position_is_case_insensitive() {
+        use rpi_harness::session::types::ForkPosition;
+        for (value, expected) in [
+            ("at", ForkPosition::At),
+            ("At", ForkPosition::At),
+            ("AT", ForkPosition::At),
+            ("before", ForkPosition::Before),
+            ("Before", ForkPosition::Before),
+            ("BEFORE", ForkPosition::Before),
+        ] {
+            let a = parse_args(&s(&[
+                "--fork",
+                "xyz",
+                "--fork-entry",
+                "message-2",
+                "--fork-position",
+                value,
+            ]));
+            assert!(a.errors.is_empty(), "{value}: {:?}", a.errors);
+            assert_eq!(a.fork_position, Some(expected), "{value}");
+        }
+    }
+
+    /// `--fork-entry` is only read inside `SessionSelection::Fork`, and
+    /// `--fork-position` only makes sense alongside an explicit entry: without
+    /// one it reaches the harness as `entry_id: None, position: Some(Before)`
+    /// and truncates the current leaf from the child.
+    #[test]
+    fn fork_cut_flags_require_fork() {
+        let a = parse_args(&s(&["--fork-entry", "message-2", "--print", "hi"]));
+        assert_eq!(a.errors, vec!["--fork-entry requires --fork".to_string()]);
+
+        // `--fork-position` alone is missing both prerequisites; the existing
+        // rule stays, and the new entry rule is reported alongside it.
+        let a = parse_args(&s(&["--fork-position", "before"]));
+        assert_eq!(
+            a.errors,
+            vec![
+                "--fork-position requires --fork".to_string(),
+                "--fork-position requires --fork-entry".to_string(),
+            ]
+        );
+
+        // Both flags together report once each, in flag order.
+        let a = parse_args(&s(&["--fork-position=at", "--fork-entry=message-2"]));
+        assert_eq!(
+            a.errors,
+            vec![
+                "--fork-entry requires --fork".to_string(),
+                "--fork-position requires --fork".to_string(),
+            ]
+        );
+
+        // With `--fork` they parse cleanly.
+        let a = parse_args(&s(&[
+            "--fork",
+            "xyz",
+            "--fork-entry",
+            "message-2",
+            "--fork-position",
+            "at",
+        ]));
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+    }
+
+    /// The reviewer's P2: `--fork-position` without `--fork-entry` is not
+    /// inert — the harness takes the current leaf as the implicit target and
+    /// then applies `Before`, dropping it from the child. Cover both position
+    /// values, both argv spellings, and the no-`--fork` combination.
+    #[test]
+    fn fork_position_requires_fork_entry() {
+        for value in ["at", "before", "AT", "BEFORE"] {
+            // Separate-value form.
+            let a = parse_args(&s(&["--fork", "xyz", "--fork-position", value]));
+            assert_eq!(
+                a.errors,
+                vec!["--fork-position requires --fork-entry".to_string()],
+                "{value}: the flag is not inert"
+            );
+            assert!(a.fork_position.is_some(), "{value}");
+
+            // Inline `--flag=value` form.
+            let flag = format!("--fork-position={value}");
+            let a = parse_args(&s(&["--fork", "xyz", &flag]));
+            assert_eq!(
+                a.errors,
+                vec!["--fork-position requires --fork-entry".to_string()],
+                "{flag}: the flag is not inert"
+            );
+        }
+
+        // With --fork-entry present, both forms are accepted.
+        let a = parse_args(&s(&[
+            "--fork",
+            "xyz",
+            "--fork-entry",
+            "message-2",
+            "--fork-position=before",
+        ]));
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(
+            a.fork_position,
+            Some(rpi_harness::session::types::ForkPosition::Before)
+        );
     }
 
     #[test]
@@ -1234,6 +1707,29 @@ mod tests {
         );
         let invalid = parse_args(&s(&["--tui-mode", "split"]));
         assert!(!invalid.errors.is_empty());
+    }
+
+    #[test]
+    fn host_accepts_terminal_presentation_flags() {
+        let args = parse_args(&s(&[
+            "--host",
+            "work",
+            "--tui-mode",
+            "regular",
+            "--theme=light",
+        ]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(args.host.as_deref(), Some("work"));
+        assert_eq!(args.tui_mode, TuiMode::Regular);
+        assert_eq!(args.theme.as_deref(), Some("light"));
+
+        let args = parse_args(&s(&["--no-themes", "--tui-mode=fullscreen", "--host=work"]));
+        assert!(args.errors.is_empty(), "{:?}", args.errors);
+        assert_eq!(args.tui_mode, TuiMode::Fullscreen);
+        assert!(args.no_themes);
+        assert!(!parse_args(&s(&["--host", "--provider", "fixture"]))
+            .errors
+            .is_empty());
     }
 
     #[test]

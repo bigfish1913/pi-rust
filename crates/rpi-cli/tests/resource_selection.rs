@@ -728,9 +728,10 @@ fn exact_mode_reload_is_restart_required_and_preparation_is_frozen() {
         };
         let uncreated_root=root.join("preflight-only-session-root");
         let persistent_args=Args { no_session:false, session_id:Some("preflight-only".into()),session_dir:Some(uncreated_root.clone()), ..args.clone() };
-        drop(prepare_extensions(&persistent_args,&root,true).unwrap());
+        let home = rpi_cli::config::AgentHome::process();
+        drop(prepare_extensions(&home, &persistent_args, &root, true).unwrap());
         assert!(!uncreated_root.exists(),"preflight must not create a session root/file/lock");
-        let prepared = prepare_extensions(&args, &root, true).unwrap();
+        let prepared = prepare_extensions(&home, &args, &root, true).unwrap();
         put(root.join(".rpi/packages.json"),json!({"packages":[{"name":"metadata","version":"changed-version","source":"changed-source","cargo_package":"changed-identity","artifacts":[]}]}).to_string());
         // The config is a frozen startup snapshot, not a second discovery opportunity.
         put(
@@ -738,6 +739,7 @@ fn exact_mode_reload_is_restart_required_and_preparation_is_frozen() {
             r#"{"version":1,"tools":{"mode":"default"}}"#,
         );
         let resolved = rpi_cli::provider::resolve(
+            &rpi_cli::config::AgentHome::process(),
             Some("anthropic"),
             Some(rpi_cli::provider::DEFAULT_MODEL_ID),
             None,
@@ -745,9 +747,10 @@ fn exact_mode_reload_is_restart_required_and_preparation_is_frozen() {
             None,
         )
         .unwrap();
-        let (harness, _, mut context) = build_prepared(&resolved, &args, &root, true, prepared)
-            .await
-            .unwrap();
+        let (harness, _, mut context) =
+            build_prepared(&home, &resolved, &args, &root, true, prepared)
+                .await
+                .unwrap();
         let before = rpi_cli::resource_selection::get_resource_state(&harness)
             .await
             .unwrap();

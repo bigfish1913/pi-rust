@@ -376,7 +376,12 @@ impl Settings {
 /// (not an error). Malformed JSON ⇒ `ConfigError::Json`. Tolerates `//` line
 /// comments (a copied pi settings.json may contain them).
 pub fn load_settings() -> Result<Settings, ConfigError> {
-    let path = config::settings_path()?;
+    load_settings_at(None)
+}
+
+/// [`load_settings`] against an explicit agent home.
+pub(crate) fn load_settings_at(agent_dir: Option<&Path>) -> Result<Settings, ConfigError> {
+    let path = config::settings_path_at(agent_dir)?;
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_settings(&text).map_err(|e| ConfigError::Json {
             path: path.clone(),
@@ -427,7 +432,16 @@ pub fn load_effective_model_settings(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<Settings, ConfigError> {
-    let mut effective = load_settings()?;
+    load_effective_model_settings_at(None, cwd, project_trusted)
+}
+
+/// [`load_effective_model_settings`] against an explicit agent home.
+pub(crate) fn load_effective_model_settings_at(
+    agent_dir: Option<&Path>,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<Settings, ConfigError> {
+    let mut effective = load_settings_at(agent_dir)?;
     if project_trusted {
         if let Some((_, project)) = load_active_project_settings(cwd)? {
             if project.default_provider.is_some() {
@@ -516,8 +530,37 @@ fn parse_settings_value(text: &str) -> Result<serde_json::Value, serde_json::Err
 /// parser as [`load_settings`]. Missing file ⇒ a fresh object. Existing files
 /// that cannot be parsed safely are left untouched and reported as errors.
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
-    let path = config::settings_path().map_err(|e| e.to_string())?;
+    save_settings_at(None, settings)
+}
+
+/// [`save_settings`] against an explicit agent home.
+pub(crate) fn save_settings_at(
+    agent_dir: Option<&Path>,
+    settings: &Settings,
+) -> Result<(), String> {
+    let path = config::settings_path_at(agent_dir).map_err(|e| e.to_string())?;
     save_settings_to_path(settings, &path, None)
+}
+
+impl config::AgentHome {
+    /// Load this home's `settings.json` (missing file = defaults).
+    pub fn settings(&self) -> Result<Settings, ConfigError> {
+        load_settings_at(self.explicit_path())
+    }
+
+    /// Global -> trusted-project model-selection settings for this home.
+    pub fn effective_model_settings(
+        &self,
+        cwd: &Path,
+        project_trusted: bool,
+    ) -> Result<Settings, ConfigError> {
+        load_effective_model_settings_at(self.explicit_path(), cwd, project_trusted)
+    }
+
+    /// Persist this home's `settings.json`, preserving unknown fields.
+    pub fn save_settings(&self, settings: &Settings) -> Result<(), String> {
+        save_settings_at(self.explicit_path(), settings)
+    }
 }
 
 /// Persist project-scoped settings under `.rpi/settings.json`.

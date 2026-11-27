@@ -46,6 +46,7 @@ fn explicit_tool_prompts_follow_startup_reload_and_tool_filtering() {
         .block_on(async {
             let cwd = tempfile::tempdir().unwrap();
             let resolved = rpi_cli::provider::resolve(
+                &rpi_cli::config::AgentHome::process(),
                 Some("anthropic"),
                 Some(rpi_cli::provider::DEFAULT_MODEL_ID),
                 None,
@@ -63,8 +64,15 @@ fn explicit_tool_prompts_follow_startup_reload_and_tool_filtering() {
                 extension: vec![std::env::var_os(CHILD).unwrap().into()],
                 ..Default::default()
             };
-            let (harness, _events, mut context) =
-                build(&resolved, &args, cwd.path(), true).await.unwrap();
+            let (harness, _events, mut context) = build(
+                &rpi_cli::config::AgentHome::process(),
+                &resolved,
+                &args,
+                cwd.path(),
+                true,
+            )
+            .await
+            .unwrap();
             let snippet = "- echo  — Echo the supplied text";
             let rule = "Use echo only when an echo is requested";
             let prompt = harness.get_system_prompt().await.unwrap().unwrap();

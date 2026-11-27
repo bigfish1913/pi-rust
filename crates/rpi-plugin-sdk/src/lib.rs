@@ -78,6 +78,8 @@ pub mod handles;
 pub mod process;
 #[cfg(feature = "provider")]
 pub mod provider;
+#[cfg(feature = "quickjs-allocator")]
+pub mod quickjs;
 #[cfg(feature = "stdio")]
 pub mod stdio;
 
@@ -387,12 +389,12 @@ pub struct StableToolSchema {
 /// project-scoped fallback when `sessionId` is missing rather than refusing to
 /// work.
 ///
-/// Plugins using host-managed child actions additionally receive per-call
+/// Plugins using invocation-bound run actions additionally receive per-call
 /// `runtimeHandle` (opaque integer) and `runtimeKey` (capability string). Worker
 /// threads use that handle as runtime_action's opaque user_data and include
-/// `__rpiRuntimeKey` in ChildAgent arguments. Never log, persist, expose to the
+/// `__rpiRuntimeKey` in action arguments. Never log, persist, expose to the
 /// model, or reuse these values across tool calls. Missing values mean the
-/// host cannot support worker-originated ChildAgent safely; fail closed.
+/// host cannot authenticate worker-originated run actions; fail closed.
 ///
 /// **Consequence for plugin parameter types:** a plugin must tolerate unknown
 /// top-level keys in its arguments. Reading them out of a `serde_json::Value`
@@ -1201,7 +1203,7 @@ pub enum RuntimeActionId {
     /// Safe live execution metadata (no credentials, endpoints or headers).
     /// Args: `{}`; result: model identity, thinkingLevel, tools, cwd, sessionId.
     GetExecutionContext = 23,
-    /// Host-owned independent child run. `op`: start/poll/cancel/dispose.
+    /// Compatibility action for existing delegation extensions. `op`: start/poll/cancel/dispose.
     /// Start: task, optional role/maxTurns/timeoutSeconds/tools/toolCallId.
     /// Others: childId. Poll drains text deltas and returns status/result.
     /// Handles are scoped to the calling plugin and must be disposed.
@@ -1304,6 +1306,11 @@ pub enum RuntimeActionId {
     /// that wants to contribute candidates registers an autocomplete provider
     /// through [`PluginApi::register_autocomplete_provider`].
     GetEditorText = 32,
+    /// Start or control an independent, invocation-bound, in-memory run.
+    /// Start takes `input`, `maxTurns`, `timeoutSeconds`, and optional `tools`.
+    /// Poll, cancel and dispose take `runId`. The caller must dispose finished
+    /// runs. Tool selection can only narrow the parent's active tools.
+    IndependentRun = 33,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1357,6 +1364,7 @@ impl TryFrom<u32> for RuntimeActionId {
             30 => Ok(Self::ToolProgram),
             31 => Ok(Self::ReloadModels),
             32 => Ok(Self::GetEditorText),
+            33 => Ok(Self::IndependentRun),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1403,6 +1411,7 @@ impl RuntimeActionId {
         Self::ToolProgram,
         Self::ReloadModels,
         Self::GetEditorText,
+        Self::IndependentRun,
     ];
 
     /// The highest defined action id.
@@ -1512,9 +1521,14 @@ pub type CommandArgumentCompletionFn =
 /// payload (for example `{"customType":"token-usage","usage":{...}}`);
 /// entry renderers receive `{"customType":"...","data":...}`. Message and
 /// entry renderers return `{"text":"...","markdown":true|false}` or
-/// `{"lines":["..."]}` for terminal UI. Markdown transformers return
-/// `{"markdown":"..."}`. The rendered value is one transcript row/component,
-/// not an arbitrary component tree.
+/// `{"lines":["..."]}` for terminal UI. Entry renderers may instead return
+/// `{"display":false}` with status `0` to claim an entry without displaying it:
+/// no component, spacer or raw-text fallback is added. Only the boolean `false`
+/// hides; it takes precedence over `text` and `lines`. This is entry-only and
+/// requires a host implementing explicit visibility (older hosts may fall back
+/// to raw text). Non-zero status still means unhandled, not hidden.
+/// Markdown transformers return `{"markdown":"..."}`. The rendered value is
+/// one transcript row/component, not an arbitrary component tree.
 pub type RenderFn =
     extern "C" fn(input_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
@@ -1805,6 +1819,10 @@ pub const RPI_PLUGIN_ABI_VERSION_UNIFIED: u32 = 4;
 /// The unversioned symbol for the unified ABI.
 pub const REGISTER_SYMBOL_UNIFIED: &[u8] = b"rpi_plugin_register\0";
 
+/// Optional export that opts a library into repeated, concurrent registration
+/// in one mapped image. See [`export_shared_plugin!`] for the contract.
+pub const SHARED_SESSIONS_SYMBOL_V1: &[u8] = b"rpi_plugin_shared_sessions_v1\0";
+
 /// The host-provided API struct. The first two fields (`abi_version`
 /// and `struct_size`) are contract-identity markers that survive future
 /// signature changes: a plugin reads them from the pointer before anything
@@ -1878,8 +1896,11 @@ pub struct PluginApi {
     /// Register a renderer for session custom entries. The host invokes it with
     /// `{"customType":"...","data":...}` and accepts the same single-row
     /// output as [`RenderFn`]: `{"text":"...","markdown":true|false}` or
-    /// `{"lines":["..."]}`. A renderer is tried in registration order; the
-    /// first valid JSON response wins.
+    /// `{"lines":["..."]}`, or `{"display":false}` for an explicitly hidden
+    /// entry (no component, spacer or fallback text). A renderer is tried in
+    /// registration order; the first valid JSON response with status `0` wins,
+    /// including a hidden response. Non-zero means unhandled. No ABI change is
+    /// needed; hosts predating explicit visibility may still render raw text.
     pub register_entry_renderer: Option<
         extern "C" fn(
             name: StbStringRef,
@@ -2270,11 +2291,32 @@ pub fn guard_or<R>(fallback: R, body: impl FnOnce() -> R) -> R {
 #[macro_export]
 macro_rules! export_plugin {
     ($body:expr) => {
+        // The loader calls this ABI entrypoint with a live vtable pointer.
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         #[no_mangle]
         pub extern "C" fn rpi_plugin_register(api: *const $crate::PluginApi) -> i32 {
             // SAFETY: host guarantees `api` is valid for this call.
             unsafe { $crate::register_entrypoint(api, $body) }
         }
+    };
+}
+
+/// Export a plugin that supports multiple registrations in one library image.
+///
+/// A Host may register concurrently and may stop, reload, or fail one
+/// registration while others continue. Keep session state and host callback
+/// context with their owning registration or with individual call handles.
+/// Any shared state must be thread safe and independent of session lifetimes.
+/// A shutdown callback must release only its own registration's resources,
+/// including after a partially failed registration. Closing the last session
+/// does not reset library globals. Older hosts use the standard entrypoint.
+#[macro_export]
+macro_rules! export_shared_plugin {
+    ($body:expr) => {
+        $crate::export_plugin!($body);
+
+        #[no_mangle]
+        pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
     };
 }
 
@@ -2783,6 +2825,7 @@ mod tests {
             RuntimeActionId::ToolProgram,
             RuntimeActionId::ReloadModels,
             RuntimeActionId::GetEditorText,
+            RuntimeActionId::IndependentRun,
         ];
 
         // Stable wire ids must not depend on which proposal was merged first.
@@ -2804,7 +2847,8 @@ mod tests {
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::StopRound));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ReloadModels));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::GetEditorText));
-        assert_eq!(RuntimeActionId::MAX, 32);
+        assert_eq!(u32::from(RuntimeActionId::IndependentRun), 33);
+        assert_eq!(RuntimeActionId::MAX, 33);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         let one_past_last = RuntimeActionId::MAX + 1;

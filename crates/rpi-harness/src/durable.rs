@@ -34,7 +34,11 @@ pub const MAX_EXECUTION_PAGE_RECORDS: usize = 64;
 /// Reserved control types cannot be authored by public custom-entry APIs.
 /// Durable control records are owned by the latest native durable protocol.
 pub(crate) fn reserved_control_type(custom_type: &str) -> bool {
-    custom_type.starts_with("rpi.durable.")
+    custom_type.starts_with("rpi.durable.") || reserved_host_admission_type(custom_type)
+}
+
+pub(crate) fn reserved_host_admission_type(custom_type: &str) -> bool {
+    custom_type.starts_with("rpi.host.admission.")
 }
 #[derive(Clone)]
 pub struct DurableService {

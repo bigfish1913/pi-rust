@@ -42,7 +42,7 @@ Session mutation sequence. The host adapter preserves the existing typed frame
 payloads and discriminator rules. Primary JSONL history still needs a full
 initial scan; extracting a reducer alone does not make startup bounded.
 
-This is a **native library**, distinct from the existing `rpi-package`
+This is a **native library**, distinct from the existing `rpi-extension`
 `rpi-durable` workflow plugin. This step neither loads both packages into one
 workspace nor replaces the plugin. Before a future release/integration, the
 native/library and plugin naming/version ownership must be reconciled explicitly.

@@ -29,6 +29,7 @@ struct Inner {
     registry: Mutex<Registry>,
     capacity: Arc<Semaphore>,
     revision: Arc<AtomicU64>,
+    tasks: crate::host::cli_tasks::CliTaskScope,
 }
 impl Default for Inner {
     fn default() -> Self {
@@ -36,6 +37,7 @@ impl Default for Inner {
             registry: Mutex::new(Registry::default()),
             capacity: Arc::new(Semaphore::new(8)),
             revision: Arc::new(AtomicU64::new(1)),
+            tasks: crate::host::cli_tasks::CliTaskScope::default(),
         }
     }
 }
@@ -46,6 +48,7 @@ struct Registry {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
+        self.tasks.seal();
         for thread in self
             .registry
             .lock()
@@ -64,6 +67,7 @@ struct Thread {
     reference: String,
     sink: SideQuestionSink,
     runtime: tokio::runtime::Handle,
+    tasks: crate::host::cli_tasks::CliTaskAdmission,
     retired: CancellationToken,
     revision: Arc<AtomicU64>,
     state: Mutex<ThreadState>,
@@ -129,10 +133,13 @@ impl Job {
     }
     fn observe(&self, event: AgentEvent) {
         if let AgentEvent::MessageUpdate {
-            assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
+            assistant_message_event,
             ..
         } = event
         {
+            let AssistantMessageEvent::TextDelta { delta, .. } = *assistant_message_event else {
+                return;
+            };
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.status != "running" {
                 return;
@@ -196,8 +203,9 @@ impl Thread {
         // No provider calls while holding the thread or registry mutex.
         for request in pending {
             request.job.finish("cancelled", None);
-            self.runtime.spawn(async move {
-                let _ = request.child.harness.close().await;
+            let settlement = self.tasks.clone();
+            self.tasks.spawn(&self.runtime, async move {
+                settle_prepared(request.child, &settlement).await;
             });
         }
         self.changed();
@@ -243,6 +251,26 @@ impl Thread {
     }
 }
 impl SideQuestions {
+    pub(crate) fn begin_shutdown(&self) {
+        self.0.tasks.seal();
+        let threads = std::mem::take(
+            &mut self
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .threads,
+        );
+        // Retire and drop sinks outside the registry lock. Removed threads and
+        // cleanup continuations remain covered by their admission capabilities.
+        for thread in threads.into_values() {
+            thread.retire();
+        }
+    }
+    #[allow(dead_code)] // Staged until the CLI's complete resource owner is wired.
+    pub(crate) async fn wait_shutdown(&self) -> Result<(), String> {
+        self.0.tasks.wait().await
+    }
     pub(crate) fn revision(&self) -> u64 {
         self.0.revision.load(Ordering::SeqCst)
     }
@@ -297,6 +325,34 @@ impl SideQuestions {
         args: Value,
         sink: SideQuestionSink,
     ) -> Result<Value, String> {
+        let admission = self.0.tasks.admit()?;
+        if matches!(args["op"].as_str(), Some("start" | "new" | "show")) {
+            let service = self.clone();
+            let parent = parent.clone();
+            return self
+                .0
+                .tasks
+                .call(async move {
+                    service
+                        .handle_inner(&parent, owner, args, sink, admission)
+                        .await
+                })
+                .await?;
+        }
+        self.handle_inner(parent, owner, args, sink, admission)
+            .await
+    }
+    async fn handle_inner(
+        &self,
+        parent: &AgentHarness,
+        owner: u64,
+        args: Value,
+        sink: SideQuestionSink,
+        admission: crate::host::cli_tasks::CliTaskAdmission,
+    ) -> Result<Value, String> {
+        if self.0.tasks.signal().is_cancelled() {
+            return Err("native auxiliary resources are retiring".into());
+        }
         let op = args["op"]
             .as_str()
             .ok_or("missing side question operation")?;
@@ -388,7 +444,9 @@ impl SideQuestions {
                 .await
                 .map_err(|e| e.to_string())?;
             let scope = anchor.scope.clone();
-            let _ = anchor.harness.close().await;
+            if !settle_prepared(anchor, &admission).await {
+                return Err("side question anchor cleanup failed".into());
+            }
             let candidate = Arc::new(Thread {
                 owner,
                 id,
@@ -396,7 +454,8 @@ impl SideQuestions {
                 reference,
                 sink: sink.clone(),
                 runtime: tokio::runtime::Handle::current(),
-                retired: CancellationToken::new(),
+                tasks: admission.clone(),
+                retired: self.0.tasks.signal().child_token(),
                 revision: self.0.revision.clone(),
                 state: Mutex::new(ThreadState {
                     turns: Vec::new(),
@@ -412,6 +471,7 @@ impl SideQuestions {
             let selected = {
                 let mut registry = self.0.registry.lock().unwrap_or_else(|e| e.into_inner());
                 if registry.revoked.contains(&owner)
+                    || self.0.tasks.signal().is_cancelled()
                     || scope.is_cancelled()
                     || parent.session().storage().metadata().id != session_id
                 {
@@ -432,7 +492,7 @@ impl SideQuestions {
                 let weak = Arc::downgrade(&candidate);
                 let registry = Arc::downgrade(&self.0);
                 let retired = candidate.retired.clone();
-                tokio::spawn(async move {
+                candidate.tasks.spawn(&candidate.runtime, async move {
                     tokio::select! {
                         _ = retired.cancelled() => {},
                         _ = scope.cancelled() => {
@@ -483,7 +543,7 @@ impl SideQuestions {
                     job: job.clone(),
                     child,
                 });
-                let admission = (|| {
+                let queue_admission = (|| {
                     thread.check()?;
                     if prepared.as_ref().unwrap().child.scope.is_cancelled()
                         || parent.session().storage().metadata().id != session_id
@@ -515,16 +575,16 @@ impl SideQuestions {
                     state.pending.push_back(prepared.take().unwrap());
                     Ok((queued, permit))
                 })();
-                let (queued, permit) = match admission {
+                let (queued, permit) = match queue_admission {
                     Ok(v) => v,
                     Err(error) => {
-                        let _ = prepared.unwrap().child.harness.close().await;
+                        settle_prepared(prepared.unwrap().child, &admission).await;
                         return Err(error);
                     }
                 };
                 if let Some(permit) = permit {
                     let t = thread.clone();
-                    tokio::spawn(async move {
+                    thread.tasks.spawn(&thread.runtime, async move {
                         worker(t, permit).await;
                     });
                 }
@@ -550,6 +610,17 @@ fn memory_session(id: &str, parent: &str) -> Session {
         )),
         None,
     )
+}
+async fn settle_prepared(
+    child: ChildHarness,
+    settlement: &crate::host::cli_tasks::CliTaskAdmission,
+) -> bool {
+    let settled = child.harness.close().await.is_ok();
+    if !settled {
+        settlement.mark_unknown();
+    }
+    child.execution_scope.wait_idle().await;
+    settled
 }
 async fn worker(thread: Arc<Thread>, _permit: OwnedSemaphorePermit) {
     loop {
@@ -623,7 +694,7 @@ async fn worker(thread: Arc<Thread>, _permit: OwnedSemaphorePermit) {
             if thread.check().is_err() {
                 job.finish("cancelled", None);
             }
-            run(request.child, job.clone(), prompt, TIMEOUT).await;
+            run(request.child, job.clone(), prompt, TIMEOUT).await?;
             Ok::<(), String>(())
         })
         .catch_unwind()
@@ -633,7 +704,9 @@ async fn worker(thread: Arc<Thread>, _permit: OwnedSemaphorePermit) {
             Ok(Err(error)) => job.finish("failed", Some(error)),
             Err(_) => job.finish("failed", Some("side question runner panicked".into())),
         }
-        let _ = cleanup.close().await;
+        if cleanup.close().await.is_err() {
+            thread.tasks.mark_unknown();
+        }
         execution_scope.wait_idle().await;
         {
             let mut state = thread.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -643,7 +716,12 @@ async fn worker(thread: Arc<Thread>, _permit: OwnedSemaphorePermit) {
         }
     }
 }
-async fn run(child: ChildHarness, job: Arc<Job>, prompt: String, timeout: Duration) {
+async fn run(
+    child: ChildHarness,
+    job: Arc<Job>,
+    prompt: String,
+    timeout: Duration,
+) -> Result<(), String> {
     let lane = child.harness.lane("main");
     let run = child
         .execution_scope
@@ -706,7 +784,11 @@ async fn run(child: ChildHarness, job: Arc<Job>, prompt: String, timeout: Durati
         let _ = child.harness.close().await;
         let _ = tokio::time::timeout(Duration::from_secs(2), &mut run).await;
     }
-    let _ = child.harness.close().await;
+    child
+        .harness
+        .close()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
