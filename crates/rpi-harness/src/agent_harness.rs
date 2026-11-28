@@ -599,6 +599,7 @@ pub trait AgentLane: Send + Sync {
 /// loop on `main`. The `signal` is a child of the harness root token; cancel it
 /// to abort. `idle` fires when the guard is released.
 struct ActiveRun {
+    preserve_injected_queues: bool,
     /// The durable operation ended, but its final callbacks still own admission.
     finishing: bool,
     /// Recovery can replay external tools, so it cannot hold message_writes.
@@ -1051,6 +1052,26 @@ impl AgentHarness {
                 .map(|m| m.into_message())
                 .collect(),
         })
+    }
+
+    /// Cancel the current operation on this lane and preserve its pending
+    /// steering and follow-up messages until a later run. Return whether there
+    /// was an operation to signal, independently of its eventual settlement.
+    pub fn stop_preserving_queue(&self) -> HarnessResult<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        let Some(active) = inner
+            .active_run
+            .as_mut()
+            .filter(|run| run.lane == self.lane)
+        else {
+            return Ok(false);
+        };
+        active.preserve_injected_queues = true;
+        active.signal.cancel();
+        Ok(true)
     }
 
     /// "Finish the current turn, then stop" — the gentle counterpart of abort.
@@ -3203,6 +3224,10 @@ impl AgentHarness {
         if inner.closed {
             return Err(HarnessError::closed());
         }
+        // Check under the same lock that publishes and stops an active run.
+        if crate::execution::ExecutionRequest::current_admission_cancelled() {
+            return Err(HarnessError::agent("Operation aborted before admission"));
+        }
         if let Some(active) = &inner.active_run {
             return Err(HarnessError::lane_busy(
                 self.lane.clone(),
@@ -3236,6 +3261,7 @@ impl AgentHarness {
             .filter(|_| self.lane == "main")
             .map(|observer| crate::execution::ExecutionLease::new(observer, &self.lane));
         inner.active_run = Some(ActiveRun {
+            preserve_injected_queues: false,
             finishing: false,
             recovering: true,
             run_id: run_id.clone(),
@@ -3499,7 +3525,19 @@ impl AgentHarness {
         settle: &Arc<crate::settle::SettleState>,
     ) -> Vec<AgentMessage> {
         let _gate = self.message_writes.lock().await;
-        let reservation = QueueReservation::reserve(queue, &self.lane, false);
+        let reservation = {
+            // Serialize reservation with Stop. Both drain hooks honor the
+            // active run's flag for its whole lifetime.
+            let inner = self.inner.lock().unwrap();
+            if inner
+                .active_run
+                .as_ref()
+                .is_some_and(|run| run.lane == self.lane && run.preserve_injected_queues)
+            {
+                return Vec::new();
+            }
+            QueueReservation::reserve(queue, &self.lane, false)
+        };
         let mut messages = Vec::with_capacity(reservation.items.len());
         for item in &reservation.items {
             settle.push_injected(item.entry_id.clone(), item.message.clone());
