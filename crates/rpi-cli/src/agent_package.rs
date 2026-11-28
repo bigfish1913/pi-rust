@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::resource_management::Scope;
-use crate::resource_selection::{contained, file, read_limited, relative};
+use crate::resource_selection::{contained, file, read_limited, relative, validate_tool_names};
 
 mod distribution;
 pub(crate) use distribution::install;
@@ -114,6 +114,8 @@ impl Manifest {
                 "invalid {MANIFEST} schema, package identity, or command count"
             ));
         }
+        validate_tool_names(&manifest.agent.tools)
+            .map_err(|error| format!("invalid {MANIFEST}: {error}"))?;
         for path in &manifest.agent.instructions {
             package_file(root, path)?;
         }
@@ -305,4 +307,38 @@ pub(crate) fn prepare_launch(name: &str, cwd: &Path) -> Result<Launch, String> {
         session_dir,
         _lease: lease,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_rejects_empty_and_duplicate_tool_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for (tools, valid) in [
+            (vec![], true),
+            (vec!["read", "bash"], true),
+            (vec![""], false),
+            (vec!["read", "read"], false),
+        ] {
+            let manifest = json!({
+                "schema_version": 1,
+                "name": "fixture",
+                "version": "0.1.0",
+                "agent": {"instructions": [], "tools": tools},
+            });
+            std::fs::write(root.join(MANIFEST), manifest.to_string()).unwrap();
+            let result = Manifest::read(&root, "fixture", Some("0.1.0"));
+            if valid {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(
+                    result.err().as_deref(),
+                    Some("invalid rpi-package.json: empty or duplicate tool name")
+                );
+            }
+        }
+    }
 }

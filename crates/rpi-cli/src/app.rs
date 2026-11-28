@@ -308,6 +308,10 @@ async fn run_inner() -> i32 {
     }
 
     if parsed.host.is_some() {
+        if package_name.is_some() {
+            eprintln!("error: --host cannot be combined with `rpi run package`");
+            return EXIT_USAGE;
+        }
         if dev_options.is_some() {
             eprintln!("error: --host cannot be combined with dev/dev-local");
             return EXIT_USAGE;

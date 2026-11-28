@@ -249,6 +249,16 @@ pub(crate) fn relative(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_tool_names(names: &[String]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for name in names {
+        if name.is_empty() || !seen.insert(name) {
+            return Err("empty or duplicate tool name".into());
+        }
+    }
+    Ok(())
+}
+
 impl ResolvedSelection {
     pub fn load(args: &Args, cwd: &Path, trusted: bool) -> Result<Option<Self>, String> {
         Self::load_for(&crate::config::AgentHome::process(), args, cwd, trusted)
@@ -317,12 +327,7 @@ impl ResolvedSelection {
             return Err("unsupported resource config version".into());
         }
         if let ToolSelection::Only { names } = &selection.tools {
-            let mut seen = HashSet::new();
-            for name in names {
-                if name.is_empty() || !seen.insert(name) {
-                    return Err("empty or duplicate tool name".into());
-                }
-            }
+            validate_tool_names(names)?;
         }
         let mut skills = Vec::new();
         let mut extensions = Vec::new();
