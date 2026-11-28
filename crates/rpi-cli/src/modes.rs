@@ -18,18 +18,23 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::io::{BufRead, IsTerminal, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use rpi_agent::events::AgentEvent;
 use rpi_ai::types::{AssistantMessage, Content, ImageContent, StopReason, UserMessage};
 use rpi_harness::agent_harness::{
-    AgentHarness, AgentLane, CompactionOutcome, CompactionResult, HarnessRunOutcome,
+    AgentHarness, AgentLane, CompactionOutcome, CompactionResult, HarnessRunOutcome, RunResult,
 };
-use rpi_harness::events::{HarnessEvent, RunEndOutcome};
+use rpi_harness::events::{HarnessEvent, RunEndOutcome, WatchHandle, WatchListener};
+use rpi_harness::result::HarnessResult;
 use rpi_harness::session::session::SessionEntryCommit;
 use rpi_harness::session::types::{
     BranchBounds, Entry, EntryCursor, EntryOrder, EntryQuery, LaneRecord, RecordQuery,
 };
+
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::args::Args;
 use crate::rpc::protocol as rpc_protocol;
@@ -56,6 +61,17 @@ pub fn outcome_exit_code(outcome: &HarnessRunOutcome) -> i32 {
     }
 }
 
+/// Batch modes use a Tokio task so the durable run future fits on Windows
+/// worker stacks even when the CLI is entered on the process main thread.
+fn spawn_batch_prompt(
+    lane: &Arc<dyn AgentLane>,
+    prompt: String,
+    images: Vec<ImageContent>,
+) -> tokio::task::JoinHandle<HarnessResult<RunResult>> {
+    let lane = Arc::clone(lane);
+    tokio::spawn(async move { lane.prompt_text(&prompt, images).await })
+}
+
 /// `print` mode: send the initial message (prompt text + inline `@file`
 /// expansions), then any follow-up messages, print the final assistant text,
 /// return the exit code. Mirrors TS `runPrintMode` (text).
@@ -72,35 +88,9 @@ pub async fn print(
     let mut persistence_failed = false;
     let mut last_msg: Option<AssistantMessage> = None;
 
-    // The initial prompt (and its `@file` attachments) go in one user message;
-    // extra positionals are separate prompts (mirrors the TS loop).
-    let mut prompts: Vec<String> = Vec::new();
-    if let Some(init) = initial {
-        prompts.push(init);
-    }
-    for m in extra_messages {
-        prompts.push(m.clone());
-    }
-
-    if prompts.is_empty() {
-        // Nothing to do — print mode with no prompt is a no-op success.
-        return 0;
-    }
-
     let mut images = initial_images;
-    for prompt in prompts {
-        let run_lane = Arc::clone(&lane);
-        let run_images = std::mem::take(&mut images);
-        // Keep the harness future on a Tokio worker rather than the Windows
-        // process-main stack. The durable run future is intentionally large
-        // (it owns recovery, context, and settlement state); RPC already runs
-        // prompts on a worker, while print mode used to poll it directly and
-        // overflow the small process-main stack before the provider request.
-        let outcome = match tokio::spawn(
-            async move { run_lane.prompt_text(&prompt, run_images).await },
-        )
-        .await
-        {
+    for prompt in initial.into_iter().chain(extra_messages.iter().cloned()) {
+        let outcome = match spawn_batch_prompt(&lane, prompt, std::mem::take(&mut images)).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 eprintln!("print run task failed: {error}");
@@ -197,29 +187,52 @@ pub async fn json(
     initial: Option<String>,
     extra_messages: &[String],
     initial_images: Vec<ImageContent>,
-    mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+) -> i32 {
+    json_with_harness_events(
+        harness,
+        initial,
+        extra_messages,
+        initial_images,
+        agent_events,
+        Arc::new(emit_json_event),
+    )
+    .await
+}
+
+struct JsonHarnessSubscription(WatchHandle<()>);
+
+impl JsonHarnessSubscription {
+    fn start(harness: &AgentHarness, listener: WatchListener) -> Self {
+        let mut watch = harness.events().watch(|| ());
+        watch.start(listener);
+        Self(watch)
+    }
+}
+
+impl Drop for JsonHarnessSubscription {
+    fn drop(&mut self) {
+        self.0.unsubscribe();
+    }
+}
+
+async fn json_with_harness_events(
+    harness: &AgentHarness,
+    initial: Option<String>,
+    extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
+    agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    on_harness_event: WatchListener,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
-    let collected: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let collected_for_watch = collected.clone();
-
-    // A watch captures every event (RunStart fires inline during prompt_text,
-    // before a post-call listener could attach — same reason as the M5g test).
-    let mut watch = harness.events().watch(|| ());
-    watch.start(Arc::new(move |event: &HarnessEvent| {
-        // Emit each event live as JSON, and also buffer for the final summary.
-        emit_json_event(event);
-        collected_for_watch.lock().unwrap().push(event.clone());
-    }));
-    // Keep the watch alive for the whole run. Leaking is acceptable for a
-    // single-shot CLI process (the bus outlives this scope anyway).
-    std::mem::forget(watch);
+    // Register before prompting because RunStart is emitted inline.
+    let subscription = JsonHarnessSubscription::start(harness, on_harness_event);
 
     // The harness bus carries run lifecycle events; the agent receiver carries
     // the native fine-grained stream (turns, message deltas, and tools).
     let (agent_done_tx, mut agent_done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let agent_event_task = agent_events.take().map(|mut rx| {
-        tokio::spawn(async move {
+    let agent_event_task = agent_events.map(|mut rx| {
+        AbortOnDropHandle::new(tokio::spawn(async move {
             let done_tx = agent_done_tx;
             loop {
                 match rx.recv().await {
@@ -234,24 +247,21 @@ pub async fn json(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        })
+        }))
     });
-
-    let mut prompts: Vec<String> = Vec::new();
-    if let Some(init) = initial {
-        prompts.push(init);
-    }
-    for m in extra_messages {
-        prompts.push(m.clone());
-    }
 
     let mut last_exit = 0;
     let mut persistence_failed = false;
     let mut final_outcome: Option<HarnessRunOutcome> = None;
 
     let mut images = initial_images;
-    for prompt in prompts {
-        match lane.prompt_text(&prompt, std::mem::take(&mut images)).await {
+    for prompt in initial.into_iter().chain(extra_messages.iter().cloned()) {
+        let task = spawn_batch_prompt(&lane, prompt, std::mem::take(&mut images));
+        let result = match AbortOnDropHandle::new(task).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(error) => Err(format!("JSON run task failed: {error}")),
+        };
+        let rejected = match result {
             Ok(result) => {
                 // The harness resolves after its run outcome, while the
                 // broadcast listener may still be scheduling the terminal
@@ -265,26 +275,13 @@ pub async fn json(
                 .await;
                 last_exit = outcome_exit_code(&result.outcome);
                 final_outcome = Some(result.outcome);
+                false
             }
-            Err(e) => {
-                // Emit a structured error line + exit.
-                let line = serde_json::json!({
-                    "type": "error",
-                    "error": e.to_string(),
-                });
-                println!("{line}");
-                for failure in lane.take_write_failures() {
-                    println!(
-                        "{}",
-                        serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
-                    );
-                }
-                if let Some(task) = agent_event_task {
-                    task.abort();
-                }
-                return 1;
+            Err(error) => {
+                println!("{}", serde_json::json!({"type": "error", "error": error}));
+                true
             }
-        }
+        };
         for failure in lane.take_write_failures() {
             persistence_failed = true;
             println!(
@@ -292,6 +289,14 @@ pub async fn json(
                 serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
             );
         }
+        if rejected {
+            return 1;
+        }
+    }
+    drop(subscription);
+    if let Some(task) = agent_event_task {
+        task.abort();
+        let _ = task.await;
     }
 
     // Terminal result summary.
@@ -320,9 +325,6 @@ pub async fn json(
         last_exit = 1;
     }
     println!("{result_line}");
-    if let Some(task) = agent_event_task {
-        task.abort();
-    }
     last_exit
 }
 
@@ -3621,6 +3623,55 @@ mod tests {
         AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
     };
     use rpi_harness::session::types::OperationError;
+
+    #[tokio::test]
+    async fn json_batch_releases_subscriptions_between_invocations() {
+        use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+
+        let provider = FauxProvider::new(
+            FauxScript::new()
+                .with_text("one")
+                .with_text("two")
+                .with_text("three"),
+        );
+        let (agent_events, _) = tokio::sync::broadcast::channel(64);
+        let harness = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+            model: provider.default_model().clone(),
+            models: vec![provider],
+            agent_emitter: Some(Arc::new(rpi_agent::events::BroadcastEmitter::from_sender(
+                agent_events.clone(),
+            ))),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        for (prompt, extras) in [("first", vec!["follow-up".into()]), ("second", vec![])] {
+            let captured = Arc::clone(&events);
+            let result = json_with_harness_events(
+                &harness,
+                Some(prompt.into()),
+                &extras,
+                vec![],
+                Some(agent_events.subscribe()),
+                Arc::new(move |event| captured.lock().unwrap().push(event.type_tag())),
+            )
+            .await;
+            assert_eq!(result, 0);
+            assert_eq!(agent_events.receiver_count(), 0);
+        }
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "run_start",
+                "run_end",
+                "run_start",
+                "run_end",
+                "run_start",
+                "run_end"
+            ]
+        );
+    }
 
     /// `get_queue` reports `NextRun` as `nextRun`; editing that item in the
     /// Web UI cancels it and re-submits the reported name. It must not be

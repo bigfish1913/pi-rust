@@ -1645,6 +1645,56 @@ impl JsonlSessionStorage {
         self.metadata.clone()
     }
 
+    /// Verify the source that is about to be replaced while the writer tail
+    /// is held. A checkpoint seeds the revision; subsequent lines advance it
+    /// just as they do during replay. Unreadable mutations block publication.
+    async fn verified_replacement_header(
+        &self,
+        expected: HistoryIdentity,
+    ) -> SessionResult<(JsonlV4Header, Option<HistoryCheckpoint>)> {
+        let content = file_result(
+            self.fs.read_text_file(&self.metadata.path, None).await,
+            "read JSONL history for replacement",
+        )?;
+        let mut lines = content.lines();
+        let header = parse_header(lines.next().unwrap_or_default()).map_err(|e| {
+            SessionError::invalid_entry(format!("parse JSONL replacement header: {e}"))
+        })?;
+        if header.id != self.metadata.id || header.history_generation() != expected.generation {
+            return Err(SessionError::storage(
+                "history replacement header identity conflict",
+            ));
+        }
+        let checkpoint = history_checkpoint(&header)
+            .map_err(|e| SessionError::invalid_entry(format!("parse JSONL checkpoint: {e}")))?;
+        let initial_revision = checkpoint
+            .as_ref()
+            .map_or(0, |image| image.history_identity.revision);
+        let revision = lines.filter(|line| !line.trim().is_empty()).try_fold(
+            initial_revision,
+            |latest, line| {
+                let mutation = parse_mutation(line).map_err(|error| {
+                    SessionError::invalid_entry(format!(
+                        "parse JSONL replacement mutation: {error}"
+                    ))
+                })?;
+                let seq = mutation.seq();
+                if seq <= latest {
+                    return Err(SessionError::invalid_entry(format!(
+                        "out-of-order JSONL replacement mutation at sequence {seq}"
+                    )));
+                }
+                Ok(seq)
+            },
+        )?;
+        if revision != expected.revision {
+            return Err(SessionError::storage(
+                "history replacement revision conflict during publication",
+            ));
+        }
+        Ok((header, checkpoint))
+    }
+
     async fn replace_history_owned(
         &self,
         expected_revision: u64,
@@ -1678,46 +1728,13 @@ impl JsonlSessionStorage {
         let next_generation = expected_generation
             .checked_add(1)
             .ok_or_else(|| SessionError::storage("history replacement generation exhausted"))?;
-        let content = file_result(
-            self.fs.read_text_file(&self.metadata.path, None).await,
-            "read JSONL history for replacement",
-        )?;
-        let header_line = content
-            .split_once('\n')
-            .map(|(line, _)| line)
-            .unwrap_or(content.as_str())
-            .trim_end_matches('\r');
-        let physical_revision = content
-            .split_terminator('\n')
-            .skip(1)
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                parse_mutation(line.trim_end_matches('\r'))
-                    .map(|mutation| mutation.seq())
-                    .map_err(|error| {
-                        SessionError::invalid_entry(format!(
-                            "parse JSONL replacement mutation: {error}"
-                        ))
-                    })
+        let (mut header, checkpoint) = self
+            .verified_replacement_header(HistoryIdentity {
+                revision: expected_revision,
+                generation: expected_generation,
             })
-            .try_fold(0u64, |maximum, seq| seq.map(|seq| maximum.max(seq)))?;
-        if physical_revision != expected_revision {
-            return Err(SessionError::storage(
-                "history replacement revision conflict during publication",
-            ));
-        }
-        let mut header = parse_header(header_line).map_err(|e| {
-            SessionError::invalid_entry(format!("parse JSONL replacement header: {e}"))
-        })?;
-        if header.id != self.metadata.id || header.history_generation() != expected_generation {
-            return Err(SessionError::storage(
-                "history replacement header identity conflict",
-            ));
-        }
-        if history_checkpoint(&header)
-            .map_err(|e| SessionError::invalid_entry(format!("parse JSONL checkpoint: {e}")))?
-            .is_some()
-        {
+            .await?;
+        if checkpoint.is_some() {
             return Err(SessionError::storage(
                 "checkpoint history requires checkpoint replacement",
             ));
@@ -1780,41 +1797,9 @@ impl JsonlSessionStorage {
             .checked_add(1)
             .ok_or_else(|| SessionError::storage("history replacement generation exhausted"))?;
         let candidate = ResidentState::from_checkpoint(checkpoint.state.clone())?;
-        let content = file_result(
-            self.fs.read_text_file(&self.metadata.path, None).await,
-            "read JSONL history for checkpoint replacement",
-        )?;
-        let header_line = content
-            .split_once('\n')
-            .map(|(line, _)| line)
-            .unwrap_or(content.as_str())
-            .trim_end_matches('\r');
-        let mut header = parse_header(header_line).map_err(|e| {
-            SessionError::invalid_entry(format!("parse JSONL checkpoint header: {e}"))
-        })?;
-        if header.id != self.metadata.id || header.history_generation() != expected_generation {
-            return Err(SessionError::storage(
-                "history checkpoint header identity conflict",
-            ));
-        }
-        let header_revision = history_checkpoint(&header)
-            .map_err(|e| SessionError::invalid_entry(format!("parse JSONL checkpoint: {e}")))?
-            .map(|image| image.history_identity.revision);
-        if header_revision.unwrap_or_else(|| {
-            content
-                .split_terminator('\n')
-                .skip(1)
-                .filter(|line| !line.trim().is_empty())
-                .filter_map(|line| parse_mutation(line.trim_end_matches('\r')).ok())
-                .map(|mutation| mutation.seq())
-                .max()
-                .unwrap_or(0)
-        }) != expected_revision
-        {
-            return Err(SessionError::storage(
-                "history checkpoint revision conflict during publication",
-            ));
-        }
+        let (mut header, _) = self
+            .verified_replacement_header(checkpoint.history_identity)
+            .await?;
         let archive = checkpoint.receipt_archive;
         let mut published = HistoryCheckpoint::new(
             HistoryIdentity {
@@ -3693,6 +3678,82 @@ mod tests {
             Some(content.len() as u64),
             "reopened JSONL must observe the same published physical image"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_replacement_accounts_for_appended_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, storage, clock, ids) = session_on_disk(&temp).await;
+        let initial = storage.history_identity().await.unwrap();
+        let checkpoint = SessionState::new().history_checkpoint(initial).unwrap();
+        let first = storage
+            .replace_history_with_checkpoint_if_revision_and_generation(
+                initial.revision,
+                initial.generation,
+                checkpoint,
+            )
+            .await
+            .unwrap();
+        let stale =
+            JsonlSessionStorage::load(fs.clone(), "session.jsonl", clock.clone(), ids.clone())
+                .await
+                .unwrap();
+        storage
+            .append_entry(provisioned_message("after-checkpoint"), "main")
+            .await
+            .unwrap();
+        let before = fs.read_text_file("session.jsonl", None).await.unwrap();
+        storage.release_writer_lease();
+        let stale_image = SessionState::new().history_checkpoint(first).unwrap();
+        let error = stale
+            .replace_history_with_checkpoint_if_revision_and_generation(
+                first.revision,
+                first.generation,
+                stale_image,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("revision conflict"));
+        assert_eq!(
+            fs.read_text_file("session.jsonl", None).await.unwrap(),
+            before
+        );
+        stale.release_writer_lease();
+
+        let current =
+            JsonlSessionStorage::load(fs.clone(), "session.jsonl", clock.clone(), ids.clone())
+                .await
+                .unwrap();
+        let identity = current.history_identity().await.unwrap();
+        let state = current
+            .state
+            .lock()
+            .await
+            .clone()
+            .into_detached()
+            .await
+            .unwrap();
+        let published = current
+            .replace_history_with_checkpoint_if_revision_and_generation(
+                identity.revision,
+                identity.generation,
+                state.history_checkpoint(identity).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(published.revision, identity.revision);
+        assert_eq!(published.generation, first.generation + 1);
+        current.release_writer_lease();
+
+        let reopened = JsonlSessionStorage::load(fs, "session.jsonl", clock, ids)
+            .await
+            .unwrap();
+        assert_eq!(reopened.history_identity().await.unwrap(), published);
+        assert!(reopened
+            .get_entry("after-checkpoint")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

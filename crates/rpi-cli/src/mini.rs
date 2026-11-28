@@ -62,12 +62,11 @@ pub(crate) async fn execute(
     }
     let debug_system_prompt = std::mem::take(&mut args.debug_system_prompt);
     let prepared =
-        crate::session::prepare_host_extensions(home, &args, cwd, trusted, plugin_images).map_err(
-            |error| {
+        crate::session::prepare_host_extensions(home, &args, cwd, trusted, plugin_images, None)
+            .map_err(|error| {
                 report(format!("error: {error}"));
                 EXIT_RUNTIME
-            },
-        )?;
+            })?;
     let (harness, events, _context) =
         crate::session::build_prepared(home, &resolved, &args, cwd, trusted, prepared)
             .await

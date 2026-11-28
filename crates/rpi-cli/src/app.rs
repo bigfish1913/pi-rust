@@ -22,7 +22,7 @@ use rpi_ai::types::{ImageContent, ImageContentType};
 
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
 use crate::provider::{resolve_with_extensions, ResolveError};
-use crate::session::{build_prepared, prepare_extensions, BuildError};
+use crate::session::{build_prepared, prepare_cli_extensions, prepare_extensions, BuildError};
 use crate::startup_diagnostics::{Phase, StartupSpan};
 
 /// The exit code for a usage/parse error. (TS `main.ts` uses `process.exit(1)`
@@ -444,14 +444,6 @@ async fn run_inner() -> i32 {
     let cwd_lookup = StartupSpan::start(Phase::CwdLookup);
     let restored_cwd = crate::session::peek_restored_session_cwd(&selection, &cwd).await;
     cwd_lookup.finish();
-    // Pin the session the peek resolved: `-c` re-lists the directory when the
-    // build runs, and another `rpi` may have written a newer session in
-    // between. Adopting one session's directory while opening another would
-    // put the tools in a directory the opened conversation never used, which is
-    // the failure this adoption exists to prevent.
-    if let Some(restored) = &restored_cwd {
-        crate::session::pin_restored_selection(&mut parsed, restored);
-    }
     let launch_cwd = cwd;
     let cwd = match &restored_cwd {
         Some(restored) => match &restored.adopted {
@@ -500,9 +492,12 @@ async fn run_inner() -> i32 {
     };
     // Reject a bound exact session before dev can build or stage any code.
     if dev_options.is_some() {
-        if let Err(error) =
-            crate::session::preflight_extension_startup(&parsed, &cwd, project_trusted)
-        {
+        if let Err(error) = crate::session::preflight_extension_startup(
+            &parsed,
+            &cwd,
+            project_trusted,
+            restored_cwd.as_ref(),
+        ) {
             print_build_error(&error);
             return EXIT_RUNTIME;
         }
@@ -513,18 +508,14 @@ async fn run_inner() -> i32 {
         Err(code) => return code,
     };
     let extension_prepare = StartupSpan::start(Phase::ExtensionPrepare);
-    let prepared = match prepare_extensions(
-        &crate::config::AgentHome::process(),
-        &parsed,
-        &cwd,
-        project_trusted,
-    ) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            print_build_error(&error);
-            return EXIT_RUNTIME;
-        }
-    };
+    let prepared =
+        match prepare_cli_extensions(&parsed, &cwd, project_trusted, restored_cwd.as_ref()) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                print_build_error(&error);
+                return EXIT_RUNTIME;
+            }
+        };
     extension_prepare.finish();
     let model_resolve = StartupSpan::start(Phase::ModelResolve);
     let resolved = match resolve_with_extensions(
