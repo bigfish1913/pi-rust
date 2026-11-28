@@ -589,9 +589,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
     env:
-      # Update this deliberately when rpi-extension compatibility is reviewed.
+      # Pin the reviewed IndependentRun migration from rpi-extension#121.
       # The SHA makes the extension set reproducible and auditable.
-      RPI_EXTENSION_REF: e37cb36010ed20db40a9b3a327ae182c8a4637c7
+      RPI_EXTENSION_REF: aad12e8c6d4944a34da6ccdc3ebd97bde9f3649d
       COMPAT_DIAGNOSTICS_NAME: extension-compat-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out host
@@ -765,6 +765,19 @@ jobs:
       - name: Assert every staged extension loads in the current host
         shell: bash
         run: RPI_SMOKE_PLUGIN_DIR="$RPI_COMPAT_STAGE" cargo test -p rpi-extensions --test extension_compat --locked -- --ignored
+
+      - name: Exercise delegation through the official subagents extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Windows) library=rpi_subagents.dll ;;
+            macOS) library=librpi_subagents.dylib ;;
+            Linux) library=librpi_subagents.so ;;
+          esac
+          export RPI_TEST_SUBAGENT_LIBRARY="$GITHUB_WORKSPACE/rpi-extension/target/release/$library"
+          test -f "$RPI_TEST_SUBAGENT_LIBRARY"
+          cargo test -p rpi-cli --test subagent_packages --release --locked --target-dir target/extension-compat
 
       - name: Exercise native RPC, ACP and Web against the staged set
         shell: bash

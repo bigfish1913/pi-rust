@@ -9,11 +9,7 @@ async fn a_start_queued_by_an_expired_invocation_cannot_attach_to_the_idle_root(
     signal.cancel();
     let result = with_invocation_signal(
         signal,
-        manager.handle(
-            &parent,
-            7,
-            json!({"op":"start","task":"expired queued start"}),
-        ),
+        manager.start_test_run(&parent, 7, "expired queued start"),
     )
     .await;
     // Always stop any incorrectly admitted work before reporting the failure.
@@ -38,18 +34,13 @@ async fn an_idle_root_child_observes_the_originating_tool_cancellation() {
     let signal = CancellationToken::new();
     let child = with_invocation_signal(
         signal.clone(),
-        manager.handle(
-            &parent,
-            7,
-            json!({"op":"start","task":"cancel through invocation"}),
-        ),
+        manager.start_test_run(&parent, 7, "cancel through invocation"),
     )
     .await
     .unwrap();
     signal.cancel();
-    let id = child["childId"].as_str().unwrap();
-    let terminal =
-        tokio::time::timeout(Duration::from_millis(250), wait(&manager, &parent, id)).await;
+    let id = child["runId"].as_str().unwrap();
+    let terminal = tokio::time::timeout(Duration::from_millis(250), wait(&manager, id)).await;
     manager.cancel_all();
     let value = terminal
         .expect("child must observe invocation cancellation, not only root admission state");

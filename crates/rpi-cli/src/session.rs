@@ -467,6 +467,46 @@ type PreparedExtensionStartup = (
     ),
 );
 
+// A previous frontend can finish writing between replay and acquisition.
+// Retry only a stale replay, before registering any extensions, and keep the
+// same Session and workspace through the next preflight.
+async fn prepare_host_restore(
+    repo: &rpi_harness::session::jsonl::JsonlSessionRepo,
+    meta: &rpi_harness::session::jsonl::JsonlSessionMetadata,
+    mut validate: impl FnMut(&rpi_harness::session::SessionValues) -> Result<(), String>,
+) -> Result<rpi_harness::session::jsonl::PreparedJsonlRestore, BuildError> {
+    for _ in 0..2 {
+        let replay = StartupSpan::start(Phase::PreparedReplay);
+        let prepared = repo
+            .prepare_restore_by_jsonl_metadata(meta)
+            .await
+            .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+        replay.finish();
+        let read_facts = StartupSpan::start(Phase::PreparedFacts);
+        let facts = prepared
+            .facts()
+            .await
+            .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+        read_facts.finish();
+        if facts.metadata.cwd != meta.cwd || facts.metadata.created_at != meta.created_at {
+            return Err(BuildError::SessionOpen(
+                "session identity changed during restore preparation; reopen session".into(),
+            ));
+        }
+        validate(&facts.values).map_err(BuildError::SessionOpen)?;
+        if let Some(current) = prepared
+            .reserve_current_writer()
+            .await
+            .map_err(|e| BuildError::SessionOpen(e.to_string()))?
+        {
+            return Ok(current);
+        }
+    }
+    Err(BuildError::SessionOpen(
+        "session history changed during restore preparation; reopen session".into(),
+    ))
+}
+
 fn preflight_extension_startup_with_restore(
     home: &crate::config::AgentHome,
     args: &Args,
@@ -536,55 +576,34 @@ fn preflight_extension_startup_with_restore(
                         });
                         let transition = resources.as_ref().is_some_and(|r| r.transition.is_some());
                         let fork = matches!(selection, SessionSelection::Fork { .. });
-                        let (facts, prepared) = if transition {
-                            (
+                        let validate = |values: &rpi_harness::session::SessionValues| {
+                            let binding_validate = StartupSpan::start(Phase::BindingValidate);
+                            let result = crate::resource_selection::validate_session_binding(
+                                values,
+                                resources.as_ref(),
+                            );
+                            binding_validate.finish();
+                            result
+                        };
+                        let prepared = if prepare_restore && !transition && !fork {
+                            Some(prepare_host_restore(&repo, &meta, validate).await?)
+                        } else {
+                            let facts = if transition {
                                 rpi_harness::session::jsonl::JsonlSessionStorage::read_resource_transition_facts(
                                     Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())), &meta.path,
                                     Arc::new(SystemClock), Arc::new(DefaultIdGenerator::new()),
                                 )
                                 .await
-                                .map_err(|e| BuildError::SessionOpen(e.to_string()))?,
-                                None,
-                            )
-                        } else if fork {
-                            (
-                                repo.read_facts_by_jsonl_metadata(&meta)
-                                    .await
-                                    .map_err(|e| BuildError::SessionOpen(e.to_string()))?,
-                                None,
-                            )
-                        } else if prepare_restore {
-                            let prepared_replay = StartupSpan::start(Phase::PreparedReplay);
-                            let prepared = repo
-                                .prepare_restore_by_jsonl_metadata(&meta)
-                                .await
-                                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
-                            prepared_replay.finish();
-                            let prepared_facts = StartupSpan::start(Phase::PreparedFacts);
-                            let facts = prepared
-                                .facts()
-                                .await
-                                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
-                            prepared_facts.finish();
-                            (facts, Some(prepared))
-                        } else {
-                            (
-                                repo.read_facts_by_jsonl_metadata(&meta)
-                                    .await
-                                    .map_err(|e| BuildError::SessionOpen(e.to_string()))?,
-                                None,
-                            )
+                            } else {
+                                repo.read_facts_by_jsonl_metadata(&meta).await
+                            }
+                            .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                            if let Some(restored) = restored {
+                                restored.verify_metadata(&facts.metadata)?;
+                            }
+                            validate(&facts.values).map_err(BuildError::SessionOpen)?;
+                            None
                         };
-                        if let Some(restored) = restored {
-                            restored.verify_metadata(&facts.metadata)?;
-                        }
-                        let binding_validate = StartupSpan::start(Phase::BindingValidate);
-                        crate::resource_selection::validate_session_binding(
-                            &facts.values,
-                            resources.as_ref(),
-                        )
-                        .map_err(BuildError::SessionOpen)?;
-                        binding_validate.finish();
                         Ok((
                             match selection {
                                 SessionSelection::Fork {
@@ -3555,6 +3574,8 @@ async fn restore_session(
     prepared_restore: Option<rpi_harness::session::jsonl::PreparedJsonlRestore>,
 ) -> Result<Session, BuildError> {
     if let Some(prepared) = prepared_restore {
+        // Preflight verified the selected file and reserved its writer. Commit
+        // that replay without resolving an ID or a newest-file selection again.
         let path = prepared.metadata().path;
         let storage = prepared
             .commit()
@@ -7059,6 +7080,92 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_restore_revalidates_history_after_the_previous_writer_settles() {
+        use rpi_harness::session::jsonl::{
+            JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
+        };
+        use rpi_harness::session::{SessionValueWriter, SessionValues};
+
+        for reject_binding in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let cwd = project.path().canonicalize().unwrap();
+            let dir = cwd.join("sessions");
+            let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+                fs: Arc::new(OsExecutionEnv::with_cwd(cwd.clone())),
+                sessions_root: dir.to_string_lossy().into_owned(),
+                clock: Arc::new(SystemClock),
+                ids: Arc::new(DefaultIdGenerator::new()),
+            });
+            let previous = Arc::new(
+                repo.create_typed(&JsonlSessionCreateOptions {
+                    id: None,
+                    parent_session_id: None,
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    metadata: None,
+                })
+                .await
+                .unwrap(),
+            );
+            let meta = previous.jsonl_metadata();
+            let previous = Session::new(previous, None);
+            let writer = SessionValueWriter::new(previous.clone());
+            let key = if reject_binding {
+                "rpi.resource-selection.v1"
+            } else {
+                "test-handoff"
+            };
+            let mut checks = 0;
+            let prepared = prepare_host_restore(&repo, &meta, |values| {
+                checks += 1;
+                if checks == 1 {
+                    assert!(values.get(key).is_none());
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            writer
+                                .set(key, serde_json::json!("final write"))
+                                .await
+                                .unwrap();
+                            previous.drain().await;
+                        });
+                    });
+                    previous.storage().release_writer_lease();
+                } else {
+                    assert_eq!(values.get_as::<String>(key).as_deref(), Some("final write"));
+                }
+                crate::resource_selection::validate_session_binding(values, None)
+            })
+            .await;
+            assert_eq!(checks, 2);
+            if reject_binding {
+                let Err(error) = prepared else {
+                    panic!("Host accepted an invalid binding from the final write");
+                };
+                assert!(error
+                    .to_string()
+                    .contains("invalid persisted resource binding"));
+                let lease_probe = repo.prepare_restore_by_jsonl_metadata(&meta).await.unwrap();
+                assert!(lease_probe
+                    .reserve_current_writer()
+                    .await
+                    .unwrap()
+                    .is_some());
+            } else {
+                let selection = SessionSelection::ByExactId {
+                    id: meta.id.clone(),
+                    dir,
+                };
+                let restored = restore_session(&selection, &meta.cwd, Some(prepared.unwrap()))
+                    .await
+                    .unwrap();
+                assert!(restored.storage().writer_lease_held());
+                assert_eq!(restored.storage().metadata().id, meta.id);
+                let values = SessionValues::load(&restored).await.unwrap();
+                assert_eq!(values.get_as::<String>(key).as_deref(), Some("final write"));
+            }
+        }
+    }
+
     // ---- restored-session working directory ----
 
     /// A restore peek must name the directory the session was created in —
@@ -7240,6 +7347,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_peeked_session_is_the_one_the_build_opens() {
+        use rpi_harness::session::jsonl::{encode_header, JsonlV4Header};
+
         let tmp = tempfile::tempdir().unwrap();
         let first_project = tmp.path().join("project-first");
         let second_project = tmp.path().join("project-second");
@@ -7267,36 +7376,31 @@ mod tests {
             .expect("a resumable session");
         assert_eq!(peeked.adopted, Some(first_project.clone()));
 
-        // A newer session appears in another project before the build runs.
-        create_jsonl_session_with_id(
-            &sessions,
-            &second_project.to_string_lossy(),
-            Some("cwdrace001-newer".into()),
-        )
-        .await
-        .unwrap();
-
-        let home = crate::config::AgentHome::from_option(Some(tmp.path().join("agent"))).unwrap();
-        let cwd = first_project.to_string_lossy();
-        let newer = find_session_metadata("cwdrace001-newer", &cwd, &sessions)
-            .await
-            .unwrap()
-            .unwrap();
+        // A newer file with the same ID appears in another workspace.
+        let newer = sessions.join("newer-cwdrace001.jsonl");
+        let header = JsonlV4Header::new(
+            peeked.id.clone(),
+            2,
+            second_project.to_string_lossy().into_owned(),
+            None,
+            None,
+            None,
+        );
+        std::fs::write(&newer, encode_header(&header)).unwrap();
         std::fs::File::options()
             .write(true)
-            .open(&newer.path)
+            .open(&newer)
             .unwrap()
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
             .unwrap();
-        assert_eq!(
-            list_session_metadata_in_dir(&cwd, &sessions).await.unwrap()[0].id,
-            newer.id
-        );
-        let exact = find_session_metadata(&peeked.id, &cwd, &sessions)
+        let newer = newer.canonicalize().unwrap();
+        let home = crate::config::AgentHome::from_option(Some(tmp.path().join("agent"))).unwrap();
+        let cwd = first_project.to_string_lossy();
+        let by_id = find_session_metadata(&peeked.id, &cwd, &sessions)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(exact.id, peeked.id);
+        assert_eq!(Path::new(&by_id.path).canonicalize().unwrap(), newer);
         let (_, (selection, prepared)) = preflight_extension_startup_with_restore(
             &home,
             &args,
@@ -7306,6 +7410,10 @@ mod tests {
             Some(&peeked),
         )
         .unwrap();
+        assert_eq!(
+            Path::new(&prepared.as_ref().unwrap().metadata().path),
+            peeked.path
+        );
         let reopened = restore_session(&selection, &cwd, prepared).await.unwrap();
         assert_eq!(reopened.storage().metadata().id, peeked.id);
         drop(reopened);
@@ -7333,11 +7441,10 @@ mod tests {
             Err(BuildError::SessionOpen(_))
         ));
         assert!(restore_session(&selection, &cwd, prepared).await.is_err());
-        assert!(list_session_metadata_in_dir(&cwd, &sessions)
-            .await
-            .unwrap()
-            .iter()
-            .all(|meta| meta.id != peeked.id));
+        let remaining = list_session_metadata_in_dir(&cwd, &sessions).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, peeked.id);
+        assert_eq!(Path::new(&remaining[0].path).canonicalize().unwrap(), newer);
     }
 
     /// Trust must be resolved against the directory it is asked about. A

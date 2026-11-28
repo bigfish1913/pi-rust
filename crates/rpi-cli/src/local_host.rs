@@ -661,24 +661,30 @@ async fn serve_session(
         )
         .await;
     }
-    let reply = match crate::session::dispatch_session_event_async(
+    if let Some(message) = crate::session::dispatch_session_event_async(
         &context,
         rpi_plugin_sdk::EventTag::BeforeTuiStart,
     )
     .await
     {
-        Some(message) => OpenReply::Error { message },
-        None => OpenReply::Opened {
+        // The bridge exits as soon as it reads Error. Keep the rejection
+        // private until a subsequent open can claim the transcript writer.
+        retire_rpc_session(&harness, &context).await?;
+        return write_json(&mut output, &OpenReply::Error { message }).await;
+    }
+    let opened = write_json(
+        &mut output,
+        &OpenReply::Opened {
             host_pid: std::process::id(),
             agent_id: uuid::Uuid::new_v4().to_string(),
             session_id: harness.session_id(),
         },
-    };
-    let opened = write_json(&mut output, &reply).await;
+    )
+    .await;
     // Keep the socket's write half alive through settlement so a client that
     // waits for EOF can reopen the same transcript after the writer is retired.
     let output = Arc::new(output);
-    if opened.is_ok() && matches!(reply, OpenReply::Opened { .. }) {
+    if opened.is_ok() {
         crate::modes::rpc_host_session(
             &harness,
             events,
@@ -690,6 +696,14 @@ async fn serve_session(
         )
         .await;
     }
+    retire_rpc_session(&harness, &context).await?;
+    opened
+}
+
+async fn retire_rpc_session(
+    harness: &rpi_harness::agent_harness::AgentHarness,
+    context: &crate::session::ReloadContext,
+) -> Result<(), String> {
     harness
         .wait_for_idle()
         .await
@@ -703,7 +717,7 @@ async fn serve_session(
     let storage = harness.session().storage();
     storage.drain().await;
     storage.release_writer_lease();
-    opened
+    Ok(())
 }
 
 fn validate_workspace(workspace: &Path) -> Result<PathBuf, String> {

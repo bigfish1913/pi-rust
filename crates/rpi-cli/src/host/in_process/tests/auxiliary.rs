@@ -83,9 +83,12 @@ async fn native_auxiliary_exit_then_real_dll_release_precede_physical_writer_and
         Arc::new(fixture.harness.clone()),
     );
     let host = Arc::new(host);
-    host.child_agent(7, serde_json::json!({"op":"start","task":"background"}))
-        .await
-        .unwrap();
+    host.independent_run(
+        7,
+        serde_json::json!({"op":"start","input":"background","maxTurns":8,"timeoutSeconds":300}),
+    )
+    .await
+    .unwrap();
     entered(&gate, 1).await;
 
     let ledger = PluginCleanupLedger::new();

@@ -218,7 +218,7 @@ ABI 的字符串与步骤返回都是裸指针，SDK 提供一组宏把契约收
 ### 独立子任务
 
 `GetExecutionContext` 返回当前模型身份、thinking、活动工具、cwd 和会话 ID，
-不包含凭据、认证头或 endpoint。`ChildAgent` 提供 `start/poll/cancel/dispose`，
+不包含凭据、认证头或 endpoint。`IndependentRun` 提供 `start/poll/cancel/dispose`，
 在独立内存会话中继承有效 provider 绑定、项目工具和父审批 UI，不重入父 lane。
 工具范围只能缩小，预算和取消由宿主管理。旧宿主不支持时必须明确报错，
 不能静默退回重新解析默认配置的子进程。详见 [子 agent 协议](subagents.md)。

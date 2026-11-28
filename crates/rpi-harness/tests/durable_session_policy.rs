@@ -319,9 +319,9 @@ async fn rejected_targets_preserve_binding_queues_receipts_and_child_scope_on_ev
     let old = s.snapshot().await.unwrap();
     let receipt = s.request_outcome("enqueue").await.unwrap();
     let queued = h.queued_messages().await.unwrap();
-    // create_child constructs only a local harness/scope; it does not start a run.
+    // The constructor prepares the local harness and scope before execution.
     let child = h
-        .create_child(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
+        .create_independent_run(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
         .await
         .unwrap();
     for lane in ["main", "side"] {
@@ -517,7 +517,7 @@ async fn target_revision_race_and_cancellation_during_prepare_preserve_the_old_s
         .await
         .unwrap();
     let child = h
-        .create_child(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
+        .create_independent_run(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
         .await
         .unwrap();
     let before = service(&h).snapshot().await.unwrap();

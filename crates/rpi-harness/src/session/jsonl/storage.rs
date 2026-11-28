@@ -150,6 +150,15 @@ impl PreparedJsonlRestore {
         self.commit_verified(true).await
     }
 
+    /// Reserve the writer before assembling runtime resources. If the replay
+    /// went stale, discard it and release the lease so the caller can repeat
+    /// read-only preflight. Any deferred repair still requires commit.
+    pub async fn reserve_current_writer(self) -> SessionResult<Option<Self>> {
+        self.storage.ensure_writer_lease().await?;
+        let current = self.storage.loaded_history_matches(false).await?;
+        Ok(current.then_some(self))
+    }
+
     async fn commit_verified(self, strict: bool) -> SessionResult<JsonlSessionStorage> {
         let mut storage = self.storage;
         // Ownership precedes verification and deferred repair. Strict mode
@@ -160,7 +169,11 @@ impl PreparedJsonlRestore {
         storage.ensure_writer_lease().await?;
         lease.finish(0, 0);
         let verify = crate::session::diagnostics::RecoveryPhase::start("prepared_source_verify");
-        storage.verify_loaded_history(strict).await?;
+        if !storage.loaded_history_matches(strict).await? {
+            return Err(SessionError::invalid_entry(
+                "session history changed during restore preparation; reopen session",
+            ));
+        }
         verify.finish(0, 0);
         let repair = crate::session::diagnostics::RecoveryPhase::start("prepared_repair");
         storage.commit_pending_repair().await?;
@@ -821,7 +834,7 @@ impl JsonlSessionStorage {
         }
     }
 
-    async fn verify_loaded_history(&self, strict: bool) -> SessionResult<()> {
+    async fn loaded_history_matches(&self, strict: bool) -> SessionResult<bool> {
         let identity = if strict {
             None
         } else {
@@ -839,7 +852,7 @@ impl JsonlSessionStorage {
             // preserve even a nonzero mtime. Strict mode bypasses this shortcut;
             // unknown mtime (0) also always falls back to the digest.
             if identity.matches(&info) && identity.mtime_ms != 0 {
-                return Ok(());
+                return Ok(true);
             }
         }
         let expected = self
@@ -871,12 +884,7 @@ impl JsonlSessionStorage {
                 .as_bytes(),
             )
         };
-        if actual != expected {
-            return Err(SessionError::invalid_entry(
-                "session history changed during restore preparation; reopen session",
-            ));
-        }
-        Ok(())
+        Ok(actual == expected)
     }
 
     async fn commit_pending_repair(&mut self) -> SessionResult<()> {
@@ -924,9 +932,12 @@ impl JsonlSessionStorage {
                         .then(|| preview::native_path(fs.as_ref(), path))
                         .flatten()
                         .and_then(|path| preview::Source::replay(path, source.as_ref(), length));
-                let storage =
+                let mut storage =
                     Self::load_streaming(fs, path, clock, ids, source.clone(), length, policy)
                         .await?;
+                if let Some(info) = &info_before_read {
+                    storage.record_replay_identity(info, length);
+                }
                 if let Some(preview_source) =
                     preview_source.filter(|stamp| stamp.matches(source.as_ref()))
                 {

@@ -96,7 +96,7 @@ async fn initial_run_guard_precedes_recovery_reservation_prompt_and_provider() {
                 .await
                 .unwrap();
             let child = h
-                .create_child(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
+                .create_independent_run(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
                 .await
                 .unwrap();
             prune_sentinel(h.session()).await;
