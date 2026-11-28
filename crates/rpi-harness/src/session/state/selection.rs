@@ -41,7 +41,15 @@ impl<P: Clone> IndexedState<P> {
         self.entries_by_id.get(id).copied()
     }
     pub(crate) fn nearest_transcript(&self, id: &str) -> Option<usize> {
-        self.query_ancestry[self.entry_index(id)?].transcript
+        self.transcript_at(self.entry_index(id)?)
+    }
+
+    pub(super) fn transcript_at(&self, index: usize) -> Option<usize> {
+        self.query_ancestry[index].transcript
+    }
+
+    pub(super) fn previous_transcript(&self, index: usize) -> Option<usize> {
+        self.parent_ancestry(index).transcript
     }
 
     fn ancestry_at(&self, leaf: Option<&str>) -> SessionResult<QueryAncestry> {
@@ -77,17 +85,17 @@ impl<P: Clone> IndexedState<P> {
             // Entries are append-ordered, so passing the cursor rules out
             // ancestry on this lane even when it exists on a sibling branch.
             while let Some(index) = next.filter(|&index| index > cursor) {
-                next = self.parent_ancestry(index).transcript;
+                next = self.previous_transcript(index);
             }
             if next != Some(cursor) {
                 return Err(missing());
             }
-            next = self.parent_ancestry(cursor).transcript;
+            next = self.previous_transcript(cursor);
         }
         let mut rows = Vec::new();
         while let Some(index) = next.filter(|_| rows.len() < query.limit.max(1)) {
             rows.push(index);
-            next = self.parent_ancestry(index).transcript;
+            next = self.previous_transcript(index);
         }
         rows.reverse();
         Ok((rows, ancestry.transcript_count, next.is_some()))

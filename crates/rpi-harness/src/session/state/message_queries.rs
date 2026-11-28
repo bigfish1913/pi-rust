@@ -48,6 +48,13 @@ impl<P: Clone> IndexedState<P> {
             if leaf < ancestor {
                 return false;
             }
+            if let Some(transcript) = self
+                .transcript_at(leaf)
+                .filter(|&index| index < leaf && index >= ancestor)
+            {
+                leaf = transcript;
+                continue;
+            }
             match self.metadata[leaf]
                 .parent_id()
                 .and_then(|id| self.entries_by_id.get(id))
@@ -158,49 +165,43 @@ impl<P: Clone> IndexedState<P> {
         let cursor = cursors.into_iter().flatten().next().unwrap();
         validate_id(cursor)?;
         let leaf = self.query_leaf(lane, query.leaf_id.as_deref())?;
-        // Validate membership while retaining only the closest newer messages,
-        // never a full branch path or unselected payload. Near-tail queries stop
-        // after the requested older neighbourhood rather than walking to root.
+        let off_branch = || invalid("message cursor not on selected branch snapshot");
+        let anchor = self.entry_index(cursor).ok_or_else(off_branch)?;
+        if !self.metadata[anchor].is_transcript() {
+            return Err(
+                if leaf.is_some_and(|leaf| self.query_is_ancestor(anchor, leaf)) {
+                    invalid("cursor must identify a transcript message")
+                } else {
+                    off_branch()
+                },
+            );
+        }
+        // Retain the closest newer transcript rows while validating that the
+        // cursor is on the selected branch. The ancestry index skips gaps.
         let mut newer = std::collections::VecDeque::with_capacity(query.limit + 1);
         let mut discarded_newer = false;
-        let mut next = leaf;
-        let mut anchor = None;
-        while let Some(index) = next {
-            let entry = &self.metadata[index];
-            next = entry
-                .parent_id()
-                .and_then(|id| self.entries_by_id.get(id))
-                .copied();
-            if entry.id() == cursor {
-                if !entry.is_transcript() {
-                    return Err(invalid("cursor must identify a transcript message"));
-                }
-                anchor = Some(index);
-                break;
-            }
-            if entry.is_transcript() {
-                newer.push_back(index);
-                if newer.len() > query.limit + 1 {
-                    newer.pop_front();
-                    discarded_newer = true;
-                }
+        let mut next = leaf.and_then(|leaf| self.transcript_at(leaf));
+        while let Some(index) = next.filter(|&index| index > anchor) {
+            next = self.previous_transcript(index);
+            newer.push_back(index);
+            if newer.len() > query.limit + 1 {
+                newer.pop_front();
+                discarded_newer = true;
             }
         }
-        let anchor =
-            anchor.ok_or_else(|| invalid("message cursor not on selected branch snapshot"))?;
+        if next != Some(anchor) {
+            return Err(off_branch());
+        }
         let newer: Vec<_> = newer.into_iter().rev().collect();
         let mut older = Vec::with_capacity(query.limit + 1);
-        while let Some(index) = next {
-            let entry = &self.metadata[index];
-            next = entry
-                .parent_id()
-                .and_then(|id| self.entries_by_id.get(id))
-                .copied();
-            if entry.is_transcript() {
+        if query.after_id.is_none() {
+            next = self.previous_transcript(anchor);
+            while let Some(index) = next {
                 older.push(index);
                 if older.len() > query.limit {
                     break;
                 }
+                next = self.previous_transcript(index);
             }
         }
         let (selected, mut has_more_before, mut has_more_after) = if query.before_id.is_some() {

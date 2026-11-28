@@ -4,7 +4,7 @@ use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use reqwest::{Client, Response, Url};
+use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -136,7 +136,9 @@ async fn stage(args: &[&str], usage: &str) -> Result<StagedRelease, String> {
     if url.query().is_some() || url.fragment().is_some() {
         return Err("package manifest URL must not contain a query or fragment".into());
     }
-    let response = download(&client, url.clone()).await?;
+    let response = download(&client, url.clone())
+        .await
+        .map_err(|error| error.to_string())?;
     let archive_base = archive_base(&url, response.url()).clone();
     let manifest = body_limited(response, 64 * 1024).await?;
     let release: Release = serde_json::from_slice(&manifest).map_err(|e| e.to_string())?;
@@ -184,7 +186,31 @@ async fn stage(args: &[&str], usage: &str) -> Result<StagedRelease, String> {
     let asset = archive_base
         .join(&archive.asset)
         .map_err(|e| e.to_string())?;
-    let bytes = body_limited(download(&client, asset).await?, archive.bytes).await?;
+    let release_asset = url
+        .join(&archive.asset)
+        .map_err(|error| error.to_string())?;
+    let response = match download(&client, asset.clone()).await {
+        Err(error)
+            if asset != release_asset
+                && matches!(
+                    error.status(),
+                    Some(
+                        StatusCode::BAD_REQUEST
+                            | StatusCode::UNAUTHORIZED
+                            | StatusCode::FORBIDDEN
+                            | StatusCode::NOT_FOUND
+                            | StatusCode::GONE
+                    )
+                ) =>
+        {
+            // Some release servers redirect individual assets to opaque
+            // object URLs. Their public sibling endpoints still work.
+            download(&client, release_asset).await
+        }
+        result => result,
+    }
+    .map_err(|error| error.to_string())?;
+    let bytes = body_limited(response, archive.bytes).await?;
     if bytes.len() as u64 != archive.bytes
         || format!("{:x}", Sha256::digest(&bytes)) != archive.sha256
     {
@@ -230,14 +256,8 @@ fn check_url(url: &Url) -> Result<(), String> {
     Ok(())
 }
 
-async fn download(client: &Client, url: Url) -> Result<Response, String> {
-    client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())
+async fn download(client: &Client, url: Url) -> Result<Response, reqwest::Error> {
+    client.get(url).send().await?.error_for_status()
 }
 
 #[cfg(test)]

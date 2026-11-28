@@ -14,7 +14,10 @@ use crate::{
 use serde_json::{json, Value};
 use std::{
     io,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::{
@@ -22,6 +25,8 @@ use tokio::{
     net::{unix::OwnedWriteHalf, UnixStream},
     sync::mpsc,
 };
+
+const HISTORY_LIMIT: usize = 100;
 
 pub(super) async fn run(connection: Connection, rpc: bool) -> Result<(), String> {
     use std::io::IsTerminal;
@@ -77,8 +82,9 @@ pub(super) async fn run(connection: Connection, rpc: bool) -> Result<(), String>
         println!("Joined area {name} · Session {session_id}");
         return Ok(());
     }
-    let mut history_limit = 100;
-    request_history(&mut write, history_limit)
+    let mut history_limit = HISTORY_LIMIT;
+    let mut history_before = None::<String>;
+    request_history(&mut write, history_limit, None)
         .await
         .map_err(|e| e.to_string())?;
     let write = Arc::new(tokio::sync::Mutex::new(write));
@@ -92,12 +98,31 @@ pub(super) async fn run(connection: Connection, rpc: bool) -> Result<(), String>
                 Some("response")
                     if frame["id"] == "history"
                         && frame["success"] == false
-                        && frame["error"] == RESPONSE_TOO_LARGE
-                        && history_limit > 1 =>
+                        && frame["error"] == RESPONSE_TOO_LARGE =>
                 {
-                    history_limit = history_limit.div_ceil(2);
+                    if let Some(before) = frame["beforeId"]
+                        .as_str()
+                        .filter(|before| Some(*before) != history_before.as_deref())
+                    {
+                        if history_before.is_none() {
+                            let _ = tx.send(DriverEvent::Notice(
+                                "Skipped oversized saved messages while loading Host history."
+                                    .into(),
+                            ));
+                        }
+                        history_before = Some(before.to_owned());
+                        history_limit = HISTORY_LIMIT;
+                    } else if history_limit > 1 {
+                        history_limit = history_limit.div_ceil(2);
+                    } else {
+                        let _ = tx.send(DriverEvent::Notice(RESPONSE_TOO_LARGE.into()));
+                        continue;
+                    }
                     let mut writer = history_writer.lock().await;
-                    if let Err(error) = request_history(&mut *writer, history_limit).await {
+                    if let Err(error) =
+                        request_history(&mut *writer, history_limit, history_before.as_deref())
+                            .await
+                    {
                         let _ = tx.send(DriverEvent::Notice(error.to_string()));
                         break;
                     }
@@ -160,10 +185,14 @@ pub(super) async fn run(connection: Connection, rpc: bool) -> Result<(), String>
     result
 }
 
-async fn request_history(writer: &mut OwnedWriteHalf, limit: usize) -> io::Result<()> {
+async fn request_history(
+    writer: &mut OwnedWriteHalf,
+    limit: usize,
+    before: Option<&str>,
+) -> io::Result<()> {
     write_value(
         writer,
-        &json!({"type":"get_messages","id":"history","limit":limit}),
+        &json!({"type":"get_messages","id":"history","limit":limit,"beforeId":before}),
     )
     .await
 }
@@ -272,8 +301,11 @@ async fn relay(
     mut frames: mpsc::Receiver<io::Result<Vec<u8>>>,
     stdout: &mut (impl AsyncWrite + Unpin),
 ) -> io::Result<()> {
+    let pending = AtomicUsize::new(0);
     let outbound = async {
         while let Some(frame) = frames.recv().await {
+            // The peer can reply before our frame write future returns.
+            pending.fetch_add(1, Ordering::Relaxed);
             write_frame(&mut write, &frame?).await.map_err(io_error)?;
         }
         // The Host finishes its serial command queue before observing EOF.
@@ -285,10 +317,19 @@ async fn relay(
             let value: Value = read_frame(&mut read, MAX_FRAME_BYTES)
                 .await
                 .map_err(io_error)?;
+            if value["type"] == "response" && pending.load(Ordering::Relaxed) > 0 {
+                pending.fetch_sub(1, Ordering::Relaxed);
+            }
             let mut frame = serde_json::to_vec(&value)?;
             frame.push(b'\n');
             stdout.write_all(&frame).await?;
             stdout.flush().await?;
+        }
+        if pending.load(Ordering::Relaxed) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Host session closed before all RPC replies arrived",
+            ));
         }
         Ok(())
     };
@@ -363,5 +404,33 @@ mod tests {
                 .map(|request| &request["id"])
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn host_eof_with_a_pending_reply_is_an_error_after_stdin_eof() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (read, write) = client.into_split();
+        let (send, frames) = mpsc::channel(1);
+        let request = json!({"type": "get_commands", "id": "pending"});
+        send.send(Ok(serde_json::to_vec(&request).unwrap()))
+            .await
+            .unwrap();
+        drop(send);
+        let serve = async {
+            let mut server = BufReader::new(server);
+            let frame: Value = read_frame(&mut server, MAX_FRAME_BYTES).await.unwrap();
+            assert_eq!(frame, request);
+            assert!(server.fill_buf().await.unwrap().is_empty());
+            write_value(server.get_mut(), &json!({"type": "agent_start"}))
+                .await
+                .unwrap();
+        };
+        let mut output = tokio::io::sink();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(relay(read, write, frames, &mut output), serve)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
     }
 }
