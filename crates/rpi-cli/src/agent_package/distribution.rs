@@ -189,33 +189,7 @@ async fn stage(args: &[&str], usage: &str) -> Result<StagedRelease, String> {
     let release_asset = url
         .join(&archive.asset)
         .map_err(|error| error.to_string())?;
-    let response = match download(&client, asset.clone()).await {
-        Err(error)
-            if asset != release_asset
-                && matches!(
-                    error.status(),
-                    Some(
-                        StatusCode::BAD_REQUEST
-                            | StatusCode::UNAUTHORIZED
-                            | StatusCode::FORBIDDEN
-                            | StatusCode::NOT_FOUND
-                            | StatusCode::GONE
-                    )
-                ) =>
-        {
-            // Some release servers redirect individual assets to opaque
-            // object URLs. Their public sibling endpoints still work.
-            download(&client, release_asset).await
-        }
-        result => result,
-    }
-    .map_err(|error| error.to_string())?;
-    let bytes = body_limited(response, archive.bytes).await?;
-    if bytes.len() as u64 != archive.bytes
-        || format!("{:x}", Sha256::digest(&bytes)) != archive.sha256
-    {
-        return Err("package archive size or SHA-256 mismatch".into());
-    }
+    let bytes = fetch_archive(&client, asset, release_asset, &archive).await?;
     let bundle = tempfile::tempdir().map_err(|e| e.to_string())?;
     extract(&bytes, bundle.path())?;
     let root = bundle.path().canonicalize().map_err(|e| e.to_string())?;
@@ -229,6 +203,55 @@ async fn stage(args: &[&str], usage: &str) -> Result<StagedRelease, String> {
         version: release.version,
         origin: url.to_string(),
     })
+}
+
+async fn fetch_archive(
+    client: &Client,
+    asset: Url,
+    release_asset: Url,
+    archive: &Archive,
+) -> Result<Vec<u8>, String> {
+    let first = match download(client, asset.clone()).await {
+        Ok(response) => verified_archive_body(response, archive).await,
+        Err(error)
+            if matches!(
+                error.status(),
+                Some(
+                    StatusCode::BAD_REQUEST
+                        | StatusCode::UNAUTHORIZED
+                        | StatusCode::FORBIDDEN
+                        | StatusCode::NOT_FOUND
+                        | StatusCode::GONE
+                )
+            ) =>
+        {
+            Err(error.to_string())
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    match first {
+        Err(error) if asset != release_asset => {
+            // The manifest can redirect to an opaque object endpoint. Its
+            // apparent sibling may be absent or even serve an HTML page.
+            match download(client, release_asset).await {
+                Ok(response) => verified_archive_body(response, archive)
+                    .await
+                    .map_err(|_| error),
+                Err(_) => Err(error),
+            }
+        }
+        result => result,
+    }
+}
+
+async fn verified_archive_body(response: Response, archive: &Archive) -> Result<Vec<u8>, String> {
+    let bytes = body_limited(response, archive.bytes).await?;
+    if bytes.len() as u64 != archive.bytes
+        || format!("{:x}", Sha256::digest(&bytes)) != archive.sha256
+    {
+        return Err("package archive size or SHA-256 mismatch".into());
+    }
+    Ok(bytes)
 }
 
 fn archive_base<'a>(requested: &'a Url, effective: &'a Url) -> &'a Url {
@@ -263,6 +286,7 @@ async fn download(client: &Client, url: Url) -> Result<Response, reqwest::Error>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[test]
     fn sibling_archive_uses_the_release_directory_after_redirect() {
@@ -277,6 +301,62 @@ mod tests {
                 "https://github.com/org/repo/releases/{path}/release.json"
             ));
             assert_eq!(archive_base(&requested, &effective), &requested);
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_fallback_checks_the_digest_of_both_candidates() {
+        let valid = b"valid bytes";
+        let wrong = b"wrong bytes";
+        let archive = Archive {
+            asset: "bundle.zip".into(),
+            bytes: valid.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(valid)),
+        };
+        let client = Client::builder().no_proxy().build().unwrap();
+        for public in [valid, wrong] {
+            let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = Url::parse(&format!("http://{}/", server.local_addr().unwrap())).unwrap();
+            let serve = async {
+                for (path, body) in [("objects", wrong), ("release", public)] {
+                    let (mut stream, _) = server.accept().await.unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    assert!(line.starts_with(&format!("GET /{path}/bundle.zip ")));
+                    loop {
+                        line.clear();
+                        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(header.as_bytes()).await.unwrap();
+                    stream.write_all(body).await.unwrap();
+                }
+            };
+            let fetch = fetch_archive(
+                &client,
+                base.join("objects/bundle.zip").unwrap(),
+                base.join("release/bundle.zip").unwrap(),
+                &archive,
+            );
+            let (result, ()) =
+                tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(fetch, serve) })
+                    .await
+                    .unwrap();
+            if public == valid {
+                assert_eq!(result.unwrap(), valid);
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "package archive size or SHA-256 mismatch"
+                );
+            }
         }
     }
 }
