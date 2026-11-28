@@ -340,6 +340,15 @@ renderer 接收消息或自定义消息 envelope（例如
 transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿主通过注册时提供的
 `plugin_free_string` 回收。
 
+**内容由扩展提供，布局与生命周期由宿主控制。** 普通工具结果和命令返回的
+`kind: "message"` 都是转录内容；`markdown: true`、`lines` 或自定义 renderer 只改变
+内容表现，不意味着底部常驻。宿主把转录内容放进实时消息区，后续回复显示在它下面；
+浏览旧历史页时，新到达的流式消息不会修改旧页。在旧页显示的临时命令消息随该页退休。
+plan/todo 由宿主在原始转录位置更新与重放，
+扩展不应通过终端光标移动或直接重绘实现“固定面板”。需要临时选择器、输入对话框或
+状态栏时，使用宿主已提供的对应交互能力；不要把普通消息当作这些专用 UI 的替代品。
+本规则不新增布局参数、ABI 或持久化格式。
+
 渲染器**只在交互式 TUI 中调用**：`--mode rpc` 和 `-p` 不调用任何渲染器，渲染结果也不进入
 事件流，所以远程客户端要自己渲染 transcript。会话建立时 stderr 上的
 `renderers: N markdown-transform, N message-render, N entry-render (active)` 只报告
@@ -358,8 +367,8 @@ transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿�
 其余固定行为：
 
 - entry renderer 的 `data` 可能为 `null`（自定义条目没带 `data` 时），不要假定它是对象。
-- TUI 在调用 entry renderer **之前**就跳过 `plan-mode`、`todo`、`todo-state`，为这三个
-  type 注册渲染器不会被调用。
+- TUI 在调用 entry renderer **之前**就由宿主原位重放 `plan-mode`、`todo`、`todo-state`；
+  为这三个 type 注册渲染器不会被调用。
 - `{"lines":[…]}` 会以 `\n` 拼成**一个**纯文本行，不是每行一个组件；需要多行时自己在
   `text` 里带换行。
 - entry renderer 可返回 `rc == 0` 与 `{"display":false}`，明确表示「已处理但隐藏」：
