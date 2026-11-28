@@ -62,6 +62,7 @@ async fn native_fork_initialization_uses_current_binding_even_for_old_message_cu
         extensions: vec![],
         instructions: vec![],
         transition: None,
+        package_commands: Default::default(),
         validated_skills: None,
     };
     let env: Arc<dyn rpi_tools::ExecutionEnv> =

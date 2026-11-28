@@ -22,7 +22,7 @@ use rpi_ai::types::{ImageContent, ImageContentType};
 
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
 use crate::provider::{resolve_with_extensions, ResolveError};
-use crate::session::{build_prepared, prepare_extensions, BuildError};
+use crate::session::{build_prepared, prepare_cli_extensions, prepare_extensions, BuildError};
 use crate::startup_diagnostics::{Phase, StartupSpan};
 
 /// The exit code for a usage/parse error. (TS `main.ts` uses `process.exit(1)`
@@ -258,6 +258,9 @@ async fn run_inner() -> i32 {
         Some("events") => return crate::events::run(&argv[1..]).await,
         Some("session") => return crate::session_gc::run(&argv[1..]).await,
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
+        Some("install") if argv.get(1).is_some_and(|arg| arg == "package") => {
+            return crate::agent_package::install(&argv[2..]).await;
+        }
         Some("install") => return crate::install::run_async(&argv[1..]).await,
         Some("uninstall") => return crate::install::uninstall(&argv[1..]),
         Some("extension") => return crate::packages::run_extension(&argv[1..]),
@@ -279,7 +282,24 @@ async fn run_inner() -> i32 {
         _ => {}
     }
 
-    let mut parsed = parse_args(&argv);
+    let package_name = if argv.first().is_some_and(|arg| arg == "run")
+        && argv.get(1).is_some_and(|arg| arg == "package")
+    {
+        match argv.get(2).map(String::as_str) {
+            None | Some("--help" | "-h") => {
+                println!("rpi run package NAME [rpi options] (native JSONL RPC)");
+                return if argv.len() < 3 { EXIT_USAGE } else { 0 };
+            }
+            Some(name) => Some(name.to_owned()),
+        }
+    } else {
+        None
+    };
+    let mut parsed = if package_name.is_some() {
+        crate::args::parse_startup_args(&argv[3..], true)
+    } else {
+        parse_args(&argv)
+    };
     crate::timings::time("args parsed", crate::timings::TimingNamespace::Main);
 
     // ---- Parsed startup stages ----
@@ -288,6 +308,10 @@ async fn run_inner() -> i32 {
     }
 
     if parsed.host.is_some() {
+        if package_name.is_some() {
+            eprintln!("error: --host cannot be combined with `rpi run package`");
+            return EXIT_USAGE;
+        }
         if dev_options.is_some() {
             eprintln!("error: --host cannot be combined with dev/dev-local");
             return EXIT_USAGE;
@@ -314,6 +338,33 @@ async fn run_inner() -> i32 {
     let cwd = match resolve_cwd() {
         Ok(cwd) => cwd,
         Err(code) => return code,
+    };
+    let _package_launch = if let Some(name) = package_name {
+        if parsed.resource_config.is_some()
+            || parsed.resource_transition.is_some()
+            || parsed.session_dir.is_some()
+            || parsed.session.is_some()
+            || parsed.fork.is_some()
+            || parsed.mini
+            || !parsed.messages.is_empty()
+            || !parsed.file_args.is_empty()
+        {
+            eprintln!("error: package runs select their own resources and session directory; send prompts and commands via RPC");
+            return EXIT_USAGE;
+        }
+        let launch = match crate::agent_package::prepare_launch(&name, &cwd) {
+            Ok(launch) => launch,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return EXIT_RUNTIME;
+            }
+        };
+        parsed.mode = crate::args::Mode::Rpc;
+        parsed.resource_config = Some(launch.config.path().to_path_buf());
+        parsed.session_dir = Some(launch.session_dir.clone());
+        Some(launch)
+    } else {
+        None
     };
     // ---- Legacy-layout migration (flat ~/.rpi → ~/.rpi/agent/) ----
     // Best-effort; never blocks startup. Skipped when RPI_CODING_AGENT_DIR is
@@ -393,14 +444,6 @@ async fn run_inner() -> i32 {
     let cwd_lookup = StartupSpan::start(Phase::CwdLookup);
     let restored_cwd = crate::session::peek_restored_session_cwd(&selection, &cwd).await;
     cwd_lookup.finish();
-    // Pin the session the peek resolved: `-c` re-lists the directory when the
-    // build runs, and another `rpi` may have written a newer session in
-    // between. Adopting one session's directory while opening another would
-    // put the tools in a directory the opened conversation never used, which is
-    // the failure this adoption exists to prevent.
-    if let Some(restored) = &restored_cwd {
-        crate::session::pin_restored_selection(&mut parsed, restored);
-    }
     let launch_cwd = cwd;
     let cwd = match &restored_cwd {
         Some(restored) => match &restored.adopted {
@@ -449,9 +492,12 @@ async fn run_inner() -> i32 {
     };
     // Reject a bound exact session before dev can build or stage any code.
     if dev_options.is_some() {
-        if let Err(error) =
-            crate::session::preflight_extension_startup(&parsed, &cwd, project_trusted)
-        {
+        if let Err(error) = crate::session::preflight_extension_startup(
+            &parsed,
+            &cwd,
+            project_trusted,
+            restored_cwd.as_ref(),
+        ) {
             print_build_error(&error);
             return EXIT_RUNTIME;
         }
@@ -462,18 +508,14 @@ async fn run_inner() -> i32 {
         Err(code) => return code,
     };
     let extension_prepare = StartupSpan::start(Phase::ExtensionPrepare);
-    let prepared = match prepare_extensions(
-        &crate::config::AgentHome::process(),
-        &parsed,
-        &cwd,
-        project_trusted,
-    ) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            print_build_error(&error);
-            return EXIT_RUNTIME;
-        }
-    };
+    let prepared =
+        match prepare_cli_extensions(&parsed, &cwd, project_trusted, restored_cwd.as_ref()) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                print_build_error(&error);
+                return EXIT_RUNTIME;
+            }
+        };
     extension_prepare.finish();
     let model_resolve = StartupSpan::start(Phase::ModelResolve);
     let resolved = match resolve_with_extensions(

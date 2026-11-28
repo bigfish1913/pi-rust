@@ -532,6 +532,36 @@ fn invalid_host_config_is_rejected_before_starting_daemon() {
     }
 }
 
+#[test]
+fn package_runs_reject_host_before_starting_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("host.json"), "invalid Host configuration").unwrap();
+    for host in ["--host", "--host=work"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rpi"))
+            .args([
+                "run",
+                "package",
+                "missing",
+                host,
+                "--mode",
+                "rpc",
+                "--offline",
+            ])
+            .current_dir(root.path())
+            .env("RPI_CODING_AGENT_DIR", root.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--host cannot be combined with `rpi run package`"),
+            "{stderr}"
+        );
+        assert!(!root.path().join("local-host-v1").exists());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cap_rejects_new_agents_and_idle_timeout_waits_for_settlement() {
     timeout(Duration::from_secs(25), capacity_probe())

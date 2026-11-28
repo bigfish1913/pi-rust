@@ -27,6 +27,7 @@
 //! Resources load from `.rpi/` and `~/.rpi/agent/`; extensions are Rust
 //! `cdylib` plugins installed and developed with `rpi install` / `rpi dev`.
 
+mod agent_package;
 pub mod agent_session;
 pub mod app;
 pub mod approval_gate;

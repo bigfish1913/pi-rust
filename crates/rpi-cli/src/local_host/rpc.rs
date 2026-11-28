@@ -54,7 +54,11 @@ impl Request {
         }
     }
 
-    pub(super) async fn apply(self, args: &mut Args, cwd: PathBuf) -> PathBuf {
+    pub(super) async fn apply(
+        self,
+        args: &mut Args,
+        cwd: PathBuf,
+    ) -> (PathBuf, Option<crate::session::RestoredSessionCwd>) {
         args.provider = self.provider.or(args.provider.take());
         args.model = self.model.or(args.model.take());
         args.session = self.session;
@@ -92,13 +96,12 @@ impl Request {
         let session_root = crate::session::configured_session_dir(args, &cwd);
         args.session_dir = Some(session_root.clone());
         let selection = crate::session::select_session_in_dir(args, session_root);
-        if let Some(restored) = crate::session::peek_restored_session_cwd(&selection, &cwd).await {
-            crate::session::pin_restored_selection(args, &restored);
-            if let Some(adopted) = restored.adopted {
-                return adopted;
-            }
-        }
-        cwd
+        let restored = crate::session::peek_restored_session_cwd(&selection, &cwd).await;
+        let cwd = restored
+            .as_ref()
+            .and_then(|target| target.adopted.clone())
+            .unwrap_or(cwd);
+        (cwd, restored)
     }
 }
 
