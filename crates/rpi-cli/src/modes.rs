@@ -2340,52 +2340,11 @@ async fn rpc_get_stats(
     harness: &AgentHarness,
 ) -> Result<serde_json::Value, String> {
     let stats = lane.get_stats().await.map_err(|error| error.to_string())?;
-    // Filter before cloning/hydrating; legacy streaming progress is unrelated.
-    let mut records = Vec::new();
-    for record_type in [
-        "operation_started",
-        "operation_finished",
-        "retry_pending",
-        "usage",
-    ] {
-        records.extend(
-            harness
-                .session()
-                .find_records(&RecordQuery {
-                    lane: Some(lane.name().to_string()),
-                    record_type: Some(record_type),
-                    order: Some(EntryOrder::OldestFirst),
-                    ..Default::default()
-                })
-                .await
-                .map_err(|error| error.to_string())?,
-        );
-    }
-    records.sort_unstable_by_key(LaneRecord::seq);
-    let mut operation_counts = std::collections::BTreeMap::<String, u64>::new();
-    for record in &records {
-        let kind = match record {
-            LaneRecord::OperationStarted(started) => {
-                let key = started.intent.kind();
-                *operation_counts.entry(key.to_string()).or_default() += 1;
-                if matches!(
-                    &started.intent,
-                    rpi_harness::session::types::OperationIntent::Run {
-                        resume_data: Some(_),
-                        ..
-                    }
-                ) {
-                    *operation_counts.entry("resume".to_string()).or_default() += 1;
-                }
-                continue;
-            }
-            LaneRecord::OperationFinished(_) => "operation_finished",
-            LaneRecord::RetryPending(_) => "retry_pending",
-            LaneRecord::Usage(_) => "usage",
-            _ => continue,
-        };
-        *operation_counts.entry(kind.to_string()).or_default() += 1;
-    }
+    let operation_counts = harness
+        .session()
+        .operation_counts(lane.name())
+        .await
+        .map_err(|error| error.to_string())?;
     let count = |name: &str| operation_counts.get(name).copied().unwrap_or_default();
     let model = lane.get_model().await.ok();
     let input = stats.cached_tokens + stats.uncached_tokens;

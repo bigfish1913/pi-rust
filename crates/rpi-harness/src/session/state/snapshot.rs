@@ -140,7 +140,9 @@ impl<'de> Deserialize<'de> for SessionState {
         }
         let mut open_operations_by_lane: HashMap<String, BTreeMap<u64, OperationStartedRecord>> =
             HashMap::new();
+        let mut operation_counts = HashMap::new();
         for record in &snapshot.records {
+            index::count_operation(&mut operation_counts, record);
             match record {
                 LaneRecord::OperationStarted(started) => {
                     open_operations_by_lane
@@ -161,9 +163,11 @@ impl<'de> Deserialize<'de> for SessionState {
         if entries_by_id.len() != snapshot.entries.len() {
             return Err(D::Error::custom("snapshot has duplicate entry IDs"));
         }
-        let mut nearest_user = Vec::with_capacity(snapshot.entries.len());
-        for (index, entry) in snapshot.entries.iter().enumerate() {
-            let previous = match entry.parent_id() {
+        let metadata: Vec<_> = snapshot.entries.iter().map(EntryMeta::from_entry).collect();
+        let mut nearest_user = Vec::with_capacity(metadata.len());
+        let mut nearest_transcript = Vec::with_capacity(metadata.len());
+        for (index, meta) in metadata.iter().enumerate() {
+            let parent = match meta.parent_id() {
                 Some(id) => {
                     let parent = entries_by_id
                         .get(id)
@@ -171,22 +175,21 @@ impl<'de> Deserialize<'de> for SessionState {
                         .ok_or_else(|| {
                             D::Error::custom("snapshot has a missing or forward parent")
                         })?;
-                    nearest_user[*parent]
+                    Some(*parent)
                 }
                 None => None,
             };
-            nearest_user.push(
-                if matches!(
-                    entry.as_message(),
-                    Some(rpi_agent::message::AgentMessage::User(_))
-                ) {
-                    Some(index)
-                } else {
-                    previous
-                },
-            );
+            nearest_user.push(if meta.is_user() {
+                Some(index)
+            } else {
+                parent.and_then(|index| nearest_user[index])
+            });
+            nearest_transcript.push(if meta.is_transcript() {
+                Some(index)
+            } else {
+                parent.and_then(|index| nearest_transcript[index])
+            });
         }
-        let metadata = snapshot.entries.iter().map(EntryMeta::from_entry).collect();
         let hot_append_count = snapshot
             .records
             .iter()
@@ -198,11 +201,13 @@ impl<'de> Deserialize<'de> for SessionState {
             index: IndexedState {
                 metadata,
                 nearest_user,
+                nearest_transcript,
                 sequence: snapshot.sequence,
                 used_ids,
                 entries: snapshot.entries,
                 entries_by_id,
                 records: snapshot.records,
+                operation_counts,
                 hot_append_count,
                 #[cfg(test)]
                 retire_record_checks: 0,

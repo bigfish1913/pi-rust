@@ -8,9 +8,11 @@ pub(crate) struct IndexedState<P: Clone> {
     pub(super) entries: Vec<P>,
     pub(super) metadata: Vec<EntryMeta>,
     pub(super) entries_by_id: HashMap<String, usize>,
-    // Rebuilt by replay, including imported/forked entries; never persisted separately.
+    // Derived ancestry indexes, rebuilt from parent links on restore.
     pub(super) nearest_user: Vec<Option<usize>>,
+    pub(super) nearest_transcript: Vec<Option<usize>>,
     pub(super) records: Vec<LaneRecord>,
+    pub(super) operation_counts: HashMap<String, BTreeMap<&'static str, u64>>,
     // Resident append bodies are the only records that a clear can retire.
     // Cold-only replay uses this as an O(1) guard before considering records.
     pub(super) hot_append_count: usize,
@@ -39,7 +41,9 @@ impl<P: Clone> IndexedState<P> {
             metadata: Vec::new(),
             entries_by_id: HashMap::new(),
             nearest_user: Vec::new(),
+            nearest_transcript: Vec::new(),
             records: Vec::new(),
+            operation_counts: HashMap::new(),
             hot_append_count: 0,
             #[cfg(test)]
             retire_record_checks: 0,
@@ -332,6 +336,10 @@ impl<P: Clone> IndexedState<P> {
         &self.stats
     }
 
+    pub(crate) fn operation_counts(&self, lane: &str) -> BTreeMap<&'static str, u64> {
+        self.operation_counts.get(lane).cloned().unwrap_or_default()
+    }
+
     pub(crate) fn matches_record_query(&self, record: &LaneRecord, query: &RecordQuery) -> bool {
         let lane_ok = query
             .lane
@@ -405,13 +413,16 @@ impl<P: Clone> IndexedState<P> {
                     }
                 }
                 // Parent existence (when set).
-                if let Some(parent) = entry.parent_id() {
-                    if !self.entries_by_id.contains_key(parent) {
-                        return Err(SessionError::invalid_entry(format!(
-                            "Invalid session mutation: references missing parent {parent}"
-                        )));
-                    }
-                }
+                let parent = entry
+                    .parent_id()
+                    .map(|parent| {
+                        self.entry_index(parent).ok_or_else(|| {
+                            SessionError::invalid_entry(format!(
+                                "Invalid session mutation: references missing parent {parent}"
+                            ))
+                        })
+                    })
+                    .transpose()?;
 
                 let meta = EntryMeta::from_entry(&entry);
                 // Construct payload only after validation, before committing any state.
@@ -419,12 +430,14 @@ impl<P: Clone> IndexedState<P> {
                 let nearest_user = if meta.is_user() {
                     Some(self.entries.len())
                 } else {
-                    entry
-                        .parent_id()
-                        .and_then(|id| self.entries_by_id.get(id))
-                        .and_then(|index| self.nearest_user[*index])
+                    parent.and_then(|index| self.nearest_user[index])
                 };
                 self.nearest_user.push(nearest_user);
+                self.nearest_transcript.push(if meta.is_transcript() {
+                    Some(self.entries.len())
+                } else {
+                    parent.and_then(|index| self.nearest_transcript[index])
+                });
                 let is_message = matches!(entry, Entry::Message(_));
                 self.sequence = seq;
                 self.used_ids.insert(entry.id().to_string());
@@ -479,6 +492,7 @@ impl<P: Clone> IndexedState<P> {
                     self.stats.total_tokens += usage_rec.usage.total_tokens;
                     self.stats.cost_total += usage_rec.usage.cost.total;
                 }
+                count_operation(&mut self.operation_counts, &record);
                 self.log.push(StoredLogItem::Record(self.records.len()));
                 self.records.push(record.clone());
                 if let LaneRecord::AssistantFrame(frame) = &record {
@@ -544,6 +558,19 @@ impl<P: Clone> IndexedState<P> {
                     })));
                 Ok(ApplyOutcome::Fact)
             }
+        }
+    }
+}
+
+pub(super) fn count_operation(
+    lanes: &mut HashMap<String, BTreeMap<&'static str, u64>>,
+    record: &LaneRecord,
+) {
+    if let [Some(key), extra] = record.operation_count_keys() {
+        let counts = lanes.entry(record.lane().to_owned()).or_default();
+        *counts.entry(key).or_default() += 1;
+        if let Some(extra) = extra {
+            *counts.entry(extra).or_default() += 1;
         }
     }
 }

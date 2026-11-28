@@ -5,6 +5,9 @@ impl<P: Clone> IndexedState<P> {
     pub(crate) fn entry_index(&self, id: &str) -> Option<usize> {
         self.entries_by_id.get(id).copied()
     }
+    pub(crate) fn nearest_transcript(&self, id: &str) -> Option<usize> {
+        self.nearest_transcript[self.entry_index(id)?]
+    }
     pub(crate) fn metadata(&self) -> &[EntryMeta] {
         &self.metadata
     }

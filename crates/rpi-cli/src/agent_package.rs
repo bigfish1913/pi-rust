@@ -7,7 +7,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::resource_management::Scope;
-use crate::resource_selection::{contained, file, read_limited, relative, validate_tool_names};
+use crate::resource_selection::{
+    contained, file, read_instruction, read_limited, relative, unique_paths, validate_tool_names,
+};
 
 mod distribution;
 pub(crate) use distribution::{install, update};
@@ -120,6 +122,20 @@ impl Manifest {
             package_file(root, path)?;
         }
         Ok((manifest, bytes))
+    }
+
+    fn validate_release_instructions(&self, root: &Path) -> Result<(), String> {
+        let paths = self
+            .agent
+            .instructions
+            .iter()
+            .map(|path| package_file(root, path))
+            .collect::<Result<Vec<_>, _>>()?;
+        unique_paths(&paths)?;
+        for path in paths {
+            read_instruction(&path)?;
+        }
+        Ok(())
     }
 }
 
@@ -312,6 +328,33 @@ pub(crate) fn prepare_launch(name: &str, cwd: &Path) -> Result<Launch, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_instructions_must_pass_the_launch_size_and_encoding_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let manifest: Manifest = serde_json::from_value(json!({
+            "schema_version": 1,
+            "name": "fixture",
+            "version": "0.1.0",
+            "agent": {"instructions": ["instructions.md"], "tools": []},
+        }))
+        .unwrap();
+        let path = root.join("instructions.md");
+        let limit = crate::resource_selection::MAX_SELECTION_BYTES;
+        std::fs::write(&path, vec![b'x'; limit]).unwrap();
+        manifest.validate_release_instructions(&root).unwrap();
+        std::fs::write(&path, vec![b'x'; limit + 1]).unwrap();
+        assert!(manifest
+            .validate_release_instructions(&root)
+            .unwrap_err()
+            .contains("exceeds 64 KiB"));
+        std::fs::write(path, [0xff]).unwrap();
+        assert!(manifest
+            .validate_release_instructions(&root)
+            .unwrap_err()
+            .contains("utf-8"));
+    }
 
     #[test]
     fn manifest_rejects_empty_and_duplicate_tool_names() {

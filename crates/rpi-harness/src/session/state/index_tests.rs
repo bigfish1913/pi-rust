@@ -8,6 +8,87 @@ use crate::session::types::{
 #[derive(Clone, Debug, PartialEq)]
 struct ColdRef(u64); // Deliberately has neither Entry methods nor serde support.
 
+#[test]
+fn operation_counts_are_lane_scoped_and_rebuilt_from_both_snapshot_formats() {
+    use serde_json::json;
+
+    let mut state = SessionState::new();
+    state
+        .apply_mutation(SessionMutation::Lane {
+            seq: 1,
+            lane: "other".into(),
+            leaf_id: None,
+        })
+        .unwrap();
+    for (lane, mut record) in [
+        (
+            "main",
+            json!({"type":"operation_started","id":"run","intent":{
+                "kind":"run","originalPrompt":[],"initialMessages":[],"resumeData":{}
+            }}),
+        ),
+        (
+            "main",
+            json!({"type":"retry_pending","id":"retry","runId":"run",
+            "attempt":2,"resultEntryId":"result"}),
+        ),
+        (
+            "main",
+            json!({"type":"operation_finished","id":"finished","runId":"run","outcome":"completed"}),
+        ),
+        (
+            "other",
+            json!({"type":"operation_started","id":"compact","intent":{
+                "kind":"compaction","resultEntryId":"compaction-result"
+            }}),
+        ),
+        (
+            "other",
+            json!({"type":"operation_started","id":"navigate","intent":{
+                "kind":"navigation","targetId":null,"summarize":false
+            }}),
+        ),
+        (
+            "other",
+            json!({"type":"usage","id":"usage","cause":"adjustment",
+            "usage":rpi_ai::types::Usage::zero()}),
+        ),
+    ] {
+        record["lane"] = json!(lane);
+        record["timestamp"] = json!(42);
+        record["seq"] = json!(state.next_sequence());
+        state
+            .apply_mutation(SessionMutation::Record {
+                record: serde_json::from_value(record).unwrap(),
+            })
+            .unwrap();
+    }
+    let checkpoint: SessionState =
+        serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    let startup = state
+        .index
+        .startup_image(|entry| Some(entry.clone()))
+        .unwrap()
+        .restore(|entry, _| Some(entry))
+        .unwrap();
+    for index in [&state.index, &checkpoint.index, &startup] {
+        assert_eq!(
+            index.operation_counts("main"),
+            BTreeMap::from([
+                ("operation_finished", 1),
+                ("resume", 1),
+                ("retry_pending", 1),
+                ("run", 1),
+            ])
+        );
+        assert_eq!(
+            index.operation_counts("other"),
+            BTreeMap::from([("compaction", 1), ("navigation", 1), ("usage", 1),])
+        );
+        assert!(index.operation_counts("unrecorded").is_empty());
+    }
+}
+
 fn user(seq: u64, id: &str, parent: Option<&str>) -> SessionMutation {
     SessionMutation::Entry {
         seq,

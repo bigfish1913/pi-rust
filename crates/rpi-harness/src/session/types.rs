@@ -1190,6 +1190,27 @@ impl LaneRecord {
             LaneRecord::RetryPending(_) => "retry_pending",
         }
     }
+
+    pub(crate) fn operation_count_keys(&self) -> [Option<&'static str>; 2] {
+        match self {
+            Self::OperationStarted(started) => [
+                Some(started.intent.kind()),
+                matches!(
+                    started.intent,
+                    OperationIntent::Run {
+                        resume_data: Some(_),
+                        ..
+                    }
+                )
+                .then_some("resume"),
+            ],
+            Self::OperationFinished(_) | Self::RetryPending(_) | Self::Usage(_) => {
+                [Some(self.record_type()), None]
+            }
+            _ => [None, None],
+        }
+    }
+
     /// `runId` association (mirrors TS `hasRunId`), including the provenance of
     /// legacy queues. A queue cancellation can outlive its accepting operation.
     /// The operation_started record's *identity* is its `id`, handled separately.
@@ -2056,6 +2077,34 @@ pub trait SessionStorage: Send + Sync {
         ))
     }
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>>;
+
+    /// Return lifetime operation counts for one lane, including records on
+    /// branches that are no longer active. The default supports custom backends.
+    async fn operation_counts(&self, lane: &str) -> SessionResult<BTreeMap<&'static str, u64>> {
+        let mut counts = BTreeMap::new();
+        for record_type in [
+            "operation_started",
+            "operation_finished",
+            "retry_pending",
+            "usage",
+        ] {
+            let records = self
+                .find_records(&RecordQuery {
+                    lane: Some(lane.to_owned()),
+                    record_type: Some(record_type),
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                })
+                .await?;
+            for record in records {
+                for key in record.operation_count_keys().into_iter().flatten() {
+                    *counts.entry(key).or_default() += 1;
+                }
+            }
+        }
+        Ok(counts)
+    }
+
     /// Count and select within one storage snapshot, cloning only the page.
     async fn record_page(&self, query: &RecordPageQuery) -> SessionResult<RecordPage>;
     /// Returns unfinished `operation_started` records, newest first. Recovery

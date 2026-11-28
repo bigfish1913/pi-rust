@@ -23,7 +23,7 @@
 //! - **Defensive copies**: reads clone (TS `structuredClone`); the state stores
 //!   owned `Entry`/`LaneRecord` so `clone()` is the defensive copy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -573,6 +573,11 @@ impl SessionStorage for InMemorySessionStorage {
 
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
         self.inner.read_state(|state| state.find_records(query))
+    }
+
+    async fn operation_counts(&self, lane: &str) -> SessionResult<BTreeMap<&'static str, u64>> {
+        self.inner
+            .read_state(|state| Ok(state.operation_counts(lane)))
     }
 
     async fn record_page(

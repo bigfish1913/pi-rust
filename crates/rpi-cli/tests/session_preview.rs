@@ -326,6 +326,52 @@ async fn repaired_history_has_a_current_preview_after_first_restore_and_upgrade(
 }
 
 #[tokio::test]
+async fn preview_skips_long_runs_of_custom_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new(temp.path());
+    let storage = fixture.create().await;
+    append(&storage, "first", "main").await;
+    let meta = storage.jsonl_metadata();
+    drop(storage);
+
+    let mut file =
+        std::io::BufWriter::new(OpenOptions::new().append(true).open(&meta.path).unwrap());
+    let mut parent = "first".to_owned();
+    for seq in 2..=4100 {
+        let id = format!("custom-{seq}");
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "kind": "entry", "lane": "main", "type": "custom", "customType": "fixture",
+                "id": id, "seq": seq, "parentId": parent, "timestamp": seq,
+            })
+        )
+        .unwrap();
+        parent = id;
+    }
+    file.flush().unwrap();
+    drop(file);
+
+    let storage = fixture
+        .repo
+        .prepare_restore_by_jsonl_metadata(&meta)
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+    let preview = fixture.preview().await;
+    assert_eq!(preview["messages"][0]["entryId"], "first");
+    assert_eq!(preview["hasMore"], false);
+    append(&storage, "second", "main").await;
+    let preview = fixture.preview().await;
+    assert_eq!(preview["messages"][0]["entryId"], "first");
+    assert_eq!(preview["messages"][1]["entryId"], "second");
+    assert_eq!(preview["hasMore"], false);
+}
+
+#[tokio::test]
 async fn preview_rejects_inode_and_prefix_changes_and_leaves_sources_untouched() {
     let temp = tempfile::tempdir().unwrap();
     let fixture = Fixture::new(temp.path());
