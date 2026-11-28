@@ -333,11 +333,13 @@ async fn cancelling_prompt_allows_the_message_write_gate_to_release() {
             .probe
             .pause_queue_reads
             .store(true, Ordering::SeqCst);
+        let execution_request = rpi_harness::execution::ExecutionRequest::new(json!("test"));
         let prompt = rpc_prompt_cancellable(
             &fixture.harness,
             &lane,
             crate::rpc::prompt_content::ParsedPrompt::Legacy("test".into()),
             cancel.clone(),
+            &execution_request,
         );
         let cancel_at_gate = async {
             fixture.probe.queue_read_entered.notified().await;

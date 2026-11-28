@@ -26,6 +26,7 @@ pub struct ExecutionIdentity {
 pub struct ExecutionRequest {
     id: Value,
     last: Arc<Mutex<Option<ExecutionIdentity>>>,
+    admission_cancel: Option<CancellationToken>,
 }
 tokio::task_local! { static REQUEST: ExecutionRequest; }
 impl ExecutionRequest {
@@ -33,7 +34,21 @@ impl ExecutionRequest {
         Self {
             id,
             last: Default::default(),
+            admission_cancel: None,
         }
+    }
+    /// Reject admission if this caller abandons the request before taking a lease.
+    pub fn with_admission_cancellation(mut self, cancel: CancellationToken) -> Self {
+        self.admission_cancel = Some(cancel);
+        self
+    }
+    pub fn admission_cancelled(&self) -> bool {
+        self.admission_cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    }
+    pub(crate) fn current_admission_cancelled() -> bool {
+        REQUEST.try_with(Self::admission_cancelled).unwrap_or(false)
     }
     pub async fn scope<F: Future>(&self, future: F) -> F::Output {
         REQUEST.scope(self.clone(), future).await
