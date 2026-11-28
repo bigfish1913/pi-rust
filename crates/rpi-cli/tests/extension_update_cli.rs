@@ -175,7 +175,7 @@ async fn corrupt_registries_fail_identically_and_help_still_works() {
 #[tokio::test]
 async fn unsupported_extension_commands_are_usage_errors_not_model_prompts() {
     let cli = Cli::new();
-    for subcommand in ["unknown", "link", "list", "unlink", "install"] {
+    for subcommand in ["unknown", "link", "unlink", "recover"] {
         let result = cli.run(&["extension", subcommand]).await;
         assert_eq!(result.0, 2, "{result:?}");
         assert!(result
@@ -183,6 +183,9 @@ async fn unsupported_extension_commands_are_usage_errors_not_model_prompts() {
             .contains(&format!("unknown extension command `{subcommand}`")));
         assert!(result.1.contains("Usage: rpi extension <command>"));
     }
+    let removed = cli.run(&["resource", "list", "--scope", "global"]).await;
+    assert_eq!(removed.0, 2, "{removed:?}");
+    assert!(removed.2.contains("`rpi resource` is not available"));
     assert_eq!(std::fs::read_dir(&cli.agent).unwrap().count(), 0);
     assert_eq!(std::fs::read_dir(&cli.cwd).unwrap().count(), 0);
 }

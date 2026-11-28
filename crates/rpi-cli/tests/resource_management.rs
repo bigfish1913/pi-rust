@@ -38,7 +38,7 @@ impl Cli {
         } else {
             tempfile::tempdir().unwrap()
         };
-        let root = directory.path().to_path_buf();
+        let root = directory.path().canonicalize().unwrap();
         let artifact = format!("fixture.{}", std::env::consts::DLL_EXTENSION);
         put(
             root.join("artifact").join(&artifact),
@@ -151,9 +151,8 @@ fn main() {
             b"managed bytes",
         );
         self.ok(&[
-            "resource",
-            "install",
             "package",
+            "install",
             "demo",
             "--scope",
             "project",
@@ -204,6 +203,86 @@ fn main() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn published_package_install_update_and_remove_use_the_same_registry() {
+    use sha2::{Digest, Sha256};
+    use std::io::Cursor;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let cli = Cli::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for version in ["1.0.0", "1.1.0"] {
+            let asset = format!("demo-{version}.zip");
+            let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            archive
+                .start_file("rpi-package.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            serde_json::to_writer(
+                &mut archive,
+                &json!({"schema_version":1,"name":"demo","version":version,
+                    "agent":{"instructions":[],"tools":["read"]}}),
+            )
+            .unwrap();
+            let archive = archive.finish().unwrap().into_inner();
+            let release = json!({"schema_version":1,"name":"demo","version":version,
+                "asset":asset,"bytes":archive.len(),"sha256":format!("{:x}",Sha256::digest(&archive))})
+            .to_string();
+            for (file, body) in [("release.json", release.as_bytes()), (&asset, &archive)] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert!(
+                    line.starts_with(&format!("GET /{version}/{file} ")),
+                    "{line}"
+                );
+                while line != "\r\n" {
+                    line.clear();
+                    assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                }
+                let stream = stream.get_mut();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        }
+    });
+
+    let install_url = format!("http://{address}/1.0.0/release.json");
+    cli.ok(&["package", "install", "demo", "--manifest", &install_url])
+        .await;
+    let update_url = format!("http://{address}/1.1.0/release.json");
+    cli.ok(&[
+        "package",
+        "update",
+        "demo",
+        "--scope",
+        "global",
+        "--manifest",
+        &update_url,
+    ])
+    .await;
+    server.await.unwrap();
+
+    let inspect = cli
+        .ok(&["package", "inspect", "demo", "--scope", "global"])
+        .await;
+    let inspect: Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(inspect["data"]["resources"][0]["version"], "1.1.0");
+    assert_eq!(inspect["data"]["resources"][0]["source"], update_url);
+    cli.ok(&["package", "remove", "demo", "--scope", "global"])
+        .await;
+    assert!(!cli.root.join("agent/packages/demo").exists());
+    let list = cli.ok(&["package", "list", "--scope", "global"]).await;
+    let list: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(list["data"]["resources"], json!([]));
 }
 
 #[tokio::test]
@@ -426,7 +505,7 @@ async fn safe_legacy_package_names_allow_list_inspect_and_unrelated_install() {
     }
     let registry = std::fs::read(cli.native().join("packages.json")).unwrap();
     cli.ok(&["package", "list"]).await;
-    let list = cli.ok(&["resource", "list", "--scope", "project"]).await;
+    let list = cli.ok(&["package", "list", "--scope", "project"]).await;
     let list: Value = serde_json::from_slice(&list.stdout).unwrap();
     for name in ["_legacy", ".tools"] {
         assert!(list["data"]["resources"]
@@ -434,13 +513,12 @@ async fn safe_legacy_package_names_allow_list_inspect_and_unrelated_install() {
             .unwrap()
             .iter()
             .any(|r| r["name"] == name && r["ownership"] == "legacy-native"));
-        cli.ok(&["resource", "inspect", "package", name, "--scope", "project"])
+        cli.ok(&["package", "inspect", name, "--scope", "project"])
             .await;
         let denied = cli
             .run(&[
-                "resource",
-                "install",
                 "package",
+                "install",
                 name,
                 "--scope",
                 "project",
@@ -452,9 +530,8 @@ async fn safe_legacy_package_names_allow_list_inspect_and_unrelated_install() {
     }
     put(cli.root.join("skill/SKILL.md"), b"body");
     cli.ok(&[
-        "resource",
-        "install",
         "skill",
+        "install",
         "unrelated",
         "--scope",
         "project",
@@ -521,9 +598,8 @@ async fn snapshots_preserve_executable_modes_and_strip_special_bits_on_every_cop
                 mode
             );
             cli.ok(&[
-                "resource",
-                op,
                 kind,
+                op,
                 "demo",
                 "--scope",
                 "project",

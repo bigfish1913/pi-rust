@@ -1,35 +1,52 @@
-# Local native resource management (stage B contract)
+# Package and local snapshot management
 
-`rpi resource` manages local snapshots, not a distribution format or a running
-agent. It never infers installation permission from Cargo.toml. Source compilation
-remains explicitly authorized through `package link` / `install --path` / `--build`;
-the local resource facade copies prebuilt artifacts and resource-only directories.
-No network, provider, native registration, prompt injection, or hot apply occurs.
-The facade has no `--build` switch: passing it is rejected. Its source artifacts
-must already exist; use the existing explicit build/link commands separately.
+`rpi package` installs published agent packages and local package snapshots.
+`rpi skill` and `rpi extension` manage standalone local snapshots. Local
+installation copies existing artifacts or directories without contacting a network,
+running Cargo, registering native code, or changing a running agent. Use
+`rpi package link` or `rpi install` with `--path` or `--build` to compile
+Rust extensions.
+
+## Published agent packages
+
+```sh
+rpi package install NAME [--version VERSION | --manifest URL]
+rpi package update NAME --scope global [--version VERSION | --manifest URL]
+rpi package inspect NAME --scope global
+rpi package remove NAME --scope global
+```
+
+The installer resolves the release, verifies and extracts its archive, and
+validates the packaged agent manifest before publishing it as a global snapshot.
+Published updates require an existing published installation. Use `--manifest`
+again when updating from a custom release URL.
 
 ## Commands and observations
 
-```
-rpi resource list --scope project|global
-rpi resource inspect KIND NAME --scope project|global
-rpi resource install KIND NAME --path PATH --scope project|global [--version TEXT]
-rpi resource update KIND NAME --path PATH --scope project|global [--version TEXT]
-rpi resource reinstall KIND NAME --path PATH --scope project|global [--version TEXT]
-rpi resource remove KIND NAME --scope project|global
-rpi resource recover --scope project|global
+```sh
+rpi package list --scope project|global
+rpi package inspect NAME --scope project|global
+rpi package install NAME --path PATH --scope project|global [--version TEXT]
+rpi package update NAME --path PATH --scope project|global [--version TEXT]
+rpi package reinstall NAME --path PATH --scope project|global [--version TEXT]
+rpi package remove NAME --scope project|global
+rpi package recover --scope project|global
 ```
 
-Kinds: `package`, `skill`, `extension`. Scope is always explicit. All results are
-bounded JSON v1, including errors. Names are portable ASCII identifiers. Versions
-are nullable user-recorded facts, not guessed releases or ABI compatibility.
+Use `list`, `inspect`, `install`, `update`, `reinstall`, and `remove` with
+`rpi skill` or `rpi extension` to manage snapshots of that kind.
+`rpi package recover` handles incomplete transactions for all three kinds in
+the selected scope. Scoped snapshot commands return bounded JSON v1, including
+errors. Names are portable ASCII identifiers. The optional local version is a
+label supplied by the caller.
 Observations include source, scope-qualified identity, observed SHA-256 inventory,
 selectable paths, diagnostics, ownership, and lease-based in-use status. In-use is
 not loaded/applied: only stage A's live resource state can establish those facts.
 Inspection is read-only and never runs Cargo or opens a native library. Unmanaged
 native files are reported but are not adopted, overwritten, or removed.
-Success envelopes carry `operation`, `scope`, `kind` and `name` (the latter two
-are null for scope-wide operations), plus `data.outcome`. Errors have
+Success envelopes carry `operation`, `scope`, `kind`, `name`, and
+`data.outcome`. List results have a null `name`. Recovery results have a
+null `kind` and `name`. Errors have
 `success:false` and bounded diagnostics, with parsed request context when valid.
 Limits per scope/request: 128 owned resources, 256 KiB metadata/result, 2048
 inventory entries, depth 32, 64 MiB per file and 256 MiB total observed bytes.
@@ -88,7 +105,7 @@ The facade stages snapshots and metadata on the destination filesystem and uses
 rename/backup publication under the exclusive lease, following the existing
 native install transaction pattern. A bounded rollback journal precedes activation.
 Failure restores old bytes and receipts; a crash leaves a journal and blocks new
-host startup until `resource recover` rolls it back under the same exclusion.
+host startup until `rpi package recover` rolls it back under the same exclusion.
 Next-state metadata and the full success envelope are bounded before publication;
 post-commit backup cleanup failure remains a committed success with a bounded
 `diagnostics` entry, not a false claim that the install failed. Orphan backups
@@ -108,8 +125,7 @@ Standalone receipts expose real paths usable in `skills` / `extensions` arrays.
 Persistent instructions remain the explicit `main_package.instructions` mapping.
 Legacy project/global Skill precedence and existing discovery remain deliberate;
 global Packages are selected explicitly, not injected into legacy discovery.
-Legacy commands remain available; they cannot replace/remove resources owned by
-the new facade and direct users to `resource` instead. Automatic `extension update`
+Use scoped commands to replace or remove managed snapshots. Automatic `extension update`
 (and its `package update` alias) skips facade-owned Packages; explicitly naming one
 gives resource-update guidance rather than invoking Cargo. Legacy Package writes
 check the addressed directory, extensions and artifact/staging paths; aliases and
@@ -122,8 +138,8 @@ no transcript migration, task stopping, unload, or live capability widening occu
 For example, install a resource-only or combined bundle globally:
 
 ```sh
-rpi resource install package demo --path ../bundle --scope global
-rpi resource inspect package demo --scope global
+rpi package install demo --path ../bundle --scope global
+rpi package inspect demo --scope global
 ```
 
 Then start RPC with this caller-authored resource configuration (persistent

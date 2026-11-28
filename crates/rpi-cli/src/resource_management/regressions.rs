@@ -33,12 +33,16 @@ fn safe_legacy_registry_names_do_not_relax_managed_or_metadata_validation() {
     assert_eq!(packages(root).unwrap().packages.len(), 2);
     for name in ["_legacy", ".tools"] {
         assert!(identifier(name).is_err(), "managed grammar widened");
-        assert!(
-            parse(&["inspect", "package", name, "--scope", "project"].map(str::to_owned)).is_ok()
-        );
-        assert!(
-            parse(&["remove", "package", name, "--scope", "project"].map(str::to_owned)).is_err()
-        );
+        assert!(parse(
+            Kind::Package,
+            &["inspect", name, "--scope", "project"].map(str::to_owned)
+        )
+        .is_ok());
+        assert!(parse(
+            Kind::Package,
+            &["remove", name, "--scope", "project"].map(str::to_owned)
+        )
+        .is_err());
     }
     for records in [
         vec![record("..", json!([]))],

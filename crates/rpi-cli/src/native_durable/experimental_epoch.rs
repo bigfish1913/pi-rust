@@ -41,6 +41,7 @@ pub(crate) fn early_check(argv: &[String]) -> Result<(), String> {
                 | "install"
                 | "uninstall"
                 | "extension"
+                | "skill"
                 | "resource"
                 | "package"
                 | "pi-package"
@@ -185,6 +186,7 @@ mod tests {
             "install",
             "uninstall",
             "extension",
+            "skill",
             "__rpi_dev_cleanup",
         ] {
             assert!(early_check(&[first.into(), FLAG.into(), "epoch".into()]).is_err());

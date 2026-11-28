@@ -358,7 +358,8 @@ fn safe_early_dispatch_rejections_do_not_read_or_convert_test_owned_files() {
         vec!["--server", "--native-durable", FLAG, EPOCH],
         vec!["--web", "--native-durable", FLAG, EPOCH],
         vec!["dev", "--native-durable", FLAG, EPOCH],
-        vec!["resource", "list", "--native-durable", FLAG, EPOCH],
+        vec!["package", "list", "--native-durable", FLAG, EPOCH],
+        vec!["skill", "list", "--native-durable", FLAG, EPOCH],
         vec!["auth", "--native-durable", FLAG, EPOCH],
         vec!["--resource-capabilities", "--native-durable", FLAG, EPOCH],
         vec![

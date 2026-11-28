@@ -17,9 +17,10 @@
    executes that argument. `--help` itself performs no native host startup.
 4. `exactSelection` describes the v1 startup flag, tools modes, scopes and
    64-KiB configuration / 256-KiB observation bounds. `management` describes
-   local `resource` kinds (`package`, `skill`, `extension`), explicit project/
-   global scopes, list/inspect/install/update/reinstall/remove/recover and their
-   native bounds. `transition` describes its v1 request fields, expected state,
+   local snapshot kinds and commands, explicit project/global scopes,
+   list/inspect/install/update/reinstall/remove/recover and their native bounds.
+   `management.recoveryCommand` identifies the shared recovery entry point.
+   `transition` describes its v1 request fields, expected state,
    target schema, operation ID constraint and 64-KiB request bound.
    `loadedFacts: false` is deliberate: the profile makes **no installed resource
    or ABI compatibility claim**. Verify actual configured startup ready/state.
