@@ -7347,8 +7347,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_peeked_session_is_the_one_the_build_opens() {
-        use rpi_harness::session::jsonl::{encode_header, JsonlV4Header};
-
         let tmp = tempfile::tempdir().unwrap();
         let first_project = tmp.path().join("project-first");
         let second_project = tmp.path().join("project-second");
@@ -7377,16 +7375,17 @@ mod tests {
         assert_eq!(peeked.adopted, Some(first_project.clone()));
 
         // A newer file with the same ID appears in another workspace.
-        let newer = sessions.join("newer-cwdrace001.jsonl");
-        let header = JsonlV4Header::new(
-            peeked.id.clone(),
-            2,
-            second_project.to_string_lossy().into_owned(),
-            None,
-            None,
-            None,
-        );
-        std::fs::write(&newer, encode_header(&header)).unwrap();
+        let second_cwd = second_project.to_string_lossy();
+        create_jsonl_session_with_id(&sessions, &second_cwd, Some(peeked.id.clone()))
+            .await
+            .unwrap();
+        let newer =
+            list_session_metadata_in_scope_in_dir(&second_cwd, &sessions, SessionScope::Project)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+        let newer = PathBuf::from(newer.path);
         std::fs::File::options()
             .write(true)
             .open(&newer)
