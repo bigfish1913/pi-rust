@@ -19,12 +19,51 @@ const MAX_ROWS: usize = 8 * 1024 * 1024;
 const VERSION: u32 = 2;
 pub(in crate::session::jsonl) const SUFFIX: &str = ".preview.json";
 pub(in crate::session::jsonl) const TEMP_SUFFIX: &str = ".preview.json.tmp";
+pub(in crate::session::jsonl) const STAMP_SUFFIX: &str = ".preview.stamp";
 
 #[derive(Clone)]
 pub(in crate::session::jsonl) struct Source {
     path: PathBuf,
-    pub stamp: SourceStamp,
+    stamp: SourceStamp,
     pub attempted: bool,
+    span_repair: Option<SpanRepair>,
+    header_rewrite: Option<HeaderRewrite>,
+    published: Option<Arc<PublishedIndex>>,
+}
+
+#[derive(Clone)]
+struct SpanRepair {
+    last_old_sequence: u64,
+    skipped: Arc<[(u64, u64)]>,
+}
+
+pub(in crate::session::jsonl) struct RepairLayout {
+    length: u64,
+    skipped: Vec<(u64, u64)>,
+}
+
+impl RepairLayout {
+    pub fn from_spans(spans: &[(u64, u64)]) -> Option<Self> {
+        let mut length = 0;
+        let mut removed = 0;
+        let mut skipped = Vec::new();
+        for &(offset, count) in spans {
+            let gap = offset.checked_sub(length)?;
+            if gap != removed {
+                skipped.push((offset, gap));
+                removed = gap;
+            }
+            length = length.checked_add(count)?.checked_add(1)?;
+        }
+        Some(Self { length, skipped })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HeaderRewrite {
+    last_old_sequence: u64,
+    old_len: u64,
+    new_len: u64,
 }
 
 impl Source {
@@ -37,6 +76,9 @@ impl Source {
             path,
             stamp,
             attempted: false,
+            span_repair: None,
+            header_rewrite: None,
+            published: None,
         };
         source.matches(reader).then_some(source)
     }
@@ -56,6 +98,9 @@ impl Source {
             path,
             stamp,
             attempted: false,
+            span_repair: None,
+            header_rewrite: None,
+            published: None,
         };
         source.is_current().then_some(source)
     }
@@ -69,7 +114,7 @@ impl Source {
             && self.is_current()
     }
 
-    fn is_current(&self) -> bool {
+    pub fn is_current(&self) -> bool {
         native::address(&self.path)
             .and_then(|(directory, name)| directory.open(name))
             .is_ok_and(|(_, stamp)| self.stamp == stamp)
@@ -89,11 +134,61 @@ impl Source {
             path: self.path.clone(),
             stamp: after,
             attempted: false,
+            span_repair: self.span_repair.clone(),
+            header_rewrite: self.header_rewrite,
+            published: self.published.clone(),
         })
     }
 
-    pub fn publish(&self, index: PreviewIndex) -> io::Result<()> {
-        native::publish(&self.path, index)
+    pub fn after_repair(
+        &self,
+        reader: &dyn ReadFile,
+        layout: RepairLayout,
+        last_old_sequence: u64,
+    ) -> Option<Self> {
+        let mut source = Self::replay(self.path.clone(), reader, layout.length)?;
+        if !layout.skipped.is_empty() {
+            source.span_repair = Some(SpanRepair {
+                last_old_sequence,
+                skipped: layout.skipped.into(),
+            });
+        }
+        Some(source)
+    }
+
+    pub fn final_newline_layout(&self) -> Option<RepairLayout> {
+        Some(RepairLayout {
+            length: self.stamp.length.checked_add(1)?,
+            skipped: Vec::new(),
+        })
+    }
+
+    pub fn after_header_rewrite(
+        &self,
+        reader: &dyn ReadFile,
+        last_old_sequence: u64,
+        old_len: u64,
+        new_len: u64,
+    ) -> Option<Self> {
+        let length = self
+            .stamp
+            .length
+            .checked_sub(old_len)?
+            .checked_add(new_len)?;
+        let mut source = Self::replay(self.path.clone(), reader, length)?;
+        source.span_repair = self.span_repair.clone();
+        source.header_rewrite = Some(HeaderRewrite {
+            last_old_sequence,
+            old_len,
+            new_len,
+        });
+        Some(source)
+    }
+
+    pub fn publish(mut self, index: PreviewIndex) -> io::Result<Self> {
+        self.published = Some(native::publish(&self.path, index, self.published)?);
+        self.attempted = true;
+        Ok(self)
     }
 }
 
@@ -108,7 +203,7 @@ pub(in crate::session::jsonl) fn native_path(
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(in crate::session::jsonl) struct SourceStamp {
+struct SourceStamp {
     length: u64,
     modified: SystemTime,
     created: Option<SystemTime>,
@@ -137,7 +232,7 @@ impl SourceStamp {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, PartialEq, Serialize)]
 struct Row {
     offset: u64,
     length: usize,
@@ -148,7 +243,7 @@ struct Row {
     live_null: Option<NullField>,
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
 enum NullField {
     ToolDetails,
     DeferredData,
@@ -214,11 +309,28 @@ pub(in crate::session::jsonl) struct PreviewIndex {
     has_more: bool,
 }
 
+#[cfg(unix)]
+struct PublishedIndex {
+    index: PreviewIndex,
+    stamp: SourceStamp,
+    digest: [u8; 32],
+}
+
+#[cfg(not(unix))]
+enum PublishedIndex {}
+
+#[cfg(unix)]
+#[derive(Deserialize, Eq, PartialEq, Serialize)]
+struct PreviewStamp {
+    source: SourceStamp,
+    index_digest: [u8; 32],
+}
+
 impl ResidentState {
     pub(in crate::session::jsonl) fn preview_index(
         &self,
         session_id: &str,
-        source: SourceStamp,
+        source: &Source,
     ) -> Option<PreviewIndex> {
         let mut next = self.reducer.require_lane("main").ok()?;
         let mut rows = Vec::with_capacity(LIMIT);
@@ -233,7 +345,33 @@ impl ResidentState {
                     has_more = true;
                     break;
                 }
-                rows.push(Row::from_payload(self.reducer.payload(index)?)?);
+                let mut row = Row::from_payload(self.reducer.payload(index)?)?;
+                // Recovered entries still use the original reader. Translate
+                // their offsets across any removed spans before the header shift.
+                if let Some(repair) = source
+                    .span_repair
+                    .as_ref()
+                    .filter(|repair| row.seq <= repair.last_old_sequence)
+                {
+                    let gaps = repair
+                        .skipped
+                        .partition_point(|(offset, _)| *offset <= row.offset);
+                    if gaps > 0 {
+                        row.offset = row.offset.checked_sub(repair.skipped[gaps - 1].1)?;
+                    }
+                }
+                // Progress migration copies the body verbatim. The live cold
+                // entries still point to the old file through their open handle.
+                if let Some(rewrite) = source
+                    .header_rewrite
+                    .filter(|rewrite| row.seq <= rewrite.last_old_sequence)
+                {
+                    row.offset = row
+                        .offset
+                        .checked_sub(rewrite.old_len)?
+                        .checked_add(rewrite.new_len)?;
+                }
+                rows.push(row);
             }
             next = entry.parent_id.clone();
         }
@@ -244,7 +382,7 @@ impl ResidentState {
         Some(PreviewIndex {
             version: VERSION,
             session_id: session_id.to_owned(),
-            source,
+            source: source.stamp.clone(),
             rows,
             has_more,
         })
@@ -252,6 +390,14 @@ impl ResidentState {
 }
 
 impl PreviewIndex {
+    #[cfg(unix)]
+    fn same_projection(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.session_id == other.session_id
+            && self.rows == other.rows
+            && self.has_more == other.has_more
+    }
+
     fn validate(&self, header_len: u64) -> io::Result<()> {
         let valid = self.version == VERSION
             && self.rows.len() <= LIMIT
@@ -374,7 +520,27 @@ mod native {
         name
     }
 
-    pub(super) fn publish(path: &Path, index: PreviewIndex) -> io::Result<()> {
+    fn read_bounded(mut file: File, limit: usize) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((limit + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(invalid("session preview sidecar exceeds byte limit"));
+        }
+        Ok(bytes)
+    }
+
+    fn read_stamp(directory: &Directory, name: &OsStr) -> io::Result<PreviewStamp> {
+        let (file, _) = directory.open(&sidecar(name, STAMP_SUFFIX))?;
+        serde_json::from_slice(&read_bounded(file, 1024)?).map_err(io::Error::other)
+    }
+
+    pub(super) fn publish(
+        path: &Path,
+        index: PreviewIndex,
+        cached: Option<Arc<PublishedIndex>>,
+    ) -> io::Result<Arc<PublishedIndex>> {
         index.validate(1)?;
         let parent = canonical_parent(path)?;
         let directory = Directory::absolute(&parent)?;
@@ -384,19 +550,72 @@ mod native {
         if directory.open(name)?.1 != index.source {
             return Err(invalid("session changed before preview publication"));
         }
+        let output = sidecar(name, SUFFIX);
+        let already_loaded = cached.is_some();
+        let existing = match cached {
+            Some(cached)
+                if cached.index.same_projection(&index)
+                    && directory
+                        .open(&output)
+                        .is_ok_and(|(_, stamp)| stamp == cached.stamp) =>
+            {
+                Some(cached)
+            }
+            Some(_) => None,
+            None => directory.open(&output).ok().and_then(|(file, stamp)| {
+                let bytes = read_bounded(file, MAX_INDEX).ok()?;
+                let previous: PreviewIndex = serde_json::from_slice(&bytes).ok()?;
+                previous.same_projection(&index).then(|| {
+                    Arc::new(PublishedIndex {
+                        index: previous,
+                        stamp,
+                        digest: Sha256::digest(&bytes),
+                    })
+                })
+            }),
+        };
+        if let Some(existing) = existing {
+            if existing.index.source != index.source {
+                // Keep the row index immutable while advancing its freshness
+                // proof. Readers bind the proof to the exact index bytes.
+                let proof = PreviewStamp {
+                    source: index.source,
+                    index_digest: existing.digest,
+                };
+                if already_loaded || !read_stamp(&directory, name).is_ok_and(|old| old == proof) {
+                    let bytes = serde_json::to_vec(&proof).map_err(io::Error::other)?;
+                    publish_sidecar(
+                        &directory,
+                        &parent,
+                        name,
+                        &sidecar(name, STAMP_SUFFIX),
+                        &proof.source,
+                        &bytes,
+                    )?;
+                }
+            }
+            return Ok(existing);
+        }
         let bytes = serde_json::to_vec(&index).map_err(io::Error::other)?;
         if bytes.len() > MAX_INDEX {
             return Err(invalid("session preview index exceeds byte limit"));
         }
-        let output = sidecar(name, SUFFIX);
-        if directory.open(&output).ok().is_some_and(|(file, stamp)| {
-            let mut existing = Vec::new();
-            stamp.length == bytes.len() as u64
-                && file.take(stamp.length).read_to_end(&mut existing).is_ok()
-                && bytes == existing
-        }) {
-            return Ok(());
-        }
+        let stamp = publish_sidecar(&directory, &parent, name, &output, &index.source, &bytes)?;
+        Ok(Arc::new(PublishedIndex {
+            index,
+            stamp,
+            digest: Sha256::digest(&bytes),
+        }))
+    }
+
+    fn publish_sidecar(
+        directory: &Directory,
+        parent: &Path,
+        name: &OsStr,
+        output: &OsStr,
+        source: &SourceStamp,
+        bytes: &[u8],
+    ) -> io::Result<SourceStamp> {
         let temp = sidecar(name, TEMP_SUFFIX);
         match unlinkat(&directory.0, &temp, AtFlags::empty()) {
             Ok(()) | Err(rustix::io::Errno::NOENT) => {}
@@ -406,21 +625,18 @@ mod native {
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW;
         let mut file = File::from(openat(&directory.0, &temp, flags, Mode::RUSR | Mode::WUSR)?);
         let result = (|| {
-            file.write_all(&bytes)?;
-            if directory.open(name)?.1 != index.source || !directory.is_current(&parent)? {
+            file.write_all(bytes)?;
+            if &directory.open(name)?.1 != source || !directory.is_current(parent)? {
                 return Err(invalid("session changed during preview publication"));
             }
             // The journal already crossed its durability boundary. The optional
             // index can be lost on power failure and is safe to regenerate.
-            renameat(&directory.0, &temp, &directory.0, &output)?;
+            renameat(&directory.0, &temp, &directory.0, output)?;
             if directory.open(name).is_err() {
-                // Deletion may race between the final source check and rename.
-                // Remove a newly published orphan while this writer still owns
-                // the lease and any successor is excluded.
-                let _ = unlinkat(&directory.0, &output, AtFlags::empty());
+                let _ = unlinkat(&directory.0, output, AtFlags::empty());
                 return Err(invalid("session disappeared during preview publication"));
             }
-            Ok(())
+            SourceStamp::new(&file.metadata()?)
         })();
         if result.is_err() {
             let _ = unlinkat(&directory.0, &temp, AtFlags::empty());
@@ -451,17 +667,21 @@ mod native {
         }
         let name = candidate.ok_or_else(|| invalid("session is unavailable"))?;
         let (index, _) = directory.open(&sidecar(&name, SUFFIX))?;
-        let mut index_bytes = Vec::new();
-        index
-            .take((MAX_INDEX + 1) as u64)
-            .read_to_end(&mut index_bytes)?;
-        if index_bytes.len() > MAX_INDEX {
-            return Err(invalid("session preview index exceeds byte limit"));
-        }
-        let index: PreviewIndex = serde_json::from_slice(&index_bytes).map_err(io::Error::other)?;
+        let index_bytes = read_bounded(index, MAX_INDEX)?;
+        let mut index: PreviewIndex =
+            serde_json::from_slice(&index_bytes).map_err(io::Error::other)?;
         let (file, stamp) = directory.open(&name)?;
-        if index.source != stamp || index.session_id != session_id {
-            return Err(invalid("session preview is stale"));
+        if index.session_id != session_id {
+            return Err(invalid("session preview identity changed"));
+        }
+        if index.source != stamp {
+            let proof_matches = read_stamp(&directory, &name).is_ok_and(|proof| {
+                proof.source == stamp && proof.index_digest == Sha256::digest(&index_bytes)
+            });
+            if !proof_matches {
+                return Err(invalid("session preview is stale"));
+            }
+            index.source = stamp.clone();
         }
 
         let mut reader = BufReader::new(file);
@@ -524,7 +744,11 @@ mod native {
         Err(io::ErrorKind::Unsupported.into())
     }
 
-    pub(super) fn publish(_: &Path, _: PreviewIndex) -> io::Result<()> {
+    pub(super) fn publish(
+        _: &Path,
+        _: PreviewIndex,
+        _: Option<Arc<PublishedIndex>>,
+    ) -> io::Result<Arc<PublishedIndex>> {
         Err(io::ErrorKind::Unsupported.into())
     }
 

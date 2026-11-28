@@ -911,7 +911,6 @@ async fn review_pr104_replay_preserves_the_live_cache_hit_rate() {
             },
             &tui,
             &state,
-            &state.chat_container,
             &lane,
         )
         .await;
@@ -1464,7 +1463,6 @@ async fn review_distinct_turn_with_same_timestamp_and_usage_is_not_dropped() {
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;
@@ -1505,7 +1503,6 @@ async fn review_reconcile_at_agent_end_is_not_recounted_by_a_later_identical_eve
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;
@@ -1530,7 +1527,6 @@ async fn review_reconcile_at_agent_end_is_not_recounted_by_a_later_identical_eve
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;
@@ -1569,7 +1565,6 @@ async fn review_pending_message_end_after_reconcile_does_not_double_usage() {
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;
@@ -1628,7 +1623,6 @@ async fn review_unpersisted_message_after_reconcile_still_counts_once() {
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;

@@ -330,28 +330,54 @@ async fn stop_on_a_finished_child_reports_already_finished_without_rewriting_it(
     .unwrap();
 }
 
-/// `finished_ms` is first-write-wins: a later `fail()` (for example a Stop
-/// click) must not move the timestamp of a child that already settled.
 #[test]
-fn mark_finished_keeps_the_first_terminal_timestamp() {
+fn oversized_final_output_records_the_terminal_timestamp() {
+    let manager = IndependentRuns::default();
     let child = job(7);
-    {
-        let mut state = child.state.lock().unwrap();
-        state.finished_ms = Some(1_000);
-    }
-    child.mark_finished();
-    assert_eq!(
-        child.state.lock().unwrap().finished_ms,
-        Some(1_000),
-        "mark_finished must not overwrite an existing terminal timestamp"
-    );
+    child.state.lock().unwrap().bytes = MAX_OUTPUT;
+    manager
+        .jobs
+        .lock()
+        .unwrap()
+        .insert("c".into(), child.clone());
 
-    let fresh = job(7);
-    fresh.mark_finished();
-    let first = fresh.state.lock().unwrap().finished_ms;
-    assert!(first.is_some());
-    fresh.mark_finished();
-    assert_eq!(fresh.state.lock().unwrap().finished_ms, first);
+    child.complete(json!({"status":"completed","text":"report"}), 8);
+    let row = manager.roster().pop().unwrap();
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["error"], "child output limit exceeded");
+    assert!(row["finishedMs"].as_u64().is_some());
+    assert_eq!(manager.stop("c").unwrap()["status"], "already-finished");
+    assert_eq!(manager.roster(), vec![row]);
+}
+
+#[test]
+fn stop_receipt_matches_the_winner_of_concurrent_completion() {
+    let manager = IndependentRuns::default();
+    let child = job(7);
+    manager
+        .jobs
+        .lock()
+        .unwrap()
+        .insert("c".into(), child.clone());
+    let barrier = std::sync::Barrier::new(2);
+
+    let receipt = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            barrier.wait();
+            child.complete(json!({"status":"completed","text":"report"}), 8);
+        });
+        barrier.wait();
+        manager.stop("c").unwrap()
+    });
+
+    let row = manager.roster().pop().unwrap();
+    let expected_status = match receipt["status"].as_str() {
+        Some("cancelled") => "failed",
+        Some("already-finished") => "done",
+        _ => panic!("unexpected Stop receipt: {receipt}"),
+    };
+    assert_eq!(row["status"], expected_status);
+    assert!(row["finishedMs"].as_u64().is_some());
 }
 
 /// `stop` is the HOST path: it is intentionally not owner-scoped, unlike the

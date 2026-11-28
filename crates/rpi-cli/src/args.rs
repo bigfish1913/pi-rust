@@ -333,6 +333,10 @@ fn file_arg(arg: &str) -> Option<PathBuf> {
 /// handles `--name=value` for *unknown* flags; we extend it to known flags for
 /// ergonomics). Short flags use a single leading `-`.
 pub fn parse_args(args: &[String]) -> Args {
+    parse_startup_args(args, false)
+}
+
+pub(crate) fn parse_startup_args(args: &[String], package: bool) -> Args {
     // Native durable is the CLI default. Keep `Args::default()` unchanged for
     // embedded/test hosts that construct programmatic options explicitly.
     let mut result = Args {
@@ -825,7 +829,7 @@ pub fn parse_args(args: &[String]) -> Args {
                 .push(format!("--mini does not support --{flag}"));
         }
     }
-    if result.resource_config.is_none() && result.resource_transition.is_none() {
+    if !package && result.resource_config.is_none() && result.resource_transition.is_none() {
         // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
         env_extension_dirs.append(&mut result.extensions_dir);
         result.extensions_dir = env_extension_dirs;
@@ -934,8 +938,7 @@ pub fn print_help() {
   --fork-position <at|before>    With --fork-entry: keep the selected message in the
                                  new branch (at) or drop it (before). Default: before
   --session-dir <dir>            Directory for session storage
-  --session-preview <uuid>       Read the recent saved transcript (standalone with --session-dir)
-  --no-session                   Ephemeral mode (do not persist the session)
+{session_preview}  --no-session                   Ephemeral mode (do not persist the session)
   --name, -n <name>              Set the session display name
   --tools, -t <list>             Comma-separated allowlist of tool names to enable
   --exclude-tools, -xt <list>    Comma-separated denylist of tool names to disable
@@ -976,6 +979,9 @@ pub fn print_help() {
   uninstall <crate>              Remove an installed Rust cdylib extension
   extension update [name]        Update project and global installed Rust extensions
                                 (see `rpi extension update --help`)
+  install package NAME [--version VERSION | --manifest URL]  Install a published agent package
+  update package NAME [--version VERSION | --manifest URL]   Update a published agent package
+  run package NAME [options]               Start an installed agent package (JSONL RPC)
   package link|list|update|unlink Manage project-local Rust extension packages
                                 (update is a legacy alias; see `rpi package --help`)
   dev [options]                  Build, watch, and hot-reload a Rust extension
@@ -1027,6 +1033,11 @@ pub fn print_help() {
 ",
         name = crate::APP_NAME,
         builtin = builtin,
+        session_preview = if cfg!(unix) {
+            "  --session-preview <uuid>       Read the recent saved transcript (standalone with --session-dir)\n"
+        } else {
+            ""
+        },
         u = "\x1b[1m",
         r = "\x1b[0m",
     );

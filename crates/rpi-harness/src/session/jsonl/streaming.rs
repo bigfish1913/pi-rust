@@ -196,12 +196,16 @@ impl JsonlSessionStorage {
         length: u64,
         policy: ReadPolicy,
     ) -> SessionResult<Self> {
+        let preview_source = (policy.repairs() || policy.defers_repairs())
+            .then(|| preview::native_path(fs.as_ref(), path))
+            .flatten()
+            .and_then(|path| preview::Source::replay(path, reader.as_ref(), length));
         let scanner = || {
             let mut scan = Scanner::new(reader.clone(), length);
             scan.policy = policy;
             scan
         };
-        if let Some(storage) = Self::load_streaming_impl(
+        let mut storage = if let Some(storage) = Self::load_streaming_impl(
             fs.clone(),
             path,
             clock.clone(),
@@ -211,11 +215,21 @@ impl JsonlSessionStorage {
         )
         .await?
         {
-            return Ok(storage);
+            storage
+        } else {
+            Self::load_streaming_impl(fs, path, clock, ids, scanner(), false)
+                .await?
+                .ok_or_else(|| {
+                    SessionError::storage("unexpected fallback from full history replay")
+                })?
+        };
+        if let Some(source) = preview_source.filter(|source| source.matches(reader.as_ref())) {
+            *storage.preview_source.lock().unwrap() = Some(source);
         }
-        Self::load_streaming_impl(fs, path, clock, ids, scanner(), false)
-            .await?
-            .ok_or_else(|| SessionError::storage("unexpected fallback from full history replay"))
+        if policy.repairs() {
+            storage.commit_pending_repair().await?;
+        }
+        Ok(storage)
     }
 
     /// `None` restarts replay from the header because the suffix needs physical
@@ -468,61 +482,18 @@ impl JsonlSessionStorage {
         if !storage.progress.required {
             *storage.legacy_history_digest.lock().unwrap() = Some(source_digest);
         }
-        if repair && (allow_repair || defer_repair) {
-            if allow_repair {
-                storage.ensure_writer_lease().await?;
-                let digest = Arc::new(std::sync::Mutex::new(None));
-                let output = digest.clone();
-                publish_file_atomically(&fs, path, move |fs, temp| {
-                    Box::pin(async move {
-                        file_result(
-                            fs.write_file(temp, FileContent::Bytes(Vec::new()), None)
-                                .await,
-                            "stage session repair",
-                        )?;
-                        let mut hash = Sha256::new();
-                        for (offset, count) in spans {
-                            copy_range(fs, temp, &reader, offset, count, &mut hash).await?;
-                            file_result(
-                                fs.append_file(temp, FileContent::Bytes(vec![b'\n']), None)
-                                    .await,
-                                "stage repaired newline",
-                            )?;
-                            hash.update(b"\n");
-                        }
-                        *output.lock().unwrap() = Some(hash.finalize());
-                        Ok(())
-                    })
-                })
-                .await?;
-                if !storage.progress.required {
-                    *storage.legacy_history_digest.lock().unwrap() = *digest.lock().unwrap();
-                }
-            } else {
-                *storage.pending_repair.lock().unwrap() =
-                    Some(PendingRepair::Streaming { reader, spans });
-            }
-        } else {
-            if !terminated && (allow_repair || defer_repair) {
-                if allow_repair {
-                    storage.ensure_writer_lease().await?;
-                    file_result(
-                        fs.append_file(path, FileContent::Text("\n".into()), None)
-                            .await,
-                        "repair unterminated session tail",
-                    )?;
-                    file_result(
-                        fs.sync_file(path, true, None).await,
-                        "sync repaired unterminated session tail",
-                    )?;
+        if allow_repair || defer_repair {
+            *storage.pending_repair.lock().unwrap() = if repair {
+                Some(PendingRepair::Streaming { reader, spans })
+            } else if !terminated {
+                let digest = (!storage.progress.required).then(|| {
                     scan.hash.update(b"\n");
-                } else {
-                    *storage.pending_repair.lock().unwrap() = Some(PendingRepair::AppendNewline);
-                }
-            }
-            if !storage.progress.required && allow_repair {
-                *storage.legacy_history_digest.lock().unwrap() = Some(scan.hash.finalize());
-            }
+                    scan.hash.finalize()
+                });
+                Some(PendingRepair::AppendNewline { digest })
+            } else {
+                None
+            };
         }
         policy.check(line_no - 1)?;
         // These are disjoint accumulated timings, not per-row stderr events.
@@ -539,8 +510,18 @@ impl JsonlSessionStorage {
         &mut self,
         pending: PendingRepair,
     ) -> SessionResult<()> {
-        match pending {
+        let preview_source = self
+            .preview_source
+            .lock()
+            .unwrap()
+            .take()
+            .filter(preview::Source::is_current);
+        let layout = match pending {
             PendingRepair::Streaming { reader, spans } => {
+                let layout = preview_source
+                    .as_ref()
+                    .filter(|source| source.matches(reader.as_ref()))
+                    .and_then(|_| preview::RepairLayout::from_spans(&spans));
                 let path = self.metadata.path.clone();
                 let digest = Arc::new(std::sync::Mutex::new(None));
                 let output = digest.clone();
@@ -549,7 +530,7 @@ impl JsonlSessionStorage {
                         file_result(
                             fs.write_file(temp, FileContent::Bytes(Vec::new()), None)
                                 .await,
-                            "stage prepared session repair",
+                            "stage session repair",
                         )?;
                         let mut hash = Sha256::new();
                         for (offset, count) in spans {
@@ -557,7 +538,7 @@ impl JsonlSessionStorage {
                             file_result(
                                 fs.append_file(temp, FileContent::Bytes(vec![b'\n']), None)
                                     .await,
-                                "stage prepared session repair line",
+                                "stage session repair newline",
                             )?;
                             hash.update(b"\n");
                         }
@@ -569,6 +550,7 @@ impl JsonlSessionStorage {
                 if !self.progress.required {
                     *self.legacy_history_digest.lock().unwrap() = *digest.lock().unwrap();
                 }
+                layout
             }
             PendingRepair::Eager { bytes } => {
                 let digest = Sha256::digest(&bytes);
@@ -586,32 +568,33 @@ impl JsonlSessionStorage {
                 if !self.progress.required {
                     *self.legacy_history_digest.lock().unwrap() = Some(digest);
                 }
+                None
             }
-            PendingRepair::AppendNewline => {
+            PendingRepair::AppendNewline { digest } => {
+                let layout = preview_source
+                    .as_ref()
+                    .and_then(preview::Source::final_newline_layout);
                 file_result(
                     self.fs
                         .append_file(&self.metadata.path, FileContent::Text("\n".into()), None)
                         .await,
-                    "repair prepared unterminated session tail",
+                    "repair unterminated session tail",
                 )?;
                 file_result(
                     self.fs.sync_file(&self.metadata.path, true, None).await,
-                    "sync prepared unterminated session tail",
+                    "sync repaired unterminated session tail",
                 )?;
-                if !self.progress.required {
-                    let reader = file_result(
-                        self.fs.open_read_file(&self.metadata.path).await,
-                        "read repaired session history",
-                    )?
-                    .ok_or_else(|| SessionError::storage("missing repaired session history"))?;
-                    let length =
-                        file_result(reader.byte_len().await, "stat repaired session history")?
-                            .ok_or_else(|| {
-                                SessionError::storage("repaired session history has no length")
-                            })?;
-                    *self.legacy_history_digest.lock().unwrap() =
-                        Some(hash_reader(&reader, length).await?);
+                if let Some(digest) = digest {
+                    *self.legacy_history_digest.lock().unwrap() = Some(digest);
                 }
+                layout
+            }
+        };
+        if let Some((source, layout)) = preview_source.zip(layout) {
+            if let Ok(Some(reader)) = self.fs.open_read_file(&self.metadata.path).await {
+                let sequence = self.state.lock().await.sequence();
+                *self.preview_source.lock().unwrap() =
+                    source.after_repair(reader.as_ref(), layout, sequence);
             }
         }
         Ok(())
@@ -665,6 +648,13 @@ impl JsonlSessionStorage {
             serde_json::to_string(&value).map_err(|e| SessionError::storage(e.to_string()))?
         );
         let body_offset = raw.len() as u64 + 1;
+        let upgraded_header_len = upgraded.len() as u64;
+        let preview_source = self
+            .preview_source
+            .lock()
+            .unwrap()
+            .take()
+            .filter(|source| source.matches(reader.as_ref()));
         let progress = super::super::progress::JsonlProgressStore::new(
             self.fs.clone(),
             &path,
@@ -710,6 +700,18 @@ impl JsonlSessionStorage {
         .await?;
         self.progress = progress;
         *self.legacy_history_digest.lock().unwrap() = None;
+        if let Some(source) = preview_source {
+            if let Ok(Some(reader)) = self.fs.open_read_file(&path).await {
+                let sequence = self.state.lock().await.sequence();
+                *self.preview_source.lock().unwrap() = source.after_header_rewrite(
+                    reader.as_ref(),
+                    sequence,
+                    body_offset,
+                    upgraded_header_len,
+                );
+                self.publish_preview().await;
+            }
+        }
         Ok(true)
     }
 }

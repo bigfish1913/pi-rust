@@ -177,6 +177,7 @@ impl JsonlProgressStore {
             })
         })
         .await
+        .map_err(Into::into)
     }
 
     async fn load(&self, state: &mut State) -> SessionResult<()> {
@@ -386,14 +387,12 @@ impl JsonlProgressStore {
             })
             .await;
         if let Err(error) = publish_result {
-            // A staging failure leaves the destination untouched and can be
-            // retried by the same live owner. Once publication is attempted,
-            // however, the rename or a following sync may have succeeded before
-            // the error was reported; never append using that stale projection.
-            if !error.message.starts_with("stage progress checkpoint:") {
+            // A failed checkpoint write is retryable. Preserve the reopen
+            // requirement for sync and publication failures.
+            if error.stage != super::storage::PublicationStage::Populating {
                 state.poisoned = true;
             }
-            return Err(error);
+            return Err(error.into());
         }
         state.length = length;
         state.digest = digest;

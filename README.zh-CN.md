@@ -520,7 +520,7 @@ MIT，详见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-27"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-27" width="230" alt="微信交流群二维码"></a><br>
+      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-28"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-28" width="230" alt="微信交流群二维码"></a><br>
       <sub><b>微信交流群</b> — 扫码加入</sub>
     </td>
     <td align="center" width="50%">

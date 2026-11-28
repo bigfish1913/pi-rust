@@ -150,12 +150,11 @@ pub(super) async fn drain_agent_events(
     mut rx: broadcast::Receiver<AgentEvent>,
     tui: Arc<TuiAltScreen>,
     state: Arc<TuiState>,
-    chat: Arc<Container>,
     lane: Arc<dyn AgentLane>,
 ) {
     loop {
         match rx.recv().await {
-            Ok(event) => handle_agent_event(event, &tui, &state, &chat, &lane).await,
+            Ok(event) => handle_agent_event(event, &tui, &state, &lane).await,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 // `MessageUpdate` carries a full snapshot of the block list, so
                 // the transcript re-syncs on its own. `MessageEnd` does NOT —
@@ -184,7 +183,6 @@ pub(super) async fn handle_agent_event(
     event: AgentEvent,
     tui: &Arc<TuiAltScreen>,
     state: &Arc<TuiState>,
-    chat: &Arc<Container>,
     lane: &Arc<dyn AgentLane>,
 ) {
     match event {
@@ -298,6 +296,10 @@ pub(super) async fn handle_agent_event(
                 tui.request_render(false);
             }
             AgentMessage::Custom(custom) => {
+                // Custom renderers choose content, not placement. Like other
+                // streamed messages, these stay in the live slot even while
+                // an older history page is visible.
+                let chat = state.transcript_container();
                 let payload = serde_json::json!({
                     "customType": custom.role,
                     "content": custom.content,
@@ -315,7 +317,7 @@ pub(super) async fn handle_agent_event(
                     chat.add_child(Arc::new(Spacer::new(1)));
                     tui.request_render(false);
                 } else {
-                    add_note_message(&state.notice_container(), &custom_message_fallback(&custom));
+                    add_note_message(&chat, &custom_message_fallback(&custom));
                     tui.request_render(false);
                 }
             }
@@ -484,7 +486,7 @@ pub(super) async fn handle_agent_event(
             result,
             is_error,
         } => {
-            state.transcript_view().apply(
+            state.apply_tool_end(
                 &UiEvent::ToolEnd {
                     id: tool_call_id,
                     name: tool_name,

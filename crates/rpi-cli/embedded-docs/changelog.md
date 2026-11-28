@@ -13,11 +13,19 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [0.32.0](https://github.com/bigfish1913/pi-rust/compare/v0.31.0...v0.32.0) - 2026-11-28
 
+### Added
+
+- *(cli)* install and run published agent packages ([#447](https://github.com/bigfish1913/pi-rust/pull/447))
+
 ### Fixed
 
+- *(tui)* keep plans and ordinary output in transcript order ([#446](https://github.com/bigfish1913/pi-rust/pull/446))
 - *(host)* settle RPC startup and retry stale session restores ([#448](https://github.com/bigfish1913/pi-rust/pull/448))
+- Verify JSONL replacement, keep the selected Session during restore, and clean up batch event subscriptions ([#450](https://github.com/bigfish1913/pi-rust/pull/450))
+- Fence uncertain storage writes and stabilize TUI scheduling, batch output, and independent runs ([#451](https://github.com/bigfish1913/pi-rust/pull/451))
+- Restore Session previews and support upgrades for published agent packages ([#454](https://github.com/bigfish1913/pi-rust/pull/454))
 
-### Other
+### Changed
 
 - Retire ChildAgent in favor of IndependentRun ([#449](https://github.com/bigfish1913/pi-rust/pull/449))
 

@@ -5,6 +5,10 @@ use rpi_harness::session::{CounterIdGenerator, FakeClock, InMemorySessionStorage
 
 #[path = "tests/entry_visibility.rs"]
 mod entry_visibility;
+#[path = "tests/output_order.rs"]
+mod output_order;
+#[path = "tests/plan_order.rs"]
+mod plan_order;
 #[path = "tests/startup_header.rs"]
 mod startup_header;
 #[path = "tests/update_notices.rs"]
@@ -91,13 +95,11 @@ fn update_notices_mount_before_live_transcript_slot() {
     );
 
     let children = chat.get_children();
-    assert_eq!(children.len(), 4); // Includes the reserved regular update hint.
+    assert_eq!(children.len(), 3); // Includes the reserved regular update hint.
     let updates: Arc<dyn Component> = history.updates.clone();
     let active: Arc<dyn Component> = history.active.clone();
-    let panels: Arc<dyn Component> = history.panels.clone();
     assert!(Arc::ptr_eq(&children[0], &updates));
     assert!(Arc::ptr_eq(&children[1], &active));
-    assert!(Arc::ptr_eq(&children[2], &panels));
     assert!(strip_ansi(&chat.render(100).join("\\n")).contains("Package Update Available"));
 }
 
@@ -131,7 +133,7 @@ async fn pages_replace_not_accumulate_and_release_old_components_and_search() {
     finish_request(&state).await;
     assert!(text(&state).contains("history-entry-122"));
     assert!(!text(&state).contains("history-entry-072"));
-    assert_eq!(state.chat_container.child_count(), 5); // Includes reserved hint.
+    assert_eq!(state.chat_container.child_count(), 4); // Includes reserved hint.
 }
 
 #[tokio::test]
@@ -177,18 +179,10 @@ async fn invalid_cursor_preserves_page_and_stale_generation_or_storage_never_mat
 }
 
 #[tokio::test]
-async fn latest_append_settlement_is_bounded_and_old_pages_do_not_revert_panels() {
+async fn latest_append_settlement_is_bounded_and_old_pages_keep_their_snapshot() {
     let (storage, state, tui) = fixture(75).await;
     request(state.clone(), tui.clone(), Direction::Latest);
     finish_request(&state).await;
-    crate::transcript_view::update_plan_panel(
-        &state.history_page.panels,
-        &serde_json::json!({"details":{"kind":"plan","active":true,"plan":"current-plan"}}),
-    );
-    crate::transcript_view::update_todo_list(
-        &state.history_page.panels,
-        &serde_json::json!({"details":{"todos":[{"text":"current-task","done":false}]}}),
-    );
     for index in 75..145 {
         append(
             &storage,
@@ -221,7 +215,6 @@ async fn latest_append_settlement_is_bounded_and_old_pages_do_not_revert_panels(
     settle(&state, &tui);
     assert_eq!(old, text(&state));
     assert!(state.history_page.active.get_children().is_empty());
-    assert_eq!(state.history_page.panels.child_count(), 2);
 }
 
 #[tokio::test]
@@ -315,7 +308,7 @@ async fn repeated_restore_replaces_the_page_and_mounts_live_user_messages() {
     let old_page = Arc::downgrade(&state.chat_container.get_children()[1]);
     restore_bound(&state, &state.chat_container).await;
     assert!(old_page.upgrade().is_none());
-    assert_eq!(state.chat_container.child_count(), 5); // Includes reserved hint.
+    assert_eq!(state.chat_container.child_count(), 4); // Includes reserved hint.
     state.set_status(RunStatus::Working);
     state.transcript_view().add_user("visible-live-user");
     assert!(text(&state).contains("visible-live-user"));
@@ -351,12 +344,12 @@ async fn repeated_page_failures_keep_one_notice_and_preserve_the_page() {
         request(state.clone(), tui.clone(), Direction::Older);
         finish_request(&state).await;
         assert!(Arc::ptr_eq(&page, &state.chat_container.get_children()[1]));
-        assert_eq!(state.chat_container.child_count(), 6); // Reserved hint + failure.
+        assert_eq!(state.chat_container.child_count(), 4); // Error is inline.
         assert_eq!(text(&state).matches("Could not load history").count(), 1);
     }
     request(state.clone(), tui.clone(), Direction::Latest);
     finish_request(&state).await;
-    assert_eq!(state.chat_container.child_count(), 5); // Includes reserved hint.
+    assert_eq!(state.chat_container.child_count(), 4); // Includes reserved hint.
     assert!(!text(&state).contains("Could not load history"));
 }
 
@@ -421,20 +414,18 @@ async fn bounded_panel_restore_uses_sequence_order_across_legacy_todo_kinds() {
         )
         .await;
     }
-    let tree = Session::new(storage, None).view("main");
-    restore_history_panels(&tree, &state.history_page.panels).await;
-    let panel_text = strip_ansi(&state.history_page.panels.render(100).join("\n"));
-    assert!(panel_text.contains("newest-task"));
-    assert!(!panel_text.contains("obsolete-task"));
-    assert_eq!(state.history_page.panels.child_count(), 2);
-    request(state.clone(), tui.clone(), Direction::Latest);
-    finish_request(&state).await;
+    restore_bound(&state, &state.chat_container).await;
+    let restored = text(&state);
+    assert!(restored.contains("newest-task"));
+    assert!(!restored.contains("obsolete-task"));
+    assert_eq!(restored.matches("Plan · Planning").count(), 1);
     request(state.clone(), tui.clone(), Direction::Older);
     finish_request(&state).await;
-    assert_eq!(
-        panel_text,
-        strip_ansi(&state.history_page.panels.render(100).join("\n"))
-    );
+    assert!(!text(&state).contains("newest-task"));
+    assert!(!text(&state).contains("Plan ·"));
+    request(state.clone(), tui, Direction::Latest);
+    finish_request(&state).await;
+    assert!(text(&state).contains("newest-task"));
 }
 
 #[tokio::test]

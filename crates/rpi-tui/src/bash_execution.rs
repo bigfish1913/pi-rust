@@ -723,22 +723,14 @@ mod tests {
     fn completed_panel_reports_total_elapsed() {
         let c = BashExecutionComponent::new("sleep 1");
         c.append_output("done\n");
-        std::thread::sleep(std::time::Duration::from_millis(120));
         c.set_complete(Some(0), false, BashTruncation::default());
+        let finished = c.finished_at.lock().unwrap().unwrap();
+        let elapsed = Duration::from_millis(120);
+        *c.started_at.lock().unwrap() = Some(finished - elapsed);
+
+        assert_eq!(c.elapsed(), elapsed);
         let plain = strip_ansi(&c.render(60).join("\n"));
-        // The completion line leads with the total elapsed time.
-        assert!(
-            plain.contains("0.1s") || plain.contains("0.2s"),
-            "total elapsed missing: {plain}"
-        );
-        // And it stops advancing once the command is finished.
-        let first = c.render(60).join("\n");
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        assert_eq!(
-            first,
-            c.render(60).join("\n"),
-            "elapsed kept counting after completion"
-        );
+        assert!(plain.contains("0.1s"), "total elapsed missing: {plain}");
     }
 
     #[test]

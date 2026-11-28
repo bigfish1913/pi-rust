@@ -150,12 +150,12 @@ struct ResolvedPackage {
 }
 
 #[derive(Deserialize)]
-struct GitReference {
+pub(crate) struct GitReference {
     #[serde(rename = "ref")]
     reference: String,
 }
 
-fn best_tag_version(refs: &[GitReference], name: &str) -> Option<semver::Version> {
+pub(crate) fn best_tag_version(refs: &[GitReference], name: &str) -> Option<semver::Version> {
     let prefix = format!("refs/tags/{name}-v");
     refs.iter()
         .filter_map(|reference| reference.reference.strip_prefix(&prefix))
@@ -169,7 +169,7 @@ fn tag_published(refs: &[GitReference], name: &str, version: &str) -> bool {
     refs.iter().any(|reference| reference.reference == expected)
 }
 
-async fn repository_tags(
+pub(crate) async fn repository_tags(
     client: &reqwest::Client,
     api: &str,
     name: &str,
