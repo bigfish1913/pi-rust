@@ -193,7 +193,9 @@ pub(super) enum PendingRepair {
     Eager {
         bytes: Vec<u8>,
     },
-    AppendNewline,
+    AppendNewline {
+        digest: Option<[u8; 32]>,
+    },
 }
 
 /// Recovery policy is independent of cold payload residency. Both replay paths
@@ -663,7 +665,7 @@ impl JsonlSessionStorage {
             .state
             .lock()
             .await
-            .preview_index(&self.metadata.id, source.stamp.clone())
+            .preview_index(&self.metadata.id, &source)
         else {
             return;
         };
@@ -672,13 +674,18 @@ impl JsonlSessionStorage {
         let storage = self.clone();
         let published = tokio::task::spawn_blocking(move || {
             let held = storage.writer_lease.lock().unwrap();
-            held.is_some()
-                && !storage.writer_lease_revoked.load(Ordering::Acquire)
-                && source.publish(index).is_ok()
+            if held.is_some() && !storage.writer_lease_revoked.load(Ordering::Acquire) {
+                source.publish(index).ok()
+            } else {
+                None
+            }
         })
         .await
-        .unwrap_or(false);
-        if !published {
+        .ok()
+        .flatten();
+        if let Some(source) = published {
+            *self.preview_source.lock().unwrap() = Some(source);
+        } else {
             tracing::debug!("session preview unavailable after publication attempt");
         }
     }
@@ -897,6 +904,7 @@ impl JsonlSessionStorage {
         let Some(pending) = pending else {
             return Ok(());
         };
+        self.ensure_writer_lease().await?;
         self.commit_pending_repair_impl(pending).await
     }
 
@@ -928,21 +936,11 @@ impl JsonlSessionStorage {
             if let Some(length) =
                 file_result(source.byte_len().await, "stat session history reader")?
             {
-                let preview_source =
-                    matches!(policy, ReadPolicy::Restore | ReadPolicy::PreparedRestore)
-                        .then(|| preview::native_path(fs.as_ref(), path))
-                        .flatten()
-                        .and_then(|path| preview::Source::replay(path, source.as_ref(), length));
                 let mut storage =
                     Self::load_streaming(fs, path, clock, ids, source.clone(), length, policy)
                         .await?;
                 if let Some(info) = &info_before_read {
                     storage.record_replay_identity(info, length);
-                }
-                if let Some(preview_source) =
-                    preview_source.filter(|stamp| stamp.matches(source.as_ref()))
-                {
-                    *storage.preview_source.lock().unwrap() = Some(preview_source);
                 }
                 return Ok(storage);
             }

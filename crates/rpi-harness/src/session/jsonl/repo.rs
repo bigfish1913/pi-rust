@@ -358,6 +358,7 @@ impl JsonlSessionRepo {
             super::storage::startup_checkpoint::TEMP_SUFFIX,
             super::cold_frames::preview::SUFFIX,
             super::cold_frames::preview::TEMP_SUFFIX,
+            super::cold_frames::preview::STAMP_SUFFIX,
             ".progress.jsonl",
             ".progress.jsonl.tmp",
         ] {
