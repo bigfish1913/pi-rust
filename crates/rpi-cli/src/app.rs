@@ -258,6 +258,9 @@ async fn run_inner() -> i32 {
         Some("events") => return crate::events::run(&argv[1..]).await,
         Some("session") => return crate::session_gc::run(&argv[1..]).await,
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
+        Some("install") if argv.get(1).is_some_and(|arg| arg == "package") => {
+            return crate::agent_package::install(&argv[2..]).await;
+        }
         Some("install") => return crate::install::run_async(&argv[1..]).await,
         Some("uninstall") => return crate::install::uninstall(&argv[1..]),
         Some("extension") => return crate::packages::run_extension(&argv[1..]),
@@ -279,7 +282,24 @@ async fn run_inner() -> i32 {
         _ => {}
     }
 
-    let mut parsed = parse_args(&argv);
+    let package_name = if argv.first().is_some_and(|arg| arg == "run")
+        && argv.get(1).is_some_and(|arg| arg == "package")
+    {
+        match argv.get(2).map(String::as_str) {
+            None | Some("--help" | "-h") => {
+                println!("rpi run package NAME [rpi options] (native JSONL RPC)");
+                return if argv.len() < 3 { EXIT_USAGE } else { 0 };
+            }
+            Some(name) => Some(name.to_owned()),
+        }
+    } else {
+        None
+    };
+    let mut parsed = if package_name.is_some() {
+        crate::args::parse_startup_args(&argv[3..], true)
+    } else {
+        parse_args(&argv)
+    };
     crate::timings::time("args parsed", crate::timings::TimingNamespace::Main);
 
     // ---- Parsed startup stages ----
@@ -288,6 +308,10 @@ async fn run_inner() -> i32 {
     }
 
     if parsed.host.is_some() {
+        if package_name.is_some() {
+            eprintln!("error: --host cannot be combined with `rpi run package`");
+            return EXIT_USAGE;
+        }
         if dev_options.is_some() {
             eprintln!("error: --host cannot be combined with dev/dev-local");
             return EXIT_USAGE;
@@ -314,6 +338,33 @@ async fn run_inner() -> i32 {
     let cwd = match resolve_cwd() {
         Ok(cwd) => cwd,
         Err(code) => return code,
+    };
+    let _package_launch = if let Some(name) = package_name {
+        if parsed.resource_config.is_some()
+            || parsed.resource_transition.is_some()
+            || parsed.session_dir.is_some()
+            || parsed.session.is_some()
+            || parsed.fork.is_some()
+            || parsed.mini
+            || !parsed.messages.is_empty()
+            || !parsed.file_args.is_empty()
+        {
+            eprintln!("error: package runs select their own resources and session directory; send prompts and commands via RPC");
+            return EXIT_USAGE;
+        }
+        let launch = match crate::agent_package::prepare_launch(&name, &cwd) {
+            Ok(launch) => launch,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return EXIT_RUNTIME;
+            }
+        };
+        parsed.mode = crate::args::Mode::Rpc;
+        parsed.resource_config = Some(launch.config.path().to_path_buf());
+        parsed.session_dir = Some(launch.session_dir.clone());
+        Some(launch)
+    } else {
+        None
     };
     // ---- Legacy-layout migration (flat ~/.rpi → ~/.rpi/agent/) ----
     // Best-effort; never blocks startup. Skipped when RPI_CODING_AGENT_DIR is
