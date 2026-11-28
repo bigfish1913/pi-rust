@@ -34,7 +34,7 @@ async fn manage(
     source: Option<&Path>,
 ) -> Value {
     let path = source.map(|p| p.to_str().unwrap());
-    let mut args = vec!["resource", op, kind, name, "--scope", scope];
+    let mut args = vec![kind, op, name, "--scope", scope];
     if let Some(p) = path {
         args.extend(["--path", p]);
     }
@@ -62,7 +62,7 @@ fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 async fn installed_packages_scopes_snapshots_actual_model_tools_and_host_leases() {
     let fixture = Fixture::build().await;
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
+    let root = &temp.path().canonicalize().unwrap();
     let a = root.join("source-a");
     let b = root.join("source-b");
     let extra = root.join("source-skill");
@@ -126,9 +126,13 @@ async fn installed_packages_scopes_snapshots_actual_model_tools_and_host_leases(
     assert_eq!(unchanged["outcome"], "unchanged");
     let before = snapshot(root);
     for scope in ["project", "global"] {
-        let (ok, listed) = cli(root, &["resource", "list", "--scope", scope]).await;
-        assert!(ok, "{listed}");
-        assert_eq!(listed["data"]["resources"].as_array().unwrap().len(), 3);
+        for kind in ["package", "skill", "extension"] {
+            let (ok, listed) = cli(root, &[kind, "list", "--scope", scope]).await;
+            assert!(ok, "{listed}");
+            let resources = listed["data"]["resources"].as_array().unwrap();
+            assert_eq!(resources.len(), 1);
+            assert_eq!(resources[0]["kind"], kind);
+        }
         let inspected = manage(root, "inspect", "package", "demo", scope, None).await;
         assert_eq!(inspected["resources"][0]["version"], Value::Null);
         assert_eq!(inspected["resources"][0]["loaded"], Value::Null);
@@ -234,18 +238,14 @@ async fn installed_packages_scopes_snapshots_actual_model_tools_and_host_leases(
         .unwrap();
     fixture.assert_registrations(&root.join("registrations.log"));
     for scope in ["global", "project"] {
-        let (ok, state) = cli(root, &["resource", "list", "--scope", scope]).await;
-        assert!(ok, "{state}");
-        assert!(state["data"]["resources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|r| r["inUse"] == true && r["loaded"].is_null()));
-        let (ok, value) = cli(
-            root,
-            &["resource", "remove", "package", "demo", "--scope", scope],
-        )
-        .await;
+        for kind in ["package", "skill", "extension"] {
+            let (ok, state) = cli(root, &[kind, "list", "--scope", scope]).await;
+            assert!(ok, "{state}");
+            let resource = &state["data"]["resources"][0];
+            assert_eq!(resource["inUse"], true);
+            assert!(resource["loaded"].is_null());
+        }
+        let (ok, value) = cli(root, &["package", "remove", "demo", "--scope", scope]).await;
         assert!(!ok && value["error"].as_str().unwrap().contains("in use"));
     }
     for args in [
@@ -258,12 +258,9 @@ async fn installed_packages_scopes_snapshots_actual_model_tools_and_host_leases(
     }
     global.stop().await;
     assert!(
-        !cli(
-            root,
-            &["resource", "remove", "skill", "extra", "--scope", "global"]
-        )
-        .await
-        .0
+        !cli(root, &["skill", "remove", "extra", "--scope", "global"])
+            .await
+            .0
     );
     project.child.kill().await.unwrap();
     project.child.wait().await.unwrap();
@@ -331,9 +328,9 @@ async fn installed_packages_scopes_snapshots_actual_model_tools_and_host_leases(
 #[tokio::test]
 async fn readonly_catalog_unmanaged_candidates_corruption_and_concurrent_requests() {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
+    let root = &temp.path().canonicalize().unwrap();
     for scope in ["project", "global"] {
-        let (ok, v) = cli(root, &["resource", "list", "--scope", scope]).await;
+        let (ok, v) = cli(root, &["package", "list", "--scope", scope]).await;
         assert!(ok, "{v}");
     }
     assert!(!root.join(".rpi").exists() && !root.join("agent").exists());
@@ -347,13 +344,11 @@ async fn readonly_catalog_unmanaged_candidates_corruption_and_concurrent_request
         "not a library",
     );
     let before = snapshot(root);
-    let (ok, v) = cli(root, &["resource", "list", "--scope", "project"]).await;
-    assert!(ok, "{v}");
-    assert!(v["data"]["resources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|r| r["ownership"] == "unmanaged"));
+    for kind in ["package", "extension"] {
+        let (ok, v) = cli(root, &[kind, "list", "--scope", "project"]).await;
+        assert!(ok, "{v}");
+        assert_eq!(v["data"]["resources"][0]["ownership"], "unmanaged");
+    }
     assert_eq!(snapshot(root), before);
     assert!(!root.join(".rpi/.resource-lease").exists());
     assert!(!root.join("registrations.log").exists());
@@ -365,9 +360,8 @@ async fn readonly_catalog_unmanaged_candidates_corruption_and_concurrent_request
         !cli(
             root,
             &[
-                "resource",
-                "install",
                 "skill",
+                "install",
                 "safe",
                 "--scope",
                 "project",
@@ -384,9 +378,8 @@ async fn readonly_catalog_unmanaged_candidates_corruption_and_concurrent_request
     );
     std::fs::remove_file(root.join(".rpi/packages.json")).unwrap();
     let args = [
-        "resource",
-        "install",
         "skill",
+        "install",
         "safe",
         "--scope",
         "project",
@@ -407,12 +400,9 @@ async fn readonly_catalog_unmanaged_candidates_corruption_and_concurrent_request
     );
     put(root.join(".rpi/skills/safe/unmanaged.txt"), "keep");
     assert!(
-        !cli(
-            root,
-            &["resource", "remove", "skill", "safe", "--scope", "project"]
-        )
-        .await
-        .0
+        !cli(root, &["skill", "remove", "safe", "--scope", "project"])
+            .await
+            .0
     );
     assert_eq!(
         std::fs::read(root.join(".rpi/skills/safe/unmanaged.txt")).unwrap(),

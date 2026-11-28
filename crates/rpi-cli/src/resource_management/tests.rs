@@ -351,7 +351,6 @@ fn bounded_input_depth_width_receipts_and_next_state_do_not_publish_invalid_inst
     assert!(!root.join("skills/overflow").exists());
     let args = [
         "install",
-        "skill",
         "v",
         "--scope",
         "project",
@@ -360,7 +359,7 @@ fn bounded_input_depth_width_receipts_and_next_state_do_not_publish_invalid_inst
         "--version",
         "",
     ];
-    assert!(parse(&args.map(str::to_owned)).is_err());
+    assert!(parse(Kind::Skill, &args.map(str::to_owned)).is_err());
     let mut deep = source.clone();
     for _ in 0..34 {
         deep.push("d");

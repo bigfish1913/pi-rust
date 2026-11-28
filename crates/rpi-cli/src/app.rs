@@ -257,21 +257,22 @@ async fn run_inner() -> i32 {
         }
         Some("events") => return crate::events::run(&argv[1..]).await,
         Some("session") => return crate::session_gc::run(&argv[1..]).await,
-        Some("update") if argv.get(1).is_some_and(|arg| arg == "package") => {
-            return crate::agent_package::update(&argv[2..]).await;
-        }
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
-        Some("install") if argv.get(1).is_some_and(|arg| arg == "package") => {
-            return crate::agent_package::install(&argv[2..]).await;
-        }
         Some("install") => return crate::install::run_async(&argv[1..]).await,
         Some("uninstall") => return crate::install::uninstall(&argv[1..]),
         Some("extension") => return crate::packages::run_extension(&argv[1..]),
-        Some("resource") => return crate::resource_management::run(&argv[1..]),
-        Some("package") => return crate::packages::run(&argv[1..]),
+        Some("skill") => {
+            return crate::resource_management::run(
+                crate::resource_management::Kind::Skill,
+                &argv[1..],
+            );
+        }
+        Some("package") => return crate::packages::run(&argv[1..]).await,
         // These historical aliases are intentionally rejected instead of
         // falling through to the prompt path.
-        Some(removed @ ("pi-package" | "pi-update" | "install-pi" | "uninstall-pi")) => {
+        Some(
+            removed @ ("resource" | "pi-package" | "pi-update" | "install-pi" | "uninstall-pi"),
+        ) => {
             eprintln!(
                 "error: `rpi {removed}` is not available; use `rpi package`, `rpi install`, or `rpi update`."
             );

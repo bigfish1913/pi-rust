@@ -49,16 +49,13 @@ async fn apply_release(operation: &str, args: &[String]) -> i32 {
         .map(String::as_str)
         .filter(|arg| *arg != "--offline")
         .collect();
-    let usage = format!("rpi {operation} package NAME [--version VERSION | --manifest URL]");
-    if args == ["--help"] || args == ["-h"] {
-        println!("{usage}");
-        return 0;
-    }
+    let usage = format!(
+        "rpi package {operation} NAME [--version VERSION | --manifest URL] [--scope global]"
+    );
     match stage(&args, &usage).await {
         Ok(release) => crate::resource_management::publish_release(
             &[
                 operation.into(),
-                "package".into(),
                 release.name,
                 "--path".into(),
                 release.root.to_string_lossy().into_owned(),
@@ -85,18 +82,30 @@ struct StagedRelease {
 }
 
 async fn stage(args: &[&str], usage: &str) -> Result<StagedRelease, String> {
-    let (name, version, manifest) = match args {
-        [name] => (*name, None, None),
-        [name, "--version", version] => (
-            *name,
-            Some(semver::Version::parse(version).map_err(|e| e.to_string())?),
-            None,
-        ),
-        [name, "--manifest", manifest] => (*name, None, Some(*manifest)),
-        _ => return Err(usage.into()),
+    let [name, options @ ..] = args else {
+        return Err(usage.into());
     };
+    let name = *name;
     if !identifier(name) {
         return Err("invalid agent package name".into());
+    }
+    let mut version = None;
+    let mut manifest = None;
+    let mut scoped = false;
+    for option in options.chunks(2) {
+        match option {
+            ["--scope", "global"] if !scoped => scoped = true,
+            ["--scope", scope] if *scope != "global" => {
+                return Err("published agent packages require --scope global".into());
+            }
+            ["--version", value] if version.is_none() && manifest.is_none() => {
+                version = Some(semver::Version::parse(value).map_err(|e| e.to_string())?);
+            }
+            ["--manifest", value] if version.is_none() && manifest.is_none() => {
+                manifest = Some(*value);
+            }
+            _ => return Err(usage.into()),
+        }
     }
     if crate::args::offline_env_enabled() {
         return Err("package download is disabled in offline mode".into());

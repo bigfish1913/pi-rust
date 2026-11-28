@@ -19,7 +19,8 @@ const MAX_FILE: u64 = 64 * 1024 * 1024;
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Static protocol description only: never resolves a root or opens metadata.
 pub(crate) fn capabilities() -> Value {
-    json!({"version":1,"command":"resource","kinds":["package","skill","extension"],
+    json!({"version":1,"commands":{"package":"package","skill":"skill","extension":"extension"},
+        "recoveryCommand":["package","recover"],"kinds":["package","skill","extension"],
         "scopes":["project","global"],"explicitScopeRequired":true,
         "operations":["list","inspect","install","update","reinstall","remove","recover"],
         "localSnapshotsOnly":true,"build":false,"network":false,"hotApply":false,
@@ -123,7 +124,7 @@ fn checked_scope_tail_component(component: &std::ffi::OsStr) -> Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum Kind {
+pub(crate) enum Kind {
     Package,
     Skill,
     Extension,
@@ -135,6 +136,13 @@ impl Kind {
             "skill" => Ok(Self::Skill),
             "extension" => Ok(Self::Extension),
             _ => Err("kind must be package, skill or extension".into()),
+        }
+    }
+    fn command(self) -> &'static str {
+        match self {
+            Self::Package => "package",
+            Self::Skill => "skill",
+            Self::Extension => "extension",
         }
     }
     fn dir(self) -> &'static str {
@@ -374,7 +382,7 @@ pub(crate) fn shared_lease(root: &Path) -> Result<Lease> {
 fn ensure_complete(root: &Path) -> Result<()> {
     if read_bytes(&root.join(JOURNAL), MAX_META)?.is_some() {
         return Err(
-            "incomplete resource transaction; run rpi resource recover with this scope".into(),
+            "incomplete resource transaction; run rpi package recover with this scope".into(),
         );
     }
     Ok(())
@@ -609,7 +617,10 @@ pub(crate) fn legacy_unowned(root: &Path, kind: &str, name: &str) -> Result<()> 
         .iter()
         .any(|r| r.kind == kind && r.name.eq_ignore_ascii_case(name))
     {
-        return Err("resource is managed by rpi resource; use its update/remove commands".into());
+        return Err(format!(
+            "resource is a managed snapshot; use rpi {} update/remove with --scope",
+            kind.command()
+        ));
     }
     if kind == Kind::Package {
         legacy_package_identity(name)?;
@@ -665,7 +676,9 @@ pub(crate) fn legacy_unowned_targets(root: &Path, targets: &[PathBuf]) -> Result
     for r in receipts(root)?.resources {
         let owned = path_identity(&root.join(&r.target))?;
         if targets.iter().any(|t| t == &owned || t.starts_with(&owned)) {
-            return Err("target owned by rpi resource; refusing legacy replacement/removal".into());
+            return Err(
+                "target belongs to a managed snapshot; refusing legacy replacement/removal".into(),
+            );
         }
     }
     Ok(())
@@ -997,7 +1010,7 @@ fn publish(
         return match rollback(root, &j) {
             Ok(()) => Err(error),
             Err(r) => Err(format!(
-                "{error}; rollback incomplete: {r}; run resource recover"
+                "{error}; rollback incomplete: {r}; run rpi package recover with this scope"
             )),
         };
     }
@@ -1006,7 +1019,7 @@ fn publish(
     if let Err(error) = fs::remove_file(root.join(JOURNAL)) {
         return match rollback(root,&j) {
             Ok(())=>Err(format!("commit marker removal failed: {error}; rolled back")),
-            Err(rollback)=>Err(format!("commit marker removal failed: {error}; rollback incomplete: {rollback}; run resource recover")),
+            Err(rollback)=>Err(format!("commit marker removal failed: {error}; rollback incomplete: {rollback}; run rpi package recover with this scope")),
         };
     }
     if let Err(e) = fs::remove_dir_all(root.join(&j.directory)) {
@@ -1035,9 +1048,10 @@ struct Options {
     source: Option<PathBuf>,
     version: Option<String>,
 }
-fn parse(args: &[String]) -> Result<Options> {
+fn parse(kind: Kind, args: &[String]) -> Result<Options> {
     let mut o = Options {
         op: args.first().ok_or("missing resource operation")?.clone(),
+        kind: Some(kind),
         ..Default::default()
     };
     let mut pos = Vec::new();
@@ -1077,9 +1091,7 @@ fn parse(args: &[String]) -> Result<Options> {
                 }
             }
         } else if a.starts_with('-') {
-            return Err(format!(
-                "unknown resource option {a}; builds require explicit native package link/install"
-            ));
+            return Err(format!("unknown snapshot option {a}"));
         } else {
             pos.push(a.clone());
         }
@@ -1092,20 +1104,25 @@ fn parse(args: &[String]) -> Result<Options> {
         if !pos.is_empty() || o.source.is_some() || o.version.is_some() {
             return Err("unexpected list/recover arguments".into());
         }
+        if o.op == "recover" {
+            if kind != Kind::Package {
+                return Err("use rpi package recover with this scope".into());
+            }
+            o.kind = None;
+        }
     } else if matches!(
         o.op.as_str(),
         "inspect" | "install" | "update" | "reinstall" | "remove"
     ) {
-        if pos.len() != 2 {
-            return Err("expected KIND NAME".into());
+        if pos.len() != 1 {
+            return Err("expected NAME".into());
         }
-        o.kind = Some(Kind::parse(&pos[0])?);
-        if o.op == "inspect" && o.kind == Some(Kind::Package) {
-            legacy_package_identity(&pos[1])?;
+        if o.op == "inspect" && kind == Kind::Package {
+            legacy_package_identity(&pos[0])?;
         } else {
-            identifier(&pos[1])?;
+            identifier(&pos[0])?;
         }
-        o.name = Some(pos[1].clone());
+        o.name = pos.pop();
         let mutation = matches!(o.op.as_str(), "install" | "update" | "reinstall");
         if mutation != o.source.is_some() || (!mutation && o.version.is_some()) {
             return Err("install/update/reinstall require --path; inspect/remove reject it".into());
@@ -1252,7 +1269,7 @@ fn mutate(root: &Path, o: &Options, release: Option<&str>) -> Result<Value> {
         .filter(|_| kind == Kind::Package && o.op == "update" && release.is_some())
     {
         if old.release.is_none() {
-            return Err("package was installed from a local path; update it with rpi resource update and --path".into());
+            return Err("package was installed from a local path; use rpi package update NAME --scope global --path PATH".into());
         }
         let installed = old
             .version
@@ -1331,7 +1348,7 @@ fn mutate(root: &Path, o: &Options, release: Option<&str>) -> Result<Value> {
                 let error = if same_release_version {
                     "package version is already installed with different release provenance or content"
                 } else if release.is_some() {
-                    "already installed; use rpi update package NAME"
+                    "already installed; use rpi package update NAME --scope global"
                 } else {
                     "already installed; use update or reinstall with --path"
                 };
@@ -1458,11 +1475,18 @@ fn catalog(root: &Path, o: &Options) -> Result<Value> {
     let mut items = Vec::new();
     let mut owned = BTreeSet::new();
     let mut budget = InventoryBudget::default();
-    for receipt in &r.resources {
+    for receipt in r
+        .resources
+        .iter()
+        .filter(|r| o.kind.is_none_or(|kind| r.kind == kind))
+    {
         owned.insert(receipt.target.clone());
         items.push(observe_bounded(root, scope, receipt, busy, &mut budget)?);
     }
-    for kind in [Kind::Package, Kind::Skill, Kind::Extension] {
+    for kind in [Kind::Package, Kind::Skill, Kind::Extension]
+        .into_iter()
+        .filter(|&kind| o.kind.is_none_or(|selected| kind == selected))
+    {
         let directory = root.join(kind.dir());
         checked_path(&directory)?;
         let entries = match fs::read_dir(directory) {
@@ -1525,27 +1549,35 @@ fn catalog(root: &Path, o: &Options) -> Result<Value> {
         return Err("resource ownership initialized during observation; retry catalog".into());
     }
     Ok(
-        json!({"outcome":"observed","resources":items,"diagnostics":if root.join(JOURNAL).try_exists().map_err(err)?{vec!["incomplete transaction; run resource recover"]}else{vec![]}}),
+        json!({"outcome":"observed","resources":items,"diagnostics":if root.join(JOURNAL).try_exists().map_err(err)?{vec!["incomplete transaction; run rpi package recover with this scope"]}else{vec![]}}),
     )
 }
 fn success(o: &Options, data: Value) -> Value {
     json!({"version":1,"success":true,"operation":o.op,"scope":o.scope,"kind":o.kind,"name":o.name,"data":data})
 }
-pub fn run(args: &[String]) -> i32 {
-    run_with_release(args, None)
+pub(crate) fn print_snapshot_help(kind: Kind) {
+    println!(
+        "Local {} snapshots (JSON v1):\n  list --scope project|global\n  inspect|remove NAME --scope project|global\n  install|update|reinstall NAME --path PATH --scope project|global [--version TEXT]",
+        kind.command()
+    );
+}
+
+pub(crate) fn run(kind: Kind, args: &[String]) -> i32 {
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        println!("Usage: rpi {} <command>\n", kind.command());
+        print_snapshot_help(kind);
+        return 0;
+    }
+    run_with_release(kind, args, None)
 }
 
 pub(crate) fn publish_release(args: &[String], url: &str) -> i32 {
-    run_with_release(args, Some(url))
+    run_with_release(Kind::Package, args, Some(url))
 }
 
-fn run_with_release(args: &[String], release: Option<&str>) -> i32 {
-    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-        println!("rpi resource list|inspect|install|update|reinstall|remove|recover --scope project|global\nMutations: KIND NAME --path PATH [--version TEXT]; remove/inspect: KIND NAME.\nLocal snapshots only; no builds or native registration. JSON v1, 256 KiB bound.");
-        return 0;
-    }
+fn run_with_release(kind: Kind, args: &[String], release: Option<&str>) -> i32 {
     let result: Result<Value> = (|| {
-        let o = parse(args)?;
+        let o = parse(kind, args)?;
         let cwd = std::env::current_dir().map_err(err)?;
         let root = o
             .scope
@@ -1568,7 +1600,7 @@ fn run_with_release(args: &[String], release: Option<&str>) -> i32 {
         }
         Err(e) => {
             let bounded = e.chars().take(2048).collect::<String>();
-            let context = parse(args).ok();
+            let context = parse(kind, args).ok();
             println!(
                 "{}",
                 json!({"version":1,"success":false,"operation":context.as_ref().map(|o|&o.op),"scope":context.as_ref().and_then(|o|o.scope),"kind":context.as_ref().and_then(|o|o.kind),"name":context.as_ref().and_then(|o|o.name.as_ref()),"error":bounded})

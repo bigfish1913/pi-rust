@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+use crate::resource_management::{self, Kind};
+
 const REGISTRY: &str = "packages.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,14 +30,16 @@ struct PackageRegistry {
     packages: Vec<ProjectPackage>,
 }
 
-/// Extension management deliberately exposes only the shared update operation.
 pub fn run_extension(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         None | Some("--help") | Some("-h") => {
             print_extension_help();
             0
         }
-        Some("update") => update(&args[1..]),
+        Some("update") if !has_snapshot_options(&args[1..]) => update(&args[1..]),
+        Some("list" | "inspect" | "install" | "update" | "reinstall" | "remove") => {
+            resource_management::run(Kind::Extension, args)
+        }
         Some(other) => {
             eprintln!("error: unknown extension command `{other}`");
             print_extension_help();
@@ -44,15 +48,32 @@ pub fn run_extension(args: &[String]) -> i32 {
     }
 }
 
-pub fn run(args: &[String]) -> i32 {
+pub async fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         None | Some("--help") | Some("-h") => {
             print_help();
             0
         }
         Some("link") => link(&args[1..]),
-        Some("list") => list(&args[1..]),
-        Some("update") => update(&args[1..]),
+        Some("list") if args.len() == 1 => list(),
+        Some("update") if !has_snapshot_options(&args[1..]) => update(&args[1..]),
+        Some("install" | "update" | "recover")
+            if args[1..]
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h")) =>
+        {
+            print_help();
+            0
+        }
+        Some("install") if !args[1..].iter().any(|arg| arg == "--path") => {
+            crate::agent_package::install(&args[1..]).await
+        }
+        Some("update") if !args[1..].iter().any(|arg| arg == "--path") => {
+            crate::agent_package::update(&args[1..]).await
+        }
+        Some("list" | "inspect" | "install" | "update" | "reinstall" | "remove" | "recover") => {
+            resource_management::run(Kind::Package, args)
+        }
         Some("unlink") => unlink(&args[1..]),
         Some(other) => {
             eprintln!("error: unknown package command `{other}`");
@@ -60,6 +81,11 @@ pub fn run(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+fn has_snapshot_options(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--scope" | "--path"))
 }
 
 fn link(args: &[String]) -> i32 {
@@ -338,11 +364,7 @@ fn link(args: &[String]) -> i32 {
     0
 }
 
-fn list(args: &[String]) -> i32 {
-    if !args.is_empty() && args[0] != "--help" && args[0] != "-h" {
-        eprintln!("error: unexpected list argument");
-        return 2;
-    }
+fn list() -> i32 {
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => {
@@ -447,7 +469,9 @@ fn update_at(
         .as_ref()
         .is_some_and(|name| resource_owned.contains(name))
     {
-        eprintln!("error: resource-owned Package; use rpi resource update package NAME --scope project --path PATH");
+        eprintln!(
+            "error: snapshot package; use rpi package update NAME --scope project --path PATH"
+        );
         return 1;
     }
     let packages = registry
@@ -903,11 +927,14 @@ pub fn active_project_package_artifacts(cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 fn print_extension_help() {
-    println!("Usage: rpi extension <command>\n\nCommands:\n  update [name] [--debug] [--locked] [--cdn <URL>]  Update project and global installed extensions\n\nSee `rpi extension update --help` for options.");
+    println!("Usage: rpi extension <command>\n\nCommands:\n  update [name] [--debug] [--locked] [--cdn <URL>]  Update project and global installed extensions\n\nSee `rpi extension update --help` for options.\n");
+    resource_management::print_snapshot_help(Kind::Extension);
 }
 
 pub fn print_help() {
-    println!("Usage: rpi package <command>\n\nCommands:\n  link [name] [--path <dir>] [--package <name>] [--force]  Build and link a project-local Rust extension\n  list                                                   List project packages\n  update [name] [--debug] [--locked] [--cdn <URL>]      Legacy compatibility alias for `rpi extension update`\n  unlink <name>                                          Remove a project package");
+    println!("Usage: rpi package <command>\n\nPublished agent packages (global):\n  install NAME [--version VERSION | --manifest URL]\n  update NAME --scope global [--version VERSION | --manifest URL]\n\nProject links:\n  link [name] [--path <dir>] [--package <name>] [--force]  Build and link a project-local Rust extension\n  list                                                   List project packages\n  unlink <name>                                          Remove a project link\n  update [name] [--debug] [--locked] [--cdn <URL>]         Legacy compatibility alias for `rpi extension update`\n");
+    resource_management::print_snapshot_help(Kind::Package);
+    println!("  recover --scope project|global  Recover an interrupted snapshot transaction");
 }
 fn print_link_help() {
     println!("Usage: rpi package link [name] [options]\n\nOptions:\n  --path <dir>       Extension source directory (default: current directory)\n  --package, -P <n>  Select a Cargo cdylib package\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --force, -f        Replace an existing package");

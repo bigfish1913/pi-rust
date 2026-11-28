@@ -979,11 +979,11 @@ pub fn print_help() {
   uninstall <crate>              Remove an installed Rust cdylib extension
   extension update [name]        Update project and global installed Rust extensions
                                 (see `rpi extension update --help`)
-  install package NAME [--version VERSION | --manifest URL]  Install a published agent package
-  update package NAME [--version VERSION | --manifest URL]   Update a published agent package
+  extension <command>            Manage local extension snapshots (see `rpi extension --help`)
+  skill <command>                Manage local skill snapshots (see `rpi skill --help`)
   run package NAME [options]               Start an installed agent package (JSONL RPC)
-  package link|list|update|unlink Manage project-local Rust extension packages
-                                (update is a legacy alias; see `rpi package --help`)
+  package <command>              Manage published agent packages, local snapshots, and project links
+                                (see `rpi package --help`)
   dev [options]                  Build, watch, and hot-reload a Rust extension
                                 (see `rpi dev --help`)
   dev-local [options]            Debug only the current Rust extension

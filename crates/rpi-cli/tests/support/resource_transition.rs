@@ -465,7 +465,7 @@ async fn pure_capability_negotiation_never_starts_resources_or_reads_credentials
         vec!["--resource-capabilities"],
         vec![
             "--resource-capabilities",
-            "resource",
+            "package",
             "recover",
             "--scope",
             "project",
@@ -512,6 +512,14 @@ async fn pure_capability_negotiation_never_starts_resources_or_reads_credentials
                 assert_eq!(
                     profile["management"]["kinds"],
                     json!(["package", "skill", "extension"])
+                );
+                assert_eq!(
+                    profile["management"]["commands"],
+                    json!({"package": "package", "skill": "skill", "extension": "extension"})
+                );
+                assert_eq!(
+                    profile["management"]["recoveryCommand"],
+                    json!(["package", "recover"])
                 );
                 assert_eq!(
                     profile["management"]["scopes"],
