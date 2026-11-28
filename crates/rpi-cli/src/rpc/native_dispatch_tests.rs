@@ -36,6 +36,131 @@ async fn stop(client: &mut tokio::io::DuplexStream, task: tokio::task::JoinHandl
     );
 }
 
+#[tokio::test]
+async fn production_stop_run_fences_compaction_before_admission() {
+    use rpi_harness::session::types::RecordQuery;
+
+    let (harness, provider) = rpc_test_harness("unused", 0.0).await;
+    let retained = harness.clone();
+    let (mut client, output, task) =
+        start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+    let ready = output.wait_for(|m| m["type"] == "ready").await;
+    assert!(ready["supportedCommands"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("stop_run")));
+
+    // Both commands arrive in one read on the single-threaded task executor.
+    // The accepted compaction has not acquired a harness lease yet.
+    client
+        .write_all(
+            b"{\"type\":\"compact\",\"id\":\"compact\"}\n{\"type\":\"stop_run\",\"id\":\"stop-run\"}\n",
+        )
+        .await
+        .unwrap();
+    let reply = output.wait_for(|m| m["id"] == "stop-run").await;
+    assert_eq!(reply["success"], true);
+    assert_eq!(reply["data"]["stopped"], true);
+    let settled = output
+        .wait_for(|m| m["type"] == "agent_settled" && m["requestId"] == "compact")
+        .await;
+    assert_eq!(settled["outcome"], "aborted");
+    assert!(settled["runId"].is_null());
+    assert!(retained
+        .session()
+        .find_records(&RecordQuery {
+            record_type: Some("operation_started".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    stop(&mut client, task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_stop_run_preserves_queue_during_tool_execution() {
+    let router = Arc::new(rpi_tools::file_io::FileIORouter::new());
+    let env = Arc::new(rpi_tools::InMemoryExecutionEnv::new());
+    let context =
+        rpi_tools::ExecutionToolContext::new(env.clone(), Some(env)).with_file_io(router.clone());
+    let provider = FauxProvider::new(
+        FauxScript::new().with_tool_call("read", json!({"path":"/workspace/pending.txt"})),
+    );
+    let harness = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+        model: provider.default_model().clone(),
+        models: vec![provider.clone()],
+        tools: vec![rpi_harness::types::HarnessTool::new(
+            rpi_tools::create_read_tool(&context, None),
+        )],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    crate::session::register_file_io_router(&harness, &router);
+    let retained = harness.clone();
+    let (mut client, output, task) =
+        start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+    send(
+        &mut client,
+        json!({"type":"configure_file_io","id":"config","readText":true,"writeText":false}),
+    )
+    .await;
+    assert_eq!(
+        output.wait_for(|m| m["id"] == "config").await["success"],
+        true
+    );
+    send(
+        &mut client,
+        json!({"type":"prompt","id":"run","message":"read"}),
+    )
+    .await;
+    let request = output.wait_for(|m| m["type"] == "file_io_request").await;
+    for queue in ["steer", "followUp"] {
+        send(
+            &mut client,
+            json!({"type":"queue_message","id":queue,"message":queue,"deliverAs":queue}),
+        )
+        .await;
+        assert_eq!(output.wait_for(|m| m["id"] == queue).await["success"], true);
+    }
+
+    send(&mut client, json!({"type":"stop_run","id":"stop-run"})).await;
+    let reply = output.wait_for(|m| m["id"] == "stop-run").await;
+    assert_eq!(reply["success"], true);
+    assert_eq!(reply["data"]["stopped"], true);
+    output
+        .wait_for(|m| {
+            m["type"] == "file_io_request_closed" && m["requestId"] == request["requestId"]
+        })
+        .await;
+    let settled = output
+        .wait_for(|m| m["type"] == "agent_settled" && m["requestId"] == "run")
+        .await;
+    assert_eq!(settled["outcome"], "aborted");
+    assert!(settled["reclaimed"].is_null());
+    let pending = retained.queued_messages().await.unwrap();
+    assert_eq!(pending.steering.len(), 1);
+    assert_eq!(pending.steering[0].text, "steer");
+    assert_eq!(pending.follow_up.len(), 1);
+    assert_eq!(pending.follow_up[0].text, "followUp");
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    stop(&mut client, task).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_legacy_client_gets_no_autonomous_settlement_or_execution_frames() {
     let provider = FauxProvider::new(FauxScript::new().with_text("autonomous").with_text("rpc"));

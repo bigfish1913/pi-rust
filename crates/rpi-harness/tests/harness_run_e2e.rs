@@ -4727,6 +4727,77 @@ async fn abort_reclaiming_is_atomic_on_an_idle_lane() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_preserving_queue_keeps_steering_and_follow_up_at_turn_end() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct StopOnTurnEnd {
+        harness: AgentHarness,
+        stopped: AtomicBool,
+    }
+
+    impl AgentEmitter for StopOnTurnEnd {
+        fn emit(&self, event: AgentEvent) -> futures::future::BoxFuture<'static, ()> {
+            let harness = self.harness.clone();
+            let stop = matches!(event, AgentEvent::TurnEnd { .. })
+                && !self.stopped.swap(true, Ordering::SeqCst);
+            Box::pin(async move {
+                if stop {
+                    harness
+                        .steer(UserMessage::new("queued steering", 0).into())
+                        .await
+                        .unwrap();
+                    harness
+                        .follow_up(UserMessage::new("queued follow-up", 0).into())
+                        .await
+                        .unwrap();
+                    assert!(harness.stop_preserving_queue().unwrap());
+                }
+            })
+        }
+
+        fn try_emit(&self, _event: AgentEvent) {}
+    }
+
+    let script = FauxScript::new().with_text("first turn");
+    script.append_responses(vec![
+        FauxStep::text("second run"),
+        FauxStep::text("follow-up"),
+    ]);
+    let (harness, provider, _env) = harness_with(script).await;
+    harness
+        .set_agent_emitter(Some(Arc::new(StopOnTurnEnd {
+            harness: harness.clone(),
+            stopped: AtomicBool::new(false),
+        })))
+        .await
+        .unwrap();
+    harness.prompt_text("start", vec![]).await.unwrap();
+    assert_eq!(provider.state().call_count.load(Ordering::SeqCst), 1);
+
+    let pending = harness.queued_messages().await.unwrap();
+    assert_eq!(pending.steering.len(), 1);
+    assert_eq!(pending.steering[0].text, "queued steering");
+    assert_eq!(pending.follow_up.len(), 1);
+    assert_eq!(pending.follow_up[0].text, "queued follow-up");
+    assert!(harness
+        .session()
+        .find_records(&RecordQuery {
+            record_type: Some("queue_cancelled".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The preservation flag belongs to the stopped run, even when both
+    // drain hooks are called. The following run may consume both entries.
+    harness.set_agent_emitter(None).await.unwrap();
+    harness.prompt_text("continue", vec![]).await.unwrap();
+    let pending = harness.queued_messages().await.unwrap();
+    assert!(pending.steering.is_empty() && pending.follow_up.is_empty());
+}
+
 /// `turn_end.pending_messages` must report the queue depth **without draining**.
 ///
 /// The two drain hooks (`get_steering_messages` / `get_follow_up_messages`)

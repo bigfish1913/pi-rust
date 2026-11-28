@@ -781,6 +781,7 @@ where
     let run_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut run_task: Option<OwnedRpcRun> = None;
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
+    let mut run_stop = tokio_util::sync::CancellationToken::new();
     let mut cancel_on_exit = lifetime.cancel_on_eof;
     let mut native_shutdown_reconciled = false;
     let mut exit_code = 0;
@@ -1147,8 +1148,10 @@ where
                     let _ = task.await;
                 }
                 run_cancel = tokio_util::sync::CancellationToken::new();
+                run_stop = tokio_util::sync::CancellationToken::new();
                 owner.run_cancel = run_cancel.clone();
                 let cancel_task = run_cancel.clone();
+                let stop_task = run_stop.clone();
                 // Resuming spends the tokens the interrupted run never did, so it
                 // only proceeds when recovery actually left a pending run.
                 if resume && !lane.has_pending_resume().await {
@@ -1211,7 +1214,8 @@ where
                             }
                         };
                         let execution_request =
-                            rpi_harness::execution::ExecutionRequest::new(id.clone());
+                            rpi_harness::execution::ExecutionRequest::new(id.clone())
+                                .with_admission_cancellation(stop_task);
                         let pending_settlement =
                             crate::rpc::execution::PendingSettlement::new(out_task.failure());
                         write_line(
@@ -1246,6 +1250,7 @@ where
                                     &lane_task,
                                     instructions,
                                     cancel_task,
+                                    &execution_request,
                                 ))
                                 .await;
                             if result
@@ -1277,6 +1282,7 @@ where
                                     &harness_task,
                                     &lane_task,
                                     cancel_task,
+                                    &execution_request,
                                 ))
                                 .await
                         } else {
@@ -1286,6 +1292,7 @@ where
                                     &lane_task,
                                     content,
                                     cancel_task,
+                                    &execution_request,
                                 ))
                                 .await
                         };
@@ -1306,7 +1313,10 @@ where
                                     .map(str::to_owned);
                                 (outcome.clone(), outcome == "aborted", error)
                             }
-                            Err(error) if outcome_cancel.is_cancelled() => {
+                            Err(error)
+                                if outcome_cancel.is_cancelled()
+                                    || execution_request.admission_cancelled() =>
+                            {
                                 ("aborted".to_string(), true, Some(error.clone()))
                             }
                             Err(ref error) => ("failed".to_string(), false, Some(error.clone())),
@@ -1370,6 +1380,16 @@ where
         }
 
         let result = match kind.as_str() {
+            "stop_run" => {
+                // Fence a pending admission before inspecting the active slot.
+                // The harness signals an admitted run and preserves its queues.
+                run_stop.cancel();
+                let stopped = harness.stop_preserving_queue();
+                run_cancel.cancel();
+                stopped
+                    .map(|_| serde_json::json!({"stopped": true}))
+                    .map_err(|error| error.to_string())
+            }
             "abort" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
                 // Keep wrapper cancellation for pre-admission aborts, but signal
                 // an admitted harness run before retiring external broker waiters.
@@ -1812,6 +1832,7 @@ async fn rpc_run_cancellable(
     harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
     cancel: tokio_util::sync::CancellationToken,
+    execution_request: &rpi_harness::execution::ExecutionRequest,
     operation: impl std::future::Future<Output = Result<serde_json::Value, String>>,
 ) -> Result<
     (
@@ -1827,6 +1848,14 @@ async fn rpc_run_cancellable(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
+            if execution_request.admission_cancelled() {
+                if execution_request.last_execution().is_none() {
+                    return Err("Operation aborted".into());
+                }
+                // Stop already signalled the admitted run. Drive its cleanup
+                // without calling the queue-reclaiming abort path.
+                return operation.await.map(|value| (value, None));
+            }
             if !harness.active_operation_snapshot().is_some_and(|run| run.lane == "main") {
                 return Err("Operation aborted".into());
             }
@@ -1844,9 +1873,16 @@ async fn rpc_prompt_cancellable(
     lane: &Arc<dyn AgentLane>,
     content: crate::rpc::prompt_content::ParsedPrompt,
     cancel: tokio_util::sync::CancellationToken,
+    execution_request: &rpi_harness::execution::ExecutionRequest,
 ) -> Result<serde_json::Value, String> {
-    let (mut value, reclaimed) =
-        rpc_run_cancellable(harness, lane, cancel, rpc_prompt_content(lane, content)).await?;
+    let (mut value, reclaimed) = rpc_run_cancellable(
+        harness,
+        lane,
+        cancel,
+        execution_request,
+        rpc_prompt_content(lane, content),
+    )
+    .await?;
     // Return the atomically reclaimed queue so the client can restore it.
     if let (Some(reclaimed), Some(object)) = (reclaimed, value.as_object_mut()) {
         object.insert("reclaimed".to_string(), reclaimed_payload(&reclaimed));
@@ -1872,6 +1908,7 @@ async fn rpc_compact_cancellable(
     lane: &Arc<dyn AgentLane>,
     instructions: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
+    execution_request: &rpi_harness::execution::ExecutionRequest,
 ) -> Result<serde_json::Value, String> {
     let compact = async {
         match lane.compact(instructions.as_deref()).await {
@@ -1879,7 +1916,7 @@ async fn rpc_compact_cancellable(
             Err(error) => Err(error.to_string()),
         }
     };
-    rpc_run_cancellable(harness, lane, cancel, compact)
+    rpc_run_cancellable(harness, lane, cancel, execution_request, compact)
         .await
         .map(|(value, _)| value)
 }
@@ -1935,6 +1972,7 @@ async fn rpc_resume_cancellable(
     harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
     cancel: tokio_util::sync::CancellationToken,
+    execution_request: &rpi_harness::execution::ExecutionRequest,
 ) -> Result<serde_json::Value, String> {
     let resume = async {
         match lane.resume_pending().await {
@@ -1952,7 +1990,7 @@ async fn rpc_resume_cancellable(
             Err(error) => Err(error.to_string()),
         }
     };
-    rpc_run_cancellable(harness, lane, cancel, resume)
+    rpc_run_cancellable(harness, lane, cancel, execution_request, resume)
         .await
         .map(|(value, _)| value)
 }
