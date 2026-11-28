@@ -271,6 +271,61 @@ async fn legacy_upgrade_rebases_preview_and_non_transcript_writes_keep_the_index
 }
 
 #[tokio::test]
+async fn repaired_history_has_a_current_preview_after_first_restore_and_upgrade() {
+    for prepared in [false, true] {
+        for damage in ["unterminated", "torn-tail", "duplicate-middle"] {
+            let temp = tempfile::tempdir().unwrap();
+            let fixture = Fixture::new(temp.path());
+            let storage = fixture.create().await;
+            append(&storage, "first", "main").await;
+            append(&storage, "second", "main").await;
+            let meta = storage.jsonl_metadata();
+            drop(storage);
+
+            let journal = fs::read_to_string(&meta.path).unwrap();
+            let (header, body) = journal.split_once('\n').unwrap();
+            let mut header: Value = serde_json::from_str(header).unwrap();
+            header.as_object_mut().unwrap().remove("progressFormat");
+            let body = match damage {
+                "unterminated" => body.trim_end_matches('\n').to_owned(),
+                "torn-tail" => format!("{body}{{"),
+                "duplicate-middle" => format!("{}\n{body}", body.lines().next().unwrap()),
+                _ => unreachable!(),
+            };
+            fs::write(&meta.path, format!("{header}\n{body}")).unwrap();
+            fs::remove_file(format!("{}.progress.jsonl", meta.path)).unwrap();
+            fs::remove_file(format!("{}.preview.json", meta.path)).unwrap();
+
+            let storage = if prepared {
+                let storage = fixture
+                    .repo
+                    .prepare_restore_by_jsonl_metadata(&meta)
+                    .await
+                    .unwrap()
+                    .commit()
+                    .await
+                    .unwrap();
+                assert_eq!(fixture.preview().await["messages"][1]["entryId"], "second");
+                storage
+            } else {
+                fixture.repo.open_by_jsonl_metadata(&meta).await.unwrap()
+            };
+            let storage = storage
+                .enable_progress_under_exclusive_lock()
+                .await
+                .unwrap();
+            let preview = fixture.preview().await;
+            assert_eq!(preview["messages"][0]["entryId"], "first", "{damage}");
+            assert_eq!(preview["messages"][1]["entryId"], "second", "{damage}");
+            append(&storage, "third", "main").await;
+            let preview = fixture.preview().await;
+            assert_eq!(preview["messages"][1]["entryId"], "second", "{damage}");
+            assert_eq!(preview["messages"][2]["entryId"], "third", "{damage}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn preview_rejects_inode_and_prefix_changes_and_leaves_sources_untouched() {
     let temp = tempfile::tempdir().unwrap();
     let fixture = Fixture::new(temp.path());

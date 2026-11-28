@@ -26,8 +26,37 @@ pub(in crate::session::jsonl) struct Source {
     path: PathBuf,
     stamp: SourceStamp,
     pub attempted: bool,
+    span_repair: Option<SpanRepair>,
     header_rewrite: Option<HeaderRewrite>,
     published: Option<Arc<PublishedIndex>>,
+}
+
+#[derive(Clone)]
+struct SpanRepair {
+    last_old_sequence: u64,
+    skipped: Arc<[(u64, u64)]>,
+}
+
+pub(in crate::session::jsonl) struct RepairLayout {
+    length: u64,
+    skipped: Vec<(u64, u64)>,
+}
+
+impl RepairLayout {
+    pub fn from_spans(spans: &[(u64, u64)]) -> Option<Self> {
+        let mut length = 0;
+        let mut removed = 0;
+        let mut skipped = Vec::new();
+        for &(offset, count) in spans {
+            let gap = offset.checked_sub(length)?;
+            if gap != removed {
+                skipped.push((offset, gap));
+                removed = gap;
+            }
+            length = length.checked_add(count)?.checked_add(1)?;
+        }
+        Some(Self { length, skipped })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +76,7 @@ impl Source {
             path,
             stamp,
             attempted: false,
+            span_repair: None,
             header_rewrite: None,
             published: None,
         };
@@ -68,6 +98,7 @@ impl Source {
             path,
             stamp,
             attempted: false,
+            span_repair: None,
             header_rewrite: None,
             published: None,
         };
@@ -83,7 +114,7 @@ impl Source {
             && self.is_current()
     }
 
-    fn is_current(&self) -> bool {
+    pub fn is_current(&self) -> bool {
         native::address(&self.path)
             .and_then(|(directory, name)| directory.open(name))
             .is_ok_and(|(_, stamp)| self.stamp == stamp)
@@ -103,8 +134,32 @@ impl Source {
             path: self.path.clone(),
             stamp: after,
             attempted: false,
+            span_repair: self.span_repair.clone(),
             header_rewrite: self.header_rewrite,
             published: self.published.clone(),
+        })
+    }
+
+    pub fn after_repair(
+        &self,
+        reader: &dyn ReadFile,
+        layout: RepairLayout,
+        last_old_sequence: u64,
+    ) -> Option<Self> {
+        let mut source = Self::replay(self.path.clone(), reader, layout.length)?;
+        if !layout.skipped.is_empty() {
+            source.span_repair = Some(SpanRepair {
+                last_old_sequence,
+                skipped: layout.skipped.into(),
+            });
+        }
+        Some(source)
+    }
+
+    pub fn final_newline_layout(&self) -> Option<RepairLayout> {
+        Some(RepairLayout {
+            length: self.stamp.length.checked_add(1)?,
+            skipped: Vec::new(),
         })
     }
 
@@ -121,6 +176,7 @@ impl Source {
             .checked_sub(old_len)?
             .checked_add(new_len)?;
         let mut source = Self::replay(self.path.clone(), reader, length)?;
+        source.span_repair = self.span_repair.clone();
         source.header_rewrite = Some(HeaderRewrite {
             last_old_sequence,
             old_len,
@@ -290,6 +346,20 @@ impl ResidentState {
                     break;
                 }
                 let mut row = Row::from_payload(self.reducer.payload(index)?)?;
+                // Recovered entries still use the original reader. Translate
+                // their offsets across any removed spans before the header shift.
+                if let Some(repair) = source
+                    .span_repair
+                    .as_ref()
+                    .filter(|repair| row.seq <= repair.last_old_sequence)
+                {
+                    let gaps = repair
+                        .skipped
+                        .partition_point(|(offset, _)| *offset <= row.offset);
+                    if gaps > 0 {
+                        row.offset = row.offset.checked_sub(repair.skipped[gaps - 1].1)?;
+                    }
+                }
                 // Progress migration copies the body verbatim. The live cold
                 // entries still point to the old file through their open handle.
                 if let Some(rewrite) = source
