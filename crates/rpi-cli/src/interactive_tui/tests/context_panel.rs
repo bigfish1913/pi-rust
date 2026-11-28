@@ -196,7 +196,6 @@ async fn context_command_does_not_append_chat_queue_usage_or_clear_session() {
     let chat_before = state.chat_container.render(120);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let ctx = CommandContext {
-        chat: state.chat_container.clone(),
         tui: terminal(),
         tx,
         editor: state.editor.clone(),
