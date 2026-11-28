@@ -741,46 +741,10 @@ impl ResidentState {
     /// state lock. Only default model-visible rows after the latest compaction
     /// can contribute; an ordinary assistant usage lets us skip earlier bodies.
     pub fn context_usage_plan(&self, lane: &str) -> SessionResult<ContextUsagePlan> {
-        use rpi_ai::types::StopReason;
         let leaf = self.reducer.require_lane(lane)?;
-        let mut path = self
-            .reducer
-            .walk_to_root(leaf.as_deref(), &BranchBounds::default())?;
-        path.reverse();
-        let boundary = path
-            .iter()
-            .rposition(|&i| self.reducer.entry_meta(i).unwrap().kind == "compaction")
-            .unwrap_or(0);
-        let path = &path[boundary..];
-        let anchor = path
-            .iter()
-            .rposition(|&i| {
-                let meta = self.reducer.entry_meta(i).unwrap();
-                meta.kind == "message"
-                    && meta.stop_reason.as_ref().is_some_and(|reason| {
-                        !matches!(
-                            reason,
-                            StopReason::Deferred | StopReason::Aborted | StopReason::Error
-                        )
-                    })
-                    && meta
-                        .usage
-                        .as_ref()
-                        .is_some_and(|usage| usage.context_tokens() > 0)
-            })
-            .unwrap_or(0);
-        let message_offset = path[..anchor]
-            .iter()
-            .map(|&i| self.reducer.entry_meta(i).unwrap().context_message_count)
-            .sum();
-        let selected = self.refs(
-            path[anchor..]
-                .iter()
-                .copied()
-                .filter(|&i| self.reducer.entry_meta(i).unwrap().context_message_count > 0),
-        );
+        let (indices, message_offset) = self.reducer.context_usage_indices(leaf.as_deref())?;
         Ok(ContextUsagePlan {
-            selected,
+            selected: self.refs(indices),
             message_offset,
         })
     }
@@ -791,24 +755,12 @@ impl ResidentState {
         query: &TranscriptPageQuery,
     ) -> SessionResult<TranscriptPlan> {
         let leaf_id = self.reducer.require_lane(lane)?;
-        let mut indices = self
-            .reducer
-            .walk_to_root(leaf_id.as_deref(), &BranchBounds::default())?;
-        indices.reverse();
-        indices.retain(|&i| self.reducer.entry_meta(i).unwrap().is_transcript());
-        let total = indices.len();
-        let end = match &query.before_id {
-            Some(id) => indices
-                .iter()
-                .position(|&i| self.reducer.entry_meta(i).unwrap().id == *id)
-                .ok_or_else(|| SessionError::invalid_query(format!("beforeId not found: {id}")))?,
-            None => total,
-        };
-        let start = end.saturating_sub(query.limit.max(1));
+        let (indices, total, has_more) =
+            self.reducer.transcript_indices(leaf_id.as_deref(), query)?;
         Ok(TranscriptPlan {
-            selected: self.refs(indices[start..end].iter().copied()),
+            selected: self.refs(indices),
             total,
-            has_more: start > 0,
+            has_more,
             leaf_id,
         })
     }

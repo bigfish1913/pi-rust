@@ -21,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const RESPONSE_TOO_LARGE: &str =
+    "Host response exceeds frame budget; request a smaller page";
 const COMMANDS: &[&str] = &[
     "get_state",
     "get_messages",
@@ -244,9 +246,28 @@ impl Session {
                 }
             };
             match send(&mut write, &response).await {
-                Err(Failure::FrameTooLarge) => send(&mut write, &json!({
-                    "type":"response","id":id,"command":kind,"success":false,"error":"Host response exceeds frame budget; request a smaller page"
-                })).await?,
+                Err(Failure::FrameTooLarge) => {
+                    let mut error = json!({
+                        "type":"response","id":id,"command":kind,"success":false,"error":RESPONSE_TOO_LARGE
+                    });
+                    let page = &response["data"];
+                    if kind == "get_messages"
+                        && page["firstId"].is_string()
+                        && page["firstId"] == page["lastId"]
+                    {
+                        // A singleton cannot be reduced further. Its ID is
+                        // the exclusive cursor for the next older page.
+                        error["beforeId"] = page["firstId"].clone();
+                    }
+                    let sent = send(&mut write, &error).await;
+                    if sent == Err(Failure::FrameTooLarge)
+                        && error.as_object_mut().unwrap().remove("beforeId").is_some()
+                    {
+                        send(&mut write, &error).await?;
+                    } else {
+                        sent?;
+                    }
+                }
                 result => result?,
             }
         }

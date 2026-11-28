@@ -165,7 +165,7 @@ impl<'de> Deserialize<'de> for SessionState {
         }
         let metadata: Vec<_> = snapshot.entries.iter().map(EntryMeta::from_entry).collect();
         let mut nearest_user = Vec::with_capacity(metadata.len());
-        let mut nearest_transcript = Vec::with_capacity(metadata.len());
+        let mut query_ancestry = Vec::with_capacity(metadata.len());
         for (index, meta) in metadata.iter().enumerate() {
             let parent = match meta.parent_id() {
                 Some(id) => {
@@ -184,11 +184,7 @@ impl<'de> Deserialize<'de> for SessionState {
             } else {
                 parent.and_then(|index| nearest_user[index])
             });
-            nearest_transcript.push(if meta.is_transcript() {
-                Some(index)
-            } else {
-                parent.and_then(|index| nearest_transcript[index])
-            });
+            query_ancestry.push(QueryAncestry::extend(&query_ancestry, parent, meta, index));
         }
         let hot_append_count = snapshot
             .records
@@ -201,7 +197,7 @@ impl<'de> Deserialize<'de> for SessionState {
             index: IndexedState {
                 metadata,
                 nearest_user,
-                nearest_transcript,
+                query_ancestry,
                 sequence: snapshot.sequence,
                 used_ids,
                 entries: snapshot.entries,

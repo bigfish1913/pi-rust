@@ -1,12 +1,128 @@
 //! Shared branch walks and query candidate selection. No payload is inspected.
 use super::*;
+use crate::session::types::TranscriptPageQuery;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct QueryAncestry {
+    transcript: Option<usize>,
+    transcript_count: usize,
+    context: Option<usize>,
+    // Length of the default context projection since the latest compaction.
+    context_count: usize,
+}
+
+impl QueryAncestry {
+    pub(super) fn extend(
+        entries: &[Self],
+        parent: Option<usize>,
+        meta: &EntryMeta,
+        index: usize,
+    ) -> Self {
+        let mut ancestry = parent.map_or_else(Self::default, |parent| entries[parent]);
+        if meta.is_transcript() {
+            ancestry.transcript = Some(index);
+            ancestry.transcript_count += 1;
+        }
+        if meta.context_message_count > 0 {
+            ancestry.context = Some(index);
+            if meta.kind == "compaction" {
+                ancestry.context_count = 0;
+            }
+            ancestry.context_count = ancestry
+                .context_count
+                .saturating_add(meta.context_message_count);
+        }
+        ancestry
+    }
+}
 
 impl<P: Clone> IndexedState<P> {
     pub(crate) fn entry_index(&self, id: &str) -> Option<usize> {
         self.entries_by_id.get(id).copied()
     }
     pub(crate) fn nearest_transcript(&self, id: &str) -> Option<usize> {
-        self.nearest_transcript[self.entry_index(id)?]
+        self.transcript_at(self.entry_index(id)?)
+    }
+
+    pub(super) fn transcript_at(&self, index: usize) -> Option<usize> {
+        self.query_ancestry[index].transcript
+    }
+
+    pub(super) fn previous_transcript(&self, index: usize) -> Option<usize> {
+        self.parent_ancestry(index).transcript
+    }
+
+    fn ancestry_at(&self, leaf: Option<&str>) -> SessionResult<QueryAncestry> {
+        match leaf {
+            Some(id) => self
+                .entry_index(id)
+                .map(|index| self.query_ancestry[index])
+                .ok_or_else(|| SessionError::not_found(format!("Entry not found: {id}"))),
+            None => Ok(QueryAncestry::default()),
+        }
+    }
+
+    fn parent_ancestry(&self, index: usize) -> QueryAncestry {
+        self.metadata[index]
+            .parent_id()
+            .and_then(|id| self.entry_index(id))
+            .map_or_else(QueryAncestry::default, |index| self.query_ancestry[index])
+    }
+
+    pub(crate) fn transcript_indices(
+        &self,
+        leaf: Option<&str>,
+        query: &TranscriptPageQuery,
+    ) -> SessionResult<(Vec<usize>, usize, bool)> {
+        let ancestry = self.ancestry_at(leaf)?;
+        let mut next = ancestry.transcript;
+        if let Some(id) = &query.before_id {
+            let missing = || SessionError::invalid_query(format!("beforeId not found: {id}"));
+            let cursor = self
+                .entry_index(id)
+                .filter(|&index| self.metadata[index].is_transcript())
+                .ok_or_else(missing)?;
+            // Entries are append-ordered, so passing the cursor rules out
+            // ancestry on this lane even when it exists on a sibling branch.
+            while let Some(index) = next.filter(|&index| index > cursor) {
+                next = self.previous_transcript(index);
+            }
+            if next != Some(cursor) {
+                return Err(missing());
+            }
+            next = self.previous_transcript(cursor);
+        }
+        let mut rows = Vec::new();
+        while let Some(index) = next.filter(|_| rows.len() < query.limit.max(1)) {
+            rows.push(index);
+            next = self.previous_transcript(index);
+        }
+        rows.reverse();
+        Ok((rows, ancestry.transcript_count, next.is_some()))
+    }
+
+    pub(crate) fn context_usage_indices(
+        &self,
+        leaf: Option<&str>,
+    ) -> SessionResult<(Vec<usize>, usize)> {
+        let mut next = self.ancestry_at(leaf)?.context;
+        let mut rows = Vec::new();
+        let mut offset = 0;
+        while let Some(index) = next {
+            let entry = &self.metadata[index];
+            rows.push(index);
+            if entry.kind == "compaction" {
+                break;
+            }
+            let parent = self.parent_ancestry(index);
+            if entry.is_context_usage_anchor() {
+                offset = parent.context_count;
+                break;
+            }
+            next = parent.context;
+        }
+        rows.reverse();
+        Ok((rows, offset))
     }
     pub(crate) fn metadata(&self) -> &[EntryMeta] {
         &self.metadata

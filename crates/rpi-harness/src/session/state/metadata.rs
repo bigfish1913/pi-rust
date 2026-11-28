@@ -97,6 +97,21 @@ impl EntryMeta {
         matches!(self.kind.as_ref(), "message" | "compaction")
     }
 
+    pub(crate) fn is_context_usage_anchor(&self) -> bool {
+        use rpi_ai::types::StopReason;
+        self.kind == "message"
+            && self.stop_reason.as_ref().is_some_and(|reason| {
+                !matches!(
+                    reason,
+                    StopReason::Deferred | StopReason::Aborted | StopReason::Error
+                )
+            })
+            && self
+                .usage
+                .as_ref()
+                .is_some_and(|usage| usage.context_tokens() > 0)
+    }
+
     /// Only reject using facts actually in the index. Tool/outbox predicates
     /// MUST be applied to the complete hydrated entry, before enforcing limit.
     pub(crate) fn matches_query(&self, query: &EntryQuery) -> bool {
