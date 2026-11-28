@@ -10,7 +10,7 @@ use crate::resource_management::Scope;
 use crate::resource_selection::{contained, file, read_limited, relative, validate_tool_names};
 
 mod distribution;
-pub(crate) use distribution::install;
+pub(crate) use distribution::{install, update};
 
 const MANIFEST: &str = "rpi-package.json";
 const MAX_COMMANDS: usize = 32;

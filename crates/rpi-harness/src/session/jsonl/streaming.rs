@@ -665,6 +665,13 @@ impl JsonlSessionStorage {
             serde_json::to_string(&value).map_err(|e| SessionError::storage(e.to_string()))?
         );
         let body_offset = raw.len() as u64 + 1;
+        let upgraded_header_len = upgraded.len() as u64;
+        let preview_source = self
+            .preview_source
+            .lock()
+            .unwrap()
+            .take()
+            .filter(|source| source.matches(reader.as_ref()));
         let progress = super::super::progress::JsonlProgressStore::new(
             self.fs.clone(),
             &path,
@@ -710,6 +717,18 @@ impl JsonlSessionStorage {
         .await?;
         self.progress = progress;
         *self.legacy_history_digest.lock().unwrap() = None;
+        if let Some(source) = preview_source {
+            if let Ok(Some(reader)) = self.fs.open_read_file(&path).await {
+                let sequence = self.state.lock().await.sequence();
+                *self.preview_source.lock().unwrap() = source.after_header_rewrite(
+                    reader.as_ref(),
+                    sequence,
+                    body_offset,
+                    upgraded_header_len,
+                );
+                self.publish_preview().await;
+            }
+        }
         Ok(true)
     }
 }

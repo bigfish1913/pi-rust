@@ -14,6 +14,7 @@ use std::{
     fs::{self, File, FileTimes, OpenOptions},
     io::Write,
     os::unix::fs::symlink,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Output,
     sync::Arc,
@@ -113,6 +114,7 @@ async fn preview_projects_the_latest_main_window_and_rebuilds_on_restore() {
     let storage = fixture.create().await;
     let meta = storage.jsonl_metadata();
     let index = format!("{}.preview.json", meta.path);
+    let stamp = format!("{}.preview.stamp", meta.path);
     assert!(!Path::new(&index).exists());
     fixture.miss().await;
 
@@ -140,6 +142,7 @@ async fn preview_projects_the_latest_main_window_and_rebuilds_on_restore() {
         .await
         .unwrap();
     append(&storage, "side-only", "side").await;
+    assert!(Path::new(&stamp).is_file());
     let before = fixture.preview().await;
     let rows = before["messages"].as_array().unwrap();
     assert_eq!(rows.len(), 40);
@@ -190,11 +193,81 @@ async fn preview_projects_the_latest_main_window_and_rebuilds_on_restore() {
         meta.path.clone(),
         format!("{}.progress.jsonl", meta.path),
         index,
+        stamp,
         staging,
     ] {
         assert!(!Path::new(&path).exists(), "{path}");
     }
     fixture.miss().await;
+}
+
+#[tokio::test]
+async fn legacy_upgrade_rebases_preview_and_non_transcript_writes_keep_the_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new(temp.path());
+    let storage = fixture.create().await;
+    append(&storage, "before-upgrade", "main").await;
+    let meta = storage.jsonl_metadata();
+    drop(storage);
+
+    let path = Path::new(&meta.path);
+    let index = format!("{}.preview.json", meta.path);
+    let stamp = format!("{}.preview.stamp", meta.path);
+    let journal = fs::read_to_string(path).unwrap();
+    let (header, body) = journal.split_once('\n').unwrap();
+    let mut header: Value = serde_json::from_str(header).unwrap();
+    header.as_object_mut().unwrap().remove("progressFormat");
+    fs::write(path, format!("{header}\n{body}")).unwrap();
+    fs::remove_file(format!("{}.progress.jsonl", meta.path)).unwrap();
+
+    let storage = fixture
+        .repo
+        .prepare_restore_by_jsonl_metadata(&meta)
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap()
+        .enable_progress_under_exclusive_lock()
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.preview().await["messages"][0]["entryId"],
+        "before-upgrade"
+    );
+    let index_bytes = fs::read(&index).unwrap();
+    let inode = fs::metadata(&index).unwrap().ino();
+    for number in 0..3 {
+        storage
+            .append_entry(
+                ProvisionedEntry {
+                    id: format!("custom-{number}"),
+                    kind: ProvisionedKind::Custom {
+                        custom_type: "fixture".into(),
+                        data: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.preview().await["messages"][0]["entryId"],
+            "before-upgrade"
+        );
+        assert_eq!(fs::read(&index).unwrap(), index_bytes);
+        assert_eq!(fs::metadata(&index).unwrap().ino(), inode);
+    }
+    let proof = fs::read(&stamp).unwrap();
+    fs::write(&index, [&index_bytes[..], b" "].concat()).unwrap();
+    fixture.miss().await;
+    fs::write(&index, index_bytes).unwrap();
+    assert_eq!(fs::read(&stamp).unwrap(), proof);
+
+    append(&storage, "after-upgrade", "main").await;
+    let preview = fixture.preview().await;
+    assert_eq!(preview["messages"][0]["entryId"], "before-upgrade");
+    assert_eq!(preview["messages"][1]["entryId"], "after-upgrade");
 }
 
 #[tokio::test]

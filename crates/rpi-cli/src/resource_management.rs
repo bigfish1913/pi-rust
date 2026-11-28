@@ -1247,6 +1247,35 @@ fn mutate(root: &Path, o: &Options, release: Option<&str>) -> Result<Value> {
     if matches!(o.op.as_str(), "update" | "reinstall") && previous.is_none() {
         return Err("resource is not owned/installed; use install".into());
     }
+    let same_release_version = if let Some(old) = previous
+        .as_ref()
+        .filter(|_| kind == Kind::Package && o.op == "update" && release.is_some())
+    {
+        if old.release.is_none() {
+            return Err("package was installed from a local path; update it with rpi resource update and --path".into());
+        }
+        let installed = old
+            .version
+            .as_deref()
+            .and_then(|version| semver::Version::parse(version).ok())
+            .ok_or("invalid installed package version")?;
+        let requested = o
+            .version
+            .as_deref()
+            .and_then(|version| semver::Version::parse(version).ok())
+            .ok_or("invalid requested package version")?;
+        match requested.cmp_precedence(&installed) {
+            std::cmp::Ordering::Less => {
+                return Err(format!(
+                    "cannot downgrade package from {installed} to {requested}"
+                ));
+            }
+            std::cmp::Ordering::Equal => true,
+            std::cmp::Ordering::Greater => false,
+        }
+    } else {
+        false
+    };
     let source = o
         .source
         .as_ref()
@@ -1285,7 +1314,7 @@ fn mutate(root: &Path, o: &Options, release: Option<&str>) -> Result<Value> {
             target: target.clone(),
             inventory: copied,
         };
-        if o.op == "install" {
+        if o.op == "install" || same_release_version {
             if let Some(old) = &previous {
                 let same_source = match (&old.release, &receipt.release) {
                     (None, None) => old.source == receipt.source,
@@ -1299,7 +1328,14 @@ fn mutate(root: &Path, o: &Options, release: Option<&str>) -> Result<Value> {
                         json!({"outcome":"unchanged","resource":observe(root,o.scope.unwrap(),old,false)?}),
                     );
                 }
-                return Err("already installed; use update or reinstall with --path".into());
+                let error = if same_release_version {
+                    "package version is already installed with different release provenance or content"
+                } else if release.is_some() {
+                    "already installed; use rpi update package NAME"
+                } else {
+                    "already installed; use update or reinstall with --path"
+                };
+                return Err(error.into());
             }
         }
         next = Some((receipt, staged));
@@ -1499,7 +1535,7 @@ pub fn run(args: &[String]) -> i32 {
     run_with_release(args, None)
 }
 
-pub(crate) fn install_release(args: &[String], url: &str) -> i32 {
+pub(crate) fn publish_release(args: &[String], url: &str) -> i32 {
     run_with_release(args, Some(url))
 }
 

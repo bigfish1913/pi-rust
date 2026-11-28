@@ -663,7 +663,7 @@ impl JsonlSessionStorage {
             .state
             .lock()
             .await
-            .preview_index(&self.metadata.id, source.stamp.clone())
+            .preview_index(&self.metadata.id, &source)
         else {
             return;
         };
@@ -672,13 +672,18 @@ impl JsonlSessionStorage {
         let storage = self.clone();
         let published = tokio::task::spawn_blocking(move || {
             let held = storage.writer_lease.lock().unwrap();
-            held.is_some()
-                && !storage.writer_lease_revoked.load(Ordering::Acquire)
-                && source.publish(index).is_ok()
+            if held.is_some() && !storage.writer_lease_revoked.load(Ordering::Acquire) {
+                source.publish(index).ok()
+            } else {
+                None
+            }
         })
         .await
-        .unwrap_or(false);
-        if !published {
+        .ok()
+        .flatten();
+        if let Some(source) = published {
+            *self.preview_source.lock().unwrap() = Some(source);
+        } else {
             tracing::debug!("session preview unavailable after publication attempt");
         }
     }

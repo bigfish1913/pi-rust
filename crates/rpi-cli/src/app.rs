@@ -257,6 +257,9 @@ async fn run_inner() -> i32 {
         }
         Some("events") => return crate::events::run(&argv[1..]).await,
         Some("session") => return crate::session_gc::run(&argv[1..]).await,
+        Some("update") if argv.get(1).is_some_and(|arg| arg == "package") => {
+            return crate::agent_package::update(&argv[2..]).await;
+        }
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
         Some("install") if argv.get(1).is_some_and(|arg| arg == "package") => {
             return crate::agent_package::install(&argv[2..]).await;

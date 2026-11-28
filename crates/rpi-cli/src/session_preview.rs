@@ -4,6 +4,10 @@ use serde_json::json;
 use std::{io::Write, path::Path};
 
 pub(crate) fn run(args: &[String]) -> i32 {
+    if !cfg!(unix) {
+        eprintln!("error: --session-preview requires Unix");
+        return EXIT_USAGE;
+    }
     let (id, dir) = match args {
         [flag, id, dir_flag, dir] | [dir_flag, dir, flag, id]
             if flag == "--session-preview" && dir_flag == "--session-dir" =>

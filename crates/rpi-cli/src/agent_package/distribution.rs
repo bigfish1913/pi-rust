@@ -35,17 +35,29 @@ struct Archive {
 }
 
 const REPOSITORY: &str = "https://github.com/pi-rust/rpi-package";
-const USAGE: &str = "rpi install package NAME [--version VERSION | --manifest URL]";
-
 pub(crate) async fn install(args: &[String]) -> i32 {
+    apply_release("install", args).await
+}
+
+pub(crate) async fn update(args: &[String]) -> i32 {
+    apply_release("update", args).await
+}
+
+async fn apply_release(operation: &str, args: &[String]) -> i32 {
+    let args: Vec<_> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| *arg != "--offline")
+        .collect();
+    let usage = format!("rpi {operation} package NAME [--version VERSION | --manifest URL]");
     if args == ["--help"] || args == ["-h"] {
-        println!("{USAGE}");
+        println!("{usage}");
         return 0;
     }
-    match stage(args).await {
-        Ok(release) => crate::resource_management::install_release(
+    match stage(&args, &usage).await {
+        Ok(release) => crate::resource_management::publish_release(
             &[
-                "install".into(),
+                operation.into(),
                 "package".into(),
                 release.name,
                 "--path".into(),
@@ -72,13 +84,8 @@ struct StagedRelease {
     origin: String,
 }
 
-async fn stage(args: &[String]) -> Result<StagedRelease, String> {
-    let args: Vec<_> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|arg| *arg != "--offline")
-        .collect();
-    let (name, version, manifest) = match args.as_slice() {
+async fn stage(args: &[&str], usage: &str) -> Result<StagedRelease, String> {
+    let (name, version, manifest) = match args {
         [name] => (*name, None, None),
         [name, "--version", version] => (
             *name,
@@ -86,7 +93,7 @@ async fn stage(args: &[String]) -> Result<StagedRelease, String> {
             None,
         ),
         [name, "--manifest", manifest] => (*name, None, Some(*manifest)),
-        _ => return Err(USAGE.into()),
+        _ => return Err(usage.into()),
     };
     if !identifier(name) {
         return Err("invalid agent package name".into());

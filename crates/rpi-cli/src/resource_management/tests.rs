@@ -26,6 +26,51 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
 }
 
 #[test]
+fn published_package_update_requires_an_owned_release_and_a_newer_version() {
+    let (_dir, root, source) = fixture();
+    let mut install = options("install", Kind::Package, "demo", Some(source.clone()));
+    install.version = Some("1.0.0".into());
+    let mut update = options("update", Kind::Package, "demo", Some(source.clone()));
+    update.version = Some("1.1.0".into());
+    let old_release = "https://example.com/demo/1.0.0/release.json";
+    let new_release = "https://example.com/demo/1.1.0/release.json";
+    assert!(mutate(&root, &update, Some(new_release)).is_err());
+
+    mutate(&root, &install, None).unwrap();
+    assert!(mutate(&root, &update, Some(new_release))
+        .unwrap_err()
+        .contains("local path"));
+    mutate(&root, &options("remove", Kind::Package, "demo", None), None).unwrap();
+    mutate(&root, &install, Some(old_release)).unwrap();
+    put(source.join("SKILL.md"), "updated bundle");
+    assert_eq!(
+        mutate(&root, &update, Some(new_release)).unwrap()["outcome"],
+        "replaced"
+    );
+    let record = &packages(&root).unwrap().packages[0];
+    assert_eq!(record.version, "1.1.0");
+    assert_eq!(record.source, new_release);
+    assert_eq!(
+        mutate(&root, &update, Some(new_release)).unwrap()["outcome"],
+        "unchanged"
+    );
+
+    update.version = Some("1.0.0".into());
+    assert!(mutate(&root, &update, Some(old_release))
+        .unwrap_err()
+        .contains("cannot downgrade"));
+    update.version = Some("1.1.0".into());
+    put(source.join("SKILL.md"), "changed bytes at the same version");
+    assert!(mutate(&root, &update, Some(new_release))
+        .unwrap_err()
+        .contains("different release provenance or content"));
+    assert_eq!(
+        fs::read(root.join("packages/demo/SKILL.md")).unwrap(),
+        b"updated bundle"
+    );
+}
+
+#[test]
 fn leases_distinguish_contention_from_errors_and_keep_observation_guard() {
     let (_dir, root, _) = fixture();
     let (guard, busy) = observation_lease(&root).unwrap();
