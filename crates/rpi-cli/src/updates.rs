@@ -194,11 +194,29 @@ fn report_without_remote_checks() -> UpdateReport {
 }
 
 fn startup_http_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
-        .user_agent(format!("rpi/{}", crate::VERSION))
-        .build()
+        .user_agent(format!("rpi/{}", crate::VERSION));
+    // The saved Web proxy is a fallback for this client. Keep explicit
+    // environment settings and leave the process environment alone.
+    if let Some(saved) = crate::settings::load_settings()
         .ok()
+        .and_then(|settings| settings.http_proxy)
+    {
+        let proxy_url = |upper, lower| {
+            [upper, lower, "ALL_PROXY", "all_proxy"]
+                .into_iter()
+                .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+                .unwrap_or_else(|| saved.clone())
+        };
+        let no_proxy = reqwest::NoProxy::from_env();
+        let http = reqwest::Proxy::http(proxy_url("HTTP_PROXY", "http_proxy")).ok()?;
+        let https = reqwest::Proxy::https(proxy_url("HTTPS_PROXY", "https_proxy")).ok()?;
+        builder = builder
+            .proxy(http.no_proxy(no_proxy.clone()))
+            .proxy(https.no_proxy(no_proxy));
+    }
+    builder.build().ok()
 }
 
 async fn check_startup_with_client(client: Option<reqwest::Client>) -> UpdateReport {
@@ -207,6 +225,13 @@ async fn check_startup_with_client(client: Option<reqwest::Client>) -> UpdateRep
         Err(_) => return UpdateReport::default(),
     };
     let warnings = consume_self_update_statuses(&agent_dir);
+    let cache = refresh_update_cache(&agent_dir, client).await;
+    let mut report = report_from_cache(&cache);
+    report.warnings = warnings;
+    report
+}
+
+async fn refresh_update_cache(agent_dir: &Path, client: Option<reqwest::Client>) -> UpdateCache {
     let cache_path = agent_dir.join(CACHE_FILE);
     let previous_cache = read_cache(&cache_path);
 
@@ -278,10 +303,7 @@ async fn check_startup_with_client(client: Option<reqwest::Client>) -> UpdateRep
         checked_at,
     );
 
-    let cache = merge_and_write_cache(&cache_path, checked_at, rpi_update, native_packages);
-    let mut report = report_from_cache(&cache);
-    report.warnings = warnings;
-    report
+    merge_and_write_cache(&cache_path, checked_at, rpi_update, native_packages)
 }
 
 async fn collect_bounded<I, F, T>(checks: I) -> Vec<T>
@@ -2668,8 +2690,149 @@ fn write_windows_update_status(path: &Path, state: &str, message: &str) -> Resul
         .map_err(|error| format!("could not write update status {}: {error}", path.display()))
 }
 
+/// Machine-readable update inventory for the web UI.
+///
+/// The web UI needs the same answer as the startup notice without parsing
+/// human-readable CLI output: installed versions, latest versions, and
+/// whether each target can be updated from this install.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInventory {
+    pub current_version: String,
+    pub last_checked_at: i64,
+    pub host: UpdateInventoryEntry,
+    pub extensions: Vec<UpdateInventoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInventoryEntry {
+    pub name: String,
+    pub current: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    pub updatable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `rpi updates check --json`. Currently JSON is the only supported format so
+/// callers get a stable contract; the command rejects other arguments rather
+/// than silently inventing output.
+pub async fn run_updates(args: &[String]) -> i32 {
+    let refresh = match args {
+        [command, flag] if command == "check" && flag == "--json" => false,
+        [command, flag] if command == "refresh" && flag == "--json" => true,
+        _ => {
+            eprintln!("error: `rpi updates` accepts `check --json` or `refresh --json`");
+            return 2;
+        }
+    };
+    if refresh && !update_checks_disabled() {
+        if let Ok(agent_dir) = crate::config::agent_dir() {
+            refresh_update_cache(&agent_dir, startup_http_client()).await;
+        }
+    }
+    let inventory = build_inventory_from_cache();
+    match serde_json::to_string_pretty(&inventory) {
+        Ok(json) => {
+            println!("{json}");
+            0
+        }
+        Err(error) => {
+            eprintln!("error: could not serialize update inventory: {error}");
+            1
+        }
+    }
+}
+
+fn build_inventory_from_cache() -> UpdateInventory {
+    let cache = crate::config::agent_dir()
+        .ok()
+        .and_then(|dir| read_cache(&dir.join(CACHE_FILE)))
+        .unwrap_or_default();
+    let host_latest = cache
+        .rpi_latest
+        .as_ref()
+        .filter(|latest| is_newer(crate::VERSION, latest))
+        .cloned();
+    UpdateInventory {
+        current_version: crate::VERSION.to_owned(),
+        last_checked_at: cache.checked_at,
+        host: UpdateInventoryEntry {
+            name: "rpi".into(),
+            current: crate::VERSION.into(),
+            updatable: host_latest.is_some(),
+            latest: host_latest,
+            reason: None,
+        },
+        extensions: installed_extension_inventory(
+            &cache,
+            crate::install::installed_native_packages(),
+        ),
+    }
+}
+
+fn installed_extension_inventory(
+    cache: &UpdateCache,
+    packages: impl IntoIterator<Item = crate::install::InstalledNativePackage>,
+) -> Vec<UpdateInventoryEntry> {
+    packages
+        .into_iter()
+        .map(|package| {
+            let supports_update = package.supports_registry_update();
+            let latest = cache
+                .native_packages
+                .get(&native_cache_key(&package))
+                .filter(|latest| supports_update && is_newer(&package.version, latest))
+                .cloned();
+            UpdateInventoryEntry {
+                name: package.name.clone(),
+                current: package.version,
+                updatable: latest.is_some(),
+                latest,
+                reason: (!supports_update).then(|| "local-install".into()),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn update_inventory_reports_registry_updates_and_skips_local_installs() {
+        let registry = crate::install::InstalledNativePackage {
+            name: "registry-ext".into(),
+            version: "1.0.0".into(),
+            source: None,
+            prebuilt: None,
+            artifacts: Vec::new(),
+        };
+        let local = crate::install::InstalledNativePackage {
+            name: "local-ext".into(),
+            version: "1.0.0".into(),
+            source: Some("local:preview".into()),
+            prebuilt: None,
+            artifacts: Vec::new(),
+        };
+        let cache = super::UpdateCache {
+            native_packages: std::collections::BTreeMap::from([
+                ("registry-ext".into(), "1.2.0".into()),
+                ("local-ext".into(), "2.0.0".into()),
+            ]),
+            ..super::UpdateCache::default()
+        };
+        let entries = super::installed_extension_inventory(&cache, vec![registry, local]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "registry-ext");
+        assert_eq!(entries[0].latest.as_deref(), Some("1.2.0"));
+        assert!(entries[0].updatable);
+        assert_eq!(entries[0].reason, None);
+        assert_eq!(entries[1].name, "local-ext");
+        assert_eq!(entries[1].reason.as_deref(), Some("local-install"));
+        assert!(!entries[1].updatable);
+    }
+
     #[test]
     fn extension_update_notices_unify_commands_and_separate_source_caches() {
         let _guard = crate::config::test_support::env_lock()
@@ -3118,6 +3281,33 @@ mod tests {
             !agent.exists(),
             "offline checks must not create the update cache directory"
         );
+    }
+
+    #[tokio::test]
+    async fn inventory_refresh_preserves_self_update_failure_for_startup() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore_config = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let _restore_offline = RestoreEnv::capture(crate::args::RPI_OFFLINE_ENV);
+        let temp = real_tempdir();
+        let agent = temp.path().join("agent");
+        let update_root = agent.join("self-update");
+        std::fs::create_dir_all(&update_root).unwrap();
+        let failed = update_root.join("status-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json");
+        write_test_update_status(&failed, "failed", "permission denied");
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+        std::env::set_var(crate::args::RPI_OFFLINE_ENV, "1");
+
+        assert_eq!(
+            super::run_updates(&["refresh".into(), "--json".into()]).await,
+            0
+        );
+        super::refresh_update_cache(&agent, None).await;
+        assert!(failed.exists());
+
+        let report = super::check_rpi_startup().await;
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].message.contains("permission denied"));
+        assert!(!failed.exists());
     }
 
     #[test]
