@@ -1131,6 +1131,16 @@ pub async fn build_prepared(
         append_texts.push(text);
     }
     if let Some(selected) = &resource_selection {
+        if let Some(package) = selected
+            .package
+            .as_ref()
+            .filter(|_| selected.package_commands.digest().is_some())
+        {
+            append_texts.push(format!(
+                "Installed agent package root: {}. Resolve references to the package's skills/, optional-skills/, instructions/, and commands/ against this installed root. Resolve workspace files and project scripts against the current working directory.",
+                package.root.display()
+            ));
+        }
         append_texts.extend(
             selected
                 .instructions
@@ -1644,6 +1654,7 @@ pub async fn build_prepared(
                 "resourceDiscovery": "disabled",
                 "changes": "restart-required"
             }),
+            selected.package_commands.clone(),
         );
         crate::resource_selection::get_resource_state(&harness)
             .await

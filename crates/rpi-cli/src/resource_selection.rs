@@ -113,6 +113,7 @@ pub struct ResolvedSelection {
     pub extensions: Vec<PathBuf>,
     pub instructions: Vec<(PathBuf, String, String)>,
     pub transition: Option<ResourceTransition>,
+    pub(crate) package_commands: crate::agent_package::Commands,
     validated_skills: Option<ValidatedSkills>,
 }
 
@@ -163,7 +164,7 @@ impl ResourceTransition {
     }
 }
 
-fn contained(path: &Path, root: &Path) -> Result<PathBuf, String> {
+pub(crate) fn contained(path: &Path, root: &Path) -> Result<PathBuf, String> {
     let path = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
     if !path.starts_with(root) || path == root {
         return Err(format!(
@@ -193,7 +194,7 @@ fn validate_package_tree(
     Ok(())
 }
 
-fn read_limited(path: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn read_limited(path: &Path) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
@@ -219,7 +220,7 @@ fn fingerprint(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn file(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn file(path: &Path) -> Result<PathBuf, String> {
     if !path.is_file() {
         return Err(format!("missing resource file: {}", path.display()));
     }
@@ -234,7 +235,7 @@ fn unique_paths(paths: &[PathBuf]) -> Result<(), String> {
     }
     Ok(())
 }
-fn relative(path: &Path) -> Result<(), String> {
+pub(crate) fn relative(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty()
         || path
             .components()
@@ -244,6 +245,16 @@ fn relative(path: &Path) -> Result<(), String> {
             "expected a package-relative path: {}",
             path.display()
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_tool_names(names: &[String]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for name in names {
+        if name.is_empty() || !seen.insert(name) {
+            return Err("empty or duplicate tool name".into());
+        }
     }
     Ok(())
 }
@@ -316,17 +327,13 @@ impl ResolvedSelection {
             return Err("unsupported resource config version".into());
         }
         if let ToolSelection::Only { names } = &selection.tools {
-            let mut seen = HashSet::new();
-            for name in names {
-                if name.is_empty() || !seen.insert(name) {
-                    return Err("empty or duplicate tool name".into());
-                }
-            }
+            validate_tool_names(names)?;
         }
         let mut skills = Vec::new();
         let mut extensions = Vec::new();
         let mut instructions = Vec::new();
         let mut resolved_package = None;
+        let mut package_commands = crate::agent_package::Commands::default();
         if let Some(main) = &selection.main_package {
             let native_root = main.scope.root(home, cwd)?;
             let package = crate::packages::selected_package_at(&native_root, &main.name)?;
@@ -337,6 +344,11 @@ impl ResolvedSelection {
             if !root.is_dir() || !root.starts_with(&packages_root) || root == packages_root {
                 return Err("package root escapes .rpi/packages".into());
             }
+            package_commands = crate::agent_package::Commands::load(
+                &root,
+                &main.name,
+                (!package.version.is_empty()).then_some(package.version.as_str()),
+            )?;
             let skill_dir = root.join("skills");
             if skill_dir.exists() {
                 let skill_dir = contained(&skill_dir, &root)?;
@@ -413,6 +425,7 @@ impl ResolvedSelection {
             extensions,
             instructions,
             transition,
+            package_commands,
             validated_skills: None,
         }))
     }
@@ -454,6 +467,7 @@ impl ResolvedSelection {
             extensions: Vec::new(),
             instructions,
             transition: None,
+            package_commands: Default::default(),
             validated_skills: Some(ValidatedSkills {
                 skills: Vec::new(),
                 inventory: json!([]),
@@ -535,23 +549,46 @@ impl ResolvedSelection {
 
 // CLI attachment keyed by allocation, not durable session ID: concurrent hosts reopening
 // the same transcript must not inherit each other's startup observations.
-type Attachment = (Weak<dyn SessionStorage>, Value);
+type Attachment = (
+    Weak<dyn SessionStorage>,
+    Value,
+    crate::agent_package::Commands,
+);
 fn states() -> &'static Mutex<Vec<Attachment>> {
     static STATES: OnceLock<Mutex<Vec<Attachment>>> = OnceLock::new();
     STATES.get_or_init(|| Mutex::new(Vec::new()))
 }
-pub(crate) fn attach(harness: &AgentHarness, state: Value) {
+pub(crate) fn attach(
+    harness: &AgentHarness,
+    state: Value,
+    commands: crate::agent_package::Commands,
+) {
     let mut states = states().lock().unwrap();
-    states.retain(|(storage, _)| storage.strong_count() > 0);
+    states.retain(|(storage, _, _)| storage.strong_count() > 0);
     states.push((
         std::sync::Arc::downgrade(&harness.session().storage()),
         state,
+        commands,
     ));
+}
+
+pub(crate) fn package_commands(harness: &AgentHarness) -> crate::agent_package::Commands {
+    let storage = harness.session().storage();
+    states()
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|(weak, _, commands)| {
+            weak.upgrade()
+                .filter(|value| std::sync::Arc::ptr_eq(value, &storage))
+                .map(|_| commands.clone())
+        })
+        .unwrap_or_default()
 }
 
 pub async fn get_resource_state(harness: &AgentHarness) -> Result<Value, String> {
     let storage = harness.session().storage();
-    let state = states().lock().unwrap().iter().find_map(|(s, state)| {
+    let state = states().lock().unwrap().iter().find_map(|(s, state, _)| {
         s.upgrade()
             .filter(|s| std::sync::Arc::ptr_eq(s, &storage))
             .map(|_| state.clone())
@@ -644,6 +681,9 @@ pub(crate) fn validate_session_binding(
                 .collect::<Result<Vec<_>, String>>()?;
             if old.pointer("/inventory/extensions") != Some(&json!(extensions)) {
                 return Err("session resource artifact inventory changed; restore original resources or use a new session".into());
+            }
+            if old.pointer("/inventory/packageCommandsSha256").and_then(Value::as_str) != selected.package_commands.digest() {
+                return Err("session package command inventory changed; restore original resources or use a new session".into());
             }
             if old.pointer("/inventory/skills") != Some(&selected.validated_skills()?.inventory) {
                 return Err("session resource Skill inventory changed; restore original resources or use a new session".into());
@@ -868,7 +908,10 @@ pub(crate) async fn bind_inventory(
         .iter()
         .map(|t| json!(t.tool.schema()))
         .collect();
-    let inventory = json!({"skills":skills, "extensions":extensions, "toolSchemasSha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&tools).map_err(|e| e.to_string())?))});
+    let mut inventory = json!({"skills":skills, "extensions":extensions, "toolSchemasSha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&tools).map_err(|e| e.to_string())?))});
+    if let Some(digest) = selected.package_commands.digest() {
+        inventory["packageCommandsSha256"] = json!(digest);
+    }
     bind_inventory_to_session(harness.session(), selected, inventory).await
 }
 
@@ -1046,6 +1089,7 @@ mod tests {
             extensions: vec![],
             instructions: vec![],
             transition: None,
+            package_commands: Default::default(),
             validated_skills: None,
         };
         let env: std::sync::Arc<dyn rpi_tools::ExecutionEnv> =
@@ -1261,7 +1305,11 @@ mod tests {
             .unwrap_err()
             .contains("requires --resource-config"));
         harness.seal_resources(vec![]).unwrap();
-        attach(&harness, json!({"oversized": "x".repeat(MAX_STATE_BYTES)}));
+        attach(
+            &harness,
+            json!({"oversized": "x".repeat(MAX_STATE_BYTES)}),
+            Default::default(),
+        );
         assert!(get_resource_state(&harness)
             .await
             .unwrap_err()
