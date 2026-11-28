@@ -54,7 +54,7 @@ impl<P> StartupIndex<P> {
         }
         let mut entries_by_id = HashMap::with_capacity(self.entries.len());
         let mut nearest_user = Vec::with_capacity(self.entries.len());
-        let mut nearest_transcript = Vec::with_capacity(self.entries.len());
+        let mut query_ancestry = Vec::with_capacity(self.entries.len());
         let mut entries = Vec::with_capacity(self.entries.len());
         for (payload, meta) in self.entries.into_iter().zip(&self.metadata) {
             let index = entries.len();
@@ -72,11 +72,7 @@ impl<P> StartupIndex<P> {
             } else {
                 parent.and_then(|index| nearest_user[index])
             });
-            nearest_transcript.push(if meta.is_transcript() {
-                Some(index)
-            } else {
-                parent.and_then(|index| nearest_transcript[index])
-            });
+            query_ancestry.push(QueryAncestry::extend(&query_ancestry, parent, meta, index));
             entries.push(rebind(payload, meta)?);
         }
         if self.lanes.len() != self.lane_generations.len()
@@ -167,7 +163,7 @@ impl<P> StartupIndex<P> {
             metadata: self.metadata,
             entries_by_id,
             nearest_user,
-            nearest_transcript,
+            query_ancestry,
             records: self.records,
             operation_counts,
             hot_append_count,

@@ -21,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const RESPONSE_TOO_LARGE: &str =
+    "Host response exceeds frame budget; request a smaller page";
 const COMMANDS: &[&str] = &[
     "get_state",
     "get_messages",
@@ -245,7 +247,7 @@ impl Session {
             };
             match send(&mut write, &response).await {
                 Err(Failure::FrameTooLarge) => send(&mut write, &json!({
-                    "type":"response","id":id,"command":kind,"success":false,"error":"Host response exceeds frame budget; request a smaller page"
+                    "type":"response","id":id,"command":kind,"success":false,"error":RESPONSE_TOO_LARGE
                 })).await?,
                 result => result?,
             }

@@ -46,6 +46,7 @@ mod snapshot;
 mod startup;
 pub(crate) use index::IndexedState;
 pub(crate) use metadata::EntryMeta;
+use selection::QueryAncestry;
 pub(crate) use startup::StartupIndex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -659,7 +660,7 @@ impl<P: Clone> IndexedState<P> {
                 metadata: self.metadata,
                 entries_by_id: self.entries_by_id,
                 nearest_user: self.nearest_user,
-                nearest_transcript: self.nearest_transcript,
+                query_ancestry: self.query_ancestry,
                 records: self.records,
                 operation_counts: self.operation_counts,
                 hot_append_count: self.hot_append_count,

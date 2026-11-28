@@ -4,7 +4,7 @@ use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use reqwest::{Client, Url};
+use reqwest::{Client, Response, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -136,7 +136,9 @@ async fn stage(args: &[&str], usage: &str) -> Result<StagedRelease, String> {
     if url.query().is_some() || url.fragment().is_some() {
         return Err("package manifest URL must not contain a query or fragment".into());
     }
-    let manifest = download(&client, url.clone(), 64 * 1024).await?;
+    let response = download(&client, url.clone()).await?;
+    let archive_base = archive_base(&url, response.url()).clone();
+    let manifest = body_limited(response, 64 * 1024).await?;
     let release: Release = serde_json::from_slice(&manifest).map_err(|e| e.to_string())?;
     let release_version = semver::Version::parse(&release.version).map_err(|e| e.to_string())?;
     if release.schema_version != 1
@@ -179,8 +181,10 @@ async fn stage(args: &[&str], usage: &str) -> Result<StagedRelease, String> {
     {
         return Err("invalid package archive metadata".into());
     }
-    let asset = url.join(&archive.asset).map_err(|e| e.to_string())?;
-    let bytes = download(&client, asset, archive.bytes).await?;
+    let asset = archive_base
+        .join(&archive.asset)
+        .map_err(|e| e.to_string())?;
+    let bytes = body_limited(download(&client, asset).await?, archive.bytes).await?;
     if bytes.len() as u64 != archive.bytes
         || format!("{:x}", Sha256::digest(&bytes)) != archive.sha256
     {
@@ -201,6 +205,19 @@ async fn stage(args: &[&str], usage: &str) -> Result<StagedRelease, String> {
     })
 }
 
+fn archive_base<'a>(requested: &'a Url, effective: &'a Url) -> &'a Url {
+    // GitHub signs each asset separately and redirects it to a temporary
+    // download URL with no sibling assets. Use the public release directory.
+    if requested.host_str() == Some("github.com")
+        && (requested.path().contains("/releases/download/")
+            || requested.path().contains("/releases/latest/download/"))
+    {
+        requested
+    } else {
+        effective
+    }
+}
+
 fn check_url(url: &Url) -> Result<(), String> {
     let loopback = matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"));
     if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
@@ -213,15 +230,35 @@ fn check_url(url: &Url) -> Result<(), String> {
     Ok(())
 }
 
-async fn download(client: &Client, url: Url, limit: u64) -> Result<Vec<u8>, String> {
-    let response = client
+async fn download(client: &Client, url: Url) -> Result<Response, String> {
+    client
         .get(url)
         .send()
         .await
         .map_err(|e| e.to_string())?
         .error_for_status()
-        .map_err(|e| e.to_string())?;
-    body_limited(response, limit).await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sibling_archive_uses_the_release_directory_after_redirect() {
+        let parse = |s: &str| Url::parse(s).unwrap();
+        let requested = parse("https://example.test/latest/release.json");
+        let effective = parse("https://example.test/1.0.0/release.json");
+        assert_eq!(archive_base(&requested, &effective), &effective);
+
+        let effective = parse("https://release-assets.githubusercontent.com/id?signature=fixture");
+        for path in ["download/pkg-v1.0.0", "latest/download"] {
+            let requested = parse(&format!(
+                "https://github.com/org/repo/releases/{path}/release.json"
+            ));
+            assert_eq!(archive_base(&requested, &effective), &requested);
+        }
+    }
 }
 
 fn extract(bytes: &[u8], root: &Path) -> Result<(), String> {

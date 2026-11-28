@@ -10,7 +10,7 @@ pub(crate) struct IndexedState<P: Clone> {
     pub(super) entries_by_id: HashMap<String, usize>,
     // Derived ancestry indexes, rebuilt from parent links on restore.
     pub(super) nearest_user: Vec<Option<usize>>,
-    pub(super) nearest_transcript: Vec<Option<usize>>,
+    pub(super) query_ancestry: Vec<QueryAncestry>,
     pub(super) records: Vec<LaneRecord>,
     pub(super) operation_counts: HashMap<String, BTreeMap<&'static str, u64>>,
     // Resident append bodies are the only records that a clear can retire.
@@ -41,7 +41,7 @@ impl<P: Clone> IndexedState<P> {
             metadata: Vec::new(),
             entries_by_id: HashMap::new(),
             nearest_user: Vec::new(),
-            nearest_transcript: Vec::new(),
+            query_ancestry: Vec::new(),
             records: Vec::new(),
             operation_counts: HashMap::new(),
             hot_append_count: 0,
@@ -433,11 +433,12 @@ impl<P: Clone> IndexedState<P> {
                     parent.and_then(|index| self.nearest_user[index])
                 };
                 self.nearest_user.push(nearest_user);
-                self.nearest_transcript.push(if meta.is_transcript() {
-                    Some(self.entries.len())
-                } else {
-                    parent.and_then(|index| self.nearest_transcript[index])
-                });
+                self.query_ancestry.push(QueryAncestry::extend(
+                    &self.query_ancestry,
+                    parent,
+                    &meta,
+                    self.entries.len(),
+                ));
                 let is_message = matches!(entry, Entry::Message(_));
                 self.sequence = seq;
                 self.used_ids.insert(entry.id().to_string());

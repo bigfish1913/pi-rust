@@ -2,7 +2,7 @@
 use super::*;
 use crate::session::types::{
     AssistantFrameOp, AssistantFrameRecord, CustomEntry, EntryBase, MessageEntry,
-    MessageSummaryQuery, MessageWindowQuery, RecordBase,
+    MessageSummaryQuery, MessageWindowQuery, RecordBase, TranscriptPageQuery,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,6 +142,55 @@ fn mutations() -> Vec<SessionMutation> {
         },
         user(7, "c", Some("b")),
     ]
+}
+
+#[test]
+fn branch_query_ancestry_survives_checkpoint_and_startup_restore() {
+    let mut state = SessionState::new();
+    for mutation in mutations() {
+        state.apply_mutation(mutation).unwrap();
+    }
+    state
+        .apply_mutation(SessionMutation::Entry {
+            seq: 8,
+            timestamp: 42,
+            lane: Some("main".into()),
+            entry: Entry::Custom(CustomEntry {
+                base: EntryBase {
+                    entry_type: "custom".into(),
+                    id: "custom".into(),
+                    parent_id: Some("c".into()),
+                    seq: 8,
+                    timestamp: 42,
+                },
+                custom_type: "fixture".into(),
+                data: None,
+            }),
+        })
+        .unwrap();
+    let checkpoint: SessionState =
+        serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    let startup = state
+        .index
+        .startup_image(|entry| Some(entry.clone()))
+        .unwrap()
+        .restore(|entry, _| Some(entry))
+        .unwrap();
+    for index in [&state.index, &checkpoint.index, &startup] {
+        let query = TranscriptPageQuery {
+            limit: 1,
+            before_id: Some("c".into()),
+        };
+        assert_eq!(
+            index.transcript_indices(Some("custom"), &query).unwrap(),
+            (vec![1], 3, true)
+        );
+        assert!(index.transcript_indices(Some("a"), &query).is_err());
+        assert_eq!(
+            index.context_usage_indices(Some("custom")).unwrap(),
+            (vec![0, 1, 2], 0)
+        );
+    }
 }
 
 #[test]

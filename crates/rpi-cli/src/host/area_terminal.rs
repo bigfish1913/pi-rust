@@ -2,7 +2,7 @@
 
 use super::{
     area::Connection,
-    area_rpc::{io_error, SessionHello},
+    area_rpc::{io_error, SessionHello, RESPONSE_TOO_LARGE},
     client::{encode_frame, read_frame, write_frame},
     protocol::{Hello, Version, MAX_FRAME_BYTES, PROTOCOL},
 };
@@ -12,9 +12,13 @@ use crate::{
     transcript_view::UiEvent,
 };
 use serde_json::{json, Value};
-use std::{io, sync::Mutex, time::Duration};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
-    io::{AsyncWrite, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{unix::OwnedWriteHalf, UnixStream},
     sync::mpsc,
 };
@@ -73,18 +77,32 @@ pub(super) async fn run(connection: Connection, rpc: bool) -> Result<(), String>
         println!("Joined area {name} · Session {session_id}");
         return Ok(());
     }
-    write_value(
-        &mut write,
-        &json!({"type":"get_messages","id":"history","limit":100}),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let mut history_limit = 100;
+    request_history(&mut write, history_limit)
+        .await
+        .map_err(|e| e.to_string())?;
+    let write = Arc::new(tokio::sync::Mutex::new(write));
+    let history_writer = Arc::clone(&write);
     let (tx, rx) = mpsc::unbounded_channel();
     let mut status = status(&ready["state"]);
     let _ = tx.send(DriverEvent::Status(status.clone()));
     let reader = tokio::spawn(async move {
         while let Ok(frame) = read_frame::<_, Value>(&mut read, MAX_FRAME_BYTES).await {
             let event = match frame["type"].as_str() {
+                Some("response")
+                    if frame["id"] == "history"
+                        && frame["success"] == false
+                        && frame["error"] == RESPONSE_TOO_LARGE
+                        && history_limit > 1 =>
+                {
+                    history_limit = history_limit.div_ceil(2);
+                    let mut writer = history_writer.lock().await;
+                    if let Err(error) = request_history(&mut *writer, history_limit).await {
+                        let _ = tx.send(DriverEvent::Notice(error.to_string()));
+                        break;
+                    }
+                    None
+                }
                 Some("response") if frame["success"] != true => frame["error"]
                     .as_str()
                     .map(|error| DriverEvent::Notice(error.to_owned())),
@@ -128,7 +146,7 @@ pub(super) async fn run(connection: Connection, rpc: bool) -> Result<(), String>
         let _ = tx.send(DriverEvent::Ended);
     });
     let driver = Driver {
-        write: tokio::sync::Mutex::new(write),
+        write,
         events: Mutex::new(Some(rx)),
     };
     let result = crate::tui_shell::run_driver_tui_with_echo(
@@ -140,6 +158,14 @@ pub(super) async fn run(connection: Connection, rpc: bool) -> Result<(), String>
     reader.abort();
     let _ = reader.await;
     result
+}
+
+async fn request_history(writer: &mut OwnedWriteHalf, limit: usize) -> io::Result<()> {
+    write_value(
+        writer,
+        &json!({"type":"get_messages","id":"history","limit":limit}),
+    )
+    .await
 }
 
 fn history_event(message: &Value) -> Option<DriverEvent> {
@@ -165,7 +191,7 @@ fn status(state: &Value) -> DriverStatus {
 }
 
 struct Driver {
-    write: tokio::sync::Mutex<OwnedWriteHalf>,
+    write: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
     events: Mutex<Option<mpsc::UnboundedReceiver<DriverEvent>>>,
 }
 
@@ -201,8 +227,8 @@ async fn write_value(writer: &mut (impl AsyncWrite + Unpin), value: &Value) -> i
 }
 
 async fn bridge(
-    mut read: tokio::net::unix::OwnedReadHalf,
-    mut write: OwnedWriteHalf,
+    read: tokio::net::unix::OwnedReadHalf,
+    write: OwnedWriteHalf,
     ready: Value,
 ) -> io::Result<()> {
     let mut stdout = tokio::io::stdout();
@@ -212,7 +238,7 @@ async fn bridge(
     stdout.flush().await?;
     // Tokio stdin uses a blocking runtime task. A detached reader thread lets
     // the bridge exit on Host EOF even while the caller's input pipe stays open.
-    let (input, mut frames) = mpsc::channel(1);
+    let (input, frames) = mpsc::channel(1);
     std::thread::Builder::new()
         .name("rpi-host-stdin".into())
         .spawn(move || {
@@ -237,14 +263,25 @@ async fn bridge(
                 }
             }
         })?;
+    relay(read, write, frames, &mut stdout).await
+}
+
+async fn relay(
+    read: tokio::net::unix::OwnedReadHalf,
+    mut write: OwnedWriteHalf,
+    mut frames: mpsc::Receiver<io::Result<Vec<u8>>>,
+    stdout: &mut (impl AsyncWrite + Unpin),
+) -> io::Result<()> {
     let outbound = async {
         while let Some(frame) = frames.recv().await {
             write_frame(&mut write, &frame?).await.map_err(io_error)?;
         }
-        Ok(())
+        // The Host finishes its serial command queue before observing EOF.
+        write.shutdown().await
     };
+    let mut read = BufReader::new(read);
     let inbound = async {
-        loop {
+        while !read.fill_buf().await?.is_empty() {
             let value: Value = read_frame(&mut read, MAX_FRAME_BYTES)
                 .await
                 .map_err(io_error)?;
@@ -253,6 +290,78 @@ async fn bridge(
             stdout.write_all(&frame).await?;
             stdout.flush().await?;
         }
+        Ok(())
     };
-    tokio::select! { result = outbound => result, result = inbound => result }
+    tokio::pin!(inbound);
+    tokio::select! {
+        biased;
+        result = outbound => {
+            result?;
+            inbound.await
+        }
+        result = &mut inbound => {
+            result?;
+            Err(io_error(super::client::Failure::Connection))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn stdin_eof_drains_host_responses() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (read, write) = client.into_split();
+        let (send, frames) = mpsc::channel(2);
+        let requests = [
+            json!({"type": "get_commands", "id": "first"}),
+            json!({"type": "get_state", "id": "second"}),
+        ];
+        for request in &requests {
+            send.send(Ok(serde_json::to_vec(request).unwrap()))
+                .await
+                .unwrap();
+        }
+        drop(send);
+        let (mut output, mut stdout) = tokio::io::duplex(512);
+        let serve = async {
+            let mut server = BufReader::new(server);
+            for request in &requests {
+                let frame: Value = read_frame(&mut server, MAX_FRAME_BYTES).await.unwrap();
+                assert_eq!(&frame, request);
+            }
+            assert!(server.fill_buf().await.unwrap().is_empty());
+            for request in &requests {
+                write_value(
+                    server.get_mut(),
+                    &json!({"type": "response", "id": request["id"], "success": true}),
+                )
+                .await
+                .unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(relay(read, write, frames, &mut stdout), serve);
+            result.unwrap();
+        })
+        .await
+        .unwrap();
+        drop(stdout);
+        let mut text = String::new();
+        output.read_to_string(&mut text).await.unwrap();
+        let replies: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            replies.iter().map(|reply| &reply["id"]).collect::<Vec<_>>(),
+            requests
+                .iter()
+                .map(|request| &request["id"])
+                .collect::<Vec<_>>()
+        );
+    }
 }
