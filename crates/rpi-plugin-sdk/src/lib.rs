@@ -396,6 +396,10 @@ pub struct StableToolSchema {
 /// model, or reuse these values across tool calls. Missing values mean the
 /// host cannot authenticate worker-originated run actions; fail closed.
 ///
+/// For invocation-bound tools, `independentRun` is a host-owned boolean that
+/// tells the plugin whether this call originated in an independent run. Older
+/// hosts may omit it.
+///
 /// **Consequence for plugin parameter types:** a plugin must tolerate unknown
 /// top-level keys in its arguments. Reading them out of a `serde_json::Value`
 /// does that naturally; a `#[serde(deny_unknown_fields)]` parameter struct
@@ -1203,11 +1207,7 @@ pub enum RuntimeActionId {
     /// Safe live execution metadata (no credentials, endpoints or headers).
     /// Args: `{}`; result: model identity, thinkingLevel, tools, cwd, sessionId.
     GetExecutionContext = 23,
-    /// Compatibility action for existing delegation extensions. `op`: start/poll/cancel/dispose.
-    /// Start: task, optional role/maxTurns/timeoutSeconds/tools/toolCallId.
-    /// Others: childId. Poll drains text deltas and returns status/result.
-    /// Handles are scoped to the calling plugin and must be disposed.
-    ChildAgent = 24,
+    // Wire id 24 is retired and must not be reused.
     /// Read-only, host-managed side question. Registration-level commands may
     /// use start(question), status, cancel, hide and show. Never changes the
     /// main transcript or its queues. Presentation and execution stay in host.
@@ -1307,7 +1307,8 @@ pub enum RuntimeActionId {
     /// through [`PluginApi::register_autocomplete_provider`].
     GetEditorText = 32,
     /// Start or control an independent, invocation-bound, in-memory run.
-    /// Start takes `input`, `maxTurns`, `timeoutSeconds`, and optional `tools`.
+    /// Start takes `input`, `maxTurns` (0 disables the ceiling, otherwise 1–32),
+    /// `timeoutSeconds` (10–1800), and optional `tools`.
     /// Poll, cancel and dispose take `runId`. The caller must dispose finished
     /// runs. Tool selection can only narrow the parent's active tools.
     IndependentRun = 33,
@@ -1355,7 +1356,6 @@ impl TryFrom<u32> for RuntimeActionId {
             21 => Ok(Self::StdioLifecycle),
             22 => Ok(Self::UiComponent),
             23 => Ok(Self::GetExecutionContext),
-            24 => Ok(Self::ChildAgent),
             25 => Ok(Self::SideQuestion),
             26 => Ok(Self::ListCommands),
             27 => Ok(Self::Abort),
@@ -1402,7 +1402,6 @@ impl RuntimeActionId {
         Self::StdioLifecycle,
         Self::UiComponent,
         Self::GetExecutionContext,
-        Self::ChildAgent,
         Self::SideQuestion,
         Self::ListCommands,
         Self::Abort,
@@ -2816,7 +2815,6 @@ mod tests {
             RuntimeActionId::StdioLifecycle,
             RuntimeActionId::UiComponent,
             RuntimeActionId::GetExecutionContext,
-            RuntimeActionId::ChildAgent,
             RuntimeActionId::SideQuestion,
             RuntimeActionId::ListCommands,
             RuntimeActionId::Abort,
@@ -2834,6 +2832,11 @@ mod tests {
             assert_eq!(RuntimeActionId::try_from(raw), Ok(expected));
             assert_eq!(u32::from(expected), raw);
         }
+        assert_eq!(
+            RuntimeActionId::try_from(24),
+            Err(UnknownRuntimeActionId(24))
+        );
+        assert_eq!(u32::from(RuntimeActionId::SideQuestion), 25);
         assert_eq!(u32::from(RuntimeActionId::ListCommands), 26);
         assert_eq!(u32::from(RuntimeActionId::Abort), 27);
         assert_eq!(u32::from(RuntimeActionId::RelayUiDialog), 28);

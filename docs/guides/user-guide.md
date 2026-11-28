@@ -509,7 +509,7 @@ rpi install rpi-subagents
 这不是 OS 安全沙箱，允许的 shell 等工具仍保有正常能力。
 
 宿主与扩展需同时支持对应协议；旧宿主明确要求升级，不回退到默认配置的子进程。
-SDK 提供 `AgentHarness::create_child`，扩展通过 `GetExecutionContext` 和 `ChildAgent`
+SDK 提供 `AgentHarness::create_independent_run`，扩展通过 `GetExecutionContext` 和 `IndependentRun`
 runtime actions 接入。完整边界与生命周期见 [子 agent 协议](../extensions/subagents.md)。
 
 ## 7. SDK 集成

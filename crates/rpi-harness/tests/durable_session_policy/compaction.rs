@@ -53,7 +53,7 @@ async fn invalid_journal_rejects_before_recovery_intent_or_provider_and_releases
             .await
             .unwrap();
         let child = h
-            .create_child(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
+            .create_independent_run(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
             .await
             .unwrap();
         // These are direct synthetic fixture writes after valid startup.
@@ -108,7 +108,7 @@ async fn read_failure_revision_race_and_cancel_before_execution_leave_no_compact
         .await
         .unwrap();
     let child = h
-        .create_child(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
+        .create_independent_run(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
         .await
         .unwrap();
     let queues = h.queued_messages().await.unwrap();

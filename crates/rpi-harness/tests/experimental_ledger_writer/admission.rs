@@ -331,11 +331,11 @@ async fn experimental_policy_follows_independent_child_harness_creation() {
         .unwrap();
     let emitter = Arc::new(rpi_agent::CollectorEmitter::new().0);
     assert!(h
-        .create_child(invalid, emitter.clone(), 1, None)
+        .create_independent_run(invalid, emitter.clone(), 1, None)
         .await
         .is_err());
     let child = h
-        .create_child(memory_session("writer-child-fresh"), emitter, 1, None)
+        .create_independent_run(memory_session("writer-child-fresh"), emitter, 1, None)
         .await
         .unwrap();
     // Trusted embedding directly binds an owner to the independent child store;

@@ -57,7 +57,6 @@ async fn tool_images_land_in_the_live_slot_not_the_assembled_root() {
             },
             &tui,
             &state,
-            &state.chat_container,
             &lane,
         )
         .await;
@@ -122,7 +121,6 @@ async fn queued_user_images_land_in_the_live_slot_not_the_assembled_root() {
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;

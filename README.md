@@ -503,11 +503,9 @@ is excluded and recursive delegation is rejected. Approvals use the parent's UI,
 and parent completion or cancellation stops the child. This is capability
 inheritance and session isolation, not an OS sandbox.
 
-Use a compatible host and subagent extension; unsupported hosts fail explicitly
-rather than falling back to a differently configured subprocess. Rust callers use
-`AgentHarness::create_child`. Extensions read the active bindings with
-`GetExecutionContext` and manage runs with `IndependentRun`. `ChildAgent` remains
-available for compatibility with released extensions. See the
+Use a subagent extension that supports `IndependentRun`. Rust callers use
+`AgentHarness::create_independent_run`. Extensions read the active bindings with
+`GetExecutionContext` and manage runs with `IndependentRun`. See the
 [subagent protocol](docs/extensions/subagents.md) for lifecycle and limits.
 
 ### Authoring an extension

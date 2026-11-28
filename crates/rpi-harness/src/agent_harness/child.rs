@@ -66,27 +66,10 @@ impl AgentHarness {
         }))
     }
 
-    /// Compatibility constructor for the original ChildAgent action.
-    pub async fn create_child(
-        &self,
-        session: Session,
-        emitter: Arc<dyn AgentEmitter>,
-        max_turns: u32,
-        requested_tools: Option<Vec<String>>,
-    ) -> HarnessResult<ChildHarness> {
-        self.create_scoped_run(
-            session,
-            emitter,
-            max_turns,
-            requested_tools,
-            Some("delegate_task"),
-        )
-        .await
-    }
-
     /// Create an independent run with the effective parent execution bindings.
     /// The caller can narrow tool selection. Runtime provenance still prevents
-    /// nested runs regardless of which tool names are present.
+    /// nested runs regardless of which tool names are present. A zero turn
+    /// budget disables the turn ceiling for this run.
     pub async fn create_independent_run(
         &self,
         session: Session,
@@ -94,23 +77,13 @@ impl AgentHarness {
         max_turns: u32,
         requested_tools: Option<Vec<String>>,
     ) -> HarnessResult<ChildHarness> {
-        self.create_scoped_run(session, emitter, max_turns, requested_tools, None)
-            .await
-    }
-
-    async fn create_scoped_run(
-        &self,
-        session: Session,
-        emitter: Arc<dyn AgentEmitter>,
-        max_turns: u32,
-        requested_tools: Option<Vec<String>>,
-        excluded_tool: Option<&str>,
-    ) -> HarnessResult<ChildHarness> {
         if self.is_child || rpi_agent::tool_execution_scope::is_child_execution() {
             return Err(HarnessError::io("recursive child agents are not allowed"));
         }
-        if !(1..=32).contains(&max_turns) {
-            return Err(HarnessError::io("child maxTurns must be between 1 and 32"));
+        if max_turns > 32 {
+            return Err(HarnessError::io(
+                "independent run maxTurns must be between 0 and 32",
+            ));
         }
         if session.storage().metadata().id == self.session.storage().metadata().id {
             return Err(HarnessError::io(
@@ -121,10 +94,7 @@ impl AgentHarness {
         let mut tools: Vec<_> = snap
             .tools
             .iter()
-            .filter(|tool| {
-                let name = &tool.tool.schema().name;
-                excluded_tool != Some(name.as_str()) && snap.active_tool_names.contains(name)
-            })
+            .filter(|tool| snap.active_tool_names.contains(&tool.tool.schema().name))
             .cloned()
             .collect();
         if let Some(names) = requested_tools {

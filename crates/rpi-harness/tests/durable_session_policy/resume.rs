@@ -235,7 +235,7 @@ async fn pending_poststartup_damage_preserves_recovered_marker_and_every_fact() 
                 .await
                 .unwrap();
             let child =
-                f.h.create_child(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
+                f.h.create_independent_run(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
                     .await
                     .unwrap();
             let marker = f.h.pending_resume();
@@ -283,10 +283,11 @@ async fn deferred_poststartup_damage_preserves_parked_and_imported_handles_witho
                 f.h.follow_up(AgentMessage::User(UserMessage::new("keep queue", 0)))
                     .await
                     .unwrap();
-                let child =
-                    f.h.create_child(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
-                        .await
-                        .unwrap();
+                let child = f
+                    .h
+                    .create_independent_run(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
+                    .await
+                    .unwrap();
                 let receipt = service(&f.h).request_outcome("manual").await.unwrap();
                 assert!(receipt.is_some());
                 custom(
@@ -361,7 +362,7 @@ async fn barrier_cases(pending: bool) {
             panic!("fixture must queue an explicit next turn");
         };
         let child =
-            f.h.create_child(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
+            f.h.create_independent_run(memory(), Arc::new(CollectorEmitter::new().0), 1, None)
                 .await
                 .unwrap();
         let marker = f.h.pending_resume();

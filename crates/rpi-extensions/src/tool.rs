@@ -780,6 +780,7 @@ impl AgentTool for PluginToolAdapter {
             }
             context["runtimeHandle"] = serde_json::json!(invocation.user_data() as usize);
             context["runtimeKey"] = serde_json::json!(invocation.invocation_key());
+            context["independentRun"] = serde_json::json!(invocation.is_independent_invocation());
         }
         let public_binding = PublicBindingGuard::capture(&params, invocation.as_deref());
         let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "null".to_string());
@@ -1339,6 +1340,34 @@ mod tests {
         let text_json: Value = serde_json::from_str(&text.text).unwrap();
         assert!(text_json["alias"].is_null());
         assert_eq!(text_json["collision"], "[redacted invocation credential]");
+    }
+
+    #[tokio::test]
+    async fn both_drivers_replace_claimed_independent_run_with_host_provenance() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let bridge =
+            crate::ActionBridge::new(tokio::runtime::Handle::current(), Arc::new(BindingHost));
+        let scope = Arc::new(rpi_agent::tool_execution_scope::ToolExecutionScope::default());
+        for wake in [false, true] {
+            let mut adapter = echo_adapter().with_context(ToolCallContext::new("project-cwd"));
+            adapter.handle.runtime_handle = Some(bridge.user_data() as usize);
+            adapter.handle.poll_fn = binding_poll;
+            adapter.handle.set_waker_fn = wake.then_some(binding_waker);
+            for independent in [false, true] {
+                let call = adapter.execute(
+                    "context",
+                    json!({"mode":"legacy", "__rpi":{"independentRun": !independent}}),
+                    CancellationToken::new(),
+                    Arc::new(|_| {}),
+                );
+                if independent {
+                    scope.run(call).await.unwrap();
+                } else {
+                    call.await.unwrap();
+                }
+                assert_eq!(take_last_params()["__rpi"]["independentRun"], independent);
+            }
+        }
     }
 
     #[tokio::test]

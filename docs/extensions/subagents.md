@@ -1,8 +1,7 @@
 # 宿主管理的子 agent
 
 扩展可通过 `IndependentRun`（33）在独立的内存会话中运行输入，并消费进度和结果。
-`ChildAgent`（24）保留为已发布扩展的兼容入口。两种 action 共用宿主运行和清理机制，
-无需修改 `PluginApi` vtable。
+宿主通过现有 ABI 提供运行与清理机制，无需修改 `PluginApi` vtable。
 
 ## IndependentRun
 
@@ -14,15 +13,16 @@
 ```
 
 - `input` 为提交给独立会话的文本，限 1–24,000 UTF-8 bytes。调用方负责组装内容。
-- `maxTurns`（1–32）和 `timeoutSeconds`（10–1800）必填。可选的 `tools` 只能缩小
+- `maxTurns`（0–32）和 `timeoutSeconds`（10–1800）必填。`maxTurns: 0` 关闭回合上限，
+  `turnLimited` 返回 `false`，超时、取消和输出限制仍生效。可选的 `tools` 只能缩小
   父会话的活动工具集合，省略时继承该集合。`[]` 表示无工具。
 - `start` 返回 `runId`、独立 `sessionId` 和 `status: running`。`poll` 消费有界的文本
   `deltas`，并返回 `running`、`done` 或 `failed`。`done` 时检查 `result.status`、
   `result.text` 和 `result.turnLimited`。所有终态都应调用 `dispose`。
 - 通过当前顶层工具调用认证。父调用结束或取消会触发清理，子运行不能启动嵌套运行。
   新版 `delegate_task` 在扩展端从工具集合中排除自己，并负责提示词和报告格式。
-- 新扩展可以在宿主返回 ABI 状态码 `2` 并报告未知 action ID 时使用旧入口。
-  其他错误可能来自已接收的运行，不能据此重试启动。
+- 使用 `delegate_task` 需要宿主与扩展都支持 `IndependentRun`。旧 `ChildAgent`（24）
+  已移除，编号保留。
 
 ## 有效执行上下文
 
@@ -44,7 +44,7 @@
 
 ## 调用与清理
 
-两个 action 均使用 `op` 分派。插件应从工作线程调用同步 ABI，不能在
+插件应从工作线程调用同步 ABI，不能在
 单线程 Tokio executor 内同步等待宿主 action。所有结果字符串由宿主的
 `free_string` 释放。
 
@@ -53,6 +53,7 @@
 `PluginApi.user_data` 是宿主注册表中的 opaque handle，不是可解引用地址；
 失效 handle 返回错误，ID 不复用。宿主为每次工具调用创建 invocation，
 在 `__rpi` 中注入 `runtimeHandle`（整数）和随机 `runtimeKey`（字符串）。
+`independentRun` 由宿主设置，表示工具调用是否来自独立运行，插件可以据此限制副作用。
 这些值不属于公开执行上下文，不能写入模型输出、持久化参数或跨调用缓存。
 
 - 同步 execute/poll/cancel/destroy 内调用 action 时，宿主自动使用当前 driver 的
@@ -60,33 +61,12 @@
 - 插件自行创建的工作线程必须用该次 `runtimeHandle` 作为 runtime_action 的
   `user_data`，并在每个运行 action 的参数对象中添加 `__rpiRuntimeKey: runtimeKey`。
   以下 op 示例省略此字段；宿主校验后将它移除，不传递给业务 action。
-- 两种入口拒绝仅注册级、已取消、失效或 child-originated invocation，
-  无论工具叫 `delegate_task` 还是其他别名。缺少这些能力时明确提示升级，不回退。
+- `start` 仅接受具有有效 capability 的顶层工具调用。宿主拒绝已取消的调用启动新任务，
+  也拒绝独立运行通过任何工具别名再次启动任务。
 - 注册实例的裸指针不能保存在插件全局状态中。可缓存进程级函数指针，但每次
   工作线程必须绑定本次调用的 handle；候选 reload 回退不影响旧会话的绑定。
 
-### 旧 `ChildAgent` 的 start
-
-```json
-{"op":"start","task":"检查 parser","role":"reviewer","maxTurns":8,"timeoutSeconds":300,"tools":["read"]}
-```
-
-- `task` 必填，1–20,000 bytes；`role` 默认 `worker`，1–200 bytes。
-- `maxTurns` 默认 8，范围 1–32；`timeoutSeconds` 默认 300，范围 10–1800。
-  宿主拒绝非法类型或越界值，不隐式扩张预算。
-- `tools` 可省略以继承有效父工具；指定时只能缩小集合。`[]` 表示无工具。
-- `delegate_task` 从子任务的工具注册表中删除；child harness 和工具执行作用域
-  均拒绝创建孙任务，插件别名也不能经根宿主绕过子任务工具子集。
-- 不能通过 JSON 覆盖 cwd、model、凭据、审批规则或加载额外扩展。
-
-立即返回 `{"childId":"opaque-id","sessionId":"child-session-id","status":"running"}`。
-父 lane 正在执行工具时也能启动，不会重入父 lane。
-
-### 旧 `ChildAgent` 的 poll
-
-```json
-{"op":"poll","childId":"opaque-id"}
-```
+### 轮询与终态
 
 返回 `status`（`running` / `done` / `failed`）、`deltas` 字符串数组、`turns`、
 `result` 和 `error`。poll 不等待完整运行；通常每 25ms 调用一次。
@@ -98,12 +78,7 @@
 `done` 只表示生命周期结束，不等于任务成功。`turnLimited` 表示到达回合预算，
 报告可能不完整。运行失败、取消、超时和输出超限都有明确诊断。
 
-### 旧 `ChildAgent` 的 cancel / dispose
-
-```json
-{"op":"cancel","childId":"opaque-id"}
-{"op":"dispose","childId":"opaque-id"}
-```
+### 取消与释放
 
 `cancel` 设置取消信号并使错误可观察，保留 handle 供 poll 查询。
 `dispose` 同时取消并删除 handle；成功、错误或客户端取消后都必须执行。
