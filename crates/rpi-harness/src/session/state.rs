@@ -310,6 +310,10 @@ impl SessionState {
         self.index.get_stats()
     }
 
+    pub(crate) fn operation_counts(&self, lane: &str) -> BTreeMap<&'static str, u64> {
+        self.index.operation_counts(lane)
+    }
+
     /// Build the fork mutation list. Mirrors TS `createForkMutations`. The
     /// forked session replays these from `seq=1`. Forked entries keep their
     /// original `id` + `parent_id` chain and pass `lane: None` so lane-leaf
@@ -655,7 +659,9 @@ impl<P: Clone> IndexedState<P> {
                 metadata: self.metadata,
                 entries_by_id: self.entries_by_id,
                 nearest_user: self.nearest_user,
+                nearest_transcript: self.nearest_transcript,
                 records: self.records,
+                operation_counts: self.operation_counts,
                 hot_append_count: self.hot_append_count,
                 #[cfg(test)]
                 retire_record_checks: self.retire_record_checks,

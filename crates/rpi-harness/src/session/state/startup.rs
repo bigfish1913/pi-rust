@@ -54,11 +54,12 @@ impl<P> StartupIndex<P> {
         }
         let mut entries_by_id = HashMap::with_capacity(self.entries.len());
         let mut nearest_user = Vec::with_capacity(self.entries.len());
+        let mut nearest_transcript = Vec::with_capacity(self.entries.len());
         let mut entries = Vec::with_capacity(self.entries.len());
         for (payload, meta) in self.entries.into_iter().zip(&self.metadata) {
             let index = entries.len();
-            let prior = match meta.parent_id() {
-                Some(parent) => nearest_user[*entries_by_id.get(parent)?],
+            let parent = match meta.parent_id() {
+                Some(parent) => Some(*entries_by_id.get(parent)?),
                 None => None,
             };
             if !self.used_ids.contains(&meta.id)
@@ -66,7 +67,16 @@ impl<P> StartupIndex<P> {
             {
                 return None;
             }
-            nearest_user.push(if meta.is_user() { Some(index) } else { prior });
+            nearest_user.push(if meta.is_user() {
+                Some(index)
+            } else {
+                parent.and_then(|index| nearest_user[index])
+            });
+            nearest_transcript.push(if meta.is_transcript() {
+                Some(index)
+            } else {
+                parent.and_then(|index| nearest_transcript[index])
+            });
             entries.push(rebind(payload, meta)?);
         }
         if self.lanes.len() != self.lane_generations.len()
@@ -119,6 +129,7 @@ impl<P> StartupIndex<P> {
             HashMap::new();
         let mut hot_append_count = 0;
         let mut record_ids = HashSet::new();
+        let mut operation_counts = HashMap::new();
         for record in &self.records {
             if !self.lanes.contains_key(record.lane())
                 || !self.used_ids.contains(record.id())
@@ -127,6 +138,7 @@ impl<P> StartupIndex<P> {
             {
                 return None;
             }
+            index::count_operation(&mut operation_counts, record);
             match record {
                 LaneRecord::OperationStarted(started) => {
                     open_operations_by_lane
@@ -155,7 +167,9 @@ impl<P> StartupIndex<P> {
             metadata: self.metadata,
             entries_by_id,
             nearest_user,
+            nearest_transcript,
             records: self.records,
+            operation_counts,
             hot_append_count,
             #[cfg(test)]
             retire_record_checks: 0,

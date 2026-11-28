@@ -69,7 +69,7 @@ pub(super) mod startup_checkpoint;
 mod startup_tests;
 #[path = "streaming.rs"]
 mod streaming;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -2581,6 +2581,10 @@ impl SessionStorage for JsonlSessionStorage {
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
         let plan = self.state.lock().await.record_plan(query)?;
         plan.read().await
+    }
+
+    async fn operation_counts(&self, lane: &str) -> SessionResult<BTreeMap<&'static str, u64>> {
+        Ok(self.state.lock().await.operation_counts(lane))
     }
 
     async fn record_page(

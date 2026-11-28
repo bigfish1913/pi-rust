@@ -1000,6 +1000,14 @@ impl Session {
         self.query_records(query).await
     }
 
+    /// Return the lifetime operation counts for the requested lane.
+    pub async fn operation_counts(
+        &self,
+        lane: &str,
+    ) -> SessionResult<std::collections::BTreeMap<&'static str, u64>> {
+        self.storage_arc().operation_counts(lane).await
+    }
+
     pub async fn record_page(
         &self,
         query: &crate::session::types::RecordPageQuery,

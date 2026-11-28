@@ -189,7 +189,8 @@ async fn stage(args: &[&str], usage: &str) -> Result<StagedRelease, String> {
     let bundle = tempfile::tempdir().map_err(|e| e.to_string())?;
     extract(&bytes, bundle.path())?;
     let root = bundle.path().canonicalize().map_err(|e| e.to_string())?;
-    Manifest::read(&root, name, Some(&release.version))?;
+    let (manifest, _) = Manifest::read(&root, name, Some(&release.version))?;
+    manifest.validate_release_instructions(&root)?;
     Commands::load(&root, name, Some(&release.version))?;
     Ok(StagedRelease {
         _directory: bundle,

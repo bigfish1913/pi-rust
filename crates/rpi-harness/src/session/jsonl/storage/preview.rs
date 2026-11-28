@@ -11,7 +11,6 @@ use std::{
 };
 
 const LIMIT: usize = 40;
-const MAX_ANCESTORS: usize = 4096;
 const MAX_INDEX: usize = 64 * 1024;
 #[cfg(unix)]
 const MAX_HEADER: usize = 64 * 1024;
@@ -332,48 +331,44 @@ impl ResidentState {
         session_id: &str,
         source: &Source,
     ) -> Option<PreviewIndex> {
-        let mut next = self.reducer.require_lane("main").ok()?;
+        let leaf = self.reducer.require_lane("main").ok()??;
+        let mut next = self.reducer.nearest_transcript(&leaf);
         let mut rows = Vec::with_capacity(LIMIT);
-        let mut has_more = false;
-        let mut remaining = MAX_ANCESTORS;
-        while let Some(id) = next.as_deref() {
-            remaining = remaining.checked_sub(1)?;
-            let index = self.reducer.entry_index(id)?;
+        while rows.len() < LIMIT {
+            let Some(index) = next else {
+                break;
+            };
             let entry = self.reducer.entry_meta(index)?;
-            if entry.is_transcript() {
-                if rows.len() == LIMIT {
-                    has_more = true;
-                    break;
+            let mut row = Row::from_payload(self.reducer.payload(index)?)?;
+            // Recovered entries still use the original reader. Translate
+            // their offsets across any removed spans before the header shift.
+            if let Some(repair) = source
+                .span_repair
+                .as_ref()
+                .filter(|repair| row.seq <= repair.last_old_sequence)
+            {
+                let gaps = repair
+                    .skipped
+                    .partition_point(|(offset, _)| *offset <= row.offset);
+                if gaps > 0 {
+                    row.offset = row.offset.checked_sub(repair.skipped[gaps - 1].1)?;
                 }
-                let mut row = Row::from_payload(self.reducer.payload(index)?)?;
-                // Recovered entries still use the original reader. Translate
-                // their offsets across any removed spans before the header shift.
-                if let Some(repair) = source
-                    .span_repair
-                    .as_ref()
-                    .filter(|repair| row.seq <= repair.last_old_sequence)
-                {
-                    let gaps = repair
-                        .skipped
-                        .partition_point(|(offset, _)| *offset <= row.offset);
-                    if gaps > 0 {
-                        row.offset = row.offset.checked_sub(repair.skipped[gaps - 1].1)?;
-                    }
-                }
-                // Progress migration copies the body verbatim. The live cold
-                // entries still point to the old file through their open handle.
-                if let Some(rewrite) = source
-                    .header_rewrite
-                    .filter(|rewrite| row.seq <= rewrite.last_old_sequence)
-                {
-                    row.offset = row
-                        .offset
-                        .checked_sub(rewrite.old_len)?
-                        .checked_add(rewrite.new_len)?;
-                }
-                rows.push(row);
             }
-            next = entry.parent_id.clone();
+            // Progress migration copies the body verbatim. The live cold
+            // entries still point to the old file through their open handle.
+            if let Some(rewrite) = source
+                .header_rewrite
+                .filter(|rewrite| row.seq <= rewrite.last_old_sequence)
+            {
+                row.offset = row
+                    .offset
+                    .checked_sub(rewrite.old_len)?
+                    .checked_add(rewrite.new_len)?;
+            }
+            rows.push(row);
+            next = entry
+                .parent_id()
+                .and_then(|id| self.reducer.nearest_transcript(id));
         }
         if rows.is_empty() {
             return None;
@@ -384,7 +379,7 @@ impl ResidentState {
             session_id: session_id.to_owned(),
             source: source.stamp.clone(),
             rows,
-            has_more,
+            has_more: next.is_some(),
         })
     }
 }

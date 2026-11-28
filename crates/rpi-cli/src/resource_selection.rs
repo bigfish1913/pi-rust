@@ -206,6 +206,12 @@ pub(crate) fn read_limited(path: &Path) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
+
+pub(crate) fn read_instruction(path: &Path) -> Result<String, String> {
+    String::from_utf8(read_limited(path)?)
+        .map_err(|error| format!("instruction {}: {error}", path.display()))
+}
+
 fn fingerprint(path: &Path) -> Result<String, String> {
     let mut reader = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut hash = Sha256::new();
@@ -226,7 +232,7 @@ pub(crate) fn file(path: &Path) -> Result<PathBuf, String> {
     }
     std::fs::canonicalize(path).map_err(|e| e.to_string())
 }
-fn unique_paths(paths: &[PathBuf]) -> Result<(), String> {
+pub(crate) fn unique_paths(paths: &[PathBuf]) -> Result<(), String> {
     let mut seen = HashSet::new();
     for path in paths {
         if !seen.insert(path) {
@@ -415,8 +421,7 @@ impl ResolvedSelection {
             }
         }
         for (path, _, text) in &mut instructions {
-            *text = String::from_utf8(read_limited(path)?)
-                .map_err(|e| format!("instruction {}: {e}", path.display()))?;
+            *text = read_instruction(path)?;
         }
         Ok(Some(Self {
             package: resolved_package,
