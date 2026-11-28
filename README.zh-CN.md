@@ -454,7 +454,7 @@ rpi --connect host:port --token T   # 通过终端界面连接远程服务
 
 | 项目 | 状态 |
 | --- | --- |
-| 当前版本 | **[0.31.0](https://github.com/bigfish1913/pi-rust/releases)**（11 个工作区 crate 共用版本号） |
+| 当前版本 | **[0.32.0](https://github.com/bigfish1913/pi-rust/releases)**（11 个工作区 crate 共用版本号） |
 | 稳定接口 | 计划保持 `rpi-ai`、`rpi-agent`、`rpi-tools`、`rpi-harness` 和 `rpi-plugin-sdk` 的接口稳定 |
 | 最低 Rust 版本（MSRV） | 1.88 |
 | 支持的平台 | Linux（GNU 和 musl）、macOS、Windows（CI 在 Linux 上运行测试套件） |

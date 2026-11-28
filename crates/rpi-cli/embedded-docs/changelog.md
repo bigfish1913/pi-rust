@@ -11,6 +11,16 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/bigfish1913/pi-rust/compare/v0.31.0...v0.32.0) - 2026-11-28
+
+### Fixed
+
+- *(host)* settle RPC startup and retry stale session restores ([#448](https://github.com/bigfish1913/pi-rust/pull/448))
+
+### Other
+
+- Retire ChildAgent in favor of IndependentRun ([#449](https://github.com/bigfish1913/pi-rust/pull/449))
+
 ## [0.31.0](https://github.com/bigfish1913/pi-rust/compare/v0.30.0...v0.31.0) - 2026-11-27
 
 ### Added
