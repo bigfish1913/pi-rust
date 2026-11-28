@@ -1645,6 +1645,56 @@ impl JsonlSessionStorage {
         self.metadata.clone()
     }
 
+    /// Verify the source that is about to be replaced while the writer tail
+    /// is held. A checkpoint seeds the revision; subsequent lines advance it
+    /// just as they do during replay. Unreadable mutations block publication.
+    async fn verified_replacement_header(
+        &self,
+        expected: HistoryIdentity,
+    ) -> SessionResult<(JsonlV4Header, Option<HistoryCheckpoint>)> {
+        let content = file_result(
+            self.fs.read_text_file(&self.metadata.path, None).await,
+            "read JSONL history for replacement",
+        )?;
+        let mut lines = content.lines();
+        let header = parse_header(lines.next().unwrap_or_default()).map_err(|e| {
+            SessionError::invalid_entry(format!("parse JSONL replacement header: {e}"))
+        })?;
+        if header.id != self.metadata.id || header.history_generation() != expected.generation {
+            return Err(SessionError::storage(
+                "history replacement header identity conflict",
+            ));
+        }
+        let checkpoint = history_checkpoint(&header)
+            .map_err(|e| SessionError::invalid_entry(format!("parse JSONL checkpoint: {e}")))?;
+        let initial_revision = checkpoint
+            .as_ref()
+            .map_or(0, |image| image.history_identity.revision);
+        let revision = lines.filter(|line| !line.trim().is_empty()).try_fold(
+            initial_revision,
+            |latest, line| {
+                let mutation = parse_mutation(line).map_err(|error| {
+                    SessionError::invalid_entry(format!(
+                        "parse JSONL replacement mutation: {error}"
+                    ))
+                })?;
+                let seq = mutation.seq();
+                if seq <= latest {
+                    return Err(SessionError::invalid_entry(format!(
+                        "out-of-order JSONL replacement mutation at sequence {seq}"
+                    )));
+                }
+                Ok(seq)
+            },
+        )?;
+        if revision != expected.revision {
+            return Err(SessionError::storage(
+                "history replacement revision conflict during publication",
+            ));
+        }
+        Ok((header, checkpoint))
+    }
+
     async fn replace_history_owned(
         &self,
         expected_revision: u64,
@@ -1796,56 +1846,6 @@ impl JsonlSessionStorage {
             revision: expected_revision,
             generation: next_generation,
         })
-    }
-
-    /// Verify the source that is about to be replaced while the writer tail
-    /// is held. A checkpoint seeds the revision; subsequent lines advance it
-    /// just as they do during replay. Unreadable mutations block publication.
-    async fn verified_replacement_header(
-        &self,
-        expected: HistoryIdentity,
-    ) -> SessionResult<(JsonlV4Header, Option<HistoryCheckpoint>)> {
-        let content = file_result(
-            self.fs.read_text_file(&self.metadata.path, None).await,
-            "read JSONL history for replacement",
-        )?;
-        let mut lines = content.lines();
-        let header = parse_header(lines.next().unwrap_or_default()).map_err(|e| {
-            SessionError::invalid_entry(format!("parse JSONL replacement header: {e}"))
-        })?;
-        if header.id != self.metadata.id || header.history_generation() != expected.generation {
-            return Err(SessionError::storage(
-                "history replacement header identity conflict",
-            ));
-        }
-        let checkpoint = history_checkpoint(&header)
-            .map_err(|e| SessionError::invalid_entry(format!("parse JSONL checkpoint: {e}")))?;
-        let initial_revision = checkpoint
-            .as_ref()
-            .map_or(0, |image| image.history_identity.revision);
-        let revision = lines.filter(|line| !line.trim().is_empty()).try_fold(
-            initial_revision,
-            |latest, line| {
-                let mutation = parse_mutation(line).map_err(|error| {
-                    SessionError::invalid_entry(format!(
-                        "parse JSONL replacement mutation: {error}"
-                    ))
-                })?;
-                let seq = mutation.seq();
-                if seq <= latest {
-                    return Err(SessionError::invalid_entry(format!(
-                        "out-of-order JSONL replacement mutation at sequence {seq}"
-                    )));
-                }
-                Ok(seq)
-            },
-        )?;
-        if revision != expected.revision {
-            return Err(SessionError::storage(
-                "history replacement revision conflict during publication",
-            ));
-        }
-        Ok((header, checkpoint))
     }
 
     async fn reconcile_if_needed(&self) -> SessionResult<()> {
