@@ -658,7 +658,7 @@ Join us to ask questions, share ideas and try early builds.
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-27"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-27" width="230" alt="WeChat group QR code"></a><br>
+      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-28"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-28" width="230" alt="WeChat group QR code"></a><br>
       <sub><b>WeChat</b> — Scan to join</sub>
     </td>
     <td align="center" width="50%">
