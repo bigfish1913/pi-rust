@@ -278,7 +278,8 @@ pub struct JsonlSessionStorage {
     /// silently reacquire a new lease. Reopen creates a fresh binding.
     writer_lease_revoked: Arc<AtomicBool>,
     needs_reconcile: Arc<std::sync::atomic::AtomicBool>,
-    /// Set when a failed append cannot be proven/truncated safely.
+    /// Set when a failed append cannot be rolled back safely or a replacement
+    /// may have reached disk without advancing the live reducer.
     uncertain: Arc<AtomicBool>,
     /// Shared replacement generation for clones of one storage binding.
     generation: Arc<AtomicU64>,
@@ -348,12 +349,6 @@ impl JsonlSessionStorage {
             let _reservation = reservation;
             if let Err(error) = worker.ensure_writer_lease().await {
                 return Err(error);
-            }
-            if worker.uncertain.load(Ordering::Acquire) {
-                return Err(SessionError::storage(format!(
-                    "Session {} has an unsettled append; reopen it before writing",
-                    worker.metadata.path
-                )));
             }
             if let Err(error) = worker.reconcile_if_needed().await {
                 return Err(error);
@@ -458,6 +453,12 @@ impl JsonlSessionStorage {
     }
 
     async fn ensure_writer_lease(&self) -> SessionResult<()> {
+        if self.uncertain.load(Ordering::Acquire) {
+            return Err(SessionError::storage(format!(
+                "Session {} has an unsettled append or replacement; reopen it before writing",
+                self.metadata.path
+            )));
+        }
         self.acquire_writer_lease().await?;
         let verification = {
             let held = self
@@ -1749,18 +1750,7 @@ impl JsonlSessionStorage {
         for mutation in &canonical_mutations {
             output.push_str(&encode_mutation(mutation));
         }
-        let fs = self.fs.clone();
-        let path = self.metadata.path.clone();
-        publish_file_atomically(&fs, &path, move |fs, temp_path| {
-            Box::pin(async move {
-                file_result(
-                    fs.write_file(temp_path, FileContent::Text(output), None)
-                        .await,
-                    "stage JSONL history replacement",
-                )
-            })
-        })
-        .await?;
+        self.publish_history_replacement(output).await?;
         *self.state.lock().await = candidate;
         self.generation.store(next_generation, Ordering::Release);
         Ok(HistoryIdentity {
@@ -1824,19 +1814,7 @@ impl JsonlSessionStorage {
         header.metadata = Some(metadata);
         let output = encode_header(&header);
         let legacy_digest = (!self.progress.required).then(|| Sha256::digest(output.as_bytes()));
-        let fs = self.fs.clone();
-        let path = self.metadata.path.clone();
-        let staged = output.clone();
-        publish_file_atomically(&fs, &path, move |fs, temp_path| {
-            Box::pin(async move {
-                file_result(
-                    fs.write_file(temp_path, FileContent::Text(staged), None)
-                        .await,
-                    "stage JSONL checkpoint replacement",
-                )
-            })
-        })
-        .await?;
+        self.publish_history_replacement(output).await?;
         *self.state.lock().await = candidate;
         self.generation.store(next_generation, Ordering::Release);
         if let Some(digest) = legacy_digest {
@@ -1848,13 +1826,34 @@ impl JsonlSessionStorage {
         })
     }
 
-    async fn reconcile_if_needed(&self) -> SessionResult<()> {
-        if self.uncertain.load(Ordering::Acquire) {
-            return Err(SessionError::storage(format!(
-                "Session {} has an unsettled append; reopen it before writing",
-                self.metadata.path
-            )));
+    async fn publish_history_replacement(&self, output: String) -> SessionResult<()> {
+        // The next append must open the published inode, never the retired one.
+        *self.append.lock().await = None;
+        let result =
+            publish_file_atomically(&self.fs, &self.metadata.path, move |fs, temp_path| {
+                Box::pin(async move {
+                    file_result(
+                        fs.write_file(temp_path, FileContent::Text(output), None)
+                            .await,
+                        "stage JSONL history replacement",
+                    )
+                })
+            })
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error.stage == PublicationStage::Publishing {
+                    // The file may already contain the new generation while the
+                    // live reducer still reflects the old one.
+                    self.uncertain.store(true, Ordering::Release);
+                }
+                Err(error.into())
+            }
         }
+    }
+
+    async fn reconcile_if_needed(&self) -> SessionResult<()> {
         if !self.needs_reconcile.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -2945,6 +2944,24 @@ fn is_assistant_frame_append(line: &str) -> bool {
         && value.get("op").and_then(serde_json::Value::as_str) == Some("append")
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PublicationStage {
+    Populating,
+    SyncingStagedFile,
+    Publishing,
+}
+
+pub(super) struct FilePublicationError {
+    pub(super) stage: PublicationStage,
+    error: SessionError,
+}
+
+impl From<FilePublicationError> for SessionError {
+    fn from(error: FilePublicationError) -> Self {
+        error.error
+    }
+}
+
 /// Build a complete sibling temporary file, then atomically rename it over the
 /// destination. Mirrors TS `publishFileAtomically`.
 ///
@@ -2957,7 +2974,7 @@ pub(super) async fn publish_file_atomically<F>(
     fs: &Arc<dyn FileSystem>,
     destination_path: &str,
     populate: F,
-) -> SessionResult<()>
+) -> Result<(), FilePublicationError>
 where
     F: for<'a> FnOnce(
         &'a Arc<dyn FileSystem>,
@@ -2971,15 +2988,18 @@ where
     // the staged `.tmp` is best-effort removed on ANY failure (staging or
     // rename), so a crash/failure never leaves a partial `.tmp` behind. The
     // original destination is untouched until the rename commits.
+    let mut stage = PublicationStage::Populating;
     let result: SessionResult<()> = (async {
         populate(fs, &temp_path).await?;
         // A successful write/flush only establishes visibility. Backends with
         // physical durability support sync the complete staged file before
         // publication, then sync the containing directory after rename.
+        stage = PublicationStage::SyncingStagedFile;
         file_result(
             fs.sync_file(&temp_path, false, None).await,
             &format!("Failed to sync staged file {destination_path}"),
         )?;
+        stage = PublicationStage::Publishing;
         file_result(
             fs.rename_file(&temp_path, destination_path, None).await,
             &format!("Failed to publish staged file {destination_path}"),
@@ -3001,7 +3021,7 @@ where
         // Best-effort cleanup; preserve the original error.
         let _ = fs.remove(&temp_path, false, true, None).await;
     }
-    result
+    result.map_err(|error| FilePublicationError { stage, error })
 }
 
 /// Result of scanning a JSONL history for frames a `clear_run` already retired.

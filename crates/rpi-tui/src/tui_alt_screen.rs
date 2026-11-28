@@ -415,22 +415,25 @@ impl TuiAltScreen {
     /// [`TuiAltScreen::stop`] shuts it down; call it after the TUI has been
     /// wrapped in the `Arc` the host renders through.
     pub fn start_render_scheduler(self: &Arc<Self>) {
-        if self.scheduler_started.swap(true, Ordering::AcqRel) {
+        let Ok(mut thread) = self.scheduler_thread.lock() else {
+            return;
+        };
+        if thread.is_some() {
             return;
         }
+        let Ok(mut state) = self.scheduler.state.lock() else {
+            return;
+        };
+        state.shutdown = false;
+        self.scheduler_started.store(true, Ordering::Release);
         let tui = self.clone();
-        let spawned = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("rpi-tui-render".to_string())
-            .spawn(move || tui.run_render_scheduler());
-        match spawned {
-            Ok(handle) => {
-                if let Ok(mut slot) = self.scheduler_thread.lock() {
-                    *slot = Some(handle);
-                }
-            }
+            .spawn(move || tui.run_render_scheduler())
+        {
+            Ok(handle) => *thread = Some(handle),
             Err(_) => {
-                // A failed spawn must not silently disable repaints: fall back
-                // to the synchronous path rather than parking frames forever.
+                // Fall back to synchronous requests after a failed spawn.
                 self.scheduler_started.store(false, Ordering::Release);
             }
         }
@@ -1785,10 +1788,12 @@ impl TUI for TuiAltScreen {
         // Stop the coalescing scheduler *before* the terminal goes away, and
         // join it so a frame already in flight cannot repaint the screen after
         // shutdown (the class of bug the 0.1.18 regular-mode fix targets).
+        let mut scheduler_thread = self.scheduler_thread.lock().ok();
         self.scheduler.shutdown();
-        if let Some(handle) = self.scheduler_thread.lock().ok().and_then(|mut s| s.take()) {
+        if let Some(handle) = scheduler_thread.as_mut().and_then(|thread| thread.take()) {
             let _ = handle.join();
         }
+        self.scheduler_started.store(false, Ordering::Release);
 
         if self.uses_main_screen() {
             if let Ok(terminal) = self.terminal.lock() {
@@ -3251,10 +3256,19 @@ mod tests {
         assert!(!tui.flush_pending_render());
     }
 
-    /// End-to-end throttle check on the real scheduler thread. Each frame emits
-    /// exactly one synchronized-output opener (`\x1b[?2026h`), so counting those
-    /// counts painted frames. Before the throttle, every one of the 200
-    /// "streamed deltas" repainted the whole transcript.
+    fn wait_for_rendered_text(output: &Mutex<String>, text: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if output.lock().unwrap().contains(text) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn streaming_burst_paints_at_most_one_frame_per_interval() {
         let output = Arc::new(Mutex::new(String::new()));
@@ -3262,26 +3276,48 @@ mod tests {
             output: output.clone(),
         };
         let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), true, None));
-        let content = Arc::new(Text::new("0", 0, 0));
+        let content = Arc::new(Text::new("initial frame", 0, 0));
         tui.set_layout_root(Some(content.clone()));
         tui.start_render_scheduler();
         tui.start_readerless();
         output.lock().unwrap().clear();
-
+        let started = Instant::now();
         for i in 0..200 {
             content.set_text(&format!("delta {i}"));
             tui.request_render(false);
-            std::thread::sleep(Duration::from_millis(1));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        content.set_text("final frame");
+        tui.request_render(false);
 
+        let painted = wait_for_rendered_text(&output, "final frame");
         let frames = output.lock().unwrap().matches("\x1b[?2026h").count();
-        assert!(frames >= 1, "the scheduler must still paint frames");
-        assert!(
-            frames <= 40,
-            "200 requests in ~250 ms must coalesce into ~16 ms frames, painted {frames}"
-        );
+        let allowed = started.elapsed().as_millis() / u128::from(MIN_RENDER_INTERVAL_MS) + 1;
         tui.stop(TuiStopOptions::default());
+        assert!(painted, "the scheduler must paint the final request");
+        assert!(
+            frames as u128 <= allowed,
+            "painted {frames} frames, expected at most {allowed}"
+        );
+    }
+
+    #[test]
+    fn render_scheduler_paints_after_restarting_the_same_screen() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), true, None));
+        let content = Arc::new(Text::new("initial frame", 0, 0));
+        tui.set_layout_root(Some(content.clone()));
+        for text in ["first update", "restarted update"] {
+            tui.start_render_scheduler();
+            tui.start_readerless();
+            content.set_text(text);
+            tui.request_render(false);
+            let painted = wait_for_rendered_text(&output, text);
+            tui.stop(TuiStopOptions::default());
+            assert!(painted, "the scheduler did not paint {text}");
+        }
     }
 
     /// A transcript row that holds a Kitty placement, plus enough rows around

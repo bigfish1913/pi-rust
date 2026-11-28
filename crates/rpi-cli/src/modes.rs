@@ -82,6 +82,23 @@ pub async fn print(
     extra_messages: &[String],
     initial_images: Vec<ImageContent>,
 ) -> i32 {
+    print_to(
+        harness,
+        initial,
+        extra_messages,
+        initial_images,
+        std::io::stdout(),
+    )
+    .await
+}
+
+async fn print_to(
+    harness: &AgentHarness,
+    initial: Option<String>,
+    extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
+    mut out: impl Write,
+) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
 
     let mut last_exit = 0;
@@ -110,11 +127,9 @@ pub async fn print(
         match outcome {
             Ok(result) => {
                 last_exit = outcome_exit_code(&result.outcome);
-                match &result.outcome {
+                last_msg = match result.outcome {
                     HarnessRunOutcome::Completed { final_message, .. }
-                    | HarnessRunOutcome::Aborted { final_message, .. } => {
-                        last_msg = Some(final_message.clone());
-                    }
+                    | HarnessRunOutcome::Aborted { final_message, .. } => Some(final_message),
                     HarnessRunOutcome::Failed {
                         error,
                         final_message,
@@ -132,12 +147,14 @@ pub async fn print(
                         } else {
                             eprintln!("run failed: {error:?}");
                         }
+                        None
                     }
                     HarnessRunOutcome::Suspended { .. } => {
                         eprintln!("run suspended (deferred) — resume is not supported in v1");
                         last_exit = 1;
+                        None
                     }
-                }
+                };
             }
             Err(e) => {
                 eprintln!("prompt rejected: {e}");
@@ -161,7 +178,6 @@ pub async fn print(
             }
             _ => {
                 let text = assistant_text(m);
-                let mut out = std::io::stdout();
                 let _ = out.write_all(text.as_bytes());
                 if !text.ends_with('\n') {
                     let _ = out.write_all(b"\n");
@@ -5562,6 +5578,57 @@ mod tests {
     fn assistant_text_concatenates_text_blocks() {
         let m = assistant("hello", StopReason::Stop);
         assert_eq!(assistant_text(&m), "hello");
+    }
+
+    #[tokio::test]
+    async fn print_only_outputs_the_last_prompt_result() {
+        use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript, FauxStep};
+        use rpi_ai::types::DeferredHandle;
+
+        for stop in [StopReason::Stop, StopReason::Error, StopReason::Deferred] {
+            let script = FauxScript::new().with_text("earlier answer");
+            let provider = FauxProvider::new(script.clone());
+            let mut final_message = faux_assistant_message("final answer", stop);
+            if stop == StopReason::Error {
+                final_message.error_message = Some("scripted error".into());
+            }
+            if stop == StopReason::Deferred {
+                let model = provider.default_model();
+                final_message.deferred = Some(DeferredHandle {
+                    provider: model.provider.clone(),
+                    model_id: model.id.clone(),
+                    api: model.api.as_str().into(),
+                    id: "print-deferred".into(),
+                    expires_at: None,
+                    poll_after_ms: None,
+                    data: None,
+                });
+            }
+            script.append_responses(vec![FauxStep::message(final_message)]);
+            let harness = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+                model: provider.default_model().clone(),
+                models: vec![provider],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let mut output = Vec::new();
+            let status = print_to(
+                &harness,
+                Some("first prompt".into()),
+                &["second prompt".into()],
+                Vec::new(),
+                &mut output,
+            )
+            .await;
+            if stop == StopReason::Stop {
+                assert_eq!(status, 0);
+                assert_eq!(output, b"final answer\n");
+            } else {
+                assert_eq!(status, 1, "{stop:?}");
+                assert!(output.is_empty(), "{stop:?}: {output:?}");
+            }
+        }
     }
 
     #[test]
