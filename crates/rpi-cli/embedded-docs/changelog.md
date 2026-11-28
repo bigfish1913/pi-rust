@@ -16,6 +16,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 ### Added
 
 - *(cli)* install and run published agent packages ([#447](https://github.com/bigfish1913/pi-rust/pull/447))
+- *(cli)* expose a read-only JSON update inventory for the host and installed extensions ([#440](https://github.com/bigfish1913/pi-rust/pull/440))
 
 ### Fixed
 
