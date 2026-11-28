@@ -1,4 +1,4 @@
-//! Inventory-only coverage: no prompts, providers, disk sessions, or config writes.
+//! Coverage of extension command inventory and session routing policy.
 use super::*;
 use rpi_harness::session::{
     memory::{InMemorySessionStorage, SystemClock},
@@ -19,6 +19,28 @@ fn empty_host(
         flags,
         rpi_extensions::ToolCallContext::default(),
     )
+}
+
+#[tokio::test]
+async fn mini_extension_session_actions_stay_in_memory() {
+    let cwd = tempfile::tempdir().unwrap();
+    let sessions = cwd.path().join("sessions");
+    let harness = Arc::new(template_harness(cwd.path()).await);
+    let (host, binding) = empty_host(cwd.path(), BTreeMap::new());
+    HarnessActionHost::set_harness(&binding, harness.clone());
+    let host = host
+        .with_session_dir(sessions.clone())
+        .with_ephemeral_sessions_only(true);
+
+    host.new_session(json!({})).await.unwrap();
+    assert!(harness.session().storage().is_ephemeral());
+    assert!(host.fork(json!({})).await.unwrap_err().contains("--mini"));
+    assert!(host
+        .switch_session(json!({"id": "saved"}))
+        .await
+        .unwrap_err()
+        .contains("--mini"));
+    assert!(!sessions.exists());
 }
 
 async fn inventory(host: &HarnessActionHost) -> Vec<Value> {

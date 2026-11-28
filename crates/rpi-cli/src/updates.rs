@@ -113,6 +113,31 @@ enum UpdateChannel {
     Stable,
     Preview,
 }
+
+const HOMEBREW_UPGRADE_COMMAND: &str = "brew upgrade rpi";
+
+fn current_homebrew_keg() -> Option<PathBuf> {
+    homebrew_keg_for_exe(&std::env::current_exe().ok()?)
+}
+
+/// Resolve Homebrew's `bin/rpi` symlink to `Cellar/rpi/<version>/bin/rpi`.
+/// The receipt distinguishes a Homebrew keg from a similarly named directory.
+fn homebrew_keg_for_exe(exe: &Path) -> Option<PathBuf> {
+    let exe = exe.canonicalize().ok()?;
+    let bin = exe.parent()?;
+    let keg = bin.parent()?;
+    let formula = keg.parent()?;
+    if exe.file_name()? == crate::APP_NAME
+        && bin.file_name()? == "bin"
+        && formula.file_name()? == crate::APP_NAME
+        && formula.parent()?.file_name()? == "Cellar"
+        && keg.join("INSTALL_RECEIPT.json").is_file()
+    {
+        return Some(keg.to_path_buf());
+    }
+    None
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SelfUpdateStatus {
@@ -169,23 +194,29 @@ fn report_without_remote_checks() -> UpdateReport {
 }
 
 fn startup_http_client() -> Option<reqwest::Client> {
-    // The web UI saves its proxy in settings.json. Apply it here as well so
-    // update checks work when invoked directly, while still letting an
-    // explicit shell-level proxy override win.
-    if let Ok(settings) = crate::settings::load_settings() {
-        if let Some(proxy) = settings.http_proxy {
-            for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
-                if std::env::var_os(key).is_none() {
-                    std::env::set_var(key, &proxy);
-                }
-            }
-        }
-    }
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
-        .user_agent(format!("rpi/{}", crate::VERSION))
-        .build()
+        .user_agent(format!("rpi/{}", crate::VERSION));
+    // The saved Web proxy is a fallback for this client. Keep explicit
+    // environment settings and leave the process environment alone.
+    if let Some(saved) = crate::settings::load_settings()
         .ok()
+        .and_then(|settings| settings.http_proxy)
+    {
+        let proxy_url = |upper, lower| {
+            [upper, lower, "ALL_PROXY", "all_proxy"]
+                .into_iter()
+                .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+                .unwrap_or_else(|| saved.clone())
+        };
+        let no_proxy = reqwest::NoProxy::from_env();
+        let http = reqwest::Proxy::http(proxy_url("HTTP_PROXY", "http_proxy")).ok()?;
+        let https = reqwest::Proxy::https(proxy_url("HTTPS_PROXY", "https_proxy")).ok()?;
+        builder = builder
+            .proxy(http.no_proxy(no_proxy.clone()))
+            .proxy(https.no_proxy(no_proxy));
+    }
+    builder.build().ok()
 }
 
 async fn check_startup_with_client(client: Option<reqwest::Client>) -> UpdateReport {
@@ -194,6 +225,13 @@ async fn check_startup_with_client(client: Option<reqwest::Client>) -> UpdateRep
         Err(_) => return UpdateReport::default(),
     };
     let warnings = consume_self_update_statuses(&agent_dir);
+    let cache = refresh_update_cache(&agent_dir, client).await;
+    let mut report = report_from_cache(&cache);
+    report.warnings = warnings;
+    report
+}
+
+async fn refresh_update_cache(agent_dir: &Path, client: Option<reqwest::Client>) -> UpdateCache {
     let cache_path = agent_dir.join(CACHE_FILE);
     let previous_cache = read_cache(&cache_path);
 
@@ -265,10 +303,7 @@ async fn check_startup_with_client(client: Option<reqwest::Client>) -> UpdateRep
         checked_at,
     );
 
-    let cache = merge_and_write_cache(&cache_path, checked_at, rpi_update, native_packages);
-    let mut report = report_from_cache(&cache);
-    report.warnings = warnings;
-    report
+    merge_and_write_cache(&cache_path, checked_at, rpi_update, native_packages)
 }
 
 async fn collect_bounded<I, F, T>(checks: I) -> Vec<T>
@@ -411,7 +446,11 @@ fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
                 name: "rpi".into(),
                 current: crate::VERSION.into(),
                 latest: latest.into(),
-                command: "rpi update".into(),
+                command: if current_homebrew_keg().is_some() {
+                    HOMEBREW_UPGRADE_COMMAND.into()
+                } else {
+                    "rpi update".into()
+                },
             });
         }
     }
@@ -670,7 +709,9 @@ fn print_self_update_help() {
          preview    use the GitHub prerelease channel instead of stable releases\n  \
          --build    explicitly compile with Cargo instead of downloading a prebuilt binary\n  \
          --force    reinstall even when this rpi is already the latest release\n  \
-         --offline  do not touch the network; report the last known answer only"
+         --offline  do not touch the network; report the last known answer only\n\n\
+         A Homebrew install is upgraded with `brew upgrade rpi`; `rpi update`\n\
+         refuses to overwrite the binary Homebrew owns."
     );
 }
 
@@ -808,7 +849,7 @@ fn staged_pending_version(update_root: &Path, channel: UpdateChannel) -> Option<
         {
             continue;
         }
-        if newest.as_ref().map_or(true, |newest| version > *newest) {
+        if newest.as_ref().is_none_or(|newest| version > *newest) {
             newest = Some(version);
         }
     }
@@ -862,6 +903,15 @@ pub fn run_self_update(args: &[String]) -> i32 {
             return 2;
         }
     };
+
+    if let Some(keg) = current_homebrew_keg() {
+        eprintln!(
+            "error: Homebrew manages this rpi installation ({}).\n\
+             Run `{HOMEBREW_UPGRADE_COMMAND}` to update it.",
+            keg.display()
+        );
+        return 1;
+    }
 
     if offline {
         reclaim_self_update_artifacts();
@@ -2678,8 +2728,10 @@ pub async fn run_updates(args: &[String]) -> i32 {
             return 2;
         }
     };
-    if refresh {
-        let _ = check_rpi_startup().await;
+    if refresh && !update_checks_disabled() {
+        if let Ok(agent_dir) = crate::config::agent_dir() {
+            refresh_update_cache(&agent_dir, startup_http_client()).await;
+        }
     }
     let inventory = build_inventory_from_cache();
     match serde_json::to_string_pretty(&inventory) {
@@ -2728,7 +2780,7 @@ fn installed_extension_inventory(
     packages
         .into_iter()
         .map(|package| {
-            let supports_update = package.prebuilt.is_some() || package.source.is_none();
+            let supports_update = package.supports_registry_update();
             let latest = cache
                 .native_packages
                 .get(&native_cache_key(&package))
@@ -3229,6 +3281,33 @@ mod tests {
             !agent.exists(),
             "offline checks must not create the update cache directory"
         );
+    }
+
+    #[tokio::test]
+    async fn inventory_refresh_preserves_self_update_failure_for_startup() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore_config = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let _restore_offline = RestoreEnv::capture(crate::args::RPI_OFFLINE_ENV);
+        let temp = real_tempdir();
+        let agent = temp.path().join("agent");
+        let update_root = agent.join("self-update");
+        std::fs::create_dir_all(&update_root).unwrap();
+        let failed = update_root.join("status-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json");
+        write_test_update_status(&failed, "failed", "permission denied");
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+        std::env::set_var(crate::args::RPI_OFFLINE_ENV, "1");
+
+        assert_eq!(
+            super::run_updates(&["refresh".into(), "--json".into()]).await,
+            0
+        );
+        super::refresh_update_cache(&agent, None).await;
+        assert!(failed.exists());
+
+        let report = super::check_rpi_startup().await;
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].message.contains("permission denied"));
+        assert!(!failed.exists());
     }
 
     #[test]
@@ -4134,5 +4213,51 @@ Connection: close
         let result = super::lookup_latest_rpi_from(&url).await;
         assert_eq!(stop_and_join(stop, server, &url), 1);
         assert_eq!(result, Some(("0.11.0".into(), true)));
+    }
+
+    #[test]
+    fn legacy_prebuilt_records_still_receive_update_notices() {
+        let _guard = crate::config::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let agent = tempfile::tempdir().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, agent.path());
+        // Records written before exact prebuilt provenance carry only the
+        // publisher marker; a repository move must not stop their notices.
+        let record: crate::install::InstalledNativePackage =
+            serde_json::from_value(serde_json::json!({
+                "name":"demo", "version":"1.0.0",
+                "source":"prebuilt:https://github.com/pi-rust/rpi-package",
+                "artifacts":["custom.so"]
+            }))
+            .unwrap();
+        std::fs::write(
+            agent.path().join("native-packages.json"),
+            serde_json::to_vec(&[record.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(super::native_cache_key(&record), "demo");
+        let mut cache = super::UpdateCache::default();
+        cache
+            .native_packages
+            .insert(super::native_cache_key(&record), "2.0.0".into());
+        let report = super::report_from_cache(&cache);
+        assert_eq!(report.notices.len(), 1);
+        assert_eq!(report.notices[0].command, "rpi extension update demo");
+
+        // A local development build must never be advertised as updatable.
+        let local: crate::install::InstalledNativePackage = serde_json::from_value(
+            serde_json::json!({"name":"local","version":"1.0.0","source":"../local-ext"}),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.path().join("native-packages.json"),
+            serde_json::to_vec(&[local]).unwrap(),
+        )
+        .unwrap();
+        let mut cache = super::UpdateCache::default();
+        cache.native_packages.insert("local".into(), "9.9.9".into());
+        assert!(super::report_from_cache(&cache).notices.is_empty());
     }
 }

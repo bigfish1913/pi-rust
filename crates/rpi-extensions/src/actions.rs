@@ -12,8 +12,9 @@
 //!
 //! Synchronous tool callbacks inherit a host-owned invocation via a scoped
 //! thread-local; workers forward the invocation handle and capability injected
-//! into `__rpi`. ChildAgent rejects registration-only, cancelled and child
-//! invocations. A cached registration cannot override a child's driver scope.
+//! into `__rpi`. IndependentRun requires a top-level invocation. Cancellation
+//! disallows new runs while preserving cleanup. A cached registration cannot
+//! override an independent run's driver scope.
 //!
 //! [`ActionBridge`] captures a Tokio [`Handle`] at construction. Dispatch can
 //! therefore spawn from foreign threads and return over a standard synchronous
@@ -857,13 +858,13 @@ pub trait RuntimeActionHost: Send + Sync {
         Err("execution context is not supported by this host".into())
     }
 
-    /// Independent child lifecycle. `owner` is supplied by the bridge, NOT JSON.
-    async fn child_agent(
+    /// Independent run lifecycle. The bridge supplies the authenticated owner.
+    async fn independent_run(
         &self,
         _owner: u64,
         _args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        Err("ChildAgent is not supported by this host".into())
+        Err("IndependentRun is not supported by this host".into())
     }
 
     /// `GetSessionBranch` — query custom entries on the current main branch.
@@ -984,9 +985,22 @@ impl ActionBridge {
         if let Some(program) = &tool_program {
             program.bind_signal(signal.clone());
         }
+        let mut execution_context = rpi_agent::tool_execution_scope::public_execution_context();
+        // Released Goal plugins use this field to reject mutations of the
+        // parent goal from child tools. Keep the compatibility field scoped
+        // to Goal; other plugins still receive the public execution metadata.
+        if child
+            && self
+                .plugin_identity
+                .as_ref()
+                .is_some_and(|(_, name)| name == "librpi_goal" || name.starts_with("librpi_goal-v"))
+        {
+            execution_context.get_or_insert_with(|| serde_json::json!({}))["childAgent"] =
+                serde_json::Value::Bool(false);
+        }
         Arc::new(Self {
             invocation: Some((child, uuid::Uuid::new_v4().to_string(), signal)),
-            execution_context: rpi_agent::tool_execution_scope::execution_context(),
+            execution_context,
             tool_program,
             stdio: self.stdio.clone(),
             plugin_identity: self.plugin_identity.clone(),
@@ -1039,6 +1053,9 @@ impl ActionBridge {
     }
     pub(crate) fn invocation_key(&self) -> Option<&str> {
         self.invocation.as_ref().map(|(_, key, _)| key.as_str())
+    }
+    pub(crate) fn is_independent_invocation(&self) -> bool {
+        self.invocation.as_ref().is_some_and(|(child, _, _)| *child)
     }
     pub(crate) fn enter_invocation(self: &Arc<Self>) -> InvocationGuard {
         InvocationGuard {
@@ -1158,6 +1175,11 @@ impl ActionBridge {
 
     pub fn stdio_lifecycle(&self) -> crate::StdioLifecycle {
         self.stdio.clone()
+    }
+
+    /// Refuse stdio ownership for plugins in a shared process. Set before loading.
+    pub fn disable_stdio_claims(&self) {
+        self.stdio.disable_claims();
     }
 
     pub(crate) fn claim_stdio(&self) -> Result<(), String> {
@@ -1491,7 +1513,7 @@ async fn dispatch(
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
         RuntimeActionId::ToolProgram => Err("ToolProgram requires a live invocation bridge".into()),
-        RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
+        RuntimeActionId::IndependentRun => Err("IndependentRun requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
         RuntimeActionId::ListCommands => host.list_commands(args).await,
         RuntimeActionId::Abort => host.abort(args).await,
@@ -1746,7 +1768,7 @@ fn run_action(
                 "ToolProgram requires an authenticated executing invocation".into(),
             ));
         }
-    } else if action == RuntimeActionId::ChildAgent {
+    } else if action == RuntimeActionId::IndependentRun {
         // A registration handle cannot assert that it is a parent invocation.
         // All child-originated invocations fail closed, regardless of tool name.
         // Cancellation stops admission, not authenticated reclamation. The
@@ -1766,7 +1788,9 @@ fn run_action(
                             == Some(key.as_str()))
             });
         if !allowed {
-            let _ = tx.send(Err("ChildAgent requires a live parent tool invocation; recursive child agents are not allowed".into()));
+            let _ = tx.send(Err(
+                "IndependentRun requires a live top-level tool invocation".into(),
+            ));
         } else {
             let owner = bridge.plugin_identity.as_ref().map_or(0, |(id, _)| *id);
             let signal = bridge
@@ -1778,7 +1802,7 @@ fn run_action(
             bridge.runtime.spawn(async move {
                 let result = rpi_agent::tool_execution_scope::with_invocation_signal(
                     signal,
-                    host.child_agent(owner, args),
+                    host.independent_run(owner, args),
                 )
                 .await;
                 let _ = tx.send(result);
@@ -1932,11 +1956,41 @@ mod tests {
             RuntimeActionId::try_from(32).is_ok(),
             "GetEditorText must remain a valid runtime action id"
         );
+        // IndependentRun requires a live tool invocation and uses owner-scoped
+        // handles. The host's roster and stop operations have no plugin action.
+        assert_eq!(
+            RuntimeActionId::try_from(33),
+            Ok(RuntimeActionId::IndependentRun)
+        );
         assert!(
-            RuntimeActionId::try_from(33).is_err(),
+            RuntimeActionId::try_from(34).is_err(),
             "a new RuntimeActionId was added: re-verify that host-only child-agent control \
              (un-owner-scoped roster/stop) is still unreachable from the plugin ABI"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_host_refuses_stdio_during_registration() {
+        let master = ActionBridge::new(
+            Handle::current(),
+            Arc::new(MockHost {
+                prompt: String::new(),
+                saw: Mutex::new(Vec::new()),
+            }),
+        );
+        master.disable_stdio_claims();
+        let plugin = crate::HostApi::with_action_bridge(
+            "stdio-plugin",
+            crate::ExtensionRegistry::new(),
+            Arc::new(crate::NullDiagnostics),
+            master.clone(),
+        );
+        let vtable = plugin.build_vtable();
+        let _registration = crate::enter_current_api(&plugin);
+        let declare = vtable.declare.unwrap();
+        assert_ne!(declare(StbStringRef::from_str(r#"{"ownsStdio":true}"#)), 0);
+        assert!(plugin.take_registry().unwrap().declared_owns_stdio());
+        assert!(master.stdio_lifecycle().validate().is_ok());
     }
 
     #[tokio::test(flavor = "current_thread")]

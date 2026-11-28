@@ -1,0 +1,53 @@
+name: PR issue link
+
+# Contributors must reference an existing issue in the pull request description.
+# The check runs on description edits too, so a contributor can fix the failure
+# by editing the body instead of pushing a commit; it is deliberately separate
+# from CI so a body edit does not restart the whole test matrix.
+on:
+  pull_request:
+    types: [opened, edited, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  require-issue:
+    name: Require linked issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Manual dispatch has no pull request payload to inspect.
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Test the linked-issue check
+        run: python3 -B scripts/test_pr_issue_link.py
+
+      - name: Write the pull request description to a file
+        # The description goes through the environment, never through shell
+        # interpolation, so its contents cannot inject commands.
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s\n' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+
+      - name: Require an existing issue
+        # Every pull request value reaches the script through the environment;
+        # a branch name or description is attacker-controlled text.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          python3 -B scripts/check-pr-issue-link.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --body-file "$RUNNER_TEMP/pr-body.md" \
+            --author "$PR_AUTHOR" \
+            --author-association "$PR_AUTHOR_ASSOCIATION" \
+            --head-ref "$PR_HEAD_REF"

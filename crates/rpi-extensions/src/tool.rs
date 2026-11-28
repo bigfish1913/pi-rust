@@ -430,18 +430,30 @@ fn parse_content_parts(
 /// the model for it — and the model does not know the session id, while any
 /// `cwd` it guesses is a silent way to split one store into two.
 ///
-/// It is filled in two steps because the CLI assembles the tool set *before* the
-/// session it belongs to exists: [`ToolCallContext::new`] carries the `cwd`, and
-/// [`ToolCallContext::set_session_id`] completes it once the session does.
-/// Every adapter for one session shares one instance (`Arc` inside), so the late
-/// write is visible to all of them — including across an extension reload, which
-/// rebuilds the adapters from the same context.
+/// The ordinary CLI fills this in two steps: [`ToolCallContext::new`] carries
+/// `cwd`, and [`ToolCallContext::set_session_id`] completes it later. Clones
+/// share that late write, including across an extension reload.
 ///
-/// Unknown fields are absent, not empty strings: a consumer should prefer a
-/// project-scoped fallback when [`ToolCallContext::session_id`] is `None`.
-#[derive(Clone, Debug, Default)]
+/// Shared Hosts must instead use [`ToolCallContext::for_agent`]: identity is
+/// frozen, includes `agentId`, and an absent Session is explicit JSON null.
+/// Neither the CLI late setter nor process environment can retarget it. This
+/// metadata is not a permission grant or a sandbox.
+#[derive(Clone, Debug)]
 pub struct ToolCallContext {
-    inner: Arc<RwLock<ToolCallContextState>>,
+    binding: ToolCallContextBinding,
+}
+
+#[derive(Clone, Debug)]
+enum ToolCallContextBinding {
+    Late(Arc<RwLock<ToolCallContextState>>),
+    Agent(Arc<AgentToolCallContext>),
+}
+
+#[derive(Debug)]
+struct AgentToolCallContext {
+    cwd: String,
+    agent_id: String,
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -450,43 +462,97 @@ struct ToolCallContextState {
     session_id: Option<String>,
 }
 
+impl Default for ToolCallContext {
+    fn default() -> Self {
+        Self {
+            binding: ToolCallContextBinding::Late(Arc::default()),
+        }
+    }
+}
+
 impl ToolCallContext {
-    /// A context that knows the project directory but not yet the session id.
+    /// A legacy CLI context that knows cwd but not yet the Session identity.
     /// An empty `cwd` is treated as unknown.
     pub fn new(cwd: impl Into<String>) -> Self {
         let cwd = cwd.into();
         Self {
-            inner: Arc::new(RwLock::new(ToolCallContextState {
+            binding: ToolCallContextBinding::Late(Arc::new(RwLock::new(ToolCallContextState {
                 cwd: (!cwd.is_empty()).then_some(cwd),
                 session_id: None,
+            }))),
+        }
+    }
+
+    /// Freeze a trusted host's already-validated Agent identity. `None` means
+    /// genuinely Session-free, not an unknown identity or environment fallback.
+    /// Clones share immutable data; build another context for another Agent.
+    pub fn for_agent(
+        cwd: impl Into<String>,
+        agent_id: impl Into<String>,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            binding: ToolCallContextBinding::Agent(Arc::new(AgentToolCallContext {
+                cwd: cwd.into(),
+                agent_id: agent_id.into(),
+                session_id,
             })),
         }
     }
 
-    /// Record the session id once the session exists. Safe to call again (a
-    /// reload re-derives it); a poisoned lock is ignored rather than panicking
-    /// inside a tool call.
+    /// Complete a legacy CLI context. This is a no-op for a frozen Agent
+    /// context: a late CLI publication must never rebind a shared Host Agent.
+    /// A poisoned legacy lock is ignored, as before.
     pub fn set_session_id(&self, session_id: impl Into<String>) {
-        if let Ok(mut state) = self.inner.write() {
-            state.session_id = Some(session_id.into());
+        if let ToolCallContextBinding::Late(inner) = &self.binding {
+            if let Ok(mut state) = inner.write() {
+                state.session_id = Some(session_id.into());
+            }
         }
     }
 
-    /// The project directory the session was launched in, when known.
+    /// The bound Agent, or None for a legacy single-session CLI context.
+    pub fn agent_id(&self) -> Option<String> {
+        match &self.binding {
+            ToolCallContextBinding::Agent(context) => Some(context.agent_id.clone()),
+            ToolCallContextBinding::Late(_) => None,
+        }
+    }
+
+    /// The project directory, when known.
     pub fn cwd(&self) -> Option<String> {
-        self.inner.read().ok().and_then(|s| s.cwd.clone())
+        match &self.binding {
+            ToolCallContextBinding::Agent(context) => Some(context.cwd.clone()),
+            ToolCallContextBinding::Late(inner) => inner.read().ok().and_then(|s| s.cwd.clone()),
+        }
     }
 
-    /// The session id, when the session has one and the host has recorded it.
+    /// The Session id, or None for an explicitly Session-free Agent / an
+    /// incomplete legacy context. `to_json` preserves that distinction.
     pub fn session_id(&self) -> Option<String> {
-        self.inner.read().ok().and_then(|s| s.session_id.clone())
+        match &self.binding {
+            ToolCallContextBinding::Agent(context) => context.session_id.clone(),
+            ToolCallContextBinding::Late(inner) => {
+                inner.read().ok().and_then(|s| s.session_id.clone())
+            }
+        }
     }
 
-    /// The object to inject, or `None` when nothing is known yet — in which
-    /// case arguments are passed through untouched rather than gaining an empty
-    /// `{}` that a plugin would have to special-case.
+    /// The plugin-only object. A frozen Agent always has one, including an
+    /// explicit null Session. Legacy unknown fields remain absent; no known
+    /// legacy fields still means no injection, for CLI compatibility.
     pub fn to_json(&self) -> Option<Value> {
-        let state = self.inner.read().ok()?;
+        let inner = match &self.binding {
+            ToolCallContextBinding::Agent(context) => {
+                return Some(serde_json::json!({
+                    "cwd": context.cwd,
+                    "agentId": context.agent_id,
+                    "sessionId": context.session_id,
+                }));
+            }
+            ToolCallContextBinding::Late(inner) => inner,
+        };
+        let state = inner.read().ok()?;
         if state.cwd.is_none() && state.session_id.is_none() {
             return None;
         }
@@ -500,6 +566,10 @@ impl ToolCallContext {
         Some(Value::Object(object))
     }
 }
+
+#[cfg(test)]
+#[path = "tool/context_tests.rs"]
+mod context_tests;
 
 /// Add the host context to one plugin tool call's arguments.
 ///
@@ -710,6 +780,7 @@ impl AgentTool for PluginToolAdapter {
             }
             context["runtimeHandle"] = serde_json::json!(invocation.user_data() as usize);
             context["runtimeKey"] = serde_json::json!(invocation.invocation_key());
+            context["independentRun"] = serde_json::json!(invocation.is_independent_invocation());
         }
         let public_binding = PublicBindingGuard::capture(&params, invocation.as_deref());
         let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "null".to_string());
@@ -1269,6 +1340,34 @@ mod tests {
         let text_json: Value = serde_json::from_str(&text.text).unwrap();
         assert!(text_json["alias"].is_null());
         assert_eq!(text_json["collision"], "[redacted invocation credential]");
+    }
+
+    #[tokio::test]
+    async fn both_drivers_replace_claimed_independent_run_with_host_provenance() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let bridge =
+            crate::ActionBridge::new(tokio::runtime::Handle::current(), Arc::new(BindingHost));
+        let scope = Arc::new(rpi_agent::tool_execution_scope::ToolExecutionScope::default());
+        for wake in [false, true] {
+            let mut adapter = echo_adapter().with_context(ToolCallContext::new("project-cwd"));
+            adapter.handle.runtime_handle = Some(bridge.user_data() as usize);
+            adapter.handle.poll_fn = binding_poll;
+            adapter.handle.set_waker_fn = wake.then_some(binding_waker);
+            for independent in [false, true] {
+                let call = adapter.execute(
+                    "context",
+                    json!({"mode":"legacy", "__rpi":{"independentRun": !independent}}),
+                    CancellationToken::new(),
+                    Arc::new(|_| {}),
+                );
+                if independent {
+                    scope.run(call).await.unwrap();
+                } else {
+                    call.await.unwrap();
+                }
+                assert_eq!(take_last_params()["__rpi"]["independentRun"], independent);
+            }
+        }
     }
 
     #[tokio::test]

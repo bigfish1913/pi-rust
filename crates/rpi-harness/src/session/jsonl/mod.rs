@@ -11,6 +11,22 @@
 pub mod codec;
 mod cold_decode;
 mod cold_frames;
+mod digest;
+mod envelope;
+
+/// Deterministic SHA-256 over arbitrary bytes. This is an integrity/content
+/// fingerprint, not a signature or trust anchor.
+pub(crate) fn sha256_bytes(bytes: impl AsRef<[u8]>) -> [u8; 32] {
+    digest::Sha256::digest(bytes)
+}
+
+/// Lowercase hex form of [`sha256_bytes`].
+pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    sha256_bytes(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 pub mod errors;
 mod progress;
 pub mod repo;

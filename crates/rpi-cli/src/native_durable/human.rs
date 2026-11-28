@@ -140,7 +140,7 @@ fn receipt(value: &Value) -> Result<DurableReceipt, String> {
 enum View {
     Control(DurableSnapshot),
     Execution(DurableExecutionSnapshot),
-    Outcome(DurableOutcome),
+    Outcome(Box<DurableOutcome>),
     Receipt(Option<DurableReceipt>),
 }
 fn decode(value: &Value) -> Result<View, String> {
@@ -165,7 +165,7 @@ fn decode(value: &Value) -> Result<View, String> {
         let o: DurableOutcome = dto(v)?;
         snapshot(&v["snapshot"])?;
         receipt(&v["receipt"])?;
-        return Ok(View::Outcome(o));
+        return Ok(View::Outcome(Box::new(o)));
     }
     if let Some(v) = map.get("receipt") {
         return if v.is_null() {

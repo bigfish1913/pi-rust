@@ -1,4 +1,4 @@
-//! Build rpi-providers in the independent rpi-package workspace, then set
+//! Build rpi-providers in the independent rpi-extension workspace, then set
 //! RPI_TEST_PROVIDER_LIBRARY to its DLL/so/dylib and RPI_TEST_PROVIDER_PACKAGE
 //! to its package directory. The host has no vendor crate dependency.
 //! Then run cargo test -p rpi-cli --test provider_packages.
@@ -533,14 +533,31 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
         no_tools: true,
         ..Default::default()
     };
-    let prepared = rpi_cli::session::prepare_extensions(&args, &cwd, true).unwrap();
-    let resolved =
-        rpi_cli::provider::resolve_with_extensions(&args, &cwd, true, &prepared.extension_session)
-            .unwrap();
-    let (harness, _events, mut context) =
-        rpi_cli::session::build_prepared(&resolved, &args, &cwd, true, prepared)
-            .await
-            .unwrap();
+    let prepared = rpi_cli::session::prepare_extensions(
+        &rpi_cli::config::AgentHome::process(),
+        &args,
+        &cwd,
+        true,
+    )
+    .unwrap();
+    let resolved = rpi_cli::provider::resolve_with_extensions(
+        &rpi_cli::config::AgentHome::process(),
+        &args,
+        &cwd,
+        true,
+        &prepared.extension_session,
+    )
+    .unwrap();
+    let (harness, _events, mut context) = rpi_cli::session::build_prepared(
+        &rpi_cli::config::AgentHome::process(),
+        &resolved,
+        &args,
+        &cwd,
+        true,
+        prepared,
+    )
+    .await
+    .unwrap();
     let before = context
         .extension_session
         .lock()
@@ -610,7 +627,11 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
         // with models.json without requiring a provider runtime or credentials.
         let manifests =
             rpi_cli::provider::manifests_from_session(&context.extension_session.lock().unwrap());
-        let discovery = rpi_cli::provider::catalog_with_manifests(&manifests).unwrap();
+        let discovery = rpi_cli::provider::catalog_with_manifests(
+            &rpi_cli::config::AgentHome::process(),
+            &manifests,
+        )
+        .unwrap();
         assert!(manifests.iter().any(|manifest| manifest.id == "proxy"));
         assert!(discovery.iter().any(|model| model.provider == "proxy"
             && model.id == "second"

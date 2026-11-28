@@ -47,7 +47,6 @@ async fn runtime_errors_and_theme_notices_scroll_above_later_replies() {
                 },
                 &tui,
                 &state,
-                &state.chat_container,
                 &lane,
             )
             .await;

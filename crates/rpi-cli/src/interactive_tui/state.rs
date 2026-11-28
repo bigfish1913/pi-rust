@@ -157,6 +157,7 @@ pub(super) fn auto_send_step(
 }
 
 pub(super) struct TuiState {
+    pub(super) publish_process_identity: bool,
     pub(super) session_write_tasks: super::settlement::SessionWriteTasks,
     pub(super) history_page: history::HistoryUi,
     /// The root selected at startup, retained across session switches/reloads.
@@ -2105,7 +2106,6 @@ impl TuiState {
     ///
     /// [`TranscriptView`]: crate::transcript_view::TranscriptView
     pub(super) fn transcript_view(&self) -> crate::transcript_view::TranscriptView {
-        let managed = self.history_page.is_bound();
         crate::transcript_view::TranscriptView::with_maps(
             self.transcript_container(),
             self.current_assistant.clone(),
@@ -2116,12 +2116,14 @@ impl TuiState {
             self.markdown_transformer.clone(),
             self.message_seq.clone(),
         )
-        .with_panels(if managed {
-            self.history_page.panels.clone()
-        } else {
-            self.chat_container.clone()
-        })
         .with_show_images(self.images_visible())
+    }
+
+    pub(super) fn apply_tool_end(&self, event: &UiEvent, width: usize) {
+        let view = self.transcript_view();
+        self.history_page.with_latest_page(|page| {
+            view.with_restored_page(page).apply(event, width);
+        });
     }
 
     /// B5e: swap the live transformer. Used at startup (install the first

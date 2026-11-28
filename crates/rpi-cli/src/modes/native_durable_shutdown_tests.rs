@@ -157,11 +157,16 @@ impl Fixture {
                 &harness,
                 None,
                 vec![],
-                rpi_extensions::UiDialogMailbox::new(),
-                None,
-                None,
-                crate::args::RpcMessageUpdates::default(),
-                enabled,
+                crate::modes::RpcOptions {
+                    ui_dialog: rpi_extensions::UiDialogMailbox::new(),
+                    oauth_snapshot: None,
+                    extension_session: None,
+                    message_updates: crate::args::RpcMessageUpdates::default(),
+                    native_durable: enabled,
+                    home: crate::config::AgentHome::process(),
+                },
+                true,
+                super::RpcLifetime::default(),
                 input,
                 output,
             )
@@ -318,6 +323,38 @@ async fn normal_shutdown(stop: bool) {
         fixture.idle().await;
     }
 }
+#[tokio::test]
+async fn cancelling_prompt_allows_the_message_write_gate_to_release() {
+    bounded(async {
+        let fixture = Fixture::new().await;
+        let lane = fixture.harness.lane("main");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        fixture
+            .probe
+            .pause_queue_reads
+            .store(true, Ordering::SeqCst);
+        let prompt = rpc_prompt_cancellable(
+            &fixture.harness,
+            &lane,
+            crate::rpc::prompt_content::ParsedPrompt::Legacy("test".into()),
+            cancel.clone(),
+        );
+        let cancel_at_gate = async {
+            fixture.probe.queue_read_entered.notified().await;
+            assert!(fixture.harness.active_operation_snapshot().is_some());
+            cancel.cancel();
+            fixture.probe.release_queue_read.notify_one();
+        };
+        let (settled, ()) = tokio::join!(prompt, cancel_at_gate);
+        let settled = settled.unwrap();
+        assert_eq!(settled["outcome"], "aborted");
+        let run_id = settled["runId"].as_str().expect("settled run id");
+        assert!(fixture.harness.get_result(run_id).await.unwrap().is_some());
+        assert!(fixture.harness.active_operation_snapshot().is_none());
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_stop_reconciles_an_active_prompt_before_shutdown_drain() {
     bounded(async {

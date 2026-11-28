@@ -98,8 +98,7 @@ pub(super) async fn share_session(harness: &AgentHarness, chat: &Arc<Container>)
 /// last-used model is replayed ([`restore_session_model`]) and its recorded
 /// usage folded back into the footer ([`render_session_history`]).
 pub(super) async fn switch_to_session(
-    harness: &AgentHarness,
-    lane: &Arc<dyn AgentLane>,
+    session_lane: SessionLane<'_>,
     id: &str,
     cwd: &std::path::Path,
     chat: &Arc<Container>,
@@ -107,6 +106,7 @@ pub(super) async fn switch_to_session(
     tool_context: &rpi_extensions::ToolCallContext,
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) -> bool {
+    let SessionLane { harness, lane } = session_lane;
     state.history_page.invalidate();
     if *state.status.lock().unwrap() == RunStatus::Working {
         state.set_status(RunStatus::Aborting);
@@ -134,9 +134,13 @@ pub(super) async fn switch_to_session(
             // Route through the funnel so the plugin channels follow the swap;
             // a bare `set_session` would leave every plugin naming the session
             // it was serving before this call.
-            if let Err(error) =
-                crate::session::set_active_session(harness, restored.session, Some(tool_context))
-                    .await
+            if let Err(error) = crate::session::set_active_session_with_identity(
+                harness,
+                restored.session,
+                Some(tool_context),
+                state.publish_process_identity,
+            )
+            .await
             {
                 add_error_message(
                     &state.notice_container(),
@@ -202,8 +206,7 @@ pub(super) async fn switch_to_session(
 /// `/import <path>`: validate and save a session in the selected repository,
 /// then activate it through the same funnel as other session switches.
 pub(super) async fn import_session(
-    harness: &AgentHarness,
-    lane: &Arc<dyn AgentLane>,
+    session_lane: SessionLane<'_>,
     path: &str,
     cwd: &std::path::Path,
     chat: &Arc<Container>,
@@ -211,10 +214,9 @@ pub(super) async fn import_session(
     tool_context: &rpi_extensions::ToolCallContext,
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) {
+    let SessionLane { harness, lane } = session_lane;
     state.history_page.invalidate();
-    use std::path::Path as FsPath;
-
-    let src = FsPath::new(path);
+    let src = cwd.join(path);
     if !src.is_file() {
         add_error_message(
             &state.notice_container(),
@@ -254,7 +256,7 @@ pub(super) async fn import_session(
         return;
     }
     let result =
-        crate::session::import_session_file(src, &cwd.to_string_lossy(), &state.session_dir).await;
+        crate::session::import_session_file(&src, &cwd.to_string_lossy(), &state.session_dir).await;
     let new_session = match result {
         Ok(session) => session,
         Err(error) => {
@@ -266,8 +268,13 @@ pub(super) async fn import_session(
             return;
         }
     };
-    if let Err(error) =
-        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    if let Err(error) = crate::session::set_active_session_with_identity(
+        harness,
+        new_session,
+        Some(tool_context),
+        state.publish_process_identity,
+    )
+    .await
     {
         state.set_status(RunStatus::Idle);
         add_error_message(
@@ -342,8 +349,13 @@ pub(super) async fn fork_session(
             return;
         }
     };
-    if let Err(error) =
-        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    if let Err(error) = crate::session::set_active_session_with_identity(
+        harness,
+        new_session,
+        Some(tool_context),
+        state.publish_process_identity,
+    )
+    .await
     {
         state.set_status(RunStatus::Idle);
         add_error_message(
@@ -374,7 +386,7 @@ pub(super) async fn fork_session(
 /// `/new` (alias `/clear`): begin a fresh session.
 ///
 /// Creates a new JSONL session file, swaps it onto the harness through the
-/// shared [`crate::session::set_active_session`] funnel (so plugin channels
+/// shared [`crate::session::set_active_session_with_identity`] funnel (so plugin channels
 /// follow the swap), rebuilds the transcript with the session's REAL capability
 /// snapshot, and drops every per-session counter in the footer.
 ///
@@ -458,8 +470,13 @@ pub(super) async fn start_new_session(
     // Route through the funnel so the plugin channels follow the swap; a bare
     // `set_session` would leave every plugin naming the session it was serving
     // before this call.
-    if let Err(error) =
-        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    if let Err(error) = crate::session::set_active_session_with_identity(
+        harness,
+        new_session,
+        Some(tool_context),
+        state.publish_process_identity,
+    )
+    .await
     {
         add_error_message(
             &state.notice_container(),
@@ -529,7 +546,6 @@ pub(super) async fn render_session_history(
         show_images,
         hide_thinking,
     );
-    restore_history_panels(&tree, chat).await;
     if let Some(footer) = footer {
         if let Ok(name) = tree.get_name().await {
             footer.set_session_name(name.as_deref());
@@ -589,7 +605,9 @@ pub(super) fn render_history_entries(
                     }
                 }
                 AgentMessage::ToolResult(result) => {
-                    // Current panels are independent of the visible history page.
+                    // Successful plan/todo tools are restored from their
+                    // custom entries at the original transcript position.
+                    // Errors still use ordinary completed tool panels.
                     if matches!(
                         result.tool_name.as_str(),
                         "plan_mode_start" | "plan_mode_complete" | "todo"
@@ -648,22 +666,46 @@ pub(super) fn render_history_entries(
                 add_note_message(chat, &format!("Branch summary: {}", summary.summary));
             }
             Entry::Custom(custom) => {
-                if matches!(
-                    custom.custom_type.as_str(),
-                    "plan-mode" | "todo" | "todo-state"
-                ) {
+                if custom.custom_type == "plan-mode" {
+                    let mut details = custom.data.unwrap_or(serde_json::Value::Null);
+                    if let Some(fields) = details.as_object_mut() {
+                        fields.insert("kind".into(), serde_json::json!("plan"));
+                    }
+                    crate::transcript_view::update_plan_panel(
+                        chat,
+                        None,
+                        &serde_json::json!({"details": details}),
+                    );
                     continue;
                 }
-                let rendered = extension_session.as_ref().and_then(|session| {
-                    extension_entry_component(session, &custom.custom_type, custom.data.clone())
-                });
-                if let Some(component) = rendered {
-                    chat.add_child(component);
-                    chat.add_child(Arc::new(Spacer::new(1)));
-                } else if let Some(text) =
-                    custom_entry_display_text(&custom.custom_type, custom.data.as_ref())
-                {
-                    add_note_message(chat, &text);
+                if matches!(custom.custom_type.as_str(), "todo" | "todo-state") {
+                    let details = custom.data.unwrap_or(serde_json::Value::Null);
+                    crate::transcript_view::update_todo_list(
+                        chat,
+                        None,
+                        &serde_json::json!({"details": details}),
+                    );
+                    continue;
+                }
+                let rendered = extension_session
+                    .as_ref()
+                    .map(|session| {
+                        extension_entry_component(session, &custom.custom_type, custom.data.clone())
+                    })
+                    .unwrap_or(EntryRenderOutcome::Unhandled);
+                match rendered {
+                    EntryRenderOutcome::Hidden => {}
+                    EntryRenderOutcome::Rendered(component) => {
+                        chat.add_child(component);
+                        chat.add_child(Arc::new(Spacer::new(1)));
+                    }
+                    EntryRenderOutcome::Unhandled => {
+                        if let Some(text) =
+                            custom_entry_display_text(&custom.custom_type, custom.data.as_ref())
+                        {
+                            add_note_message(chat, &text);
+                        }
+                    }
                 }
             }
             Entry::ModelChange(change) => {
@@ -684,51 +726,6 @@ pub(super) fn render_history_entries(
                     &format!("Active tools: {}", change.active_tool_names.join(", ")),
                 );
             }
-        }
-    }
-}
-
-/// Current panels are restored with storage-side custom-type filters and limits.
-pub(super) async fn restore_history_panels(
-    tree: &Arc<dyn rpi_harness::session::types::SessionTree>,
-    chat: &Arc<Container>,
-) {
-    // Read at most one entry per supported persisted kind, then replay in
-    // sequence order: legacy todo-state must not overwrite a newer todo entry.
-    let mut latest = Vec::new();
-    for kind in ["plan-mode", "todo", "todo-state"] {
-        let Ok(entries) = tree
-            .find_entries_on_branch(
-                &EntryQuery {
-                    custom_type: Some(kind.into()),
-                    order: Some(EntryOrder::NewestFirst),
-                    limit: Some(1),
-                    ..Default::default()
-                },
-                &BranchBounds::default(),
-            )
-            .await
-        else {
-            continue;
-        };
-        latest.extend(entries);
-    }
-    latest.sort_by_key(Entry::seq);
-    for entry in latest {
-        let Entry::Custom(custom) = entry else {
-            continue;
-        };
-        let mut details = custom.data.unwrap_or(serde_json::Value::Null);
-        if custom.custom_type == "plan-mode" {
-            if let Some(fields) = details.as_object_mut() {
-                fields.insert("kind".into(), serde_json::json!("plan"));
-            }
-            crate::transcript_view::update_plan_panel(
-                chat,
-                &serde_json::json!({"details":details}),
-            );
-        } else {
-            crate::transcript_view::update_todo_list(chat, &serde_json::json!({"details":details}));
         }
     }
 }
@@ -890,21 +887,38 @@ pub(super) fn extension_usage_text(
         .map(ToOwned::to_owned)
 }
 
+/// Entry visibility is distinct from declining a renderer: hidden entries must
+/// not fall back to the host's raw text or leave a transcript spacer behind.
+pub(super) enum EntryRenderOutcome {
+    Unhandled,
+    Hidden,
+    Rendered(Arc<dyn rpi_tui::Component>),
+}
+
 pub(super) fn extension_entry_component(
     session: &crate::session::ExtensionSessionCell,
     custom_type: &str,
     data: Option<serde_json::Value>,
-) -> Option<Arc<dyn rpi_tui::Component>> {
+) -> EntryRenderOutcome {
     let payload = serde_json::json!({
         "customType": custom_type,
         "data": data,
     });
-    let value = invoke_extension_renderer(
+    let Some(value) = invoke_extension_renderer(
         session,
         rpi_extensions::RegisteredRendererKind::Entry,
         &payload,
-    )?;
+    ) else {
+        return EntryRenderOutcome::Unhandled;
+    };
+    // Only the literal boolean false opts in. It takes precedence over text
+    // and lines; missing, true or malformed display preserves legacy behavior.
+    if value.get("display").and_then(serde_json::Value::as_bool) == Some(false) {
+        return EntryRenderOutcome::Hidden;
+    }
     extension_text_component(&value)
+        .map(EntryRenderOutcome::Rendered)
+        .unwrap_or(EntryRenderOutcome::Unhandled)
 }
 
 /// Project an assistant message's content into the provider-free

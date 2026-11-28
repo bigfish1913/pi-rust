@@ -201,6 +201,7 @@ impl GcSessionLock {
         let lock_path = PathBuf::from(format!("{}.lock", canonical.display()));
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(&lock_path)
             .map_err(|e| format!("open session lock {}: {e}", lock_path.display()))?;

@@ -147,11 +147,11 @@
     "age": 8,
     "ageLabel": "v0.1.4",
     "description": "终端运行统计扩展，显示轮次、步骤、TPS、首 token 延迟、TPM、错误与费用；支持 /stats 和 F8 开关。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 103,
     "downloadsLabel": "103",
     "install": "rpi install rpi-run-stats",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-run-stats"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-run-stats"
   },
   {
     "name": "rpi-mcp-adapter",
@@ -161,11 +161,11 @@
     "age": 9,
     "ageLabel": "v0.2.4",
     "description": "MCP 扩展，支持持久化 stdio 与 Streamable HTTP 连接，通过 mcp_list、mcp_call 发现并调用工具。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 103,
     "downloadsLabel": "103",
     "install": "rpi install rpi-mcp-adapter",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-mcp-adapter"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-mcp-adapter"
   },
   {
     "name": "rpi-subagents",
@@ -175,11 +175,11 @@
     "age": 3,
     "ageLabel": "v0.1.9",
     "description": "生成带角色、轮次与超时限制的任务委派请求，交由宿主调度执行。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 108,
     "downloadsLabel": "108",
     "install": "rpi install rpi-subagents",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-subagents"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-subagents"
   },
   {
     "name": "rpi-orchestrator",
@@ -189,11 +189,11 @@
     "age": 3,
     "ageLabel": "v0.1.9",
     "description": "有边界的 DAG 子代理编排扩展。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 83,
     "downloadsLabel": "83",
     "install": "rpi install rpi-orchestrator",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-orchestrator"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-orchestrator"
   },
   {
     "name": "rpi-btw",
@@ -203,11 +203,11 @@
     "age": 7,
     "ageLabel": "v0.1.0",
     "description": "在不打断主对话的情况下，提出只读的旁支问题。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 33,
     "downloadsLabel": "33",
     "install": "rpi install rpi-btw --path packages/rpi-btw",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-btw"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-btw"
   },
   {
     "name": "rpi-lens",
@@ -217,11 +217,11 @@
     "age": 3,
     "ageLabel": "v0.1.9",
     "description": "边界清晰的本地代码诊断扩展，仅运行白名单检查并限制超时和输出。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 102,
     "downloadsLabel": "102",
     "install": "rpi install rpi-lens",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-lens"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-lens"
   },
   {
     "name": "rpi-todo",
@@ -231,11 +231,11 @@
     "age": 8,
     "ageLabel": "v0.2.4",
     "description": "会话任务列表，支持待办、进行中与完成状态；从当前分支恢复列表，并在终端展示进度。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 107,
     "downloadsLabel": "107",
     "install": "rpi install rpi-todo",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-todo"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-todo"
   },
   {
     "name": "rpi-goal",
@@ -245,11 +245,11 @@
     "age": 8,
     "ageLabel": "v0.1.11",
     "description": "持久化项目目标，支持 /goal、暂停与恢复、轮次及时间预算，并将目标注入会话上下文。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 95,
     "downloadsLabel": "95",
     "install": "rpi install rpi-goal",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-goal"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-goal"
   },
   {
     "name": "rpi-plan-mode",
@@ -259,11 +259,11 @@
     "age": 11,
     "ageLabel": "v0.1.6",
     "description": "会话计划模式，限制为只读探索后生成计划；支持 /plan、分支计划恢复与进度展示。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 89,
     "downloadsLabel": "89",
     "install": "rpi install rpi-plan-mode",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-plan-mode"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-plan-mode"
   },
   {
     "name": "rpi-codegraph",
@@ -273,11 +273,11 @@
     "age": 11,
     "ageLabel": "v0.1.7",
     "description": "有边界的本地源文件与 import 图谱工具，通过 codegraph serve 代理 MCP 查询到 SQLite 索引。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 105,
     "downloadsLabel": "105",
     "install": "rpi install rpi-codegraph",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-codegraph"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-codegraph"
   },
   {
     "name": "rpi-ask-user",
@@ -287,11 +287,11 @@
     "age": 11,
     "ageLabel": "v0.1.7",
     "description": "结构化提问工具，兼容 Pi 原生问题格式，支持单选、多选、自定义输入、超时和选择器数据。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 113,
     "downloadsLabel": "113",
     "install": "rpi install rpi-ask-user",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-ask-user"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-ask-user"
   },
   {
     "name": "rpi-permissions",
@@ -301,11 +301,11 @@
     "age": 11,
     "ageLabel": "v0.1.6",
     "description": "兼容原生权限策略的本地持久化工具，支持 Tool(pattern) 规则以及 check、grant、revoke、list。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 102,
     "downloadsLabel": "102",
     "install": "rpi install rpi-permissions",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-permissions"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-permissions"
   },
   {
     "name": "rpi-websearch",
@@ -315,11 +315,11 @@
     "age": 11,
     "ageLabel": "v0.1.6",
     "description": "无需密钥的网页搜索，结合 DuckDuckGo 与 Wikipedia，返回标题、链接、摘要和来源。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 104,
     "downloadsLabel": "104",
     "install": "rpi install rpi-websearch",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-websearch"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-websearch"
   },
   {
     "name": "rpi-webfetch",
@@ -329,11 +329,11 @@
     "age": 11,
     "ageLabel": "v0.1.6",
     "description": "读取公开 HTTP(S) 页面并返回有边界的文本，检查 DNS 私有地址并将失败作为工具结果返回。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 108,
     "downloadsLabel": "108",
     "install": "rpi install rpi-webfetch",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-webfetch"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-webfetch"
   },
   {
     "name": "rpi-im-message",
@@ -343,11 +343,11 @@
     "age": 11,
     "ageLabel": "v0.1.12",
     "description": "飞书/Lark 长连接消息扩展，支持持久收发、多个配置与后台消息服务。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 112,
     "downloadsLabel": "112",
     "install": "rpi install rpi-im-message",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-im-message"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-im-message"
   },
   {
     "name": "rpi-langfuse",
@@ -357,11 +357,11 @@
     "age": 8,
     "ageLabel": "v0.4.4",
     "description": "Langfuse 可观测性扩展，自动追踪模型、工具与会话事件，并提供评分和 Prompt 管理工具。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 100,
     "downloadsLabel": "100",
     "install": "rpi install rpi-langfuse",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-langfuse"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-langfuse"
   },
   {
     "name": "rpi-voice",
@@ -371,11 +371,11 @@
     "age": 11,
     "ageLabel": "v0.3.10",
     "description": "终端语音对话扩展，支持按键说话、离线语音识别、语音回复及宠物面板。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 106,
     "downloadsLabel": "106",
     "install": "rpi install rpi-voice",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-voice"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-voice"
   },
   {
     "name": "rpi-acp",
@@ -385,11 +385,11 @@
     "age": 1,
     "ageLabel": "v0.1.15",
     "description": "通过 ACP 将 rpi 接入 Zed 等编辑器，支持流式回复、持久化会话、恢复与取消。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 69,
     "downloadsLabel": "69",
     "install": "rpi install rpi-acp",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-acp"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-acp"
   },
   {
     "name": "rpi-permission-gate",
@@ -399,11 +399,11 @@
     "age": 9,
     "ageLabel": "v0.1.2",
     "description": "通过宿主 UI 对 bash、write、edit 等危险工具调用进行确认。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 72,
     "downloadsLabel": "72",
     "install": "rpi install rpi-permission-gate",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-permission-gate"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-permission-gate"
   },
   {
     "name": "rpi-ui-adapter",
@@ -413,11 +413,11 @@
     "age": 8,
     "ageLabel": "v0.1.1",
     "description": "为 rpi ACP Agent 提供 UI 适配，当前支持 Open WebUI。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 33,
     "downloadsLabel": "33",
-    "install": "rpi install rpi-ui-adapter --github pi-rust/rpi-package",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-ui-adapter"
+    "install": "rpi install rpi-ui-adapter --github pi-rust/rpi-extension",
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-ui-adapter"
   },
   {
     "name": "rpi-providers",
@@ -427,11 +427,11 @@
     "age": 2,
     "ageLabel": "v0.1.4",
     "description": "统一的 DeepSeek、OpenRouter、llama.cpp 与代理 Provider 扩展。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 50,
     "downloadsLabel": "50",
-    "install": "rpi install rpi-providers --github pi-rust/rpi-package",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-providers"
+    "install": "rpi install rpi-providers --github pi-rust/rpi-extension",
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers"
   },
   {
     "name": "rpi-web",
@@ -441,10 +441,10 @@
     "age": 1,
     "ageLabel": "v0.1.8",
     "description": "面向原生 rpi RPC 宿主的项目与聊天工作区。",
-    "author": "rpi-packages / crates.io",
+    "author": "rpi-extension / crates.io",
     "downloads": 78,
     "downloadsLabel": "78",
     "install": "rpi install rpi-web",
-    "repository": "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-web"
+    "repository": "https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-web"
   }
 ]

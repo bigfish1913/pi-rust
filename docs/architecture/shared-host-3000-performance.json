@@ -1,0 +1,801 @@
+{
+  "scope": "0.27.0 integrated shared Harness execution probe at 3000 agents; NOT the ordinary Host backend, production Host or mini",
+  "recordedAt": "2026-11-21T03:27:15.606731+00:00",
+  "worktree": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host",
+  "branch": "feat/shared-host",
+  "baseCommit": "59f985a998c9e2297b24d2675d720f43a9824d96",
+  "uncommittedSource": true,
+  "trackedPatchSha256": "196eec8516d8ed2a70b0872d2e39b33f6c2127be17d423fa699846eafc1d9915",
+  "binarySha256": "f1a121c546d9843a137922e53bf5145ebdfd76f60c501010ae5d12b3b2c6f3ae",
+  "profile": "release; thin LTO; 16 codegen units",
+  "environment": "macOS-27.0-arm64-arm-64bit",
+  "resourceLimits": {
+    "nofile": [
+      16384,
+      16384
+    ],
+    "nproc": [
+      2666,
+      4000
+    ],
+    "kernMaxfilesperproc": 61440,
+    "kernIpcSomaxconn": 128
+  },
+  "logs": "/tmp/rpi-host-3000-8RE8Xs",
+  "rounds": [
+    {
+      "round": 1,
+      "artifacts": "/tmp/rpi-host-3000-8RE8Xs/tool-3000",
+      "configuration": {
+        "binary": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/release/examples/shared_host_probe",
+        "output_root": "/tmp/rpi-host-3000-8RE8Xs/tool-3000",
+        "agents": 3000,
+        "mode": "tool",
+        "tool_kind": "async",
+        "context_bytes": 1024,
+        "history_entries": 0,
+        "workers": 4,
+        "max_blocking_threads": 32,
+        "stagger_ms": 0,
+        "hold_seconds": 2,
+        "timeout": 300,
+        "cgroup": null
+      },
+      "fixtureServer": {
+        "requests": 6000,
+        "firstRequests": 3000,
+        "finalResponses": 3000,
+        "toolResults": 3000,
+        "peakInFlight": 3000,
+        "errors": [],
+        "protocol": "HTTP/1.1, loopback, no TLS, Connection: close",
+        "measurementBoundary": "fixture server excluded; separate controller process"
+      },
+      "phases": [
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 100,
+          "setupMs": 1225,
+          "sessionCreateMs": 1215,
+          "harnessCreateMs": 9,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 200,
+          "setupMs": 2505,
+          "sessionCreateMs": 2490,
+          "harnessCreateMs": 14,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 300,
+          "setupMs": 3851,
+          "sessionCreateMs": 3831,
+          "harnessCreateMs": 19,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 400,
+          "setupMs": 5275,
+          "sessionCreateMs": 5251,
+          "harnessCreateMs": 23,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 500,
+          "setupMs": 6724,
+          "sessionCreateMs": 6695,
+          "harnessCreateMs": 28,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 600,
+          "setupMs": 8251,
+          "sessionCreateMs": 8217,
+          "harnessCreateMs": 33,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 700,
+          "setupMs": 9825,
+          "sessionCreateMs": 9786,
+          "harnessCreateMs": 38,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 800,
+          "setupMs": 11476,
+          "sessionCreateMs": 11432,
+          "harnessCreateMs": 42,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 900,
+          "setupMs": 13165,
+          "sessionCreateMs": 13116,
+          "harnessCreateMs": 47,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1000,
+          "setupMs": 14885,
+          "sessionCreateMs": 14832,
+          "harnessCreateMs": 52,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1100,
+          "setupMs": 16732,
+          "sessionCreateMs": 16673,
+          "harnessCreateMs": 57,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1200,
+          "setupMs": 18613,
+          "sessionCreateMs": 18549,
+          "harnessCreateMs": 62,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1300,
+          "setupMs": 20515,
+          "sessionCreateMs": 20446,
+          "harnessCreateMs": 67,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1400,
+          "setupMs": 22566,
+          "sessionCreateMs": 22491,
+          "harnessCreateMs": 73,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1500,
+          "setupMs": 24629,
+          "sessionCreateMs": 24549,
+          "harnessCreateMs": 78,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1600,
+          "setupMs": 26702,
+          "sessionCreateMs": 26617,
+          "harnessCreateMs": 83,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1700,
+          "setupMs": 28918,
+          "sessionCreateMs": 28828,
+          "harnessCreateMs": 88,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1800,
+          "setupMs": 31164,
+          "sessionCreateMs": 31068,
+          "harnessCreateMs": 93,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1900,
+          "setupMs": 33459,
+          "sessionCreateMs": 33358,
+          "harnessCreateMs": 98,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2000,
+          "setupMs": 35901,
+          "sessionCreateMs": 35795,
+          "harnessCreateMs": 103,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2100,
+          "setupMs": 38310,
+          "sessionCreateMs": 38199,
+          "harnessCreateMs": 109,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2200,
+          "setupMs": 40779,
+          "sessionCreateMs": 40662,
+          "harnessCreateMs": 114,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2300,
+          "setupMs": 43438,
+          "sessionCreateMs": 43316,
+          "harnessCreateMs": 119,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2400,
+          "setupMs": 46071,
+          "sessionCreateMs": 45943,
+          "harnessCreateMs": 125,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2500,
+          "setupMs": 48885,
+          "sessionCreateMs": 48752,
+          "harnessCreateMs": 131,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2600,
+          "setupMs": 51668,
+          "sessionCreateMs": 51529,
+          "harnessCreateMs": 136,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2700,
+          "setupMs": 54628,
+          "sessionCreateMs": 54483,
+          "harnessCreateMs": 142,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2800,
+          "setupMs": 57558,
+          "sessionCreateMs": 57407,
+          "harnessCreateMs": 148,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2900,
+          "setupMs": 60640,
+          "sessionCreateMs": 60484,
+          "harnessCreateMs": 153,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 3000,
+          "setupMs": 63596,
+          "sessionCreateMs": 63434,
+          "harnessCreateMs": 159,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "ready",
+          "agents": 3000,
+          "mode": "tool",
+          "toolKind": "async",
+          "contextBytes": 1024,
+          "historyEntries": 0,
+          "workers": 4,
+          "maxBlockingThreads": 32,
+          "staggerMs": 0,
+          "setupMs": 63596,
+          "sessions": "independent-jsonl",
+          "sessionCreateMs": 63434,
+          "harnessCreateMs": 159,
+          "historyAppendMs": 0,
+          "extensions": false,
+          "tls": false
+        },
+        {
+          "phase": "requests_held",
+          "requests": 3000,
+          "live": 3000
+        },
+        {
+          "phase": "tools_held",
+          "entered": 3000,
+          "live": 3000
+        },
+        {
+          "phase": "settled",
+          "agents": 3000,
+          "completed": 3000,
+          "toolEntered": 3000,
+          "toolPeak": 3000,
+          "runMs": 76741
+        },
+        {
+          "phase": "closed",
+          "agents": 3000,
+          "runMs": 78915
+        },
+        {
+          "phase": "complete",
+          "success": true
+        }
+      ],
+      "peaks": {
+        "sampledPeakHostRssBytes": 1077936128,
+        "sampledPeakGroupRssSumBytes": 1077936128,
+        "sampledPeakGroupProcesses": 1,
+        "sampledPeakHostFootprintBytes": 693896224,
+        "sampledPeakHostThreads": 38,
+        "sampledPeakHostFds": 9009
+      },
+      "heldSamples": [
+        {
+          "hostRssBytes": 37076992,
+          "processGroupRssSumBytes": 37076992,
+          "processGroupProcesses": 1,
+          "hostThreads": 8,
+          "hostFootprintBytes": 32571824,
+          "hostFds": 3009,
+          "phase": "ready",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 0,
+          "fixtureRequests": 0
+        },
+        {
+          "hostRssBytes": 694992896,
+          "processGroupRssSumBytes": 694992896,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 577487808,
+          "hostFds": 9009,
+          "phase": "requests_held",
+          "fixtureInFlight": 3000,
+          "fixtureFirstRequests": 3000,
+          "fixtureRequests": 3000
+        },
+        {
+          "hostRssBytes": 883572736,
+          "processGroupRssSumBytes": 883572736,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 536429648,
+          "hostFds": 6009,
+          "phase": "tools_held",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 3000,
+          "fixtureRequests": 3000
+        },
+        {
+          "hostRssBytes": 1077936128,
+          "processGroupRssSumBytes": 1077936128,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 201639136,
+          "hostFds": 6009,
+          "phase": "settled",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 3000,
+          "fixtureRequests": 6000
+        },
+        {
+          "hostRssBytes": 1077936128,
+          "processGroupRssSumBytes": 1077936128,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 201639136,
+          "hostFds": 9,
+          "phase": "closed",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 3000,
+          "fixtureRequests": 6000
+        }
+      ],
+      "probeStderrBytes": 0
+    },
+    {
+      "round": 2,
+      "artifacts": "/tmp/rpi-host-3000-8RE8Xs/tool-3000-2",
+      "configuration": {
+        "binary": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/release/examples/shared_host_probe",
+        "output_root": "/tmp/rpi-host-3000-8RE8Xs/tool-3000-2",
+        "agents": 3000,
+        "mode": "tool",
+        "tool_kind": "async",
+        "context_bytes": 1024,
+        "history_entries": 0,
+        "workers": 4,
+        "max_blocking_threads": 32,
+        "stagger_ms": 0,
+        "hold_seconds": 2,
+        "timeout": 300,
+        "cgroup": null
+      },
+      "fixtureServer": {
+        "requests": 6000,
+        "firstRequests": 3000,
+        "finalResponses": 3000,
+        "toolResults": 3000,
+        "peakInFlight": 3000,
+        "errors": [],
+        "protocol": "HTTP/1.1, loopback, no TLS, Connection: close",
+        "measurementBoundary": "fixture server excluded; separate controller process"
+      },
+      "phases": [
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 100,
+          "setupMs": 1306,
+          "sessionCreateMs": 1301,
+          "harnessCreateMs": 5,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 200,
+          "setupMs": 2709,
+          "sessionCreateMs": 2697,
+          "harnessCreateMs": 11,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 300,
+          "setupMs": 4185,
+          "sessionCreateMs": 4167,
+          "harnessCreateMs": 17,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 400,
+          "setupMs": 5613,
+          "sessionCreateMs": 5589,
+          "harnessCreateMs": 23,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 500,
+          "setupMs": 7190,
+          "sessionCreateMs": 7161,
+          "harnessCreateMs": 29,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 600,
+          "setupMs": 8813,
+          "sessionCreateMs": 8777,
+          "harnessCreateMs": 35,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 700,
+          "setupMs": 10516,
+          "sessionCreateMs": 10474,
+          "harnessCreateMs": 41,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 800,
+          "setupMs": 12284,
+          "sessionCreateMs": 12235,
+          "harnessCreateMs": 48,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 900,
+          "setupMs": 14129,
+          "sessionCreateMs": 14074,
+          "harnessCreateMs": 54,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1000,
+          "setupMs": 15987,
+          "sessionCreateMs": 15925,
+          "harnessCreateMs": 61,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1100,
+          "setupMs": 17884,
+          "sessionCreateMs": 17815,
+          "harnessCreateMs": 68,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1200,
+          "setupMs": 19888,
+          "sessionCreateMs": 19812,
+          "harnessCreateMs": 75,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1300,
+          "setupMs": 21882,
+          "sessionCreateMs": 21799,
+          "harnessCreateMs": 81,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1400,
+          "setupMs": 23986,
+          "sessionCreateMs": 23896,
+          "harnessCreateMs": 88,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1500,
+          "setupMs": 26101,
+          "sessionCreateMs": 25999,
+          "harnessCreateMs": 100,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1600,
+          "setupMs": 28280,
+          "sessionCreateMs": 28171,
+          "harnessCreateMs": 106,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1700,
+          "setupMs": 30614,
+          "sessionCreateMs": 30497,
+          "harnessCreateMs": 114,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1800,
+          "setupMs": 33039,
+          "sessionCreateMs": 32915,
+          "harnessCreateMs": 121,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 1900,
+          "setupMs": 35429,
+          "sessionCreateMs": 35298,
+          "harnessCreateMs": 129,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2000,
+          "setupMs": 37948,
+          "sessionCreateMs": 37809,
+          "harnessCreateMs": 136,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2100,
+          "setupMs": 40462,
+          "sessionCreateMs": 40315,
+          "harnessCreateMs": 144,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2200,
+          "setupMs": 43187,
+          "sessionCreateMs": 43032,
+          "harnessCreateMs": 152,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2300,
+          "setupMs": 46003,
+          "sessionCreateMs": 45839,
+          "harnessCreateMs": 160,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2400,
+          "setupMs": 49086,
+          "sessionCreateMs": 48912,
+          "harnessCreateMs": 170,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2500,
+          "setupMs": 52930,
+          "sessionCreateMs": 52746,
+          "harnessCreateMs": 181,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2600,
+          "setupMs": 56319,
+          "sessionCreateMs": 56125,
+          "harnessCreateMs": 190,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2700,
+          "setupMs": 59090,
+          "sessionCreateMs": 58890,
+          "harnessCreateMs": 196,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2800,
+          "setupMs": 62005,
+          "sessionCreateMs": 61799,
+          "harnessCreateMs": 202,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 2900,
+          "setupMs": 64887,
+          "sessionCreateMs": 64675,
+          "harnessCreateMs": 208,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "setup_progress",
+          "agentsCreated": 3000,
+          "setupMs": 67862,
+          "sessionCreateMs": 67643,
+          "harnessCreateMs": 215,
+          "historyAppendMs": 0
+        },
+        {
+          "phase": "ready",
+          "agents": 3000,
+          "mode": "tool",
+          "toolKind": "async",
+          "contextBytes": 1024,
+          "historyEntries": 0,
+          "workers": 4,
+          "maxBlockingThreads": 32,
+          "staggerMs": 0,
+          "setupMs": 67862,
+          "sessions": "independent-jsonl",
+          "sessionCreateMs": 67643,
+          "harnessCreateMs": 215,
+          "historyAppendMs": 0,
+          "extensions": false,
+          "tls": false
+        },
+        {
+          "phase": "requests_held",
+          "requests": 3000,
+          "live": 3000
+        },
+        {
+          "phase": "tools_held",
+          "entered": 3000,
+          "live": 3000
+        },
+        {
+          "phase": "settled",
+          "agents": 3000,
+          "completed": 3000,
+          "toolEntered": 3000,
+          "toolPeak": 3000,
+          "runMs": 85679
+        },
+        {
+          "phase": "closed",
+          "agents": 3000,
+          "runMs": 87849
+        },
+        {
+          "phase": "complete",
+          "success": true
+        }
+      ],
+      "peaks": {
+        "sampledPeakHostRssBytes": 1043496960,
+        "sampledPeakGroupRssSumBytes": 1043496960,
+        "sampledPeakGroupProcesses": 1,
+        "sampledPeakHostFootprintBytes": 689128480,
+        "sampledPeakHostThreads": 38,
+        "sampledPeakHostFds": 9009
+      },
+      "heldSamples": [
+        {
+          "hostRssBytes": 35749888,
+          "processGroupRssSumBytes": 35749888,
+          "processGroupProcesses": 1,
+          "hostThreads": 8,
+          "hostFootprintBytes": 32539056,
+          "hostFds": 3009,
+          "phase": "ready",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 0,
+          "fixtureRequests": 0
+        },
+        {
+          "hostRssBytes": 711344128,
+          "processGroupRssSumBytes": 711344128,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 586073048,
+          "hostFds": 9009,
+          "phase": "requests_held",
+          "fixtureInFlight": 3000,
+          "fixtureFirstRequests": 3000,
+          "fixtureRequests": 3000
+        },
+        {
+          "hostRssBytes": 877871104,
+          "processGroupRssSumBytes": 877871104,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 536511568,
+          "hostFds": 6009,
+          "phase": "tools_held",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 3000,
+          "fixtureRequests": 3000
+        },
+        {
+          "hostRssBytes": 1043496960,
+          "processGroupRssSumBytes": 1043496960,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 197264560,
+          "hostFds": 6009,
+          "phase": "settled",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 3000,
+          "fixtureRequests": 6000
+        },
+        {
+          "hostRssBytes": 1043496960,
+          "processGroupRssSumBytes": 1043496960,
+          "processGroupProcesses": 1,
+          "hostThreads": 38,
+          "hostFootprintBytes": 197264560,
+          "hostFds": 9,
+          "phase": "closed",
+          "fixtureInFlight": 0,
+          "fixtureFirstRequests": 3000,
+          "fixtureRequests": 6000
+        }
+      ],
+      "probeStderrBytes": 0
+    }
+  ]
+}

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rpi_tui::theme::{global_theme_manager, Theme, ThemeManager, ThemePreset};
+use rpi_tui::theme::{Theme, ThemeManager, ThemePreset};
 use rpi_tui::theme_json::ThemeJson;
 
 /// A resolved theme spec: built-in preset or theme file path.
@@ -94,7 +94,7 @@ impl LoadedTheme {
 /// and the session's theme manager (what `/theme` swaps), mirroring the
 /// preset path's dual application.
 pub fn apply_loaded(loaded: &LoadedTheme, session_manager: &ThemeManager) {
-    global_theme_manager().set(loaded.theme.clone());
+    rpi_tui::theme::set_theme(loaded.theme.clone());
     session_manager.set(loaded.theme.clone());
 }
 
@@ -358,7 +358,7 @@ pub fn apply_and_persist(
         ThemeSpec::File(path) => {
             // Surface a load error before touching any state; the label is
             // the file stem (the discovery name), not the JSON `name` field.
-            LoadedTheme::load(path).map_err(|message| message)?;
+            LoadedTheme::load(path)?;
             path.file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or("theme")
@@ -774,7 +774,7 @@ mod tests {
             rpi_tui::theme::Color::Rgb(255, 0, 0)
         );
         assert_eq!(
-            global_theme_manager().get().colors.accent,
+            rpi_tui::theme::theme().colors.accent,
             rpi_tui::theme::Color::Rgb(255, 0, 0)
         );
 

@@ -113,6 +113,7 @@ pub struct ResolvedSelection {
     pub extensions: Vec<PathBuf>,
     pub instructions: Vec<(PathBuf, String, String)>,
     pub transition: Option<ResourceTransition>,
+    pub(crate) package_commands: crate::agent_package::Commands,
     validated_skills: Option<ValidatedSkills>,
 }
 
@@ -163,7 +164,7 @@ impl ResourceTransition {
     }
 }
 
-fn contained(path: &Path, root: &Path) -> Result<PathBuf, String> {
+pub(crate) fn contained(path: &Path, root: &Path) -> Result<PathBuf, String> {
     let path = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
     if !path.starts_with(root) || path == root {
         return Err(format!(
@@ -193,7 +194,7 @@ fn validate_package_tree(
     Ok(())
 }
 
-fn read_limited(path: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn read_limited(path: &Path) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
@@ -219,7 +220,7 @@ fn fingerprint(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn file(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn file(path: &Path) -> Result<PathBuf, String> {
     if !path.is_file() {
         return Err(format!("missing resource file: {}", path.display()));
     }
@@ -234,7 +235,7 @@ fn unique_paths(paths: &[PathBuf]) -> Result<(), String> {
     }
     Ok(())
 }
-fn relative(path: &Path) -> Result<(), String> {
+pub(crate) fn relative(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty()
         || path
             .components()
@@ -248,8 +249,27 @@ fn relative(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_tool_names(names: &[String]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for name in names {
+        if name.is_empty() || !seen.insert(name) {
+            return Err("empty or duplicate tool name".into());
+        }
+    }
+    Ok(())
+}
+
 impl ResolvedSelection {
     pub fn load(args: &Args, cwd: &Path, trusted: bool) -> Result<Option<Self>, String> {
+        Self::load_for(&crate::config::AgentHome::process(), args, cwd, trusted)
+    }
+
+    pub fn load_for(
+        home: &crate::config::AgentHome,
+        args: &Args,
+        cwd: &Path,
+        trusted: bool,
+    ) -> Result<Option<Self>, String> {
         let Some(config) = args
             .resource_transition
             .as_ref()
@@ -257,6 +277,9 @@ impl ResolvedSelection {
         else {
             return Ok(None);
         };
+        if let Some(error) = args.fork_cut_errors().first() {
+            return Err((*error).to_owned());
+        }
         if (args.resource_config.is_some() && args.resource_transition.is_some())
             || (args.resource_transition.is_some()
                 && (args.name.is_some()
@@ -304,19 +327,15 @@ impl ResolvedSelection {
             return Err("unsupported resource config version".into());
         }
         if let ToolSelection::Only { names } = &selection.tools {
-            let mut seen = HashSet::new();
-            for name in names {
-                if name.is_empty() || !seen.insert(name) {
-                    return Err("empty or duplicate tool name".into());
-                }
-            }
+            validate_tool_names(names)?;
         }
         let mut skills = Vec::new();
         let mut extensions = Vec::new();
         let mut instructions = Vec::new();
         let mut resolved_package = None;
+        let mut package_commands = crate::agent_package::Commands::default();
         if let Some(main) = &selection.main_package {
-            let native_root = main.scope.root(cwd)?;
+            let native_root = main.scope.root(home, cwd)?;
             let package = crate::packages::selected_package_at(&native_root, &main.name)?;
             let packages_root =
                 std::fs::canonicalize(native_root.join("packages")).map_err(|e| e.to_string())?;
@@ -325,6 +344,11 @@ impl ResolvedSelection {
             if !root.is_dir() || !root.starts_with(&packages_root) || root == packages_root {
                 return Err("package root escapes .rpi/packages".into());
             }
+            package_commands = crate::agent_package::Commands::load(
+                &root,
+                &main.name,
+                (!package.version.is_empty()).then_some(package.version.as_str()),
+            )?;
             let skill_dir = root.join("skills");
             if skill_dir.exists() {
                 let skill_dir = contained(&skill_dir, &root)?;
@@ -401,8 +425,54 @@ impl ResolvedSelection {
             extensions,
             instructions,
             transition,
+            package_commands,
             validated_skills: None,
         }))
+    }
+
+    /// Host-only instruction subset of v1. No Args, ambient package scope,
+    /// discovery, skills or executable code. Text is frozen from bounded reads.
+    pub(crate) fn host_instructions(selection: ResourceSelection) -> Result<Self, String> {
+        if selection.version != 1
+            || selection.main_package.is_some()
+            || !selection.skills.is_empty()
+            || !selection.extensions.is_empty()
+            || selection.instructions.len() > 32
+            || matches!(selection.tools, ToolSelection::Default {})
+        {
+            return Err("unsupported Host instruction resource selection".into());
+        }
+        let mut instructions = Vec::new();
+        let mut total = 0usize;
+        for path in &selection.instructions {
+            if !path.is_absolute() {
+                return Err("Host instruction path must be absolute".into());
+            }
+            let path = file(path)?;
+            let text = String::from_utf8(read_limited(&path)?)
+                .map_err(|_| "Host instruction must be UTF-8")?;
+            total = total
+                .checked_add(text.len())
+                .ok_or("instruction size overflow")?;
+            if total > MAX_SELECTION_BYTES {
+                return Err("Host instructions exceed 64 KiB".into());
+            }
+            instructions.push((path, "explicit".into(), text));
+        }
+        unique_paths(&instructions.iter().map(|i| i.0.clone()).collect::<Vec<_>>())?;
+        Ok(Self {
+            selection,
+            package: None,
+            skills: Vec::new(),
+            extensions: Vec::new(),
+            instructions,
+            transition: None,
+            package_commands: Default::default(),
+            validated_skills: Some(ValidatedSkills {
+                skills: Vec::new(),
+                inventory: json!([]),
+            }),
+        })
     }
 
     /// Resolve once, before code or native writers. Hash the very bytes parsed
@@ -479,23 +549,46 @@ impl ResolvedSelection {
 
 // CLI attachment keyed by allocation, not durable session ID: concurrent hosts reopening
 // the same transcript must not inherit each other's startup observations.
-type Attachment = (Weak<dyn SessionStorage>, Value);
+type Attachment = (
+    Weak<dyn SessionStorage>,
+    Value,
+    crate::agent_package::Commands,
+);
 fn states() -> &'static Mutex<Vec<Attachment>> {
     static STATES: OnceLock<Mutex<Vec<Attachment>>> = OnceLock::new();
     STATES.get_or_init(|| Mutex::new(Vec::new()))
 }
-pub(crate) fn attach(harness: &AgentHarness, state: Value) {
+pub(crate) fn attach(
+    harness: &AgentHarness,
+    state: Value,
+    commands: crate::agent_package::Commands,
+) {
     let mut states = states().lock().unwrap();
-    states.retain(|(storage, _)| storage.strong_count() > 0);
+    states.retain(|(storage, _, _)| storage.strong_count() > 0);
     states.push((
         std::sync::Arc::downgrade(&harness.session().storage()),
         state,
+        commands,
     ));
+}
+
+pub(crate) fn package_commands(harness: &AgentHarness) -> crate::agent_package::Commands {
+    let storage = harness.session().storage();
+    states()
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|(weak, _, commands)| {
+            weak.upgrade()
+                .filter(|value| std::sync::Arc::ptr_eq(value, &storage))
+                .map(|_| commands.clone())
+        })
+        .unwrap_or_default()
 }
 
 pub async fn get_resource_state(harness: &AgentHarness) -> Result<Value, String> {
     let storage = harness.session().storage();
-    let state = states().lock().unwrap().iter().find_map(|(s, state)| {
+    let state = states().lock().unwrap().iter().find_map(|(s, state, _)| {
         s.upgrade()
             .filter(|s| std::sync::Arc::ptr_eq(s, &storage))
             .map(|_| state.clone())
@@ -588,6 +681,9 @@ pub(crate) fn validate_session_binding(
                 .collect::<Result<Vec<_>, String>>()?;
             if old.pointer("/inventory/extensions") != Some(&json!(extensions)) {
                 return Err("session resource artifact inventory changed; restore original resources or use a new session".into());
+            }
+            if old.pointer("/inventory/packageCommandsSha256").and_then(Value::as_str) != selected.package_commands.digest() {
+                return Err("session package command inventory changed; restore original resources or use a new session".into());
             }
             if old.pointer("/inventory/skills") != Some(&selected.validated_skills()?.inventory) {
                 return Err("session resource Skill inventory changed; restore original resources or use a new session".into());
@@ -791,7 +887,6 @@ pub(crate) async fn bind_inventory(
     harness: &AgentHarness,
     selected: &ResolvedSelection,
 ) -> Result<(), String> {
-    use rpi_harness::session::{SessionValueWriter, SessionValues};
     let resources = harness.get_resources().await.map_err(|e| e.to_string())?;
     let mut skills = Vec::new();
     for skill in resources.skills.unwrap_or_default() {
@@ -813,8 +908,46 @@ pub(crate) async fn bind_inventory(
         .iter()
         .map(|t| json!(t.tool.schema()))
         .collect();
-    let inventory = json!({"skills":skills, "extensions":extensions, "toolSchemasSha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&tools).map_err(|e| e.to_string())?))});
-    let session = harness.session();
+    let mut inventory = json!({"skills":skills, "extensions":extensions, "toolSchemasSha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&tools).map_err(|e| e.to_string())?))});
+    if let Some(digest) = selected.package_commands.digest() {
+        inventory["packageCommandsSha256"] = json!(digest);
+    }
+    bind_inventory_to_session(harness.session(), selected, inventory).await
+}
+
+/// Pure inventory validation, including tool schemas, before a Host claims its
+/// writer or repairs a torn journal. No new binding is written during preflight.
+pub(crate) fn validate_exact_inventory(
+    values: &rpi_harness::session::SessionValues,
+    selected: &ResolvedSelection,
+    inventory: &Value,
+) -> Result<(), String> {
+    validate_session_binding(values, Some(selected))?;
+    let candidate = json!({"declaration":declaration(selected),"inventory":inventory,"revision":1});
+    if serde_json::to_vec(&candidate)
+        .map_err(|e| e.to_string())?
+        .len()
+        > MAX_STATE_BYTES
+    {
+        return Err("resource binding exceeds 256 KiB".into());
+    }
+    if values
+        .get(SESSION_KEY)
+        .is_some_and(|old| old.get("inventory") != Some(inventory))
+    {
+        return Err("session resource inventory changed".into());
+    }
+    Ok(())
+}
+
+/// Shared atomic native-value append, also usable before Harness creation. The
+/// caller owns writer custody and must establish its required sync barrier.
+pub(crate) async fn bind_inventory_to_session(
+    session: &rpi_harness::session::Session,
+    selected: &ResolvedSelection,
+    inventory: Value,
+) -> Result<(), String> {
+    use rpi_harness::session::{SessionValueWriter, SessionValues};
     let values = SessionValues::load(session)
         .await
         .map_err(|e| e.to_string())?;
@@ -956,6 +1089,7 @@ mod tests {
             extensions: vec![],
             instructions: vec![],
             transition: None,
+            package_commands: Default::default(),
             validated_skills: None,
         };
         let env: std::sync::Arc<dyn rpi_tools::ExecutionEnv> =
@@ -1171,7 +1305,11 @@ mod tests {
             .unwrap_err()
             .contains("requires --resource-config"));
         harness.seal_resources(vec![]).unwrap();
-        attach(&harness, json!({"oversized": "x".repeat(MAX_STATE_BYTES)}));
+        attach(
+            &harness,
+            json!({"oversized": "x".repeat(MAX_STATE_BYTES)}),
+            Default::default(),
+        );
         assert!(get_resource_state(&harness)
             .await
             .unwrap_err()

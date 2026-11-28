@@ -11,6 +11,7 @@
 //! cancellation during blocking ops via `tokio::select!`.
 
 use std::collections::HashMap;
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -156,6 +157,13 @@ pub struct AppendReceipt {
     pub length: usize,
 }
 
+/// Physical file metadata captured on the same native handle immediately
+/// before and after a successful append.
+pub struct NativeAppendMetadata {
+    pub before: Metadata,
+    pub after: Metadata,
+}
+
 /// An optional, single-owner append capability for a journal.
 #[async_trait]
 pub trait AppendFile: Send + Sync {
@@ -172,6 +180,14 @@ pub trait AppendFile: Send + Sync {
         self.append(bytes).await?;
         Ok(None)
     }
+
+    /// Append with optional native handle metadata for a derived index.
+    async fn append_with_native_metadata(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(Option<AppendReceipt>, Option<NativeAppendMetadata>), FileError> {
+        Ok((self.append_with_receipt(bytes).await?, None))
+    }
 }
 
 /// Read capability bound to one opened file, even if its path is replaced.
@@ -180,6 +196,11 @@ pub trait AppendFile: Send + Sync {
 pub trait ReadFile: Send + Sync {
     async fn read_all(&self) -> Result<Vec<u8>, FileError>;
     async fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>, FileError>;
+
+    /// Metadata of the opened native handle, when available.
+    fn native_metadata(&self) -> Option<Metadata> {
+        None
+    }
 
     /// Current byte length of this opened generation, when supported. This is
     /// not a snapshot: later appends or truncation may change the length.
@@ -194,6 +215,12 @@ pub trait ReadFile: Send + Sync {
 pub trait FileSystem: Send + Sync {
     /// The environment's working directory (absolute).
     fn cwd(&self) -> &Path;
+
+    /// Resolve a host path when this backend explicitly permits native I/O.
+    /// Abstract and restricted backends do not grant this capability.
+    fn native_file_path(&self, _path: &str) -> Option<PathBuf> {
+        None
+    }
 
     /// Resolve `path` (relative-to-cwd, `~`, `file://`, absolute) to an absolute
     /// addressed path. Pure — no FS access, no abort. Mirrors TS `absolutePath`.
@@ -239,6 +266,26 @@ pub trait FileSystem: Send + Sync {
         content: FileContent,
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError>;
+
+    /// Atomically create an absent file and write its initial contents, never
+    /// following or replacing an existing final path. The parent must already
+    /// exist; this capability does not create directories or prove durability.
+    ///
+    /// Unsupported backends fail closed rather than emulating this with an
+    /// existence check plus truncating write. Cancellation/error after creation
+    /// may leave a partial new file; never unlink or overwrite it on retry.
+    async fn write_new_file(
+        &self,
+        path: &str,
+        _content: FileContent,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        Err(FileError::new(
+            FileErrorCode::NotSupported,
+            "exclusive file creation is unsupported",
+        )
+        .with_path(path))
+    }
 
     async fn append_file(
         &self,
@@ -292,6 +339,26 @@ pub trait FileSystem: Send + Sync {
         Ok(())
     }
 
+    /// Sync a regular journal file and its containing directory through an
+    /// explicitly supported physical persistence boundary. Unlike `sync_file`
+    /// and `sync_directory`, the compatibility default fails closed: their
+    /// no-op defaults are not evidence that a journal survived a crash.
+    ///
+    /// The caller must own the journal writer and keep the addressed file and
+    /// parent stable. This does not sync newly-created ancestor directories,
+    /// progress companions, or protect against writers bypassing ownership.
+    async fn sync_file_and_parent(
+        &self,
+        path: &str,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        Err(FileError::new(
+            FileErrorCode::NotSupported,
+            "physical journal synchronization is unsupported",
+        )
+        .with_path(path))
+    }
+
     /// Optional stable-generation reader. Unsupported backends retain eager
     /// history loading; an actual open failure must be returned, not hidden.
     async fn open_read_file(
@@ -338,6 +405,24 @@ pub trait FileSystem: Send + Sync {
         path: &str,
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<FileInfo>, FileError>;
+
+    /// Whether a directory contains a file or symlink whose name ends with
+    /// `suffix`. Does not follow symlinks and does not cache negative results.
+    /// Backends may avoid collecting unrelated entries' sizes/timestamps.
+    /// The default preserves compatibility with existing filesystem adapters.
+    async fn has_file_with_suffix(
+        &self,
+        path: &str,
+        suffix: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<bool, FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let entries = self.list_dir(path, cancel).await?;
+        check_cancel_file(cancel, Some(path))?;
+        Ok(entries
+            .iter()
+            .any(|entry| entry.kind != FileKind::Directory && entry.name.ends_with(suffix)))
+    }
 
     /// Follows symlinks (`canonicalize`). Mirrors TS `canonicalPath`. Backends
     /// may return `not_found` or `not_supported` for missing/unsupported paths;

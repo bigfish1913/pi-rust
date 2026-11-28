@@ -148,6 +148,7 @@ async fn context_command_does_not_append_chat_queue_usage_or_clear_session() {
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_var(crate::config::CONFIG_DIR_ENV, tmp.path());
     let resolved = crate::provider::resolve(
+        &crate::config::AgentHome::process(),
         Some("anthropic"),
         Some(crate::provider::DEFAULT_MODEL_ID),
         None,
@@ -165,10 +166,15 @@ async fn context_command_does_not_append_chat_queue_usage_or_clear_session() {
         system_prompt: Some("stable model context".into()),
         ..Default::default()
     };
-    let (harness, _events, reload_context) =
-        crate::session::build(&resolved, &args, tmp.path(), false)
-            .await
-            .unwrap();
+    let (harness, _events, reload_context) = crate::session::build(
+        &crate::config::AgentHome::process(),
+        &resolved,
+        &args,
+        tmp.path(),
+        false,
+    )
+    .await
+    .unwrap();
     harness
         .session()
         .append_message(user_message_with_images("keep this message", vec![]))
@@ -190,7 +196,6 @@ async fn context_command_does_not_append_chat_queue_usage_or_clear_session() {
     let chat_before = state.chat_container.render(120);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let ctx = CommandContext {
-        chat: state.chat_container.clone(),
         tui: terminal(),
         tx,
         editor: state.editor.clone(),

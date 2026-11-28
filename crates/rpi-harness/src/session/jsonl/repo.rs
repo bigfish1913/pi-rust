@@ -353,12 +353,20 @@ impl JsonlSessionRepo {
             self.fs.remove(&metadata.path, false, true, None).await,
             &format!("Failed to delete session {}", metadata.path),
         )?;
-        for suffix in [".progress.jsonl", ".progress.jsonl.tmp"] {
+        for suffix in [
+            super::storage::startup_checkpoint::SUFFIX,
+            super::storage::startup_checkpoint::TEMP_SUFFIX,
+            super::cold_frames::preview::SUFFIX,
+            super::cold_frames::preview::TEMP_SUFFIX,
+            super::cold_frames::preview::STAMP_SUFFIX,
+            ".progress.jsonl",
+            ".progress.jsonl.tmp",
+        ] {
             file_result(
                 self.fs
                     .remove(&format!("{}{suffix}", metadata.path), false, true, None)
                     .await,
-                "delete session progress",
+                "delete session companion",
             )?;
         }
         Ok(())
@@ -571,13 +579,12 @@ impl JsonlSessionRepo {
         )? {
             return Ok(false);
         }
-        let files = file_result(
-            self.fs.list_dir(&directory, None).await,
-            &format!("Failed to list sessions directory {directory}"),
-        )?;
-        Ok(files
-            .iter()
-            .any(|entry| entry.kind != FileKind::Directory && entry.name.ends_with(&suffix)))
+        file_result(
+            self.fs
+                .has_file_with_suffix(&directory, &suffix, None)
+                .await,
+            &format!("Failed to scan sessions directory {directory}"),
+        )
     }
 
     /// `<root>/<cwd-encoded-dir>`. Mirrors `sessionDirectory`.

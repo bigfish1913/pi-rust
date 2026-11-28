@@ -16,7 +16,7 @@ impl SlashCommand for HelpCommand {
         "Show available commands"
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
-        add_help_message(&ctx.chat);
+        add_help_message(&ctx.state.notice_container());
         ctx.tui.request_render(false);
     }
 }
@@ -95,7 +95,7 @@ impl SlashCommand for VersionCommand {
         "Show version information"
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
-        add_version_message(&ctx.chat);
+        add_version_message(&ctx.state.notice_container());
         ctx.tui.request_render(false);
     }
 }
@@ -110,11 +110,14 @@ impl SlashCommand for ChangelogCommand {
     }
     fn execute(&self, ctx: &CommandContext, args: &str) {
         match args.trim() {
-            "" => add_changelog_message(&ctx.chat),
-            "all" => add_changelog_message_with_scope(&ctx.chat, true),
+            "" => add_changelog_message(&ctx.state.notice_container()),
+            "all" => add_changelog_message_with_scope(&ctx.state.notice_container(), true),
             _ => {
-                ctx.chat
-                    .add_child(Arc::new(Text::new("Usage: /changelog [all]", 1, 0)));
+                ctx.state.notice_container().add_child(Arc::new(Text::new(
+                    "Usage: /changelog [all]",
+                    1,
+                    0,
+                )));
             }
         }
         ctx.tui.request_render(false);
@@ -130,7 +133,7 @@ impl SlashCommand for HotkeysCommand {
         "Show keyboard shortcuts"
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
-        add_hotkeys_message(&ctx.chat);
+        add_hotkeys_message(&ctx.state.notice_container());
         ctx.tui.request_render(false);
     }
 }
@@ -171,10 +174,12 @@ impl SlashCommand for ModelCommand {
         }
         let current_id = ctx.state.current_model_id();
         open_model_selector(
-            &ctx.state,
-            &ctx.editor_container,
-            &ctx.editor,
-            &ctx.tui,
+            EditorUi {
+                state: &ctx.state,
+                editor_container: &ctx.editor_container,
+                editor: &ctx.editor,
+                tui: &ctx.tui,
+            },
             &ctx.model_catalog
                 .read()
                 .unwrap_or_else(|error| error.into_inner()),
@@ -793,7 +798,7 @@ impl SlashCommand for SkillsCommand {
         let input = args.trim();
         if input.is_empty() {
             let resources = ctx.resources.lock().unwrap().clone();
-            show_skills_panel(&ctx.chat, &resources);
+            show_skills_panel(&ctx.state.notice_container(), &resources);
             ctx.tui.request_render(false);
             return;
         }
@@ -827,7 +832,7 @@ impl SlashCommand for SkillsCommand {
             return;
         }
 
-        add_skill_activation_message(&ctx.chat, name);
+        add_skill_activation_message(&ctx.state.notice_container(), name);
         let lane = ctx.lane.clone();
         let tui = ctx.tui.clone();
         let state = ctx.state.clone();
@@ -882,6 +887,7 @@ impl SlashCommand for UsageCommand {
 /// (B5d): reload the cdylib plugins, invalidate the old `ActionBridge` +
 /// registry snapshot, rebuild skills/prompts/context/SYSTEM.md/APPEND_SYSTEM.md
 /// + the `TeeEmitter`, and push the rebuilt state via the B5d harness setters.
+///
 /// The command itself runs on the blocking submit thread, so it can't drive
 /// the async `reload_extension_resources` routine directly — it signals the main
 /// loop via `TuiMessage::ReloadExtensions`, which awaits it on the async runtime.

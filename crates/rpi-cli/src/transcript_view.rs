@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 use base64::Engine;
 use rpi_tui::{
     render_diff, AssistantBlock, AssistantMessageComponent, AssistantMessageOptions,
-    BashExecutionComponent, BashTruncation, Container, Spacer, ToolExecutionComponent, ToolStatus,
-    UserMessageComponent,
+    BashExecutionComponent, BashTruncation, Component, Container, Spacer, ToolExecutionComponent,
+    ToolStatus, UserMessageComponent,
 };
 use serde_json::Value;
 
@@ -61,6 +61,8 @@ pub enum UiEvent {
     },
     /// The assistant message finished.
     AssistantEnd { blocks: Vec<AssistantBlock> },
+    /// A completed message loaded from the saved transcript.
+    SavedAssistant { blocks: Vec<AssistantBlock> },
     /// Tool lifecycle (args/result carry the stable wire `Value` shape).
     ToolStart {
         id: String,
@@ -109,7 +111,7 @@ impl MessageIdSeq {
 pub struct TranscriptView {
     show_images: bool,
     chat: Arc<Container>,
-    panels: Arc<Container>,
+    restored_page: Option<Arc<Container>>,
     current_assistant: Arc<Mutex<Option<Arc<AssistantMessageComponent>>>>,
     tool_components: Arc<Mutex<HashMap<String, Arc<ToolExecutionComponent>>>>,
     /// Bash executions keyed by `tool_call_id` — kept separate from the generic
@@ -164,8 +166,8 @@ impl TranscriptView {
     ) -> Self {
         Self {
             show_images: true,
-            panels: chat.clone(),
             chat,
+            restored_page: None,
             current_assistant,
             tool_components,
             bash_components,
@@ -176,14 +178,14 @@ impl TranscriptView {
         }
     }
 
-    pub(crate) fn with_panels(mut self, panels: Arc<Container>) -> Self {
-        self.panels = panels;
-        self
-    }
-
     /// Configure image visibility for newly created assistant components.
     pub fn with_show_images(mut self, show: bool) -> Self {
         self.show_images = show;
+        self
+    }
+
+    pub(crate) fn with_restored_page(mut self, page: Option<Arc<Container>>) -> Self {
+        self.restored_page = page;
         self
     }
 
@@ -239,6 +241,9 @@ impl TranscriptView {
                     comp.update_blocks(blocks);
                     comp.set_streaming(false);
                 }
+            }
+            UiEvent::SavedAssistant { blocks } => {
+                self.append_assistant(blocks, false);
             }
             UiEvent::ToolStart { id, name, args } => self.tool_start(id, name, args, width),
             UiEvent::ToolUpdate {
@@ -429,6 +434,15 @@ impl TranscriptView {
     }
 
     fn start_assistant(&self, blocks: &[AssistantBlock]) {
+        let component = self.append_assistant(blocks, true);
+        *self.current_assistant.lock().unwrap() = Some(component);
+    }
+
+    fn append_assistant(
+        &self,
+        blocks: &[AssistantBlock],
+        streaming: bool,
+    ) -> Arc<AssistantMessageComponent> {
         let comp = Arc::new(AssistantMessageComponent::new(
             AssistantMessageOptions::default(),
         ));
@@ -439,10 +453,10 @@ impl TranscriptView {
         if let Some(transformer) = self.markdown_transformer.lock().unwrap().clone() {
             comp.set_markdown_transformer(Some(transformer));
         }
-        comp.set_streaming(true);
+        comp.set_streaming(streaming);
         comp.update_blocks(blocks);
         self.chat.add_child(comp.clone());
-        *self.current_assistant.lock().unwrap() = Some(comp);
+        comp
     }
 
     /// Create the streaming assistant component if a delta arrives before
@@ -450,19 +464,7 @@ impl TranscriptView {
     fn ensure_assistant(&self) {
         let mut current = self.current_assistant.lock().unwrap();
         if current.is_none() {
-            let comp = Arc::new(AssistantMessageComponent::new(
-                AssistantMessageOptions::default(),
-            ));
-            self.assign_message_id(&comp);
-            comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
-            comp.set_show_images(self.show_images);
-            comp.set_trailing_spacing(1);
-            if let Some(transformer) = self.markdown_transformer.lock().unwrap().clone() {
-                comp.set_markdown_transformer(Some(transformer));
-            }
-            comp.set_streaming(true);
-            self.chat.add_child(comp.clone());
-            *current = Some(comp);
+            *current = Some(self.append_assistant(&[], true));
         }
     }
 
@@ -659,11 +661,14 @@ impl TranscriptView {
     fn tool_end(&self, id: &str, name: &str, result: &Value, is_error: bool, width: usize) {
         if matches!(name, "plan_mode_start" | "plan_mode_complete")
             && !is_error
-            && update_plan_panel(&self.panels, result)
+            && update_plan_panel(&self.chat, self.restored_page.as_deref(), result)
         {
             return;
         }
-        if name == "todo" && !is_error && update_todo_list(&self.panels, result) {
+        if name == "todo"
+            && !is_error
+            && update_todo_list(&self.chat, self.restored_page.as_deref(), result)
+        {
             return;
         }
         if name.trim().is_empty() {
@@ -725,8 +730,58 @@ impl TranscriptView {
     }
 }
 
+fn update_transcript_panel(
+    chat: &Container,
+    restored_page: Option<&Container>,
+    name: &str,
+    matches: fn(&ToolExecutionComponent) -> bool,
+    update: impl FnOnce(&ToolExecutionComponent),
+) {
+    for owner in std::iter::once(chat).chain(restored_page) {
+        for child in owner.get_children().into_iter().rev() {
+            if let Some(panel) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
+                if matches(panel) {
+                    update(panel);
+                    return;
+                }
+            }
+        }
+    }
+    let panel = Arc::new(ToolExecutionComponent::new(name, ""));
+    update(&panel);
+    chat.add_child(panel);
+}
+
+/// Move a newer live panel into the restored row when returning to the latest page.
+pub(crate) fn merge_transcript_panels(page: &Container, live: &Container) {
+    let mut rows = page.get_children();
+    let live_rows = live.get_children();
+    for matches in [
+        ToolExecutionComponent::is_plan_panel as fn(&ToolExecutionComponent) -> bool,
+        ToolExecutionComponent::is_todo_list,
+    ] {
+        let is_panel = |row: &Arc<dyn Component>| {
+            row.as_any()
+                .downcast_ref::<ToolExecutionComponent>()
+                .is_some_and(matches)
+        };
+        if let (Some(row), Some(live_row)) = (
+            rows.iter_mut().find(|row| is_panel(row)),
+            live_rows.iter().rev().find(|row| is_panel(row)),
+        ) {
+            *row = live_row.clone();
+            live.remove_child(live_row);
+        }
+    }
+    page.replace_children(rows);
+}
+
 /// Tool calls, slash commands, and restored entries share the same current plan.
-pub(crate) fn update_plan_panel(chat: &Arc<Container>, result: &Value) -> bool {
+pub(crate) fn update_plan_panel(
+    chat: &Container,
+    restored_page: Option<&Container>,
+    result: &Value,
+) -> bool {
     let Some(details) = result.get("details") else {
         return false;
     };
@@ -742,37 +797,29 @@ pub(crate) fn update_plan_panel(chat: &Arc<Container>, result: &Value) -> bool {
         Some(Value::String(plan)) => plan.clone(),
         _ => return false,
     };
-    for child in chat.get_children().into_iter().rev() {
-        if let Some(component) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
-            if component.is_plan_panel() {
-                component.set_plan_state(plan, active);
-                component.set_result("", false);
-                if let Some(expanded) = details.get("expanded").and_then(Value::as_bool) {
-                    component.set_expanded(expanded);
-                }
-                // Keep the panel at the position where planning started. Moving
-                // it to the tail makes all later transcript rows jump above the
-                // completed plan and, in regular mode, turns the reorder into a
-                // native-scrollback rebuild on macOS.
-                return true;
+    let expanded = details.get("expanded").and_then(Value::as_bool);
+    update_transcript_panel(
+        chat,
+        restored_page,
+        "plan_mode_complete",
+        ToolExecutionComponent::is_plan_panel,
+        |panel| {
+            panel.set_plan_state(plan, active);
+            panel.set_result("", false);
+            if let Some(expanded) = expanded {
+                panel.set_expanded(expanded);
             }
-        }
-    }
-    let component = Arc::new(ToolExecutionComponent::new("plan_mode_complete", ""));
-    component.set_plan_state(plan, active);
-    component.set_result("", false);
-    component.set_expanded(
-        details
-            .get("expanded")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        },
     );
-    chat.add_child(component);
     true
 }
 
 /// Keep one visible current task list while retaining every result in session storage.
-pub(crate) fn update_todo_list(chat: &Arc<Container>, result: &Value) -> bool {
+pub(crate) fn update_todo_list(
+    chat: &Container,
+    restored_page: Option<&Container>,
+    result: &Value,
+) -> bool {
     let Some(details) = result.get("details") else {
         return false;
     };
@@ -800,22 +847,16 @@ pub(crate) fn update_todo_list(chat: &Arc<Container>, result: &Value) -> bool {
         return false;
     };
     let text = tool_result_text(result);
-    for child in chat.get_children().into_iter().rev() {
-        if let Some(component) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
-            if component.is_todo_list() {
-                component.set_todo_state(rows);
-                component.set_result(&text, false);
-                // Keep the panel at the position where the task list first
-                // appeared. Moving it to the tail makes later transcript rows
-                // render above the current task list on every update.
-                return true;
-            }
-        }
-    }
-    let candidate = Arc::new(ToolExecutionComponent::new("todo", ""));
-    candidate.set_todo_state(rows);
-    candidate.set_result(&text, false);
-    chat.add_child(candidate);
+    update_transcript_panel(
+        chat,
+        restored_page,
+        "todo",
+        ToolExecutionComponent::is_todo_list,
+        |panel| {
+            panel.set_todo_state(rows);
+            panel.set_result(&text, false);
+        },
+    );
     true
 }
 
@@ -1285,6 +1326,33 @@ mod tests {
     }
 
     #[test]
+    fn saved_assistant_is_rendered_without_replacing_the_live_message() {
+        let view = view();
+        view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Text("pending".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::SavedAssistant {
+                blocks: vec![AssistantBlock::Text("previous reply".into())],
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::AssistantEnd {
+                blocks: vec![AssistantBlock::Text("complete reply".into())],
+            },
+            80,
+        );
+        let lines = view.chat.render(80);
+        assert!(lines.iter().any(|line| line.contains("previous reply")));
+        assert!(lines.iter().any(|line| line.contains("complete reply")));
+        assert!(lines.iter().all(|line| !line.contains("pending")));
+    }
+
+    #[test]
     fn assistant_blocks_follow_content_order() {
         let message = json!({
             "content": [
@@ -1495,11 +1563,13 @@ mod tests {
         assert_eq!(view.chat.child_count(), 3);
         assert!(update_todo_list(
             &view.chat,
+            None,
             &json!({"details":{"todos":[]}})
         ));
         assert_eq!(view.chat.child_count(), 3);
         assert!(!update_todo_list(
             &view.chat,
+            None,
             &json!({"details":{"todos":[{}]}})
         ));
         assert_eq!(view.chat.child_count(), 3);
@@ -1690,6 +1760,7 @@ mod tests {
         assert!(rpi_tui::ansi::strip_ansi(&panel.render(80).join("\n")).contains("Step 30"));
         assert!(update_plan_panel(
             &view.chat,
+            None,
             &json!({"kind":"message","details":{"kind":"plan","active":false,"plan":body,"expanded":true}})
         ));
         assert_eq!(view.chat.child_count(), 1);

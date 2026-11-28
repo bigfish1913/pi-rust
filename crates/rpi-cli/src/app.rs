@@ -22,7 +22,7 @@ use rpi_ai::types::{ImageContent, ImageContentType};
 
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
 use crate::provider::{resolve_with_extensions, ResolveError};
-use crate::session::{build_prepared, prepare_extensions, BuildError};
+use crate::session::{build_prepared, prepare_cli_extensions, prepare_extensions, BuildError};
 use crate::startup_diagnostics::{Phase, StartupSpan};
 
 /// The exit code for a usage/parse error. (TS `main.ts` uses `process.exit(1)`
@@ -85,6 +85,28 @@ async fn run_inner() -> i32 {
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // Shared Host control is an explicit independent entry point: never hydrate
+    // ambient durable/session/provider/extension state or interpret it as a prompt.
+    if argv.first().map(String::as_str) == Some("host") {
+        return crate::host::cli::run(&argv[1..]).await;
+    }
+    if let Some(first) = argv.first_mut() {
+        if first == "--native-host" || first.starts_with("--native-host=") {
+            *first = first.replacen("--native-host", "--host", 1);
+            return crate::host::area_entry::run(&argv).await;
+        }
+    }
+    if matches!(argv.as_slice(), [host, restore] if host == "--host" && restore == "--restore-areas")
+    {
+        return crate::host::area_entry::run(&argv).await;
+    }
+    if argv
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--session-preview" || arg.starts_with("--session-preview="))
+    {
+        return crate::session_preview::run(&argv);
+    }
     if let Err(error) = crate::native_durable::experimental_epoch::early_check(&argv) {
         eprintln!("error: {error}");
         return EXIT_USAGE;
@@ -129,11 +151,33 @@ async fn run_inner() -> i32 {
         return crate::dev_extension::run_cleanup_helper(&argv[1..]);
     }
 
+    #[cfg(unix)]
+    if argv
+        .first()
+        .is_some_and(|arg| arg == crate::local_host::DAEMON_COMMAND)
+    {
+        return crate::local_host::run_daemon_command(&argv[1..]).await;
+    }
+
     // ---- `rpi --connect <addr>` — pure remote client ----
     // Intercepted before any provider / harness / session / extension work so
     // the client holds no local agent resources at all: it only connects to a
     // running `rpi --server` and renders the remote transcript.
     if let Some(addr) = take_flag_value(&argv, "--connect") {
+        if argv
+            .iter()
+            .any(|arg| arg == "--host" || arg.starts_with("--host="))
+        {
+            eprintln!("error: --host cannot be combined with --connect");
+            return EXIT_USAGE;
+        }
+        if argv
+            .iter()
+            .any(|arg| arg == "--mini" || arg.starts_with("--mini="))
+        {
+            eprintln!("error: --mini cannot be combined with --connect");
+            return EXIT_USAGE;
+        }
         let token = resolve_connect_token(&argv);
         return crate::remote::tui::run(&addr, token.as_deref()).await;
     }
@@ -141,6 +185,13 @@ async fn run_inner() -> i32 {
     // Normalize the CLI flag into RPI_OFFLINE so early-dispatch subcommands and
     // the regular parsed path all observe the same process-wide gate.
     crate::args::normalize_offline_mode(&argv);
+
+    #[cfg(target_os = "macos")]
+    if argv.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        if let Some(code) = crate::host::area_entry::run_default_terminal().await {
+            return code;
+        }
+    }
 
     // `rpi dev` wraps the normal CLI: consume only development-specific
     // options, then pass every remaining argument through the regular parser.
@@ -194,14 +245,26 @@ async fn run_inner() -> i32 {
                     return EXIT_RUNTIME;
                 }
             };
-            let extension_session = crate::session::load_extensions(&args, &cwd, trusted, None);
+            let extension_session = crate::session::load_extensions(
+                &crate::config::AgentHome::process(),
+                &args,
+                &cwd,
+                trusted,
+                None,
+            );
             return crate::auth::run_with_extensions(&argv[1..], extension_session.snapshot_arc())
                 .await;
         }
         Some("events") => return crate::events::run(&argv[1..]).await,
         Some("session") => return crate::session_gc::run(&argv[1..]).await,
+        Some("update") if argv.get(1).is_some_and(|arg| arg == "package") => {
+            return crate::agent_package::update(&argv[2..]).await;
+        }
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
         Some("updates") => return crate::updates::run_updates(&argv[1..]).await,
+        Some("install") if argv.get(1).is_some_and(|arg| arg == "package") => {
+            return crate::agent_package::install(&argv[2..]).await;
+        }
         Some("install") => return crate::install::run_async(&argv[1..]).await,
         Some("uninstall") => return crate::install::uninstall(&argv[1..]),
         Some("extension") => return crate::packages::run_extension(&argv[1..]),
@@ -223,12 +286,49 @@ async fn run_inner() -> i32 {
         _ => {}
     }
 
-    let mut parsed = parse_args(&argv);
+    let package_name = if argv.first().is_some_and(|arg| arg == "run")
+        && argv.get(1).is_some_and(|arg| arg == "package")
+    {
+        match argv.get(2).map(String::as_str) {
+            None | Some("--help" | "-h") => {
+                println!("rpi run package NAME [rpi options] (native JSONL RPC)");
+                return if argv.len() < 3 { EXIT_USAGE } else { 0 };
+            }
+            Some(name) => Some(name.to_owned()),
+        }
+    } else {
+        None
+    };
+    let mut parsed = if package_name.is_some() {
+        crate::args::parse_startup_args(&argv[3..], true)
+    } else {
+        parse_args(&argv)
+    };
     crate::timings::time("args parsed", crate::timings::TimingNamespace::Main);
 
     // ---- Parsed startup stages ----
     if let Some(code) = handle_parse_short_circuits(&parsed) {
         return code;
+    }
+
+    if parsed.host.is_some() {
+        if package_name.is_some() {
+            eprintln!("error: --host cannot be combined with `rpi run package`");
+            return EXIT_USAGE;
+        }
+        if dev_options.is_some() {
+            eprintln!("error: --host cannot be combined with dev/dev-local");
+            return EXIT_USAGE;
+        }
+        #[cfg(unix)]
+        {
+            return crate::local_host::run(parsed).await;
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("error: --host requires Unix-domain sockets");
+            return EXIT_USAGE;
+        }
     }
 
     if dev_options.is_some()
@@ -242,6 +342,33 @@ async fn run_inner() -> i32 {
     let cwd = match resolve_cwd() {
         Ok(cwd) => cwd,
         Err(code) => return code,
+    };
+    let _package_launch = if let Some(name) = package_name {
+        if parsed.resource_config.is_some()
+            || parsed.resource_transition.is_some()
+            || parsed.session_dir.is_some()
+            || parsed.session.is_some()
+            || parsed.fork.is_some()
+            || parsed.mini
+            || !parsed.messages.is_empty()
+            || !parsed.file_args.is_empty()
+        {
+            eprintln!("error: package runs select their own resources and session directory; send prompts and commands via RPC");
+            return EXIT_USAGE;
+        }
+        let launch = match crate::agent_package::prepare_launch(&name, &cwd) {
+            Ok(launch) => launch,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return EXIT_RUNTIME;
+            }
+        };
+        parsed.mode = crate::args::Mode::Rpc;
+        parsed.resource_config = Some(launch.config.path().to_path_buf());
+        parsed.session_dir = Some(launch.session_dir.clone());
+        Some(launch)
+    } else {
+        None
     };
     // ---- Legacy-layout migration (flat ~/.rpi → ~/.rpi/agent/) ----
     // Best-effort; never blocks startup. Skipped when RPI_CODING_AGENT_DIR is
@@ -321,14 +448,6 @@ async fn run_inner() -> i32 {
     let cwd_lookup = StartupSpan::start(Phase::CwdLookup);
     let restored_cwd = crate::session::peek_restored_session_cwd(&selection, &cwd).await;
     cwd_lookup.finish();
-    // Pin the session the peek resolved: `-c` re-lists the directory when the
-    // build runs, and another `rpi` may have written a newer session in
-    // between. Adopting one session's directory while opening another would
-    // put the tools in a directory the opened conversation never used, which is
-    // the failure this adoption exists to prevent.
-    if let Some(restored) = &restored_cwd {
-        crate::session::pin_restored_selection(&mut parsed, restored);
-    }
     let launch_cwd = cwd;
     let cwd = match &restored_cwd {
         Some(restored) => match &restored.adopted {
@@ -377,9 +496,12 @@ async fn run_inner() -> i32 {
     };
     // Reject a bound exact session before dev can build or stage any code.
     if dev_options.is_some() {
-        if let Err(error) =
-            crate::session::preflight_extension_startup(&parsed, &cwd, project_trusted)
-        {
+        if let Err(error) = crate::session::preflight_extension_startup(
+            &parsed,
+            &cwd,
+            project_trusted,
+            restored_cwd.as_ref(),
+        ) {
             print_build_error(&error);
             return EXIT_RUNTIME;
         }
@@ -390,16 +512,18 @@ async fn run_inner() -> i32 {
         Err(code) => return code,
     };
     let extension_prepare = StartupSpan::start(Phase::ExtensionPrepare);
-    let prepared = match prepare_extensions(&parsed, &cwd, project_trusted) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            print_build_error(&error);
-            return EXIT_RUNTIME;
-        }
-    };
+    let prepared =
+        match prepare_cli_extensions(&parsed, &cwd, project_trusted, restored_cwd.as_ref()) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                print_build_error(&error);
+                return EXIT_RUNTIME;
+            }
+        };
     extension_prepare.finish();
     let model_resolve = StartupSpan::start(Phase::ModelResolve);
     let resolved = match resolve_with_extensions(
+        &crate::config::AgentHome::process(),
         &parsed,
         &cwd,
         project_trusted,
@@ -420,16 +544,12 @@ async fn run_inner() -> i32 {
         eprintln!("warning: models.json: {warning}");
     }
 
-    // The full authenticated catalog (read-only) for the TUI's `/model`
-    // selector, derived from the built provider runtimes so auth headers and
-    // base-url overrides survive.
-    let model_catalog = crate::provider::authenticated_catalog(&resolved);
-
     // `--models <patterns>`: persist the Ctrl+P cycle scope to settings.json
     // (the same set `/scoped-models` edits). Each pattern matches catalog ids
     // case-insensitively; unmatched patterns are reported so a typo doesn't
     // silently empty the cycle.
     if let Some(patterns) = &parsed.models {
+        let model_catalog = crate::provider::authenticated_catalog(&resolved);
         let mut matched: Vec<String> = Vec::new();
         for p in patterns {
             let hits: Vec<String> = model_catalog
@@ -455,14 +575,22 @@ async fn run_inner() -> i32 {
 
     // ---- harness build ----
     let harness_build = StartupSpan::start(Phase::HarnessBuild);
-    let (harness, event_rx, mut reload_context) =
-        match build_prepared(&resolved, &parsed, &cwd, project_trusted, prepared).await {
-            Ok(triple) => triple,
-            Err(e) => {
-                print_build_error(&e);
-                return EXIT_RUNTIME;
-            }
-        };
+    let (harness, event_rx, mut reload_context) = match build_prepared(
+        &crate::config::AgentHome::process(),
+        &resolved,
+        &parsed,
+        &cwd,
+        project_trusted,
+        prepared,
+    )
+    .await
+    {
+        Ok(triple) => triple,
+        Err(e) => {
+            print_build_error(&e);
+            return EXIT_RUNTIME;
+        }
+    };
     harness_build.finish();
     startup.finish();
     reload_context.dev_extension = dev_extension;
@@ -495,7 +623,7 @@ async fn run_inner() -> i32 {
         })
         .unwrap_or(false);
     if web_requested && (!web_registered || !stdio_claimed) {
-        eprintln!("error: --web requires the rpi-web server extension; it is missing, disabled, or failed to load.\nInstall it with: rpi install rpi-web --github pi-rust/rpi-package\nThen restart with: rpi --web");
+        eprintln!("error: --web requires the rpi-web server extension; it is missing, disabled, or failed to load.\nInstall it with: rpi install rpi-web --github pi-rust/rpi-extension\nThen restart with: rpi --web");
         return EXIT_USAGE;
     }
     let stdio_lifecycle = reload_context
@@ -523,6 +651,7 @@ async fn run_inner() -> i32 {
         Some(file_text.as_str())
     };
     let (initial, extra) = build_initial_message(&parsed, stdin_text.as_deref(), file_text_opt);
+    let initial = initial.or_else(|| (!file_images.is_empty()).then(String::new));
 
     // ---- mode dispatch (TS resolveAppMode → runPrintMode / InteractiveMode / runRpcMode) ----
     let stdin_is_tty = std::io::stdin().is_terminal();
@@ -576,16 +705,19 @@ async fn run_inner() -> i32 {
         None
     };
 
+    let model_catalog = || {
+        reload_context
+            .catalog
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    };
     let exit_code = match mode {
         RunMode::Print => {
-            crate::modes::print(
-                &harness,
-                &parsed,
-                initial.clone(),
-                &extra,
-                file_images.clone(),
-            )
-            .await
+            // Print mode only consumes the completed reply. Keeping the receiver
+            // alive buffers unread snapshots of the growing streamed message.
+            drop(event_rx);
+            crate::modes::print(&harness, &parsed, initial, &extra, file_images).await
         }
         RunMode::Json => {
             crate::modes::json(
@@ -603,16 +735,18 @@ async fn run_inner() -> i32 {
                 &harness,
                 Some(event_rx),
                 &parsed,
-                model_catalog,
-                initial.clone(),
-                &extra,
-                file_images.clone(),
-                if parsed.no_themes {
-                    None
-                } else {
-                    parsed.theme.as_deref().or(resolved.theme.as_deref())
+                model_catalog(),
+                crate::modes::InteractiveStartup {
+                    initial: initial.clone(),
+                    extra_messages: &extra,
+                    initial_images: file_images.clone(),
+                    theme: if parsed.no_themes {
+                        None
+                    } else {
+                        parsed.theme.as_deref().or(resolved.theme.as_deref())
+                    },
+                    no_themes: parsed.no_themes,
                 },
-                parsed.no_themes,
                 &reload_context,
             )
             .await
@@ -678,15 +812,18 @@ async fn run_inner() -> i32 {
                         let session = reload_context.extension_session.lock().unwrap();
                         session.snapshot_arc()
                     };
-                    crate::modes::rpc_with_durable(
+                    crate::modes::rpc_with_durable_home(
                         &harness,
                         Some(event_rx),
-                        model_catalog,
-                        reload_context.ui_dialog.clone(),
-                        oauth_snapshot,
-                        Some(reload_context.extension_session.clone()),
-                        parsed.rpc_message_updates,
-                        parsed.native_durable,
+                        model_catalog(),
+                        crate::modes::RpcOptions {
+                            ui_dialog: reload_context.ui_dialog.clone(),
+                            oauth_snapshot,
+                            extension_session: Some(reload_context.extension_session.clone()),
+                            message_updates: parsed.rpc_message_updates,
+                            native_durable: parsed.native_durable,
+                            home: reload_context.home.clone(),
+                        },
                     )
                     .await
                 };
@@ -788,17 +925,13 @@ fn prepare_dev_extension(
     };
 
     match crate::dev_extension::DevExtension::detect(cwd, options) {
-        Ok(extension) => {
-            if let Err(error) = extension.rebuild() {
-                eprintln!("error: initial extension build failed: {error}");
-                return Err(EXIT_RUNTIME);
+        Ok(extension) => match extension.prepare_initial(parsed) {
+            Ok(extension) => Ok(Some(extension)),
+            Err(error) => {
+                eprintln!("error: initial extension preparation failed: {error}");
+                Err(EXIT_RUNTIME)
             }
-            if let Err(error) = extension.apply_to_args(parsed) {
-                eprintln!("error: {error}");
-                return Err(EXIT_RUNTIME);
-            }
-            Ok(Some(extension))
-        }
+        },
         Err(error) => {
             // No Cargo cdylib found: degrade to skills-only mode.
             eprintln!("dev: {error}");
@@ -839,7 +972,7 @@ async fn resolve_resume(parsed: &mut Args, cwd: &Path) -> Option<i32> {
     }
 }
 
-fn emit_startup_warnings(parsed: &Args) {
+pub(crate) fn emit_startup_warnings(parsed: &Args) {
     // ---- Startup warnings (ignored-but-recognized flags) ----
     if parsed.verbose {
         for warn in &parsed.ignored {
@@ -855,15 +988,17 @@ fn emit_startup_warnings(parsed: &Args) {
 /// fuzzy-ish substring over provider, id, and display name.
 async fn list_models(search: &str, args: &Args, cwd: &Path) -> i32 {
     let trusted = crate::session::resolve_project_trust(args, cwd);
-    let prepared = match prepare_extensions(args, cwd, trusted) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            print_build_error(&error);
-            return EXIT_RUNTIME;
-        }
-    };
+    let prepared =
+        match prepare_extensions(&crate::config::AgentHome::process(), args, cwd, trusted) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                print_build_error(&error);
+                return EXIT_RUNTIME;
+            }
+        };
     let manifests = crate::provider::manifests_from_session(&prepared.extension_session);
-    let catalog = match crate::provider::catalog_with_diagnostics(&manifests) {
+    let home = crate::config::AgentHome::process();
+    let catalog = match crate::provider::catalog_with_diagnostics(&home, &manifests) {
         Ok((models, warnings)) => {
             for warning in warnings {
                 eprintln!("warning: models.json: {warning}");
@@ -896,14 +1031,14 @@ async fn list_models(search: &str, args: &Args, cwd: &Path) -> i32 {
 
     fn format_tokens(value: u64) -> String {
         if value >= 1_000_000 {
-            let whole = value % 1_000_000 == 0;
+            let whole = value.is_multiple_of(1_000_000);
             if whole {
                 format!("{}M", value / 1_000_000)
             } else {
                 format!("{:.1}M", value as f64 / 1_000_000.0)
             }
         } else if value >= 1_000 {
-            let whole = value % 1_000 == 0;
+            let whole = value.is_multiple_of(1_000);
             if whole {
                 format!("{}K", value / 1_000)
             } else {
@@ -1011,7 +1146,7 @@ fn read_piped_stdin() -> Option<String> {
 /// `<file name="...">\n<contents>\n</file>\n` and concatenated.
 ///
 /// Paths are resolved relative to `cwd` (the TS uses `resolve(readPath, cwd)`).
-fn process_file_args(
+pub(crate) fn process_file_args(
     file_args: &[std::path::PathBuf],
     cwd: &Path,
 ) -> Result<(String, Vec<ImageContent>), String> {
@@ -1092,22 +1227,46 @@ fn build_initial_message(
     (initial, extra)
 }
 
-/// Print a model-resolution error with env-specific guidance. Mirrors the TS
-/// auth-guidance / model-resolver error formatting (condensed to stderr lines).
-fn print_resolve_error(e: &ResolveError) {
+#[cfg(unix)]
+pub(crate) fn mini_input(
+    args: &mut Args,
+    file_text: String,
+    images: Vec<ImageContent>,
+) -> crate::mini::Input {
+    let mut messages = std::mem::take(&mut args.messages).into_iter();
+    let mut parts = read_piped_stdin()
+        .into_iter()
+        .chain((!file_text.is_empty()).then_some(file_text))
+        .chain(messages.next());
+    let initial = parts.next().map(|mut text| {
+        for part in parts {
+            text.push_str(&part);
+        }
+        text
+    });
+    let prompts = initial
+        .or_else(|| (!images.is_empty()).then(String::new))
+        .into_iter()
+        .chain(messages)
+        .collect();
+    crate::mini::Input { prompts, images }
+}
+
+/// Format a model-resolution error with env-specific guidance.
+pub(crate) fn resolve_error_message(e: &ResolveError) -> String {
     match e {
         ResolveError::NoApiKey { hint } => {
-            eprintln!("error: {e}");
-            eprintln!();
-            eprintln!("Provide credentials via one of: {hint}.");
+            format!("error: {e}\n\nProvide credentials via one of: {hint}.")
         }
-        ResolveError::Config(_) => {
-            eprintln!("error: {e}");
-            eprintln!();
-            eprintln!("Check ~/.rpi/auth.json / ~/.rpi/models.json (set RPI_CODING_AGENT_DIR to relocate).");
-        }
-        _ => eprintln!("error: {e}"),
+        ResolveError::Config(_) => format!(
+            "error: {e}\n\nCheck ~/.rpi/auth.json / ~/.rpi/models.json (set RPI_CODING_AGENT_DIR to relocate)."
+        ),
+        _ => format!("error: {e}"),
     }
+}
+
+fn print_resolve_error(e: &ResolveError) {
+    eprintln!("{}", resolve_error_message(e));
 }
 
 /// Print a harness-build error with flag-specific guidance for restore requests.

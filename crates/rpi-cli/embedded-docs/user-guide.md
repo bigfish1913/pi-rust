@@ -216,6 +216,8 @@ Windows 会暂存更新，等待当前进程退出后完成替换。稳定版不
 `--offline` 仅报告稳定版缓存；预览版需要联网查询 GitHub。旧 Release 没有 manifest 时，
 可等待协议资产补齐，或显式使用 `rpi update --build`。
 
+通过 Homebrew 安装时，使用 `brew upgrade rpi` 更新。启动时的更新提示也会显示这条命令。
+
 ### TUI 历史消息滚动
 
 交互式 TUI 默认使用 alternate screen，并由应用自己管理 transcript 滚动。可以使用 `PageUp` / `PageDown`、`Home` / `End`，或鼠标和触控板滚轮浏览历史消息。
@@ -357,6 +359,8 @@ rpi install my-extension --github https://github.com/owner/repo
 
 自定义仓库也须发布同一分发协议。显式仓库不依赖 crates.io；省略版本时，只在该仓库的 `<包名>-v<版本>` 标签中选择最新稳定版本。不会使用仓库的全局 latest Release。后续 `--force` 重装和启动更新检查会保留来源，并核对新版本的 manifest 是否适配当前平台。
 
+扩展目录仓库已迁移到 `pi-rust/rpi-extension`（原 `pi-rust/rpi-package`）。两个地址视为同一项目：已有安装（包括只记录 `prebuilt:<仓库>` 来源的旧记录）和 `--github pi-rust/rpi-package` 调用仍可升级，版本发现会按新仓库的 `<包名>-v<版本>` 标签跟随迁移并改写安装来源；旧仓库已发布的版本及其 CDN 前缀继续可用，因此固定旧版本的安装不会失效。
+
 发布者必须先上传所声明平台的压缩包，最后上传 manifest。manifest 尚未发布、目标平台缺失或校验不通过时安装失败，不会自动编译或选择其他版本。需要源码编译时显式使用：
 
 ```bash
@@ -398,7 +402,7 @@ rpi dev
 
 ### 网页搜索与抓取
 
-联网工具由独立的 [rpi-package 扩展](https://github.com/pi-rust/rpi-package) 提供，
+联网工具由独立的 [rpi-extension 扩展](https://github.com/pi-rust/rpi-extension) 提供，
 不属于 CLI 默认内置工具。按需安装后重启 rpi：
 
 ```bash
@@ -429,7 +433,7 @@ rpi install rpi-subagents
 这不是 OS 安全沙箱，允许的 shell 等工具仍保有正常能力。
 
 宿主与扩展需同时支持对应协议；旧宿主明确要求升级，不回退到默认配置的子进程。
-SDK 提供 `AgentHarness::create_child`，扩展通过 `GetExecutionContext` 和 `ChildAgent`
+SDK 提供 `AgentHarness::create_independent_run`，扩展通过 `GetExecutionContext` 和 `IndependentRun`
 runtime actions 接入。完整协议见仓库 `docs/extensions/subagents.md`：
 <https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/subagents.md>。
 

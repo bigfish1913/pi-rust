@@ -37,7 +37,7 @@
 
 ```toml
 [dependencies]
-rpi-plugin-sdk = "0.8"
+rpi-plugin-sdk = "0.29.0"
 rpi-extcore = "0.1" # 需要 native RPC / session / workspace 服务时再添加
 ```
 
@@ -93,7 +93,7 @@ repository = "https://github.com/example/my-rpi-extension"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rpi-plugin-sdk = "0.8"
+rpi-plugin-sdk = "0.29.0"
 serde_json = "1"
 ```
 
@@ -103,10 +103,10 @@ serde_json = "1"
 
 ## 3. ABI 入口
 
-宿主只加载统一 C ABI 符号 `rpi_plugin_register`。扩展使用 `export_plugin!`，
-通过同一个 `PluginApi` 注册能力并调用 `api.declare` 声明优先级/平台。
-SDK 在注册前检查 `abi_version` 和 `struct_size`；旧宿主缺少的尾部可选槽位补成
-`None`，插件可据此降级。版本不兼容或必需字段不完整时返回非零状态，宿主报告加载失败。
+宿主调用统一 C ABI 入口 `rpi_plugin_register`。扩展通常使用 `export_plugin!` 导出入口，
+通过 `PluginApi` 注册能力并调用 `api.declare` 声明优先级/平台。示例中的 SDK 在注册前
+检查 `abi_version` 和 `struct_size`，将旧宿主缺少的尾部可选槽位补成 `None`，插件可据此
+降级。ABI 版本不兼容或必需字段不完整时返回非零状态，宿主报告加载失败。
 
 ```rust
 rpi_plugin_sdk::export_plugin!(|api| {
@@ -128,8 +128,64 @@ rpi_plugin_sdk::export_plugin!(|api| {
 });
 ```
 
-`declare` 的 JSON 支持 `priority`（数字，越大越先）和 `platforms`（字符串数组，
+`declare` 的 JSON 支持 `priority`（整数，越小越先）和 `platforms`（字符串数组，
 如 `["linux","windows","macos"]`）；宿主在分发事件处理器时跳过不匹配的平台。
+
+### 可选：Unix Host 共享插件映像
+
+支持此功能的 Unix 本地 Host 可在多个会话中复用同一版本的 `cdylib` 映像。插件通过
+自身导出的 `rpi_plugin_shared_sessions_v1` 符号选择启用。宿主检查符号归属，标记函数体留空。
+未导出该符号的插件在该 Host 中继续使用各会话的独立映像。共享只涉及映射的库，
+每次注册仍有独立的 `PluginApi`、回调上下文、注册表和关闭流程。注册入口仍是
+`rpi_plugin_register`，统一 C ABI 仍为 v4。较旧的兼容宿主和其他加载路径忽略标记，
+照常调用标准入口。插件仍须检查自己使用的可选槽位。
+
+包含该宏的 SDK 可用 `rpi_plugin_sdk::export_shared_plugin!(register);` 替换
+`export_plugin!(register)`，其中 `register` 的签名为 `fn(&PluginApi) -> i32`。
+宏同时导出标准入口和共享标记。可从 pi-rust 的 `v0.29.1-preview.1583` 源码标签
+取得该宏，例如用以下 Git 依赖。该标签的 SDK manifest 版本为 `0.29.0`，
+crates.io 发布的 `0.29.0` 和 `0.3.20` 均没有此宏。
+
+```toml
+[dependencies]
+rpi-plugin-sdk = { git = "https://github.com/bigfish1913/pi-rust", tag = "v0.29.1-preview.1583" }
+```
+
+使用没有该宏的已发布 SDK 时，例如 `=0.8.3` 或 `=0.3.20`，可保留 `export_plugin!`，
+并在同一个 `cdylib` 显式导出等价的标记。`0.8.3` 提供 `register_plugin_lifecycle`。
+`0.3.20` 未声明该槽位，适合只依靠单次调用 handle 等现有机制就能安全回收资源的扩展。
+
+```rust
+rpi_plugin_sdk::export_plugin!(register);
+
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
+```
+
+启用前确认以下约定：
+
+- **注册上下文**。宿主在调用注册入口的线程上绑定本次注册，所有 registrar 都在该次
+  调用返回前同步调用。`&PluginApi` 只在注册期间借用。如需在回调中调用宿主，复制所需
+  函数指针及对应的 `api.user_data` 到本次注册的状态中。`api.user_data` 是宿主拥有的
+  不透明指针，只能按对应宿主 API 的约定使用。为接受插件 `user_data` 的回调传入插件
+  自己的注册上下文。原生宿主会把注册时的宿主 `user_data` 传给 slash command 回调。
+  ABI v4 的 `ToolExecuteFn` 不接收注册上下文。需要调用宿主的工具使用宿主注入的
+  `__rpi.runtimeHandle` 绑定当次调用。需要访问注册私有状态的工具还要绑定注册归属，
+  同一个 session ID 在 reload 期间可能对应两次注册。单次调用状态由 `StepHandle` 持有，
+  `destroy` 负责回收。
+- **关闭和注册失败**。需要跨调用存活的资源时，先检查并成功注册 `register_plugin_lifecycle`，
+  再启动后台工作或把上下文交给其他 registrar。检查返回值，钩子注册失败时由插件回收
+  尚未交出的资源。注册入口在部分注册后返回非零（含 SDK 捕获 panic）时，宿主丢弃该次
+  注册的部分结果，并仍调用已成功安装的关闭钩子。`begin` 只通知本次注册停止接单并取消在飞工作，须幂等、
+  非阻塞，不调用宿主。宿主在飞 FFI 调用与字符串释放完成后，在清理线程调用 `finish`，
+  由它 join 本次注册的后台工作并释放资源。确认相关工作都已结束后才释放上下文并返回 `0`。返回非零
+  会让宿主保留该映像及宿主回调上下文。缺少槽位时，只启用有独立安全回收路径的能力。
+- **共享状态**。注册可同时发生，旧注册在关闭或 reload 时，其他注册仍可工作。全局
+  `static`、`OnceLock` 和缓存随映像存活，只适合线程安全且与会话生命周期无关的数据。
+  关闭最后一个会话后 Host 仍可保留原映像，同一产物 reload 时也可能复用它。每次注册
+  都应初始化自己的状态，避免把宿主上下文、取消标记或会话资源放进全局单例。替换插件
+  文件后，新注册可使用新映像，仍在使用旧映像的注册继续保有各自的引用。
 
 ### 能力检测
 
@@ -162,7 +218,7 @@ ABI 的字符串与步骤返回都是裸指针，SDK 提供一组宏把契约收
 ### 独立子任务
 
 `GetExecutionContext` 返回当前模型身份、thinking、活动工具、cwd 和会话 ID，
-不包含凭据、认证头或 endpoint。`ChildAgent` 提供 `start/poll/cancel/dispose`，
+不包含凭据、认证头或 endpoint。`IndependentRun` 提供 `start/poll/cancel/dispose`，
 在独立内存会话中继承有效 provider 绑定、项目工具和父审批 UI，不重入父 lane。
 工具范围只能缩小，预算和取消由宿主管理。旧宿主不支持时必须明确报错，
 不能静默退回重新解析默认配置的子进程。详见 [子 agent 协议](subagents.md)。
@@ -284,6 +340,15 @@ renderer 接收消息或自定义消息 envelope（例如
 transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿主通过注册时提供的
 `plugin_free_string` 回收。
 
+**内容由扩展提供，布局与生命周期由宿主控制。** 普通工具结果和命令返回的
+`kind: "message"` 都是转录内容；`markdown: true`、`lines` 或自定义 renderer 只改变
+内容表现，不意味着底部常驻。宿主把转录内容放进实时消息区，后续回复显示在它下面；
+浏览旧历史页时，新到达的流式消息不会修改旧页。在旧页显示的临时命令消息随该页退休。
+plan/todo 由宿主在原始转录位置更新与重放，
+扩展不应通过终端光标移动或直接重绘实现“固定面板”。需要临时选择器、输入对话框或
+状态栏时，使用宿主已提供的对应交互能力；不要把普通消息当作这些专用 UI 的替代品。
+本规则不新增布局参数、ABI 或持久化格式。
+
 渲染器**只在交互式 TUI 中调用**：`--mode rpc` 和 `-p` 不调用任何渲染器，渲染结果也不进入
 事件流，所以远程客户端要自己渲染 transcript。会话建立时 stderr 上的
 `renderers: N markdown-transform, N message-render, N entry-render (active)` 只报告
@@ -302,12 +367,18 @@ transcript 行/组件，不是任意组件树；`out` 由插件分配并由宿�
 其余固定行为：
 
 - entry renderer 的 `data` 可能为 `null`（自定义条目没带 `data` 时），不要假定它是对象。
-- TUI 在调用 entry renderer **之前**就跳过 `plan-mode`、`todo`、`todo-state`，为这三个
-  type 注册渲染器不会被调用。
+- TUI 在调用 entry renderer **之前**就由宿主原位重放 `plan-mode`、`todo`、`todo-state`；
+  为这三个 type 注册渲染器不会被调用。
 - `{"lines":[…]}` 会以 `\n` 拼成**一个**纯文本行，不是每行一个组件；需要多行时自己在
   `text` 里带换行。
+- entry renderer 可返回 `rc == 0` 与 `{"display":false}`，明确表示「已处理但隐藏」：
+  不添加组件或空行，不执行原始条目兜底，也不再询问后续 renderer。仅布尔值 `false`
+  生效，且优先于 `text`/`lines`；缺省、`true`、字符串 `"false"`、`null` 等保持旧行为。
+  非 0 返回码仍是「不处理」，不能用来隐藏。此字段仅适用于 entry renderer，不改变
+  message renderer、Markdown transformer、持久化或模型上下文。旧宿主可能忽略该字段
+  并显示兜底文本；插件未加载时也维持原有兜底。该能力不新增实时 entry 事件。
 - message renderer 的响应既没有 `text` 也没有 `lines` 时，TUI 降级显示 `[customType]`；
-  entry renderer 的响应缺这两个字段时不渲染，改由宿主自己的条目文案显示。
+  entry renderer 除显式 `display:false` 外，响应缺这两个字段时改由宿主自己的条目文案显示。
 - message renderer 除渲染自定义消息外，还会以
   `{"customType":"token-usage","usage":{...}}` 被调用一次以生成用量文本，因此要能容忍这个
   payload（没有匹配的 type 时返回非 0）。
@@ -394,7 +465,7 @@ if (control.is_cancelled)(control.user_data, ProviderChunkKind::Content as u32) 
 2. 对普通逻辑写 `rlib` 单元测试；对 ABI 注册、加载和卸载写至少一个宿主 smoke test。
 3. Schema 和实现使用同一字段命名，拒绝未知字段；对路径、URL、命令、数量和输出大小设置上限。
 4. `poll` 不执行长时间阻塞任务。耗时工作放入线程/任务，handle 保存状态；取消标记必须能让任务在有限时间内结束。
-5. 全局可变状态使用明确同步，避免把 session 或 tool call 状态存进无保护的 `static mut`。
+5. 共享可变数据使用明确同步，会话和单次调用的状态分别由注册上下文和调用 handle 持有。
 6. runtime action、provider、renderer、event handler 和 resources handler 都是可选能力；注册前检查 vtable slot。
 7. 插件注册失败返回非零；单个工具执行失败返回结构化错误，不要让整个宿主退出。
 8. README 记录工具 schema、权限边界、持久化文件、网络访问、支持平台和卸载方式。
@@ -515,12 +586,17 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 ## 9. 发布检查清单
 
 - `cargo fmt --check`、`cargo clippy --all-targets`、`cargo test` 通过。
-- `crate-type` 包含 `cdylib`，使用 `export_plugin!` 导出
-  `rpi_plugin_register`。
-- 依赖已发布的 `rpi-plugin-sdk` 兼容版本，不链接宿主私有 crate。
+- `crate-type` 包含 `cdylib`，导出 `rpi_plugin_register`。启用共享映像时，同时确认
+  `rpi_plugin_shared_sessions_v1` 由插件自身导出。
+- 明确锁定兼容的 `rpi-plugin-sdk` 发布版或 Git 源码版本，不链接宿主私有 crate。
 - `rpi dev --no-watch` 能编译、加载并注册预期工具。
 - `rpi install <crate> --build --force` 的干净安装路径通过。
 - Linux/macOS/Windows 构建由 CI 验证，README 标明支持矩阵。
+- 启用共享映像时，用同一 Unix Host 同时打开两个加载同一产物的会话。可记录回调函数和
+  注册上下文的地址，确认代码来自同一映像，注册状态和宿主回调各归自己的会话。在一个会话有在飞工作时触发取消和 reload，确认旧调用能观察取消并
+  退出、旧注册清理完成、另一会话继续工作、新注册从自己的初始状态开始。分别验证原产物
+  reload、替换产物后 reload，以及关闭全部会话后再打开。再让一次注册在钩子安装后失败，
+  确认只清理失败注册且不发布其部分结果。用较旧的兼容宿主验证带标记的产物仍可正常注册。
 
 ## 10. 模型执行规则
 
@@ -634,7 +710,7 @@ provider 登录流程按 Esc，以及 `/logout` 的撤销）。插件应在长�
 provider ID、目录与凭据继续独立。单 provider 教学样例才使用 `export_provider!`。
 
 完整规范：[Provider 接入规范](provider-integration.md)。创建推理扩展时优先复制
-正式 provider package 示例见 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
+正式 provider package 示例见 [rpi-providers](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)，通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
 
 ### 方式与目录
 
@@ -698,13 +774,13 @@ OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负�
 UTF-8 跨块、usage、唯一终态、响应未结束时取消与 HTTP 401；认证隔离、端点 / 请求头
 覆盖、公开目录无认证头、命令与重载也要验证。工具和 OAuth 只声明已完成验证的能力。
 真实 API 测试默认 ignored，显式运行时从环境注入 key 并限制超时、重试和用量。
-正式统一包位于独立的 [rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
+正式统一包位于独立的 [rpi-extension 项目](https://github.com/pi-rust/rpi-extension/tree/main/packages/rpi-providers)，
 保留 `deepseek` ID，声明 `DEEPSEEK_API_KEY`，并通过 `requiresReasoningContent` 支持工具续轮。
 
-在 rpi-package 仓库运行正式 package 的离线验证：
+在 rpi-extension 仓库运行正式 package 的离线验证：
 
 ```sh
-cd /path/to/rpi-package
+cd /path/to/rpi-extension
 cargo build -p rpi-providers
 cargo test -p rpi-providers --test streaming
 cargo test -p rpi-providers --test host

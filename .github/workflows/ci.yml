@@ -241,6 +241,9 @@ jobs:
           python3 -B scripts/test_workflow_infrastructure.py
           python3 -B scripts/test_ci_transient_recovery.py
 
+      - name: Test the linked-issue check
+        run: python3 -B scripts/test_pr_issue_link.py
+
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -463,33 +466,10 @@ jobs:
               --max-ready-ms 4000 --max-single-ready-ms 8000 \
               --max-get-messages-ms 250 --max-get-state-ms 2000
           }
-          latency_only_failure() {
-            python3 - "$1" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              data = json.load(stream)
-          runs = data.get("runs", [])
-          summaries = [item for item in data.get("summaries", [])
-                       if item.get("gate", {}).get("gatesExit")]
-          only_latency = bool(data.get("status") == "FAIL" and "fatalError" not in data and
-                              runs and summaries and
-                              all(run.get("status") == "PASS" and not run.get("errors")
-                                  for run in runs) and
-                              all(item["gate"].get("complete") is True for item in summaries) and
-                              all(item.get("metrics", {}).get(key) is not None
-                                  for item in summaries
-                                  for key in ("readyMs", "getMessages40Ms", "getStateMs")) and
-                              any(item.get("gate", {}).get("status") == "FAIL"
-                                  for item in summaries))
-          raise SystemExit(0 if only_latency else 1)
-          PY
-          }
           if run_benchmark "${output_base}-1"; then
             exit 0
           fi
-          if ! latency_only_failure "${output_base}-1/results.json"; then
+          if ! python3 -B scripts/resource-cold-start-retry.py "${output_base}-1/results.json"; then
             echo 'Cold-start benchmark failed for a non-latency reason; not retrying.' >&2
             exit 1
           fi
@@ -509,33 +489,10 @@ jobs:
               --max-ready-ms 6000 --max-single-ready-ms 10000 \
               --max-get-messages-ms 250 --max-get-state-ms 2000
           }
-          latency_only_failure() {
-            python3 - "$1" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              data = json.load(stream)
-          runs = data.get("runs", [])
-          summaries = [item for item in data.get("summaries", [])
-                       if item.get("gate", {}).get("gatesExit")]
-          only_latency = bool(data.get("status") == "FAIL" and "fatalError" not in data and
-                              runs and summaries and
-                              all(run.get("status") == "PASS" and not run.get("errors")
-                                  for run in runs) and
-                              all(item["gate"].get("complete") is True for item in summaries) and
-                              all(item.get("metrics", {}).get(key) is not None
-                                  for item in summaries
-                                  for key in ("readyMs", "getMessages40Ms", "getStateMs")) and
-                              any(item.get("gate", {}).get("status") == "FAIL"
-                                  for item in summaries))
-          raise SystemExit(0 if only_latency else 1)
-          PY
-          }
           if run_benchmark "${output_base}-1"; then
             exit 0
           fi
-          if ! latency_only_failure "${output_base}-1/results.json"; then
+          if ! python3 -B scripts/resource-cold-start-retry.py "${output_base}-1/results.json"; then
             echo 'Cold-start benchmark failed for a non-latency reason; not retrying.' >&2
             exit 1
           fi
@@ -586,9 +543,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
     env:
-      # Update this deliberately when rpi-package compatibility is reviewed.
+      # Pin the reviewed IndependentRun migration from rpi-extension#121.
       # The SHA makes the extension set reproducible and auditable.
-      RPI_PACKAGE_REF: 0d8b0d4fe51964a4c8484819df2d47bcb5d4ca36
+      RPI_EXTENSION_REF: aad12e8c6d4944a34da6ccdc3ebd97bde9f3649d
       COMPAT_DIAGNOSTICS_NAME: extension-compat-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out host
@@ -597,9 +554,9 @@ jobs:
       - name: Check out pinned official extension catalog
         uses: actions/checkout@v4
         with:
-          repository: pi-rust/rpi-package
-          ref: ${{ env.RPI_PACKAGE_REF }}
-          path: rpi-package
+          repository: pi-rust/rpi-extension
+          ref: ${{ env.RPI_EXTENSION_REF }}
+          path: rpi-extension
           fetch-depth: 1
 
       - name: Record source revisions and official catalog
@@ -607,13 +564,17 @@ jobs:
         run: |
           set -euo pipefail
           echo "host=$(git rev-parse HEAD)"
-          echo "rpi-package=$(git -C rpi-package rev-parse HEAD)"
+          echo "rpi-extension=$(git -C rpi-extension rev-parse HEAD)"
           python - <<'PY'
           import json
           import pathlib
           import tomllib
-          host = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
-          catalog = json.loads(pathlib.Path("rpi-package/catalog/packages.json").read_text())
+          # The catalog carries bilingual descriptions; read UTF-8 explicitly
+          # because the Windows runner's default locale codec is cp1252.
+          host = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          catalog = json.loads(
+              pathlib.Path("rpi-extension/catalog/packages.json").read_text(encoding="utf-8")
+          )
           print(f"host-version={host['workspace']['package']['version']}")
           print(f"official-extension-count={len(catalog)}")
           print("official-extensions=" + ",".join(item["name"] for item in catalog))
@@ -654,11 +615,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/sherpa-onnx-archives
-          key: sherpa-onnx-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rpi-package/Cargo.lock') }}
+          key: sherpa-onnx-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rpi-extension/Cargo.lock') }}
 
       - name: Prefetch sherpa-onnx archive
         shell: bash
-        working-directory: rpi-package
+        working-directory: rpi-extension
         run: |
           set -euo pipefail
           version="$(python - <<'PY'
@@ -725,7 +686,7 @@ jobs:
         with:
           workspaces: |
             . -> target/extension-compat
-            rpi-package -> rpi-package/target
+            rpi-extension -> rpi-extension/target
 
       - name: Build the current host
         shell: bash
@@ -733,16 +694,16 @@ jobs:
 
       - name: Build every official extension and protocol bridge
         shell: bash
-        working-directory: rpi-package
+        working-directory: rpi-extension
         run: cargo build --workspace --release --locked
 
       - name: Stage exactly the catalog extensions
         shell: bash
-        working-directory: rpi-package
+        working-directory: rpi-extension
         run: |
           set -euo pipefail
-          cargo run --release --locked -p rpi-package-install -- pack --no-archive --out "$RUNNER_TEMP/rpi-package-dist"
-          stage="$(python - "$RUNNER_TEMP/rpi-package-dist" <<'PY'
+          cargo run --release --locked -p rpi-package-install -- pack --no-archive --out "$RUNNER_TEMP/rpi-extension-dist"
+          stage="$(python - "$RUNNER_TEMP/rpi-extension-dist" <<'PY'
           import pathlib
           import sys
           matches = sorted(pathlib.Path(sys.argv[1]).glob("rpi-packages-*"))
@@ -759,13 +720,26 @@ jobs:
         shell: bash
         run: RPI_SMOKE_PLUGIN_DIR="$RPI_COMPAT_STAGE" cargo test -p rpi-extensions --test extension_compat --locked -- --ignored
 
+      - name: Exercise delegation through the official subagents extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Windows) library=rpi_subagents.dll ;;
+            macOS) library=librpi_subagents.dylib ;;
+            Linux) library=librpi_subagents.so ;;
+          esac
+          export RPI_TEST_SUBAGENT_LIBRARY="$GITHUB_WORKSPACE/rpi-extension/target/release/$library"
+          test -f "$RPI_TEST_SUBAGENT_LIBRARY"
+          cargo test -p rpi-cli --test subagent_packages --release --locked --target-dir target/extension-compat
+
       - name: Exercise native RPC, ACP and Web against the staged set
         shell: bash
         run: |
           set -euo pipefail
           rpi_bin="target/extension-compat/release/rpi"
-          acp_bin="rpi-package/target/release/rpi-acp-bridge"
-          web_bin="rpi-package/target/release/rpi-web"
+          acp_bin="rpi-extension/target/release/rpi-acp-bridge"
+          web_bin="rpi-extension/target/release/rpi-web"
           case "$RUNNER_OS" in
             Windows) rpi_bin="$rpi_bin.exe"; acp_bin="$acp_bin.exe"; web_bin="$web_bin.exe" ;;
           esac
@@ -783,7 +757,7 @@ jobs:
           name: ${{ env.COMPAT_DIAGNOSTICS_NAME }}-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/${{ env.COMPAT_DIAGNOSTICS_NAME }}
-            ${{ runner.temp }}/rpi-package-dist/**/web.log
+            ${{ runner.temp }}/rpi-extension-dist/**/web.log
           if-no-files-found: ignore
           include-hidden-files: true
 

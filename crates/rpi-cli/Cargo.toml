@@ -33,6 +33,7 @@ tokio-util = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 fs2 = { workspace = true }
+rusqlite = { workspace = true, features = ["limits"] }
 globset = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -74,7 +75,7 @@ windows-sys = { version = "0.59", features = [
 
 [target.'cfg(unix)'.dependencies]
 # `nix::sys::signal::raise` for the Ctrl+Z suspend (`app.suspend`).
-nix = { version = "0.29", features = ["signal"] }
+nix = { version = "0.29", features = ["signal", "user"] }
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
@@ -97,6 +98,10 @@ pkg-fmt = "zip"
 default = ["clipboard"]
 # Enables real clipboard support for `/copy` and image paste (best-effort).
 clipboard = ["dep:arboard"]
+
+[build-dependencies]
+# Reuse the already locked compiler helper for target/tool-wrapper conventions.
+cc = "=1.4.7"
 
 [dev-dependencies]
 criterion = "0.5"

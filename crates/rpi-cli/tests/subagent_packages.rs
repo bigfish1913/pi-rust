@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use rpi_agent::{AgentEvent, BeforeToolCallResult, CollectorEmitter};
 use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript, FauxStep};
-use rpi_ai::types::StopReason;
+use rpi_ai::types::{Content, StopReason};
 use rpi_extensions::{
     ActionBridge, PluginToolAdapter, RuntimeActionHost, ToolCallContext, UiDialogMailbox,
 };
@@ -19,6 +19,20 @@ use serde_json::json;
 mod cancellation;
 #[path = "subagent_packages/lifetime.rs"]
 mod lifetime;
+
+async fn assert_parent_reply(parent: &AgentHarness, prompt: &str, expected: &str) {
+    let result = tokio::time::timeout(Duration::from_secs(10), parent.prompt_text(prompt, vec![]))
+        .await
+        .unwrap()
+        .unwrap();
+    let HarnessRunOutcome::Completed { final_message, .. } = result.outcome else {
+        panic!("parent did not complete {prompt:?}: {:?}", result.outcome);
+    };
+    assert!(
+        matches!(final_message.content.as_slice(), [Content::Text(text)] if text.text == expected),
+        "unexpected parent report for {prompt:?}: {final_message:?}"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_ui() {
@@ -75,7 +89,7 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
     script.set_responses(vec![
         FauxStep::tool_call(
             "delegate_task",
-            json!({"task":"read project.txt; try blocked.txt","maxTurns":4}),
+            json!({"task":"read project.txt; try blocked.txt","maxTurns":0}),
         ),
         FauxStep::factory(|context| {
             assert!(
@@ -86,6 +100,9 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
                 "{}",
                 serde_json::to_string_pretty(context).unwrap()
             );
+            let input = serde_json::to_string(context).unwrap();
+            assert!(input.contains("Complete the task within the host timeout."));
+            assert!(!input.contains("at most 0 turns"));
             assert!(context
                 .system_prompt
                 .as_deref()
@@ -121,6 +138,7 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
             let text = serde_json::to_string(context).unwrap();
             assert!(text.contains("rpi-delegation"));
             assert!(text.contains("child report"));
+            assert!(text.contains(r#"\"turnLimited\":false"#));
             faux_assistant_message("parent completed", StopReason::Stop)
         }),
     ]);
@@ -199,24 +217,15 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
         .await
         .expect("child approval must appear in parent's UI");
     });
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        parent.prompt_text("delegate", vec![]),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    assert_parent_reply(&parent, "delegate", "parent completed").await;
     answer.await.unwrap();
-    assert!(matches!(
-        result.outcome,
-        HarnessRunOutcome::Completed { .. }
-    ));
     assert!(!temp.path().join("blocked.txt").exists());
     assert!(events.lock().unwrap().iter().any(|event|matches!(event,AgentEvent::ToolExecutionUpdate{tool_name,..} if tool_name=="delegate_task")));
     let context = host.get_execution_context(json!({})).await.unwrap();
     assert_eq!(context["model"]["id"], provider.default_model().id);
     assert_eq!(context["cwd"], temp.path().to_string_lossy().as_ref());
     assert!(context.get("apiKey").is_none());
+    assert!(context.get("childAgent").is_none());
     assert!(context["model"].get("headers").is_none());
     // The same inherited approval hook must fail closed without a UI consumer.
     ui.detach();
@@ -232,15 +241,19 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
                 .contains("requires an interactive UI"));
             faux_assistant_message("headless denial observed", StopReason::Stop)
         }),
-        FauxStep::text("done"),
+        FauxStep::factory(|context| {
+            assert!(serde_json::to_string(context)
+                .unwrap()
+                .contains("headless denial observed"));
+            faux_assistant_message("parent observed headless denial", StopReason::Stop)
+        }),
     ]);
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        parent.prompt_text("delegate without UI", vec![]),
+    assert_parent_reply(
+        &parent,
+        "delegate without UI",
+        "parent observed headless denial",
     )
-    .await
-    .unwrap()
-    .unwrap();
+    .await;
     assert!(!temp.path().join("blocked.txt").exists());
     // The same DLL is also available under an alias. A child must not be able
     // to delegate through that alias, even though the native name is filtered.
@@ -267,7 +280,7 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
         FauxStep::factory(|context| {
             assert!(serde_json::to_string(context)
                 .unwrap()
-                .contains("recursive child agents are not allowed"));
+                .contains("IndependentRun requires a live top-level tool invocation"));
             faux_assistant_message("nested delegation blocked", StopReason::Stop)
         }),
         FauxStep::factory(|context| {
@@ -277,13 +290,12 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
             faux_assistant_message("parent observed nested denial", StopReason::Stop)
         }),
     ]);
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        parent.prompt_text("delegate via alias", vec![]),
+    assert_parent_reply(
+        &parent,
+        "delegate via alias",
+        "parent observed nested denial",
     )
-    .await
-    .unwrap()
-    .unwrap();
+    .await;
     let mut tools = parent.get_tools().await.unwrap();
     tools.retain(|tool| tool.tool.schema().name != "research_alias");
     parent.set_tools(tools, None).await.unwrap();
@@ -323,13 +335,12 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
                 faux_assistant_message("original parent binding", StopReason::Stop)
             }),
         ]);
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            parent.prompt_text("delegate across registration/rollback", vec![]),
+        assert_parent_reply(
+            &parent,
+            "delegate across registration/rollback",
+            "original parent binding",
         )
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
     }
 
     // Reload the same DLL with a fresh plugin bridge; no OnceLock may keep the
@@ -362,13 +373,7 @@ async fn real_subagent_plugin_inherits_project_tools_model_and_parent_approval_u
             faux_assistant_message("reloaded parent", StopReason::Stop)
         }),
     ]);
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        parent.prompt_text("delegate after reload", vec![]),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    assert_parent_reply(&parent, "delegate after reload", "reloaded parent").await;
     cancellation::repeated_cancel_does_not_exhaust_handles(&parent, &script).await;
     parent.close().await.unwrap();
     fresh_bridge.invalidate();

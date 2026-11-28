@@ -28,9 +28,39 @@ struct Resident {
     storage: Option<Arc<dyn SessionStorage>>,
     // Entries belong to rendered components, not a second retained payload copy.
     page: Option<BranchEntryPage>,
-    error: Option<Arc<Container>>,
+    page_chat: Option<Arc<Container>>,
+    // Keep the owner so retries replace one inline error, not a root footer.
+    error: Option<(Arc<Container>, Arc<Container>)>,
     // Page-local notices retire with the page, including late callbacks.
     notices: Arc<Container>,
+}
+impl Resident {
+    fn latest_page(&self) -> Option<&Arc<Container>> {
+        self.page_chat
+            .as_ref()
+            .filter(|_| self.page.as_ref().is_some_and(|page| !page.has_more_after))
+    }
+
+    fn notice_container<'a>(
+        &'a self,
+        root: &'a Arc<Container>,
+        active: &'a Arc<Container>,
+    ) -> &'a Arc<Container> {
+        if self.storage.is_none() {
+            root
+        } else if self.page.as_ref().is_some_and(|page| page.has_more_after) {
+            &self.notices
+        } else {
+            active
+        }
+    }
+
+    fn clear_error(&mut self) {
+        if let Some((owner, notice)) = self.error.take() {
+            let notice: Arc<dyn Component> = notice;
+            owner.remove_child(&notice);
+        }
+    }
 }
 #[derive(Default)]
 pub(super) struct HistoryUi {
@@ -38,7 +68,6 @@ pub(super) struct HistoryUi {
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(super) unsaved: std::sync::atomic::AtomicBool,
     pub(super) active: Arc<Container>,
-    pub(super) panels: Arc<Container>,
     pub(super) header: Arc<Container>,
     // An ephemeral component, not a durable state cache or persisted transcript.
     native_durable_enabled: bool,
@@ -66,13 +95,13 @@ impl HistoryUi {
         let mut resident = self.resident.lock().unwrap();
         resident.generation += 1;
         resident.page = None;
-        resident.error = None;
+        resident.page_chat = None;
+        resident.clear_error();
         resident.notices = Arc::new(Container::new());
         resident.storage = None;
         self.unsaved
             .store(false, std::sync::atomic::Ordering::SeqCst);
         self.active.clear();
-        self.panels.clear();
         self.header.clear();
         self.updates.clear();
         self.regular_update_hint.clear();
@@ -89,6 +118,7 @@ impl HistoryUi {
             .is_some_and(|bound| Arc::ptr_eq(bound, &storage))
         {
             resident.page = None;
+            resident.page_chat = None;
             resident.notices = Arc::new(Container::new());
             self.native_durable_notice.clear();
         }
@@ -98,18 +128,30 @@ impl HistoryUi {
         self.resident.lock().unwrap().storage.is_some()
     }
     pub(super) fn notice_container(&self, root: &Arc<Container>) -> Arc<Container> {
+        self.resident
+            .lock()
+            .unwrap()
+            .notice_container(root, &self.active)
+            .clone()
+    }
+
+    // Keep the page mounted until the live result has updated its panel.
+    pub(super) fn with_latest_page(&self, apply: impl FnOnce(Option<Arc<Container>>)) {
         let resident = self.resident.lock().unwrap();
-        if resident.storage.is_none() {
-            root.clone()
-        } else if resident
-            .page
-            .as_ref()
-            .is_some_and(|page| page.has_more_after)
-        {
-            resident.notices.clone()
-        } else {
-            self.active.clone()
-        }
+        apply(resident.latest_page().cloned());
+    }
+
+    pub(super) fn update_command_plan(
+        &self,
+        root: &Arc<Container>,
+        result: &serde_json::Value,
+    ) -> bool {
+        let resident = self.resident.lock().unwrap();
+        crate::transcript_view::update_plan_panel(
+            resident.notice_container(root, &self.active),
+            resident.latest_page().map(Arc::as_ref),
+            result,
+        )
     }
     pub(super) fn is_latest(&self) -> bool {
         self.resident
@@ -152,14 +194,6 @@ impl HistoryUi {
             .any(|child| Arc::ptr_eq(child, &active))
         {
             chat.add_child(active);
-        }
-        let panels: Arc<dyn Component> = self.panels.clone();
-        if !chat
-            .get_children()
-            .iter()
-            .any(|child| Arc::ptr_eq(child, &panels))
-        {
-            chat.add_child(panels);
         }
         self.mount_regular_update_hint(chat);
         self.mount_native_notice(chat);
@@ -270,8 +304,6 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
     let Ok(page) = tree.branch_entry_page(&Default::default()).await else {
         return;
     };
-    let panels = Arc::new(Container::new());
-    restore_history_panels(&tree, &panels).await;
     let overview = tree.branch_overview().await.ok();
     let name = tree.get_name().await.ok().flatten();
     if page.leaf_id != expected_leaf || tree.get_leaf_id().await.ok() != Some(expected_leaf) {
@@ -284,17 +316,14 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
     let page_chat = render_page(state, &page.entries);
     resident.notices = Arc::new(Container::new());
     page_chat.add_child(resident.notices.clone());
-    let publish = || {
+    let mut publish = || {
         clear_settled_active(state);
+        crate::transcript_view::merge_transcript_panels(&page_chat, &state.history_page.active);
         chat.clear();
         state.history_page.mount_header(chat);
         state.history_page.mount_updates(chat);
-        chat.add_child(page_chat);
-        resident.error = None;
-        state
-            .history_page
-            .panels
-            .replace_children(panels.get_children());
+        chat.add_child(page_chat.clone());
+        resident.clear_error();
         state.history_page.mount_active(chat);
     };
     // Retiring the live reply and mounting its persisted replacement must be
@@ -309,6 +338,7 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
         apply_overview(&state.footer, &overview);
     }
     resident.page = Some(metadata(page));
+    resident.page_chat = Some(page_chat);
     state.search.activate();
     state.search.deactivate();
     state.search_bar.set_visible(false);
@@ -382,7 +412,7 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
         (resident.generation, storage, resident.page.clone())
     };
     let task_state = state.clone();
-    *worker = Some(tokio::spawn(async move {
+    let load = async move {
         let state = task_state;
         let tree = Session::new(storage.clone(), None).view("main");
         let Ok(expected_leaf) = tree.get_leaf_id().await else {
@@ -433,20 +463,21 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
                 // reply/old page and installing the complete history page.
                 tui.update_components(|| {
                     clear_settled_active(&state);
-                    resident.error = None;
+                    resident.clear_error();
                     // Drop every reference to the old page (including images).
                     state.chat_container.clear();
                     state.history_page.mount_header(&state.chat_container);
                     state.history_page.mount_updates(&state.chat_container);
-                    state.chat_container.add_child(page_chat);
+                    state.chat_container.add_child(page_chat.clone());
                     if !page.has_more_after {
+                        crate::transcript_view::merge_transcript_panels(
+                            &page_chat,
+                            &state.history_page.active,
+                        );
                         state
                             .chat_container
                             .add_child(state.history_page.active.clone());
                     }
-                    state
-                        .chat_container
-                        .add_child(state.history_page.panels.clone());
                     state
                         .history_page
                         .mount_regular_update_hint(&state.chat_container);
@@ -462,6 +493,7 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
                 state.search.deactivate();
                 state.search_bar.set_visible(false);
                 resident.page = Some(metadata(page));
+                resident.page_chat = Some(page_chat);
                 match direction {
                     Direction::Older => tui.scroll_to_bottom(),
                     Direction::Newer => tui.scroll_to_top(),
@@ -472,18 +504,29 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
             Ok(None) => {}
             Err(error) => {
                 // Failure keeps the original page and component references intact.
-                if let Some(previous) = resident.error.take() {
-                    let previous: Arc<dyn Component> = previous;
-                    state.chat_container.remove_child(&previous);
-                }
+                resident.clear_error();
+                let owner = if resident
+                    .page
+                    .as_ref()
+                    .is_some_and(|page| page.has_more_after)
+                {
+                    resident.notices.clone()
+                } else {
+                    state.history_page.mount_active(&state.chat_container);
+                    state.history_page.active.clone()
+                };
                 let notice = Arc::new(Container::new());
                 add_error_message(&notice, &format!("Could not load history: {error}"));
-                state.chat_container.add_child(notice.clone());
-                resident.error = Some(notice);
+                owner.add_child(notice.clone());
+                resident.error = Some((owner, notice));
                 tui.request_render(false);
             }
         }
-    }));
+    };
+    *worker = Some(tokio::spawn(rpi_tui::display_context::scope(
+        rpi_tui::display_context::current(),
+        load,
+    )));
 }
 
 /// Only operation settlement reloads latest, never individual token events.

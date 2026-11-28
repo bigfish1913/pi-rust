@@ -37,6 +37,121 @@ async fn stop(client: &mut tokio::io::DuplexStream, task: tokio::task::JoinHandl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_legacy_client_gets_no_autonomous_settlement_or_execution_frames() {
+    let provider = FauxProvider::new(FauxScript::new().with_text("autonomous").with_text("rpc"));
+    let harness = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+        model: provider.default_model().clone(),
+        models: vec![provider],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let retained = harness.clone();
+    let (mut client, output, task) = super::tests::start_test_rpc_with_execution(
+        harness,
+        rpi_extensions::UiDialogMailbox::new(),
+        None,
+        false,
+    );
+    let ready = output.wait_for(|m| m["type"] == "ready").await;
+    assert!(ready["semantics"]["executionLifecycle"].is_null());
+    assert_eq!(
+        ready["semantics"]["executionLifecycleOptIn"]["value"],
+        "correlated-v1"
+    );
+    retained
+        .lane("main")
+        .send_message(
+            rpi_ai::UserMessage::new("plugin kickoff", 0).into(),
+            rpi_harness::types::SendMessageOptions {
+                trigger_turn: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    output.wait_for(|m| m["type"] == "agent_end").await;
+    // A normal RPC command still settles exactly once in legacy mode.
+    send(
+        &mut client,
+        json!({"type":"prompt", "id":"legacy", "message":"next"}),
+    )
+    .await;
+    let settled = output
+        .wait_for(|m| m["type"] == "agent_settled" && m["requestId"] == "legacy")
+        .await;
+    assert_eq!(settled["outcome"], "completed");
+    stop(&mut client, task).await;
+    let messages = output.messages();
+    assert!(!messages
+        .iter()
+        .any(|m| m["type"] == "execution_started" || m["type"] == "execution_released"));
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["type"] == "agent_settled")
+            .count(),
+        1
+    );
+    assert!(messages
+        .iter()
+        .filter(|m| m["type"] == "agent_start")
+        .all(|m| m.get("executionId").is_none()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_plugin_execution_settles_without_an_rpc_prompt() {
+    let (harness, _) = rpc_test_harness("autonomous", 0.0).await;
+    let retained = harness.clone();
+    let (mut client, output, task) =
+        start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+    output.wait_for(|m| m["type"] == "ready").await;
+    let result = retained
+        .lane("main")
+        .send_message(
+            rpi_ai::UserMessage::new("plugin kickoff", 0).into(),
+            rpi_harness::types::SendMessageOptions {
+                trigger_turn: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let rpi_harness::agent_harness::SendMessageResult::Run(run) = result else {
+        panic!("plugin must start a run");
+    };
+    let settled = output.wait_for(|m| m["type"] == "agent_settled").await;
+    assert_eq!(settled["runId"], run.run_id);
+    assert_eq!(settled["outcome"], "completed");
+    assert!(settled["executionId"].is_string());
+    assert!(settled["requestId"].is_null());
+    stop(&mut client, task).await;
+    let messages = output.messages();
+    let lifecycle: Vec<_> = messages
+        .iter()
+        .filter(|event| event["executionId"] == settled["executionId"])
+        .filter_map(|event| match event["type"].as_str() {
+            Some(kind @ ("execution_started" | "execution_released" | "agent_settled")) => {
+                Some(kind)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lifecycle,
+        ["execution_started", "execution_released", "agent_settled"]
+    );
+    let started = messages
+        .iter()
+        .find(|event| event["type"] == "execution_started")
+        .unwrap();
+    assert!(
+        started["runId"].is_null(),
+        "durable identity is not known at admission"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_terminal_publication_releases_admission_before_next_prompt() {
     use crate::rpc::prompt_content::validation_test_hook::{Gate, ReleaseOnDrop};
     use std::sync::atomic::Ordering;
@@ -639,4 +754,33 @@ async fn production_parallel_admission_and_abort_before_validation_are_atomic() 
         .iter()
         .any(|m| m["type"] == "agent_settled"));
     stop(&mut client, task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_command_panic_closes_transport_without_a_successful_settlement() {
+    let (harness, _) = rpc_test_harness("must not run", 0.0).await;
+    let _callback = harness
+        .events()
+        .on::<rpi_harness::events::RunStartEvent, _>(|_| {
+            panic!("simulated admitted execution failure");
+        });
+    let (mut client, output, task) =
+        start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+    output.wait_for(|event| event["type"] == "ready").await;
+    send(
+        &mut client,
+        json!({"type":"prompt", "id":"panic", "message":"hello"}),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    assert!(!output
+        .messages()
+        .iter()
+        .any(|event| event["type"] == "agent_settled"));
 }

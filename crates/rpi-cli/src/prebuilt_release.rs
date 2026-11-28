@@ -141,13 +141,13 @@ async fn download_manifest_to(
     cdn_base: Option<&reqwest::Url>,
 ) -> Result<PathBuf, String> {
     let distribution = validate(manifest, version, target)?;
-    let cdn_url = cdn_base
-        .map(|base| crate::cdn::archive_url(base, REPOSITORY, &manifest.tag, &distribution.url))
+    let cdn_urls = cdn_base
+        .map(|base| crate::cdn::archive_urls(base, REPOSITORY, &manifest.tag, &distribution.url))
         .transpose()?
-        .flatten();
+        .unwrap_or_default();
     let archive = crate::cdn::download_with_fallback(
         client,
-        cdn_url.as_ref(),
+        &cdn_urls,
         &distribution.url,
         distribution.size,
         &distribution.sha256,

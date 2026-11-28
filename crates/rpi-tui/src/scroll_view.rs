@@ -117,6 +117,9 @@ struct ScrollRenderCache {
     /// when the content width is identical. Keying the cache on width alone
     /// would serve those stale rows to a pure scroll frame.
     cells: crate::terminal_image::CellDimensions,
+    /// Upload scope used to choose transmission vs placement rows. A pure
+    /// scroll must not reuse placements for ids the renderer has forgotten.
+    uploaded_images: Option<Arc<std::collections::HashSet<u32>>>,
     document: Arc<RenderedDocument>,
     /// Position used to slice this viewport, not a pending live scroll delta.
     scroll_top: usize,
@@ -480,12 +483,17 @@ impl ScrollView {
     ) -> Vec<String> {
         let content_width = self.get_content_width(width);
         let cells = crate::terminal_image::effective_cell_dimensions();
+        let uploaded_images = crate::terminal_image::frame_uploaded_images();
         let cached = if reuse_cached_content {
             self.render_cache
                 .lock()
                 .ok()
                 .and_then(|cache| cache.clone())
-                .filter(|cache| cache.content_width == content_width && cache.cells == cells)
+                .filter(|cache| {
+                    cache.content_width == content_width
+                        && cache.cells == cells
+                        && cache.uploaded_images == uploaded_images
+                })
         } else {
             None
         };
@@ -544,6 +552,7 @@ impl ScrollView {
             *cache = Some(ScrollRenderCache {
                 content_width,
                 cells,
+                uploaded_images,
                 document,
                 scroll_top,
             });

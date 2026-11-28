@@ -12,6 +12,7 @@ struct Scanner {
     buffer: Vec<u8>,
     cursor: usize,
     hash: Sha256,
+    hash_before_buffer: Sha256,
     policy: ReadPolicy,
 }
 impl Scanner {
@@ -24,6 +25,7 @@ impl Scanner {
             buffer: Vec::new(),
             cursor: 0,
             hash: Sha256::new(),
+            hash_before_buffer: Sha256::new(),
             policy: ReadPolicy::Restore,
         }
     }
@@ -57,11 +59,82 @@ impl Scanner {
             if self.buffer.len() != count {
                 return Err(SessionError::storage("short session history scan"));
             }
+            self.hash_before_buffer = self.hash.clone();
             self.hash.update(&self.buffer);
             self.fetched += count as u64;
             self.cursor = 0;
         }
     }
+
+    async fn resume(&self, prefix: startup_checkpoint::Boundary) -> Option<Self> {
+        if prefix.bytes < self.offset || prefix.bytes > self.length {
+            return None;
+        }
+        // The initial header read may already contain some of the prefix or
+        // even some of the suffix. Reuse those exact bytes and hash context.
+        if prefix.bytes < self.fetched {
+            let cursor = self.buffer.len() - (self.fetched - prefix.bytes) as usize;
+            let prior = &self.buffer[..cursor];
+            let mut hash = self.hash_before_buffer.clone();
+            hash.update(prior);
+            if prior.last() != Some(&b'\n') || hash.finalize() != prefix.digest {
+                return None;
+            }
+            return Some(Self {
+                reader: self.reader.clone(),
+                length: self.length,
+                fetched: self.fetched,
+                offset: prefix.bytes,
+                buffer: self.buffer.clone(),
+                cursor,
+                hash: self.hash.clone(),
+                hash_before_buffer: self.hash_before_buffer.clone(),
+                policy: self.policy,
+            });
+        }
+        let mut hash = self.hash.clone();
+        let mut last = self.buffer.last().copied();
+        let mut offset = self.fetched;
+        while offset < prefix.bytes {
+            let count = (prefix.bytes - offset).min(CHUNK as u64) as usize;
+            let bytes = self.reader.read_range(offset, count).await.ok()?;
+            if bytes.len() != count {
+                return None;
+            }
+            hash.update(&bytes);
+            last = bytes.last().copied();
+            offset += count as u64;
+        }
+        if last != Some(b'\n') || hash.clone().finalize() != prefix.digest {
+            return None;
+        }
+        Some(Self {
+            reader: self.reader.clone(),
+            length: self.length,
+            fetched: prefix.bytes,
+            offset: prefix.bytes,
+            buffer: Vec::new(),
+            cursor: 0,
+            hash_before_buffer: hash.clone(),
+            hash,
+            policy: self.policy,
+        })
+    }
+}
+
+async fn load_checkpoint(
+    fs: &Arc<dyn FileSystem>,
+    path: &str,
+    scan: &Scanner,
+) -> Option<(startup_checkpoint::Boundary, Scanner, ResidentState)> {
+    let saved = startup_checkpoint::Checkpoint::open(fs, path).await?;
+    let boundary = saved.boundary;
+    let resumed = scan.resume(boundary).await?;
+    let state = saved
+        .image()
+        .await?
+        .bind(&scan.reader, scan.offset, boundary.bytes)?;
+    Some((boundary, resumed, state))
 }
 
 async fn copy_range(
@@ -110,7 +183,7 @@ pub(super) async fn hash_reader(
         hash.update(&bytes);
         offset += count as u64;
     }
-    Ok(hash.finalize().into())
+    Ok(hash.finalize())
 }
 
 impl JsonlSessionStorage {
@@ -123,12 +196,59 @@ impl JsonlSessionStorage {
         length: u64,
         policy: ReadPolicy,
     ) -> SessionResult<Self> {
+        let preview_source = (policy.repairs() || policy.defers_repairs())
+            .then(|| preview::native_path(fs.as_ref(), path))
+            .flatten()
+            .and_then(|path| preview::Source::replay(path, reader.as_ref(), length));
+        let scanner = || {
+            let mut scan = Scanner::new(reader.clone(), length);
+            scan.policy = policy;
+            scan
+        };
+        let mut storage = if let Some(storage) = Self::load_streaming_impl(
+            fs.clone(),
+            path,
+            clock.clone(),
+            ids.clone(),
+            scanner(),
+            true,
+        )
+        .await?
+        {
+            storage
+        } else {
+            Self::load_streaming_impl(fs, path, clock, ids, scanner(), false)
+                .await?
+                .ok_or_else(|| {
+                    SessionError::storage("unexpected fallback from full history replay")
+                })?
+        };
+        if let Some(source) = preview_source.filter(|source| source.matches(reader.as_ref())) {
+            *storage.preview_source.lock().unwrap() = Some(source);
+        }
+        if policy.repairs() {
+            storage.commit_pending_repair().await?;
+        }
+        Ok(storage)
+    }
+
+    /// `None` restarts replay from the header because the suffix needs physical
+    /// offsets from the verified prefix to preserve canonical recovery.
+    async fn load_streaming_impl(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+        mut scan: Scanner,
+        allow_checkpoint: bool,
+    ) -> SessionResult<Option<Self>> {
+        let policy = scan.policy;
         policy.check(0)?;
+        let reader = scan.reader.clone();
+        let length = scan.length;
         let allow_repair = policy.repairs();
         let defer_repair = policy.defers_repairs();
         let strict = policy.strict();
-        let mut scan = Scanner::new(reader.clone(), length);
-        scan.policy = policy;
         let Some((_, header_raw, _, header_newline)) = scan.next().await? else {
             return Err(invalid_file(path, 1, &"is missing a header"));
         };
@@ -174,33 +294,69 @@ impl JsonlSessionStorage {
             }
         }
         storage.progress.required = header.progress_format.is_some();
-        if let Some(checkpoint) =
-            history_checkpoint(&header).map_err(|error| invalid_file(path, 1, &error))?
-        {
+        let embedded =
+            history_checkpoint(&header).map_err(|error| invalid_file(path, 1, &error))?;
+        let mut cacheable = cfg!(unix)
+            && defer_repair
+            && header_newline
+            && embedded.is_none()
+            && length >= 4 * 1024 * 1024
+            && fs.native_file_path(path).is_some()
+            && info.kind == rpi_tools::env::FileKind::File;
+        if let Some(checkpoint) = embedded {
             let resident = ResidentState::from_checkpoint(checkpoint.state)?;
             *storage.state.lock().await = resident;
+        }
+        let mut reused = None;
+        if allow_checkpoint && cacheable {
+            let phase =
+                crate::session::diagnostics::RecoveryPhase::start("startup_checkpoint_load");
+            if let Some((prefix, resumed, resident)) = load_checkpoint(&fs, path, &scan).await {
+                reused = Some(prefix);
+                scan = resumed;
+                *storage.state.lock().await = resident;
+            }
+            phase.finish(0, reused.map_or(0, |prefix| prefix.lines));
         }
         let mut spans = vec![(0u64, header_raw.len() as u64)];
         let mut seen: HashMap<u64, (u64, usize)> = HashMap::new();
         let mut repair = false;
         let mut terminated = header_newline;
-        let mut line_no = 1;
-        while let Some((offset, raw, last, newline)) = scan.next().await? {
+        let first_line = reused.map_or(1, |prefix| prefix.lines);
+        let mut line_no = first_line;
+        use crate::session::diagnostics::RecoveryAccumulator;
+        let mut scan_time = RecoveryAccumulator::new("replay_scan");
+        let mut probe_time = RecoveryAccumulator::new("replay_classify");
+        let mut decode_time = RecoveryAccumulator::new("replay_decode");
+        let mut apply_time = RecoveryAccumulator::new("replay_index_apply");
+        while let Some((offset, raw, last, newline)) = {
+            let started = scan_time.start();
+            let row = scan.next().await?;
+            scan_time.record(started);
+            row
+        } {
             line_no += 1;
-            policy.check((line_no - 1) as usize)?;
+            policy.check(line_no - 1)?;
+            if reused.is_some() && !newline {
+                return Ok(None);
+            }
             terminated = newline;
             if strict && !newline {
                 return Err(SessionError::invalid_entry(
                     "resource transition requires complete unrecovered history",
                 ));
             }
+            let classify_started = probe_time.start();
             let line = std::str::from_utf8(&raw)
                 .map_err(|_| SessionError::invalid_entry("invalid session UTF-8"))?;
             // Historical assistant frames do not need their discarded payloads
             // during cold startup. Recognize their indexed metadata directly;
             // duplicate/backward sequences still fall through to the canonical
             // codec so recovery keeps its exact-equivalence checks.
-            if let Some(metadata) = super::super::cold_decode::parse_cold_frame(line) {
+            let frame_metadata = super::super::cold_decode::parse_cold_frame(line);
+            probe_time.record(classify_started);
+            if let Some(metadata) = frame_metadata {
+                let apply_started = apply_time.start();
                 let mut state = storage.state.lock().await;
                 if metadata.seq > state.sequence() {
                     if metadata.seq > state.next_sequence() {
@@ -214,15 +370,26 @@ impl JsonlSessionStorage {
                         // semantics without allocating a retained location.
                         state.reserve_loaded_frame(metadata)?;
                     }
-                    seen.insert(seq, (offset, raw.len()));
-                    spans.push((offset, raw.len() as u64));
+                    if reused.is_none() {
+                        seen.insert(seq, (offset, raw.len()));
+                        spans.push((offset, raw.len() as u64));
+                    }
+                    apply_time.record(apply_started);
                     continue;
                 }
+                apply_time.record(apply_started);
             }
-            match parse_mutation(line) {
+            let decode_started = decode_time.start();
+            let mutation = parse_mutation(line);
+            decode_time.record(decode_started);
+            match mutation {
                 Ok(mutation) => {
+                    let apply_started = apply_time.start();
                     let mut state = storage.state.lock().await;
                     if mutation.seq() <= state.sequence() {
+                        if reused.is_some() {
+                            return Ok(None);
+                        }
                         let duplicate = if let Some(&(previous, count)) = seen.get(&mutation.seq())
                         {
                             let bytes = file_result(
@@ -243,11 +410,12 @@ impl JsonlSessionStorage {
                                 ));
                             }
                             repair = true;
+                            apply_time.record(apply_started);
                             continue;
                         }
                         return Err(invalid_file(
                             path,
-                            line_no,
+                            line_no.try_into().unwrap_or(u32::MAX),
                             &format!("conflicting mutations share sequence {}", mutation.seq()),
                         ));
                     }
@@ -260,40 +428,104 @@ impl JsonlSessionStorage {
                         .apply_loaded(mutation, &reader, offset, &raw)
                         .map_err(|error| {
                             if error.code == SessionErrorCode::InvalidEntry {
-                                invalid_file(path, line_no, &error)
+                                invalid_file(path, line_no.try_into().unwrap_or(u32::MAX), &error)
                             } else {
                                 error
                             }
                         })?;
-                    seen.insert(seq, (offset, raw.len()));
-                    spans.push((offset, raw.len() as u64));
+                    if reused.is_none() {
+                        seen.insert(seq, (offset, raw.len()));
+                        spans.push((offset, raw.len() as u64));
+                    }
+                    apply_time.record(apply_started);
                 }
                 Err(error)
                     if !strict
                         && error.kind == JsonlDecodeErrorKind::Schema
                         && is_assistant_frame_append(line) =>
                 {
+                    if reused.is_some() {
+                        return Ok(None);
+                    }
+                    cacheable = false;
                     tracing::warn!(line = line_no, "skipping undecodable assistant frame");
                     spans.push((offset, raw.len() as u64));
                 }
                 Err(error) if !strict && last && error.kind == JsonlDecodeErrorKind::Syntax => {
+                    if reused.is_some() {
+                        return Ok(None);
+                    }
                     repair = true;
                     break;
                 }
-                Err(error) => return Err(invalid_file(path, line_no, &error)),
+                Err(error) => {
+                    return Err(invalid_file(
+                        path,
+                        line_no.try_into().unwrap_or(u32::MAX),
+                        &error,
+                    ))
+                }
             }
         }
-        let source_digest = <[u8; 32]>::from(scan.hash.clone().finalize());
+        let source_digest = scan.hash.clone().finalize();
+        if cacheable && !repair && terminated {
+            storage.startup_checkpoint = Some(startup_checkpoint::Update {
+                boundary: startup_checkpoint::Boundary {
+                    bytes: length,
+                    lines: line_no,
+                    digest: source_digest,
+                },
+                reused,
+            });
+        }
         *storage.loaded_history_digest.lock().unwrap() = Some(source_digest);
         if !storage.progress.required {
             *storage.legacy_history_digest.lock().unwrap() = Some(source_digest);
         }
-        if repair && (allow_repair || defer_repair) {
-            if allow_repair {
-                storage.ensure_writer_lease().await?;
+        if allow_repair || defer_repair {
+            *storage.pending_repair.lock().unwrap() = if repair {
+                Some(PendingRepair::Streaming { reader, spans })
+            } else if !terminated {
+                let digest = (!storage.progress.required).then(|| {
+                    scan.hash.update(b"\n");
+                    scan.hash.finalize()
+                });
+                Some(PendingRepair::AppendNewline { digest })
+            } else {
+                None
+            };
+        }
+        policy.check(line_no - 1)?;
+        // These are disjoint accumulated timings, not per-row stderr events.
+        // A checkpoint hit counts only replayed suffix rows in these phases.
+        let rows = line_no - first_line;
+        scan_time.finish(rows);
+        probe_time.finish(rows);
+        decode_time.finish(rows);
+        apply_time.finish(rows);
+        Ok(Some(storage))
+    }
+
+    pub(super) async fn commit_pending_repair_impl(
+        &mut self,
+        pending: PendingRepair,
+    ) -> SessionResult<()> {
+        let preview_source = self
+            .preview_source
+            .lock()
+            .unwrap()
+            .take()
+            .filter(preview::Source::is_current);
+        let layout = match pending {
+            PendingRepair::Streaming { reader, spans } => {
+                let layout = preview_source
+                    .as_ref()
+                    .filter(|source| source.matches(reader.as_ref()))
+                    .and_then(|_| preview::RepairLayout::from_spans(&spans));
+                let path = self.metadata.path.clone();
                 let digest = Arc::new(std::sync::Mutex::new(None));
                 let output = digest.clone();
-                publish_file_atomically(&fs, path, move |fs, temp| {
+                publish_file_atomically(&self.fs, &path, move |fs, temp| {
                     Box::pin(async move {
                         file_result(
                             fs.write_file(temp, FileContent::Bytes(Vec::new()), None)
@@ -306,75 +538,11 @@ impl JsonlSessionStorage {
                             file_result(
                                 fs.append_file(temp, FileContent::Bytes(vec![b'\n']), None)
                                     .await,
-                                "stage repaired newline",
+                                "stage session repair newline",
                             )?;
                             hash.update(b"\n");
                         }
-                        *output.lock().unwrap() = Some(<[u8; 32]>::from(hash.finalize()));
-                        Ok(())
-                    })
-                })
-                .await?;
-                if !storage.progress.required {
-                    *storage.legacy_history_digest.lock().unwrap() = *digest.lock().unwrap();
-                }
-            } else {
-                *storage.pending_repair.lock().unwrap() =
-                    Some(PendingRepair::Streaming { reader, spans });
-            }
-        } else {
-            if !terminated && (allow_repair || defer_repair) {
-                if allow_repair {
-                    storage.ensure_writer_lease().await?;
-                    file_result(
-                        fs.append_file(path, FileContent::Text("\n".into()), None)
-                            .await,
-                        "repair unterminated session tail",
-                    )?;
-                    file_result(
-                        fs.sync_file(path, true, None).await,
-                        "sync repaired unterminated session tail",
-                    )?;
-                    scan.hash.update(b"\n");
-                } else {
-                    *storage.pending_repair.lock().unwrap() = Some(PendingRepair::AppendNewline);
-                }
-            }
-            if !storage.progress.required && allow_repair {
-                *storage.legacy_history_digest.lock().unwrap() = Some(scan.hash.finalize().into());
-            }
-        }
-        policy.check((line_no - 1) as usize)?;
-        Ok(storage)
-    }
-
-    pub(super) async fn commit_pending_repair_impl(
-        &mut self,
-        pending: PendingRepair,
-    ) -> SessionResult<()> {
-        match pending {
-            PendingRepair::Streaming { reader, spans } => {
-                let path = self.metadata.path.clone();
-                let digest = Arc::new(std::sync::Mutex::new(None));
-                let output = digest.clone();
-                publish_file_atomically(&self.fs, &path, move |fs, temp| {
-                    Box::pin(async move {
-                        file_result(
-                            fs.write_file(temp, FileContent::Bytes(Vec::new()), None)
-                                .await,
-                            "stage prepared session repair",
-                        )?;
-                        let mut hash = Sha256::new();
-                        for (offset, count) in spans {
-                            copy_range(fs, temp, &reader, offset, count, &mut hash).await?;
-                            file_result(
-                                fs.append_file(temp, FileContent::Bytes(vec![b'\n']), None)
-                                    .await,
-                                "stage prepared session repair line",
-                            )?;
-                            hash.update(b"\n");
-                        }
-                        *output.lock().unwrap() = Some(<[u8; 32]>::from(hash.finalize()));
+                        *output.lock().unwrap() = Some(hash.finalize());
                         Ok(())
                     })
                 })
@@ -382,9 +550,10 @@ impl JsonlSessionStorage {
                 if !self.progress.required {
                     *self.legacy_history_digest.lock().unwrap() = *digest.lock().unwrap();
                 }
+                layout
             }
             PendingRepair::Eager { bytes } => {
-                let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
+                let digest = Sha256::digest(&bytes);
                 let path = self.metadata.path.clone();
                 publish_file_atomically(&self.fs, &path, move |fs, temp| {
                     Box::pin(async move {
@@ -399,32 +568,33 @@ impl JsonlSessionStorage {
                 if !self.progress.required {
                     *self.legacy_history_digest.lock().unwrap() = Some(digest);
                 }
+                None
             }
-            PendingRepair::AppendNewline => {
+            PendingRepair::AppendNewline { digest } => {
+                let layout = preview_source
+                    .as_ref()
+                    .and_then(preview::Source::final_newline_layout);
                 file_result(
                     self.fs
                         .append_file(&self.metadata.path, FileContent::Text("\n".into()), None)
                         .await,
-                    "repair prepared unterminated session tail",
+                    "repair unterminated session tail",
                 )?;
                 file_result(
                     self.fs.sync_file(&self.metadata.path, true, None).await,
-                    "sync prepared unterminated session tail",
+                    "sync repaired unterminated session tail",
                 )?;
-                if !self.progress.required {
-                    let reader = file_result(
-                        self.fs.open_read_file(&self.metadata.path).await,
-                        "read repaired session history",
-                    )?
-                    .ok_or_else(|| SessionError::storage("missing repaired session history"))?;
-                    let length =
-                        file_result(reader.byte_len().await, "stat repaired session history")?
-                            .ok_or_else(|| {
-                                SessionError::storage("repaired session history has no length")
-                            })?;
-                    *self.legacy_history_digest.lock().unwrap() =
-                        Some(hash_reader(&reader, length).await?);
+                if let Some(digest) = digest {
+                    *self.legacy_history_digest.lock().unwrap() = Some(digest);
                 }
+                layout
+            }
+        };
+        if let Some((source, layout)) = preview_source.zip(layout) {
+            if let Ok(Some(reader)) = self.fs.open_read_file(&self.metadata.path).await {
+                let sequence = self.state.lock().await.sequence();
+                *self.preview_source.lock().unwrap() =
+                    source.after_repair(reader.as_ref(), layout, sequence);
             }
         }
         Ok(())
@@ -478,6 +648,13 @@ impl JsonlSessionStorage {
             serde_json::to_string(&value).map_err(|e| SessionError::storage(e.to_string()))?
         );
         let body_offset = raw.len() as u64 + 1;
+        let upgraded_header_len = upgraded.len() as u64;
+        let preview_source = self
+            .preview_source
+            .lock()
+            .unwrap()
+            .take()
+            .filter(|source| source.matches(reader.as_ref()));
         let progress = super::super::progress::JsonlProgressStore::new(
             self.fs.clone(),
             &path,
@@ -523,6 +700,18 @@ impl JsonlSessionStorage {
         .await?;
         self.progress = progress;
         *self.legacy_history_digest.lock().unwrap() = None;
+        if let Some(source) = preview_source {
+            if let Ok(Some(reader)) = self.fs.open_read_file(&path).await {
+                let sequence = self.state.lock().await.sequence();
+                *self.preview_source.lock().unwrap() = source.after_header_rewrite(
+                    reader.as_ref(),
+                    sequence,
+                    body_offset,
+                    upgraded_header_len,
+                );
+                self.publish_preview().await;
+            }
+        }
         Ok(true)
     }
 }

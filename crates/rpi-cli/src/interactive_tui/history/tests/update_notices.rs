@@ -117,7 +117,7 @@ fn reset_clears_startup_update_cards_and_repeated_mounts_do_not_duplicate_them()
         history.mount_active(&chat);
     }
     add_update_notices(&history.updates, &report());
-    assert_eq!(chat.child_count(), 4); // Includes the reserved live hint.
+    assert_eq!(chat.child_count(), 3); // Includes the reserved live hint.
     assert_eq!(
         strip_ansi(&chat.render(100).join("\n"))
             .matches("Package Update Available")
@@ -146,8 +146,12 @@ fn assert_live_hint_once(chat: &Arc<Container>, history: &HistoryUi) {
         .iter()
         .position(|child| Arc::ptr_eq(child, &hint))
         .unwrap();
-    let panels: Arc<dyn Component> = history.panels.clone();
-    assert!(Arc::ptr_eq(&children[position - 1], &panels));
+    let active: Arc<dyn Component> = history.active.clone();
+    if history.is_latest() {
+        assert!(Arc::ptr_eq(&children[position - 1], &active));
+    } else {
+        assert!(!children.iter().any(|child| Arc::ptr_eq(child, &active)));
+    }
     let rows = regular_rows(chat.as_ref(), 100).join("\n");
     assert_eq!(
         rows.matches("Update: rpi-im-message 0.2.0 available")
@@ -206,7 +210,7 @@ fn live_hint_prioritizes_warning_and_reserves_action_space_when_truncated() {
 }
 
 #[test]
-fn live_hint_reserves_once_after_panels_before_durable_and_reset_clears_it() {
+fn live_hint_reserves_once_after_transcript_before_durable_and_reset_clears_it() {
     let history = HistoryUi::default();
     let chat = Arc::new(Container::new());
     add_note_message(&history.native_durable_notice, "durable-last");
@@ -222,7 +226,7 @@ fn live_hint_reserves_once_after_panels_before_durable_and_reset_clears_it() {
     for _ in 0..3 {
         history.mount_active(&chat);
     }
-    assert_eq!(chat.child_count(), 5);
+    assert_eq!(chat.child_count(), 4);
     assert_live_hint_once(&chat, &history);
     let regular = regular_rows(chat.as_ref(), 100).join("\n");
     assert!(regular.find("Update: ") < regular.find("durable-last"));

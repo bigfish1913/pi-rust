@@ -16,6 +16,7 @@ pub mod diagnostics;
 pub mod durable;
 pub mod error;
 pub mod events;
+pub mod execution;
 pub mod frame_progress;
 pub mod frontmatter;
 mod image_tool;

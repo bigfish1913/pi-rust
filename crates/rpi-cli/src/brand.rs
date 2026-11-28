@@ -1,16 +1,12 @@
-//! 启动时的品牌标志：一枚会自转的 3D 齿轮徽章。
+//! 启动标志：`docs/images/rpi-logo.jpg` 那枚齿轮 + rpi 的终端版本。
 //!
-//! 形状由 [`shape`] 描述，[`render`] 负责光栅化，[`spin`] 提供片头动画的时钟。
-//! 输出是纯 ASCII（单宽字符 + 主题色），所以纯文本终端、远程会话、
-//! 没有图片协议的终端里都能显示。
+//! 标志由 [`render`] 的静态表格给出（32 列 × 16 行半块字符，用主题默认前景色），
+//! 不做 3D 扫描、不做自转动画：欢迎页只需要一张确定、紧凑、和源图同构的图，
+//! 首屏行数也不该被装饰吃掉。
 
 pub(crate) mod render;
-mod shape;
-mod spin;
 
 use rpi_tui::Component;
-
-pub use spin::{animating, replay, set_enabled};
 
 /// 终端窗口/标签标题里的紧凑标记。
 pub const MARK: &str = "@";
@@ -41,11 +37,11 @@ impl Default for BrandLockup {
 
 impl Component for BrandLockup {
     fn render(&self, _width: usize) -> Vec<String> {
-        render::lockup(spin::angle())
+        render::lockup()
     }
 
     fn invalidate(&self) {
-        // Nothing is cached.
+        // Nothing is cached: the frame is a static table plus the theme colour.
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -56,11 +52,16 @@ impl Component for BrandLockup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpi_tui::ansi::{strip_ansi, visible_width};
 
     #[test]
     fn lockup_fits_the_welcome_header() {
         let rows = BrandLockup::new().render(80);
         assert_eq!(rows.len(), render::ROWS);
+        // 首屏预算：80×24 下欢迎页只剩 17 行给转录区（见 `render` 的模块文档）。
+        assert_eq!(rows.len(), 12);
+        assert!(rows.iter().all(|row| visible_width(row) == render::COLS));
+        assert!(strip_ansi(&rows[5]).contains('█'));
     }
 
     #[test]

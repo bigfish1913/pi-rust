@@ -43,10 +43,10 @@ impl Scope {
     pub fn is_project(&self) -> bool {
         *self == Self::Project
     }
-    pub fn root(self, cwd: &Path) -> Result<PathBuf> {
+    pub fn root(self, home: &crate::config::AgentHome, cwd: &Path) -> Result<PathBuf> {
         let logical = match self {
             Self::Project => cwd.join(".rpi"),
-            Self::Global => crate::config::agent_dir().map_err(err)?,
+            Self::Global => home.root().map_err(err)?,
         };
         resolve_scope_root(&logical)
     }
@@ -380,7 +380,17 @@ fn ensure_complete(root: &Path) -> Result<()> {
     Ok(())
 }
 pub(crate) fn host_leases(cwd: &Path) -> Result<Arc<Vec<Lease>>> {
-    let mut roots = vec![Scope::Project.root(cwd)?, Scope::Global.root(cwd)?];
+    host_leases_for(&crate::config::AgentHome::process(), cwd)
+}
+
+pub(crate) fn host_leases_for(
+    home: &crate::config::AgentHome,
+    cwd: &Path,
+) -> Result<Arc<Vec<Lease>>> {
+    let mut roots = vec![
+        Scope::Project.root(home, cwd)?,
+        Scope::Global.root(home, cwd)?,
+    ];
     roots.sort();
     roots.dedup();
     let mut leases = Vec::new();
@@ -521,6 +531,8 @@ struct Receipt {
     kind: Kind,
     name: String,
     source: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release: Option<String>,
     version: Option<String>,
     target: PathBuf,
     inventory: Inventory,
@@ -1171,7 +1183,7 @@ fn explicit_source(path: &Path) -> Result<PathBuf> {
     }
     fs::canonicalize(normalized).map_err(err)
 }
-fn mutate(root: &Path, o: &Options) -> Result<Value> {
+fn mutate(root: &Path, o: &Options, release: Option<&str>) -> Result<Value> {
     let _lease = mutation_lease(root)?;
     let mut r = receipts(root)?;
     let mut p = packages(root)?;
@@ -1235,6 +1247,35 @@ fn mutate(root: &Path, o: &Options) -> Result<Value> {
     if matches!(o.op.as_str(), "update" | "reinstall") && previous.is_none() {
         return Err("resource is not owned/installed; use install".into());
     }
+    let same_release_version = if let Some(old) = previous
+        .as_ref()
+        .filter(|_| kind == Kind::Package && o.op == "update" && release.is_some())
+    {
+        if old.release.is_none() {
+            return Err("package was installed from a local path; update it with rpi resource update and --path".into());
+        }
+        let installed = old
+            .version
+            .as_deref()
+            .and_then(|version| semver::Version::parse(version).ok())
+            .ok_or("invalid installed package version")?;
+        let requested = o
+            .version
+            .as_deref()
+            .and_then(|version| semver::Version::parse(version).ok())
+            .ok_or("invalid requested package version")?;
+        match requested.cmp_precedence(&installed) {
+            std::cmp::Ordering::Less => {
+                return Err(format!(
+                    "cannot downgrade package from {installed} to {requested}"
+                ));
+            }
+            std::cmp::Ordering::Equal => true,
+            std::cmp::Ordering::Greater => false,
+        }
+    } else {
+        false
+    };
     let source = o
         .source
         .as_ref()
@@ -1268,13 +1309,18 @@ fn mutate(root: &Path, o: &Options) -> Result<Value> {
             kind,
             name: name.into(),
             source,
+            release: release.map(str::to_owned),
             version,
             target: target.clone(),
             inventory: copied,
         };
-        if o.op == "install" {
+        if o.op == "install" || same_release_version {
             if let Some(old) = &previous {
-                if old.source == receipt.source
+                let same_source = match (&old.release, &receipt.release) {
+                    (None, None) => old.source == receipt.source,
+                    (old, received) => old == received,
+                };
+                if same_source
                     && old.version == receipt.version
                     && old.inventory == receipt.inventory
                 {
@@ -1282,7 +1328,14 @@ fn mutate(root: &Path, o: &Options) -> Result<Value> {
                         json!({"outcome":"unchanged","resource":observe(root,o.scope.unwrap(),old,false)?}),
                     );
                 }
-                return Err("already installed; use update or reinstall with --path".into());
+                let error = if same_release_version {
+                    "package version is already installed with different release provenance or content"
+                } else if release.is_some() {
+                    "already installed; use rpi update package NAME"
+                } else {
+                    "already installed; use update or reinstall with --path"
+                };
+                return Err(error.into());
             }
         }
         next = Some((receipt, staged));
@@ -1330,11 +1383,16 @@ fn mutate(root: &Path, o: &Options) -> Result<Value> {
     data["diagnostics"] = json!(diagnostics);
     Ok(data)
 }
+fn receipt_source(r: &Receipt) -> String {
+    r.release
+        .clone()
+        .unwrap_or_else(|| r.source.to_string_lossy().into_owned())
+}
 fn package_record(r: &Receipt) -> crate::packages::ProjectPackage {
     crate::packages::ProjectPackage {
         name: r.name.clone(),
         version: r.version.clone().unwrap_or_default(),
-        source: r.source.to_string_lossy().into_owned(),
+        source: receipt_source(r),
         cargo_package: String::new(),
         artifacts: r
             .inventory
@@ -1379,7 +1437,7 @@ fn observe_inventory(
         diagnostics.push(e.clone());
     }
     Ok(
-        json!({"kind":r.kind,"scope":scope,"identity":format!("{}:{}:{}",if scope==Scope::Project{"project"}else{"global"},r.kind.dir(),r.name),"name":r.name,"source":r.source,"version":r.version,"ownership":"resource","installed":true,"inUse":busy,"loaded":null,"applied":null,"path":root.join(&r.target),"selectable":selectable(root,scope,r),"recordedDigest":r.inventory.sha256,"observed":observed.ok(),"diagnostics":diagnostics}),
+        json!({"kind":r.kind,"scope":scope,"identity":format!("{}:{}:{}",if scope==Scope::Project{"project"}else{"global"},r.kind.dir(),r.name),"name":r.name,"source":receipt_source(r),"version":r.version,"ownership":"resource","installed":true,"inUse":busy,"loaded":null,"applied":null,"path":root.join(&r.target),"selectable":selectable(root,scope,r),"recordedDigest":r.inventory.sha256,"observed":observed.ok(),"diagnostics":diagnostics}),
     )
 }
 fn selectable(root: &Path, scope: Scope, r: &Receipt) -> Value {
@@ -1474,6 +1532,14 @@ fn success(o: &Options, data: Value) -> Value {
     json!({"version":1,"success":true,"operation":o.op,"scope":o.scope,"kind":o.kind,"name":o.name,"data":data})
 }
 pub fn run(args: &[String]) -> i32 {
+    run_with_release(args, None)
+}
+
+pub(crate) fn publish_release(args: &[String], url: &str) -> i32 {
+    run_with_release(args, Some(url))
+}
+
+fn run_with_release(args: &[String], release: Option<&str>) -> i32 {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         println!("rpi resource list|inspect|install|update|reinstall|remove|recover --scope project|global\nMutations: KIND NAME --path PATH [--version TEXT]; remove/inspect: KIND NAME.\nLocal snapshots only; no builds or native registration. JSON v1, 256 KiB bound.");
         return 0;
@@ -1481,14 +1547,17 @@ pub fn run(args: &[String]) -> i32 {
     let result: Result<Value> = (|| {
         let o = parse(args)?;
         let cwd = std::env::current_dir().map_err(err)?;
-        let root = o.scope.unwrap().root(&cwd)?;
+        let root = o
+            .scope
+            .unwrap()
+            .root(&crate::config::AgentHome::process(), &cwd)?;
         let data = if matches!(o.op.as_str(), "list" | "inspect") {
             catalog(&root, &o)?
         } else if o.op == "recover" {
             let _lease = Lease::acquire(&root, true, true)?;
             json!({"outcome":if recover(&root)?{"recovered"}else{"unchanged"}})
         } else {
-            mutate(&root, &o)?
+            mutate(&root, &o, release)?
         };
         Ok(success(&o, data))
     })();

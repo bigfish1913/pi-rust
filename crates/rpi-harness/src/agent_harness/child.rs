@@ -63,15 +63,14 @@ impl AgentHarness {
             "model": {"id": snap.model.id, "provider": snap.model.provider, "api": snap.model.api},
             "thinkingLevel": snap.thinking_level,
             "tools": tools,
-            "childAgent": !self.is_child,
         }))
     }
 
-    /// Snapshot the *effective* parent execution binding, not CLI defaults.
-    /// Tools retain the parent's project environment, extension owner/context and
-    /// approval hooks. Only transcript, emitter, admission and turn budget differ.
-    /// Requested tools may narrow, never expand, the parent's current capabilities.
-    pub async fn create_child(
+    /// Create an independent run with the effective parent execution bindings.
+    /// The caller can narrow tool selection. Runtime provenance still prevents
+    /// nested runs regardless of which tool names are present. A zero turn
+    /// budget disables the turn ceiling for this run.
+    pub async fn create_independent_run(
         &self,
         session: Session,
         emitter: Arc<dyn AgentEmitter>,
@@ -81,8 +80,10 @@ impl AgentHarness {
         if self.is_child || rpi_agent::tool_execution_scope::is_child_execution() {
             return Err(HarnessError::io("recursive child agents are not allowed"));
         }
-        if !(1..=32).contains(&max_turns) {
-            return Err(HarnessError::io("child maxTurns must be between 1 and 32"));
+        if max_turns > 32 {
+            return Err(HarnessError::io(
+                "independent run maxTurns must be between 0 and 32",
+            ));
         }
         if session.storage().metadata().id == self.session.storage().metadata().id {
             return Err(HarnessError::io(
@@ -93,10 +94,7 @@ impl AgentHarness {
         let mut tools: Vec<_> = snap
             .tools
             .iter()
-            .filter(|tool| {
-                let name = &tool.tool.schema().name;
-                name != "delegate_task" && snap.active_tool_names.contains(name)
-            })
+            .filter(|tool| snap.active_tool_names.contains(&tool.tool.schema().name))
             .cloned()
             .collect();
         if let Some(names) = requested_tools {
@@ -105,7 +103,7 @@ impl AgentHarness {
                 .any(|name| !tools.iter().any(|tool| tool.tool.schema().name == *name))
             {
                 return Err(HarnessError::io(
-                    "child tools must be a subset of active parent tools (delegation excluded)",
+                    "child tools must be a subset of the allowed active parent tools",
                 ));
             }
             tools.retain(|tool| names.contains(&tool.tool.schema().name));
@@ -115,7 +113,6 @@ impl AgentHarness {
                 "model": {"id":snap.model.id,"provider":snap.model.provider,"api":snap.model.api},
                 "thinkingLevel":snap.thinking_level,
                 "tools":tools.iter().map(|tool| tool.tool.schema().name.clone()).collect::<Vec<_>>(),
-                "childAgent":false,
                 // Host identity, never accepted from tool parameters. Shared parent
                 // durable tools use this restricted actor rather than owner rights.
                 "nativeDurableActor":format!("child-{}", uuid::Uuid::now_v7()),
@@ -215,7 +212,7 @@ impl AgentHarness {
         };
         let execution_scope = Arc::new(
             rpi_agent::tool_execution_scope::ToolExecutionScope::with_context(
-                serde_json::json!({"childAgent":false,"tools":[]}),
+                serde_json::json!({"tools":[]}),
             ),
         );
         let experimental_durable = self.durable_experimental_policy();

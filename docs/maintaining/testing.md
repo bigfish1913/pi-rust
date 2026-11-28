@@ -17,6 +17,7 @@
 | 会话恢复、消息顺序、工具重放、半截 JSONL、cwd | `task test:recovery` | 已含于 `test` 的 workspace 测试，无须重复执行同一组 Rust tests。 |
 | 冷帧/冷消息、分页、fork、progress 升级与完整性 | `rpi-harness` 的 JSONL、branch queries、storage contract 等测试 | `test` 默认 Rust 测试；主要是语义/I/O 契约，不代替全进程耗时门禁。 |
 | 资源选择、重绑定、saved-session 读取及隔离 | CLI `resource_selection`、`resource_management`、`saved_session_read`，harness 对应测试 | `test` 默认 Rust 测试；只读与写入入口分别覆盖。 |
+| AGENTS.md / CLAUDE.md 发现与 worktree 继承 | `cargo test -p rpi-harness --lib context_files:: --locked` | 默认 workspace 测试；内存 fixture 覆盖嵌套/同级 worktree、bare/submodule/损坏元数据、候选优先级和路径归一化，Unix 临时文件覆盖普通/悬空/目录软链接及 symlink cwd；不改变 trust 策略，不依赖 Git 命令或网络。 |
 | 真实 CLI 消息/工具 roundtrip、重启、kill 后恢复和会话隔离 | `task test:session`、`test_session_smoke.py` | `test` 显式构建 CLI，运行两种 RPC 编码；状态扩展未传入时不算覆盖。 |
 | 编辑器大粘贴、undo/redo owner、多轮 RPC 内存/CPU/最终结论 | `task test:resources`、`test_resource_smoke.py`、TUI Rust tests | `resources`；release 编辑器和两种 RPC 编码各 5 个测量轮次，不是实际终端视觉验证。 |
 | **701,000 append frames 的历史冷启动** | **`task test:cold-start`、`test_resource_cold_start.py`** | **`resources`；modern/legacy 各 701,000 append frames + 21,733 entries，每格式 3 次 fresh process；检查 ready、查询、内容、idle 和清理。** |
@@ -112,11 +113,11 @@ if ($LASTEXITCODE -ne 0) { throw "已安装状态扩展回归失败，诊断目�
 
 ### 3. 与相邻仓库新构建的状态扩展对比
 
-相邻仓库默认是 `../rpi-package`。仅构建和测试，不执行 install，也不替换安装中的扩展。先完成步骤 1，确保待测宿主是当前源码产物，再运行：
+相邻仓库默认是 `../rpi-extension`。仅构建和测试，不执行 install，也不替换安装中的扩展。先完成步骤 1，确保待测宿主是当前源码产物，再运行：
 
 ```powershell
 $siblingTarget = Join-Path $PWD 'target/session-smoke-sibling-cargo'
-cargo build --manifest-path ../rpi-package/Cargo.toml -p rpi-todo -p rpi-durable --locked --target-dir "$siblingTarget"
+cargo build --manifest-path ../rpi-extension/Cargo.toml -p rpi-todo -p rpi-durable --locked --target-dir "$siblingTarget"
 if ($LASTEXITCODE -ne 0) { throw '相邻扩展构建失败；不能记为扩展测试通过' }
 $diag = 'target/session-smoke-sibling-state-' + [guid]::NewGuid().ToString('N')
 python -B scripts/session-smoke.py --rpi target/session-smoke-cargo/debug/rpi.exe --diagnostics-dir "$diag" --extension "$siblingTarget/debug/rpi_todo.dll" --extension "$siblingTarget/debug/rpi_durable.dll"
@@ -236,7 +237,7 @@ cargo test -p rpi-cli --test btw_package --locked --target-dir target/session-sm
 $extensions = Join-Path $env:USERPROFILE '.rpi/agent/extensions'
 $values = @{
     RPI_TEST_PROVIDER_LIBRARY = "$extensions/rpi_providers.dll"
-    RPI_TEST_PROVIDER_PACKAGE = (Join-Path $PWD '../rpi-package/packages/rpi-providers')
+    RPI_TEST_PROVIDER_PACKAGE = (Join-Path $PWD '../rpi-extension/packages/rpi-providers')
     RPI_TEST_SUBAGENT_LIBRARY = "$extensions/rpi_subagents.dll"
     RPI_TEST_BTW_LIBRARY = "$extensions/rpi_btw.dll"
 }
@@ -397,6 +398,6 @@ Ubuntu `Offline resource regression`（`resources`）job 共用同一次构建�
 3. 编辑器与两种 RPC 编码各 5 个资源测量轮次；失败上传 `resource-smoke-diagnostics`。
 4. modern/legacy 各 3 次完整海量帧冷启动；成功/失败上传白名单 `historical-cold-start-diagnostics`。
 
-诊断均在 runner.temp，名称带 run/attempt，避免 Cargo cache 复用旧输出。`test` job 另显式运行官网校验器 `VerifierTests`，真实 Caddy 集成不包含在内。release/preview 的发布准备依赖 `test` 与 `resources` 等门禁；仓库 branch protection 的 required checks 仍需在 GitHub 设置中另行确认，工作流不能替代该设置。
+诊断均在 runner.temp，名称带 run/attempt，避免 Cargo cache 复用旧输出。`test` job 另显式运行官网校验器 `VerifierTests`，真实 Caddy 集成不包含在内。release/preview 的发布准备依赖 `test` 与 `resources` 等门禁；仓库 branch protection 的 required checks 仍需在 GitHub 设置中另行确认，工作流不能替代该设置。PR 描述还必须引用本仓库已存在的 issue，由独立工作流 `PR issue link`（`.github/workflows/pr-issue-link.yml` 的 `Require linked issue`）在打开、编辑描述、重新打开与转为 ready 时检查：先剥离 HTML 注释与代码块，再解析 `#123` 与 issue URL，并用 API 确认编号确实是 issue 而非 PR；仓库 owner、`OWNER`/`MEMBER` 关联作者以及 `release-plz-`、`automation/`、`dependabot/`、`renovate/` 分支豁免。该检查同样只有加入 branch protection 的 required checks 才会真正阻止合并。
 
 这些新增步骤不需要 secrets、不启用 live、不下载或安装独立业务扩展。本地验证不能冒充远端 CI 结果；普通 CI 的合成模型、fake PTY 与仓库 plugin-stub PASS，也不能推广为真实模型、真实终端或所有独立扩展 PASS。

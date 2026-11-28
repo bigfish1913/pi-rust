@@ -221,7 +221,7 @@ rpi package link|list|unlink # 管理项目本地 Rust 扩展包
 ### CLI 自更新
 
 `rpi update` 默认从 GitHub Release 下载预编译的 CLI，不需要本地 Rust/Cargo。
-版本按 crates.io 的发布记录解析；`rpi-release.json` 提供各平台下载地址、大小和
+稳定版版本按 GitHub Releases 的发布记录解析；`rpi-release.json` 提供各平台下载地址、大小和
 压缩包/可执行文件的 SHA-256。校验目标平台、完整性和实际版本后，原子替换当前 CLI。
 Windows 会暂存更新，等待当前进程退出后完成替换。
 
@@ -229,6 +229,8 @@ Windows 会暂存更新，等待当前进程退出后完成替换。
 缺少 manifest、下载失败或校验不通过都会报错并保留原版本，不会自动转为编译。
 `--offline` 仅报告缓存的版本信息，不下载也不编译。旧 Release 没有 manifest 时，
 可等待协议资产补齐，或显式使用 `rpi update --build`。
+
+通过 Homebrew 安装时，使用 `brew upgrade rpi` 更新。启动时的更新提示也会显示这条命令。
 
 ### 启动资源清单
 
@@ -422,6 +424,8 @@ rpi install my-extension --github https://github.com/owner/repo
 
 自定义仓库也须发布同一分发协议。显式仓库不依赖 crates.io；省略版本时，只在该仓库的 `<包名>-v<版本>` 标签中选择最新稳定版本。不会使用仓库的全局 latest Release。后续 `--force` 重装和启动更新检查会保留来源，并核对新版本的 manifest 是否适配当前平台。
 
+扩展目录仓库已迁移到 `pi-rust/rpi-extension`（原 `pi-rust/rpi-package`）。两个地址视为同一项目：已有安装（包括只记录 `prebuilt:<仓库>` 来源的旧记录）和 `--github pi-rust/rpi-package` 调用仍可升级，版本发现会按新仓库的 `<包名>-v<版本>` 标签跟随迁移并改写安装来源；旧仓库已发布的版本及其 CDN 前缀继续可用，因此固定旧版本的安装不会失效。
+
 发布者必须先上传所声明平台的压缩包，最后上传 manifest。manifest 尚未发布、目标平台缺失或校验不通过时安装失败，不会自动编译或选择其他版本。需要源码编译时显式使用：
 
 ```bash
@@ -474,7 +478,7 @@ rpi package unlink my-extension
 
 ### 网页搜索与抓取
 
-联网工具由独立的 [rpi-package 扩展](https://github.com/pi-rust/rpi-package) 提供，
+联网工具由独立的 [rpi-extension 扩展](https://github.com/pi-rust/rpi-extension) 提供，
 不属于 CLI 默认内置工具。按需安装后重启 rpi：
 
 ```bash
@@ -505,7 +509,7 @@ rpi install rpi-subagents
 这不是 OS 安全沙箱，允许的 shell 等工具仍保有正常能力。
 
 宿主与扩展需同时支持对应协议；旧宿主明确要求升级，不回退到默认配置的子进程。
-SDK 提供 `AgentHarness::create_child`，扩展通过 `GetExecutionContext` 和 `ChildAgent`
+SDK 提供 `AgentHarness::create_independent_run`，扩展通过 `GetExecutionContext` 和 `IndependentRun`
 runtime actions 接入。完整边界与生命周期见 [子 agent 协议](../extensions/subagents.md)。
 
 ## 7. SDK 集成

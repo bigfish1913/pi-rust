@@ -663,7 +663,7 @@ async fn real_child_wrapper_uses_host_actor_and_cannot_reset_parent_workflow() {
     );
     let (collector, _) = rpi_agent::CollectorEmitter::new();
     let child = parent
-        .create_child(session, Arc::new(collector), 4, None)
+        .create_independent_run(session, Arc::new(collector), 4, None)
         .await
         .unwrap();
     child

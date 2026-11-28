@@ -1,0 +1,547 @@
+use super::*;
+use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript, FauxStep};
+use rpi_ai::types::StopReason;
+use rpi_harness::types::AgentHarnessOptions;
+
+impl IndependentRuns {
+    async fn start_test_run(
+        &self,
+        parent: &AgentHarness,
+        owner: u64,
+        input: &str,
+    ) -> Result<Value, String> {
+        self.start_run(
+            parent,
+            owner,
+            &json!({"op":"start","input":input,"maxTurns":8,"timeoutSeconds":300}),
+        )
+        .await
+    }
+}
+
+async fn parent(script: FauxScript) -> AgentHarness {
+    let provider = FauxProvider::new(script);
+    let session = Session::new(
+        Arc::new(InMemorySessionStorage::new(
+            SessionMetadata {
+                id: "parent".into(),
+                created_at: 0,
+                parent_session_id: None,
+            },
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        )),
+        None,
+    );
+    AgentHarness::create(AgentHarnessOptions {
+        model: provider.default_model().clone(),
+        models: vec![provider],
+        session,
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
+fn job(owner: u64) -> Arc<Job> {
+    Arc::new(Job {
+        owner,
+        cancel: CancellationToken::new(),
+        invocation_signal: None,
+        state: Mutex::new(State::default()),
+    })
+}
+fn delta(text: String) -> AgentEvent {
+    let partial = Arc::new(faux_assistant_message("", StopReason::Stop));
+    AgentEvent::MessageUpdate {
+        message_id: None,
+        message: partial.clone(),
+        assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: text,
+            partial,
+        }),
+    }
+}
+async fn wait(manager: &IndependentRuns, id: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let value = manager
+                .handle_run(7, &json!({"op":"poll","runId":id}))
+                .unwrap();
+            if value["status"] != "running" {
+                return value;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("child must finish")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_reports_and_owner_scoped_disposal_are_independent_of_parent_transcript() {
+    let parent = parent(FauxScript::new().with_text("child report")).await;
+    let manager = IndependentRuns::default();
+    let started = manager.start_test_run(&parent, 7, "report").await.unwrap();
+    let id = started["runId"].as_str().unwrap();
+    assert_ne!(id, parent.session().storage().metadata().id);
+    let final_value = wait(&manager, id).await;
+    assert_eq!(final_value["result"]["text"], "child report");
+    assert_eq!(final_value["status"], "done");
+    assert!(parent.get_tip_id().await.unwrap().is_none());
+    for op in ["poll", "cancel", "dispose"] {
+        assert!(manager.handle_run(8, &json!({"op":op,"runId":id})).is_err());
+    }
+    manager
+        .handle_run(7, &json!({"op":"dispose","runId":id}))
+        .unwrap();
+    assert!(manager.jobs.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_and_unload_stop_pending_children_and_reject_stale_starts() {
+    let parent = parent(
+        FauxScript::new()
+            .with_text("slow report")
+            .with_tokens_per_second(0.1),
+    )
+    .await;
+    let manager = IndependentRuns::default();
+    let started = manager.start_test_run(&parent, 7, "report").await.unwrap();
+    let id = started["runId"].as_str().unwrap();
+    manager
+        .handle_run(7, &json!({"op":"cancel","runId":id}))
+        .unwrap();
+    assert!(wait(&manager, id).await["error"]
+        .as_str()
+        .unwrap()
+        .contains("cancelled"));
+    manager.cancel_owner(7);
+    assert!(manager.jobs.lock().unwrap().is_empty());
+    assert!(manager
+        .start_test_run(&parent, 7, "report")
+        .await
+        .unwrap_err()
+        .contains("unloaded"));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while manager.active.load(Ordering::Acquire) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_timeout_and_parent_scope_cancel_are_observable() {
+    for cancel_parent in [false, true] {
+        let parent = parent(
+            FauxScript::new()
+                .with_text("slow report")
+                .with_tokens_per_second(0.1),
+        )
+        .await;
+        let job = job(7);
+        let child = parent
+            .create_independent_run(
+                AgentHarnessOptions::default().session,
+                Arc::new(Emitter(job.clone())),
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        if cancel_parent {
+            child.scope.cancel();
+        }
+        run_child(child, job.clone(), "report".into(), 1, 0)
+            .await
+            .unwrap();
+        let state = job.state.lock().unwrap();
+        let error = state.error.as_deref().unwrap();
+        assert!(
+            error.contains(if cancel_parent {
+                "parent run ended"
+            } else {
+                "timed out"
+            }),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn text_and_event_budgets_are_enforced_before_queue_growth() {
+    let job = job(1);
+    job.observe(delta("a".repeat(MAX_OUTPUT)));
+    job.observe(delta("b".into()));
+    assert!(job.cancel.is_cancelled());
+    let state = job.state.lock().unwrap();
+    assert_eq!(state.bytes, MAX_OUTPUT);
+    assert_eq!(state.deltas.len(), 1);
+    drop(state);
+    let job = super::tests::job(1);
+    job.state.lock().unwrap().events = MAX_EVENTS;
+    job.observe(delta(String::new()));
+    assert!(job.cancel.is_cancelled());
+    assert!(job.state.lock().unwrap().deltas.is_empty());
+}
+
+#[test]
+fn poll_drains_bounded_batches_before_delivering_a_terminal_result() {
+    let manager = IndependentRuns::default();
+    let job = job(7);
+    for _ in 0..4 {
+        job.observe(delta("x".repeat(32 * 1024)));
+    }
+    job.state.lock().unwrap().result = Some(json!({"status":"completed","text":"report"}));
+    manager.jobs.lock().unwrap().insert("c".into(), job);
+    let a = manager
+        .handle_run(7, &json!({"op":"poll","runId":"c"}))
+        .unwrap();
+    assert_eq!(a["status"], "running");
+    assert!(a["result"].is_null());
+    assert_eq!(a["deltas"].as_array().unwrap().len(), 2);
+    let b = manager
+        .handle_run(7, &json!({"op":"poll","runId":"c"}))
+        .unwrap();
+    assert_eq!(b["status"], "done");
+    assert_eq!(b["result"]["text"], "report");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capacity_is_bounded_even_while_disposed_children_are_cleaning_up() {
+    let parent = parent(FauxScript::new()).await;
+    let manager = IndependentRuns::default();
+    manager.active.store(MAX_JOBS, Ordering::Release);
+    assert!(manager
+        .start_test_run(&parent, 7, "report")
+        .await
+        .unwrap_err()
+        .contains("cleanup"));
+    assert!(manager.jobs.lock().unwrap().is_empty());
+    manager.active.store(0, Ordering::Release);
+    for n in 0..MAX_JOBS {
+        manager.jobs.lock().unwrap().insert(format!("c{n}"), job(7));
+    }
+    assert!(manager
+        .start_test_run(&parent, 7, "report")
+        .await
+        .unwrap_err()
+        .contains("capacity"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_reports_live_children_and_stop_terminates_by_id() {
+    let parent = parent(
+        FauxScript::new()
+            .with_text("slow report")
+            .with_tokens_per_second(0.1),
+    )
+    .await;
+    let manager = IndependentRuns::default();
+    let started = manager
+        .start_test_run(&parent, 7, "survey the repo")
+        .await
+        .unwrap();
+    let id = started["runId"].as_str().unwrap();
+
+    let roster = manager.roster();
+    let row = roster
+        .iter()
+        .find(|row| row["childId"] == id)
+        .expect("the running child must be listed");
+    assert_eq!(row["status"], "running");
+    assert!(row["startedMs"].as_u64().unwrap() > 0);
+    assert!(row["finishedMs"].is_null());
+
+    let stopped = manager.stop(id).unwrap();
+    assert_eq!(stopped["childId"], id);
+    assert_eq!(stopped["status"], "cancelled");
+    let row = manager
+        .roster()
+        .into_iter()
+        .find(|row| row["childId"] == id)
+        .expect("the terminated child stays in the roster until dispose");
+    assert_eq!(row["status"], "failed");
+    assert!(row["finishedMs"].as_u64().unwrap() > 0);
+    assert!(manager.stop("nope").is_err());
+
+    manager
+        .handle_run(7, &json!({"op":"dispose","runId":id}))
+        .unwrap();
+    assert!(manager.roster().is_empty());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while manager.active.load(Ordering::Acquire) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// Stopping an already-terminal child reports `already-finished` and must not
+/// rewrite its recorded outcome or terminal timestamp: the roster is a history,
+/// not a live view a late Stop click can corrupt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_on_a_finished_child_reports_already_finished_without_rewriting_it() {
+    let parent = parent(FauxScript::new().with_text("child report")).await;
+    let manager = IndependentRuns::default();
+    let started = manager.start_test_run(&parent, 7, "report").await.unwrap();
+    let id = started["runId"].as_str().unwrap();
+    let finished = wait(&manager, id).await;
+    assert_eq!(finished["status"], "done");
+
+    let before = manager
+        .roster()
+        .into_iter()
+        .find(|row| row["childId"] == id)
+        .expect("finished child stays in the roster until dispose");
+    assert_eq!(before["status"], "done");
+    let finished_ms = before["finishedMs"].clone();
+    assert!(finished_ms.as_u64().unwrap() > 0);
+
+    let stopped = manager.stop(id).unwrap();
+    assert_eq!(stopped["childId"], id);
+    assert_eq!(stopped["status"], "already-finished");
+    let after = manager
+        .roster()
+        .into_iter()
+        .find(|row| row["childId"] == id)
+        .expect("still listed");
+    assert_eq!(
+        after["status"], "done",
+        "stop must not flip a done child to failed"
+    );
+    assert_eq!(
+        after["finishedMs"], finished_ms,
+        "the terminal timestamp is history"
+    );
+
+    manager
+        .handle_run(7, &json!({"op":"dispose","runId":id}))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while manager.active.load(Ordering::Acquire) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn oversized_final_output_records_the_terminal_timestamp() {
+    let manager = IndependentRuns::default();
+    let child = job(7);
+    child.state.lock().unwrap().bytes = MAX_OUTPUT;
+    manager
+        .jobs
+        .lock()
+        .unwrap()
+        .insert("c".into(), child.clone());
+
+    child.complete(json!({"status":"completed","text":"report"}), 8);
+    let row = manager.roster().pop().unwrap();
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["error"], "child output limit exceeded");
+    assert!(row["finishedMs"].as_u64().is_some());
+    assert_eq!(manager.stop("c").unwrap()["status"], "already-finished");
+    assert_eq!(manager.roster(), vec![row]);
+}
+
+#[test]
+fn stop_receipt_matches_the_winner_of_concurrent_completion() {
+    let manager = IndependentRuns::default();
+    let child = job(7);
+    manager
+        .jobs
+        .lock()
+        .unwrap()
+        .insert("c".into(), child.clone());
+    let barrier = std::sync::Barrier::new(2);
+
+    let receipt = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            barrier.wait();
+            child.complete(json!({"status":"completed","text":"report"}), 8);
+        });
+        barrier.wait();
+        manager.stop("c").unwrap()
+    });
+
+    let row = manager.roster().pop().unwrap();
+    let expected_status = match receipt["status"].as_str() {
+        Some("cancelled") => "failed",
+        Some("already-finished") => "done",
+        _ => panic!("unexpected Stop receipt: {receipt}"),
+    };
+    assert_eq!(row["status"], expected_status);
+    assert!(row["finishedMs"].as_u64().is_some());
+}
+
+/// `stop` is the HOST path: it is intentionally not owner-scoped, unlike the
+/// plugin path (`handle_existing` / `cancel`), which rejects a foreign owner.
+/// Pin both halves so the missing owner filter stays a documented decision
+/// instead of an accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_is_host_privileged_while_the_plugin_path_stays_owner_scoped() {
+    let parent = parent(
+        FauxScript::new()
+            .with_text("slow report")
+            .with_tokens_per_second(0.1),
+    )
+    .await;
+    let manager = IndependentRuns::default();
+    let started = manager.start_test_run(&parent, 7, "report").await.unwrap();
+    let id = started["runId"].as_str().unwrap();
+
+    // Plugin path: a different owner cannot cancel it.
+    assert!(
+        manager
+            .handle_run(8, &json!({"op":"cancel","runId":id}))
+            .is_err(),
+        "a foreign owner must not cancel another plugin's child"
+    );
+    assert_eq!(manager.roster()[0]["status"], "running");
+
+    // Host path: the host itself may stop any child it holds.
+    assert_eq!(manager.stop(id).unwrap()["status"], "cancelled");
+    assert_eq!(manager.roster()[0]["status"], "failed");
+
+    manager
+        .handle_run(7, &json!({"op":"dispose","runId":id}))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while manager.active.load(Ordering::Acquire) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn run_limits_require_integers_within_their_ranges() {
+    for (key, min, max) in [("maxTurns", 0, 32), ("timeoutSeconds", 10, 1800)] {
+        assert!(bounded_number(&json!({}), key, min, max).is_err());
+        for invalid in [
+            json!(min as i64 - 1),
+            json!(max + 1),
+            json!("10"),
+            Value::Null,
+        ] {
+            assert!(bounded_number(&json!({(key):invalid}), key, min, max).is_err());
+        }
+        for value in [min, max] {
+            assert_eq!(
+                bounded_number(&json!({(key):value}), key, min, max),
+                Ok(value)
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_run_uses_the_input_and_generic_handle() {
+    const INPUT: &str = "Read the independent run input verbatim";
+    let script = FauxScript::new();
+    script.set_responses(vec![FauxStep::factory(|context| {
+        let payload = serde_json::to_string(context).unwrap();
+        assert!(payload.contains(INPUT));
+        assert!(!payload.contains("You are a delegated"));
+        faux_assistant_message("report", StopReason::Stop)
+    })]);
+    let parent = parent(script).await;
+    let manager = IndependentRuns::default();
+    for invalid in [
+        json!({"input":INPUT,"timeoutSeconds":10}),
+        json!({"input":INPUT,"maxTurns":1}),
+        json!({"input":"x".repeat(24_001),"maxTurns":1,"timeoutSeconds":10}),
+        json!({"input":INPUT,"maxTurns":1,"timeoutSeconds":10,"tools":["not_registered"]}),
+    ] {
+        assert!(manager.start_run(&parent, 7, &invalid).await.is_err());
+    }
+    assert!(manager.roster().is_empty());
+    let started = manager
+        .start_run(
+            &parent,
+            7,
+            &json!({
+                "input":INPUT,"maxTurns":1,"timeoutSeconds":10,"tools":[]
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["runId"].as_str().unwrap();
+    assert!(started.get("childId").is_none());
+    assert_ne!(id, parent.session().storage().metadata().id);
+    assert!(parent.get_tip_id().await.unwrap().is_none());
+    let poll = json!({"op":"poll","runId":id});
+    assert!(manager.handle_run(8, &poll).is_err());
+    let settled = wait(&manager, id).await;
+    assert_eq!(settled["runId"], id);
+    assert_eq!(settled["result"]["text"], "report");
+    assert_eq!(settled["result"]["turnLimited"], true);
+    let row = manager.roster().pop().unwrap();
+    assert!(row.get("role").is_none());
+    assert!(row.get("taskPreview").is_none());
+    manager
+        .handle_run(7, &json!({"op":"dispose","runId":id}))
+        .unwrap();
+    assert!(manager.handle_run(7, &poll).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_run_with_zero_max_turns_completes_35_turns() {
+    use rpi_harness::types::HarnessTool;
+    use rpi_tools::{ExecutionToolContext, FileContent, FileSystem, InMemoryExecutionEnv};
+
+    let script = FauxScript::new();
+    let mut responses: Vec<_> = (0..34)
+        .map(|_| FauxStep::tool_call("read", json!({"path":"fixture.txt"})))
+        .collect();
+    responses.push(FauxStep::text("completed after 35 turns"));
+    script.set_responses(responses);
+    let parent = parent(script).await;
+
+    let env = Arc::new(InMemoryExecutionEnv::new());
+    env.write_file("fixture.txt", FileContent::Text("fixture".into()), None)
+        .await
+        .unwrap();
+    let context = ExecutionToolContext::new(env.clone(), Some(env));
+    parent
+        .set_tools(
+            vec![HarnessTool::new(rpi_tools::create_read_tool(
+                &context, None,
+            ))],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let manager = IndependentRuns::default();
+    let started = manager
+        .start_run(
+            &parent,
+            7,
+            &json!({
+                "op": "start",
+                "input": "read the fixture",
+                "maxTurns": 0,
+                "timeoutSeconds": 10,
+                "tools": ["read"],
+            }),
+        )
+        .await
+        .unwrap();
+    let settled = wait(&manager, started["runId"].as_str().unwrap()).await;
+    assert_eq!(settled["status"], "done");
+    assert_eq!(settled["result"]["status"], "completed");
+    assert_eq!(settled["result"]["text"], "completed after 35 turns");
+    assert_eq!(settled["result"]["turns"], 35);
+    assert_eq!(settled["result"]["turnLimited"], false);
+}
+
+mod invocation;
+mod security;

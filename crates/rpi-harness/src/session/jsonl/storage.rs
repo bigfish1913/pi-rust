@@ -51,18 +51,30 @@
 //! `append_entry` receives a [`ProvisionedEntry`] and stamps via the state +
 //! a [`Clock`], then encodes the resulting full `Entry`.
 
-use super::cold_frames::ResidentState;
+use super::cold_frames::{preview, recovery_batch, ResidentState};
 #[cfg(test)]
 #[path = "storage_compat_tests.rs"]
 mod compatibility_tests;
+#[cfg(all(test, unix))]
+#[path = "exclusive_create_tests.rs"]
+mod exclusive_create_tests;
+#[cfg(all(test, unix))]
+#[path = "history_sync_tests.rs"]
+mod history_sync_tests;
+#[path = "startup_checkpoint.rs"]
+pub(super) mod startup_checkpoint;
+#[cfg(unix)]
+#[cfg(test)]
+#[path = "storage/startup_tests.rs"]
+mod startup_tests;
 #[path = "streaming.rs"]
 mod streaming;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use super::digest::Sha256;
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use rpi_tools::env::{FileContent, FileSystem, ReadFile, WriterLease};
@@ -82,8 +94,8 @@ use crate::session::state::ApplyOutcome;
 use crate::session::types::{
     provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, HistoryCheckpoint,
     HistoryIdentity, HistoryReplacement, IdGenerator, LanePointer, LaneRecord, LogItem, LogOptions,
-    OperationStartedRecord, ProvisionedEntry, RecordQuery, SessionMetadata, SessionMutation,
-    SessionStats, SessionStorage, TranscriptPage, TranscriptPageQuery,
+    OperationStartedRecord, ProvisionedEntry, RecordQuery, RecoveryEntryCheck, SessionMetadata,
+    SessionMutation, SessionStats, SessionStorage, TranscriptPage, TranscriptPageQuery,
 };
 
 /// Read-only native facts for startup preflight. No storage/file capability is
@@ -92,6 +104,19 @@ use crate::session::types::{
 pub struct JsonlSessionFacts {
     pub metadata: JsonlSessionMetadata,
     pub values: crate::session::SessionValues,
+}
+
+/// Cheap physical identity of one replayed transcript generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReplaySourceIdentity {
+    pub size: u64,
+    pub mtime_ms: i64,
+}
+
+impl ReplaySourceIdentity {
+    pub(super) fn matches(self, info: &rpi_tools::env::FileInfo) -> bool {
+        self.size == info.size && self.mtime_ms == info.mtime_ms
+    }
 }
 
 /// A fully replayed restore which has not yet acquired the writer lease.
@@ -111,17 +136,50 @@ impl PreparedJsonlRestore {
         self.facts.metadata.clone()
     }
 
+    /// Publish using the ordinary stat fast path. Matching size/mtime is a
+    /// heuristic: same-stamp rewrites/replacements may escape detection. Use
+    /// `commit_strict` when exact replay-generation validation is required.
     pub async fn commit(self) -> SessionResult<JsonlSessionStorage> {
+        self.commit_verified(false).await
+    }
+
+    /// Claim the writer lease, verify the full replay fingerprint once, then
+    /// apply deferred repair. A matching stat never skips content verification.
+    /// This does not protect against writers that ignore an already-held lease.
+    pub async fn commit_strict(self) -> SessionResult<JsonlSessionStorage> {
+        self.commit_verified(true).await
+    }
+
+    /// Reserve the writer before assembling runtime resources. If the replay
+    /// went stale, discard it and release the lease so the caller can repeat
+    /// read-only preflight. Any deferred repair still requires commit.
+    pub async fn reserve_current_writer(self) -> SessionResult<Option<Self>> {
+        self.storage.ensure_writer_lease().await?;
+        let current = self.storage.loaded_history_matches(false).await?;
+        Ok(current.then_some(self))
+    }
+
+    async fn commit_verified(self, strict: bool) -> SessionResult<JsonlSessionStorage> {
         let mut storage = self.storage;
-        // Ownership first, then the single fingerprint check: while the lease is
-        // held no compliant writer can change the source, so this digest proves
-        // the replay still matches the generation the deferred repair publishes.
-        // Verifying before the lease would leave a window where a concurrent
-        // append lands between the check and acquisition and is then silently
-        // replaced by the repair.
+        // Ownership precedes verification and deferred repair. Strict mode
+        // always hashes once under the lease; ordinary mode may trust its stat
+        // heuristic. Never move verification ahead of lease acquisition.
+        // Timing-only phases; input/output are zero (not payload counts).
+        let lease = crate::session::diagnostics::RecoveryPhase::start("prepared_writer_lease");
         storage.ensure_writer_lease().await?;
-        storage.verify_loaded_history().await?;
+        lease.finish(0, 0);
+        let verify = crate::session::diagnostics::RecoveryPhase::start("prepared_source_verify");
+        if !storage.loaded_history_matches(strict).await? {
+            return Err(SessionError::invalid_entry(
+                "session history changed during restore preparation; reopen session",
+            ));
+        }
+        verify.finish(0, 0);
+        let repair = crate::session::diagnostics::RecoveryPhase::start("prepared_repair");
         storage.commit_pending_repair().await?;
+        repair.finish(0, 0);
+        storage.publish_preview().await;
+        storage.publish_startup_checkpoint().await;
         Ok(storage)
     }
 }
@@ -135,7 +193,9 @@ pub(super) enum PendingRepair {
     Eager {
         bytes: Vec<u8>,
     },
-    AppendNewline,
+    AppendNewline {
+        digest: Option<[u8; 32]>,
+    },
 }
 
 /// Recovery policy is independent of cold payload residency. Both replay paths
@@ -220,7 +280,8 @@ pub struct JsonlSessionStorage {
     /// silently reacquire a new lease. Reopen creates a fresh binding.
     writer_lease_revoked: Arc<AtomicBool>,
     needs_reconcile: Arc<std::sync::atomic::AtomicBool>,
-    /// Set when a failed append cannot be proven/truncated safely.
+    /// Set when a failed append cannot be rolled back safely or a replacement
+    /// may have reached disk without advancing the live reducer.
     uncertain: Arc<AtomicBool>,
     /// Shared replacement generation for clones of one storage binding.
     generation: Arc<AtomicU64>,
@@ -228,7 +289,13 @@ pub struct JsonlSessionStorage {
     /// Exact loaded legacy history, including its header, before writable opt-in.
     legacy_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
     loaded_history_digest: Arc<StdMutex<Option<[u8; 32]>>>,
+    /// Stat hint for the replayed generation, not a content identity. Ordinary
+    /// commits may skip the digest; strict commits always verify the digest.
+    /// Any detected size/mtime difference falls back to the digest.
+    loaded_history_identity: Arc<StdMutex<Option<ReplaySourceIdentity>>>,
     pending_repair: Arc<StdMutex<Option<PendingRepair>>>,
+    startup_checkpoint: Option<startup_checkpoint::Update>,
+    preview_source: Arc<StdMutex<Option<preview::Source>>>,
 }
 
 impl Clone for JsonlSessionStorage {
@@ -249,7 +316,10 @@ impl Clone for JsonlSessionStorage {
             progress: self.progress.clone(),
             legacy_history_digest: self.legacy_history_digest.clone(),
             loaded_history_digest: self.loaded_history_digest.clone(),
+            loaded_history_identity: self.loaded_history_identity.clone(),
             pending_repair: self.pending_repair.clone(),
+            startup_checkpoint: None,
+            preview_source: self.preview_source.clone(),
         }
     }
 }
@@ -282,16 +352,20 @@ impl JsonlSessionStorage {
             if let Err(error) = worker.ensure_writer_lease().await {
                 return Err(error);
             }
-            if worker.uncertain.load(Ordering::Acquire) {
-                return Err(SessionError::storage(format!(
-                    "Session {} has an unsettled append; reopen it before writing",
-                    worker.metadata.path
-                )));
-            }
             if let Err(error) = worker.reconcile_if_needed().await {
                 return Err(error);
             }
-            op(worker).await
+            let result = op(worker.clone()).await;
+            if result.is_ok() {
+                worker.publish_preview().await;
+            } else {
+                // A failed reducer commit cannot publish newly written bytes.
+                let mut source = worker.preview_source.lock().unwrap();
+                if source.as_ref().is_some_and(|source| !source.attempted) {
+                    *source = None;
+                }
+            }
+            result
         })
         .await
         .map_err(|e| SessionError::storage(format!("JSONL mutation task failed: {e}")))?
@@ -327,7 +401,10 @@ impl JsonlSessionStorage {
             generation: Arc::new(AtomicU64::new(generation)),
             legacy_history_digest: Arc::new(StdMutex::new(None)),
             loaded_history_digest: Arc::new(StdMutex::new(None)),
+            loaded_history_identity: Arc::new(StdMutex::new(None)),
             pending_repair: Arc::new(StdMutex::new(None)),
+            startup_checkpoint: None,
+            preview_source: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -378,6 +455,12 @@ impl JsonlSessionStorage {
     }
 
     async fn ensure_writer_lease(&self) -> SessionResult<()> {
+        if self.uncertain.load(Ordering::Acquire) {
+            return Err(SessionError::storage(format!(
+                "Session {} has an unsettled append or replacement; reopen it before writing",
+                self.metadata.path
+            )));
+        }
         self.acquire_writer_lease().await?;
         let verification = {
             let held = self
@@ -406,9 +489,40 @@ impl JsonlSessionStorage {
     pub async fn create(
         fs: Arc<dyn FileSystem>,
         path: &str,
+        header: JsonlV4Header,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<Self> {
+        Self::create_inner(fs, path, header, clock, ids, false).await
+    }
+
+    /// Exclusively create a new native history and progress companion. Existing
+    /// files (including symlinks/orphans) are never overwritten. Requires a real
+    /// writer lease, atomic create support and strict file/parent synchronization.
+    ///
+    /// Initialization remains owned if the caller drops its wait. A failure may
+    /// leave partial new files for explicit inspection; it never deletes files,
+    /// falls back to legacy truncating creation, or silently adopts an orphan.
+    pub async fn create_new(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        header: JsonlV4Header,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<Self> {
+        let path = path.to_owned();
+        tokio::spawn(async move { Self::create_inner(fs, &path, header, clock, ids, true).await })
+            .await
+            .map_err(|_| SessionError::storage("exclusive Session creation task stopped"))?
+    }
+
+    async fn create_inner(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
         mut header: JsonlV4Header,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
+        exclusive: bool,
     ) -> SessionResult<Self> {
         header.progress_format = Some(super::progress::FORMAT.into());
         // Claim ownership before creating either the history or its progress
@@ -418,27 +532,55 @@ impl JsonlSessionStorage {
             fs.try_acquire_writer_lease(path).await,
             &format!("Failed to acquire writer lease for {path}"),
         )?;
+        if exclusive && lease.is_none() {
+            return Err(SessionError::storage(
+                "exclusive Session creation requires a writer lease",
+            ));
+        }
         let progress =
             super::progress::JsonlProgressStore::new(fs.clone(), path, &header.id, clock.clone());
-        progress.initialize().await?;
-        file_result(
-            fs.write_file(path, FileContent::Text(encode_header(&header)), None)
-                .await,
-            &format!("Failed to initialize session {path}"),
-        )?;
-        file_result(
-            fs.sync_file(path, false, None).await,
-            &format!("Failed to sync initialized session {path}"),
-        )?;
-        let absolute = file_result(
-            fs.absolute_path(path, None).await,
-            &format!("Failed to resolve initialized session {path}"),
-        )?;
-        if let Some(parent) = absolute.parent() {
+        let encoded_header = encode_header(&header);
+        if exclusive {
+            // Claim an EMPTY primary path before touching the companion. Do
+            // not advertise a readable header until exclusive companion creation
+            // succeeds: even an orphan with the same Session ID must not become
+            // authoritative merely because a failed create left a new header.
             file_result(
-                fs.sync_directory(&parent.to_string_lossy(), None).await,
-                &format!("Failed to sync initialized session directory {path}"),
+                fs.write_new_file(path, FileContent::Bytes(Vec::new()), None)
+                    .await,
+                &format!("Failed to exclusively initialize session {path}"),
             )?;
+            progress.initialize_new().await?;
+            file_result(
+                fs.append_file(path, FileContent::Text(encoded_header.clone()), None)
+                    .await,
+                &format!("Failed to publish new session header {path}"),
+            )?;
+            file_result(
+                fs.sync_file_and_parent(path, None).await,
+                &format!("Failed to strictly sync initialized session {path}"),
+            )?;
+        } else {
+            progress.initialize().await?;
+            file_result(
+                fs.write_file(path, FileContent::Text(encoded_header.clone()), None)
+                    .await,
+                &format!("Failed to initialize session {path}"),
+            )?;
+            file_result(
+                fs.sync_file(path, false, None).await,
+                &format!("Failed to sync initialized session {path}"),
+            )?;
+            let absolute = file_result(
+                fs.absolute_path(path, None).await,
+                &format!("Failed to resolve initialized session {path}"),
+            )?;
+            if let Some(parent) = absolute.parent() {
+                file_result(
+                    fs.sync_directory(&parent.to_string_lossy(), None).await,
+                    &format!("Failed to sync initialized session directory {path}"),
+                )?;
+            }
         }
         let info = file_result(
             fs.file_info(path, None).await,
@@ -454,6 +596,18 @@ impl JsonlSessionStorage {
                 .map_err(|_| SessionError::storage("JSONL writer lease lock poisoned"))?
                 .replace(lease);
         }
+        if storage.writer_lease_held() {
+            if let Some(path) = preview::native_path(storage.fs.as_ref(), path) {
+                let source = tokio::task::spawn_blocking(move || {
+                    preview::Source::created(path, encoded_header.as_bytes())
+                })
+                .await
+                .ok()
+                .flatten();
+                *storage.preview_source.lock().unwrap() = source;
+                storage.publish_preview().await;
+            }
+        }
         Ok(storage)
     }
 
@@ -466,6 +620,74 @@ impl JsonlSessionStorage {
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
         Self::load_impl(fs, path, clock, ids, ReadPolicy::Restore).await
+    }
+
+    /// Read the native recent transcript for the given project without replay,
+    /// writer ownership, or disk changes. An absent or stale index is a miss.
+    pub fn read_preview(
+        root: &std::path::Path,
+        cwd: &std::path::Path,
+        id: &str,
+    ) -> std::io::Result<(Vec<Entry>, bool)> {
+        preview::read(root, cwd, id)
+    }
+
+    async fn publish_startup_checkpoint(&mut self) {
+        let Some(update) = self.startup_checkpoint.take() else {
+            return;
+        };
+        if !self.writer_lease_held() || !update.should_publish() {
+            return;
+        }
+        let phase = crate::session::diagnostics::RecoveryPhase::start("startup_checkpoint_publish");
+        let image = self.state.lock().await.startup_image();
+        if let Some(image) = image {
+            startup_checkpoint::publish(&self.fs, &self.metadata.path, update.boundary, image)
+                .await;
+        }
+        phase.finish(update.boundary.lines, 0);
+    }
+
+    async fn publish_preview(&self) {
+        let source = self.preview_source.lock().unwrap().clone();
+        let Some(source) = source.filter(|source| !source.attempted) else {
+            return;
+        };
+        if !self.writer_lease_held() {
+            return;
+        }
+        if let Some(current) = self.preview_source.lock().unwrap().as_mut() {
+            // An unchanged generation needs at most one attempt. A future
+            // append or reopen gets a fresh publication opportunity.
+            current.attempted = true;
+        }
+        let Some(index) = self
+            .state
+            .lock()
+            .await
+            .preview_index(&self.metadata.id, &source)
+        else {
+            return;
+        };
+        // Keep the writer lease through the rename, including when a binding
+        // is released concurrently with a publication.
+        let storage = self.clone();
+        let published = tokio::task::spawn_blocking(move || {
+            let held = storage.writer_lease.lock().unwrap();
+            if held.is_some() && !storage.writer_lease_revoked.load(Ordering::Acquire) {
+                source.publish(index).ok()
+            } else {
+                None
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(source) = published {
+            *self.preview_source.lock().unwrap() = Some(source);
+        } else {
+            tracing::debug!("session preview unavailable after publication attempt");
+        }
     }
 
     /// Fork reads never repair their source. Use the ordinary cold replay and
@@ -598,7 +820,49 @@ impl JsonlSessionStorage {
         })
     }
 
-    async fn verify_loaded_history(&self) -> SessionResult<()> {
+    /// Record the physical generation the replay describes. `size` must be the
+    /// number of bytes the replay actually consumed (and the stat must be the
+    /// one taken when that read started), otherwise a concurrent append would
+    /// make the identity describe a newer generation than the replayed bytes and
+    /// the stat fast path would accept a stale replay.
+    ///
+    /// Only the deferred prepared path records it; every other policy either
+    /// repairs immediately or never commits repair. An unknown mtime (0, from a
+    /// filesystem that cannot report one) is never recorded: a stat that always
+    /// compares equal must not be able to disable the digest.
+    fn record_replay_identity(&mut self, info: &rpi_tools::env::FileInfo, replayed_bytes: u64) {
+        if info.size != replayed_bytes || info.mtime_ms == 0 {
+            return;
+        }
+        if let Ok(mut slot) = self.loaded_history_identity.lock() {
+            *slot = Some(ReplaySourceIdentity {
+                size: info.size,
+                mtime_ms: info.mtime_ms,
+            });
+        }
+    }
+
+    async fn loaded_history_matches(&self, strict: bool) -> SessionResult<bool> {
+        let identity = if strict {
+            None
+        } else {
+            *self
+                .loaded_history_identity
+                .lock()
+                .map_err(|_| SessionError::storage("session history identity lock poisoned"))?
+        };
+        if let Some(identity) = identity {
+            let info = file_result(
+                self.fs.file_info(&self.metadata.path, None).await,
+                "stat prepared session history verifier",
+            )?;
+            // Heuristic only: same-length rewrites or atomic replacements may
+            // preserve even a nonzero mtime. Strict mode bypasses this shortcut;
+            // unknown mtime (0) also always falls back to the digest.
+            if identity.matches(&info) && identity.mtime_ms != 0 {
+                return Ok(true);
+            }
+        }
         let expected = self
             .loaded_history_digest
             .lock()
@@ -614,26 +878,21 @@ impl JsonlSessionStorage {
             )? {
                 streaming::hash_reader(&reader, length).await?
             } else {
-                <[u8; 32]>::from(Sha256::digest(&file_result(
+                Sha256::digest(file_result(
                     reader.read_all().await,
                     "read prepared session history verifier",
-                )?))
+                )?)
             }
         } else {
-            <[u8; 32]>::from(Sha256::digest(
+            Sha256::digest(
                 file_result(
                     self.fs.read_text_file(&self.metadata.path, None).await,
                     "read prepared session history verifier",
                 )?
                 .as_bytes(),
-            ))
+            )
         };
-        if actual != expected {
-            return Err(SessionError::invalid_entry(
-                "session history changed during restore preparation; reopen session",
-            ));
-        }
-        Ok(())
+        Ok(actual == expected)
     }
 
     async fn commit_pending_repair(&mut self) -> SessionResult<()> {
@@ -645,6 +904,7 @@ impl JsonlSessionStorage {
         let Some(pending) = pending else {
             return Ok(());
         };
+        self.ensure_writer_lease().await?;
         self.commit_pending_repair_impl(pending).await
     }
 
@@ -660,14 +920,29 @@ impl JsonlSessionStorage {
         let defer_repair = policy.defers_repairs();
         let strict = policy.strict();
         let read_diagnostics = crate::session::diagnostics::RecoveryPhase::start("history_read");
+        // Stat before the read: the identity must describe the generation the
+        // replay consumes, so a later stat (after an append) cannot be used.
+        let info_before_read = if defer_repair {
+            Some(file_result(
+                fs.file_info(path, None).await,
+                "stat session history",
+            )?)
+        } else {
+            None
+        };
         let reader = file_result(fs.open_read_file(path).await, "open session history reader")?;
         policy.check(0)?;
         if let Some(source) = &reader {
             if let Some(length) =
                 file_result(source.byte_len().await, "stat session history reader")?
             {
-                return Self::load_streaming(fs, path, clock, ids, source.clone(), length, policy)
-                    .await;
+                let mut storage =
+                    Self::load_streaming(fs, path, clock, ids, source.clone(), length, policy)
+                        .await?;
+                if let Some(info) = &info_before_read {
+                    storage.record_replay_identity(info, length);
+                }
+                return Ok(storage);
             }
         }
         // Compatibility only: custom readers without byte_len (or filesystems
@@ -758,7 +1033,7 @@ impl JsonlSessionStorage {
             }
         }
         storage.progress.required = header.progress_format.is_some();
-        let source_digest = <[u8; 32]>::from(Sha256::digest(content.as_bytes()));
+        let source_digest = Sha256::digest(content.as_bytes());
         *storage.loaded_history_digest.lock().unwrap() = Some(source_digest);
         if !storage.progress.required {
             *storage.legacy_history_digest.lock().unwrap() = Some(source_digest);
@@ -912,7 +1187,7 @@ impl JsonlSessionStorage {
                         storage.ensure_writer_lease().await?;
                         if !storage.progress.required {
                             *storage.legacy_history_digest.lock().unwrap() =
-                                Some(Sha256::digest(valid_prefix.as_bytes()).into());
+                                Some(Sha256::digest(valid_prefix.as_bytes()));
                         }
                         let fs = storage.fs.clone();
                         let path_owned = path.to_string();
@@ -957,7 +1232,7 @@ impl JsonlSessionStorage {
                 storage.ensure_writer_lease().await?;
                 if !storage.progress.required {
                     *storage.legacy_history_digest.lock().unwrap() =
-                        Some(Sha256::digest(repaired.as_bytes()).into());
+                        Some(Sha256::digest(repaired.as_bytes()));
                 }
                 let fs = storage.fs.clone();
                 let path_owned = path.to_string();
@@ -974,6 +1249,9 @@ impl JsonlSessionStorage {
                     })
                 })
                 .await?;
+            }
+            if let Some(info) = &info_before_read {
+                storage.record_replay_identity(info, content.len() as u64);
             }
             replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
             return Ok(storage);
@@ -1001,12 +1279,15 @@ impl JsonlSessionStorage {
                 )?;
                 if !storage.progress.required {
                     *storage.legacy_history_digest.lock().unwrap() =
-                        Some(Sha256::digest(format!("{content}\n").as_bytes()).into());
+                        Some(Sha256::digest(format!("{content}\n").as_bytes()));
                 }
             }
         }
         policy.check(physical_lines.len() - 1)?;
         replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
+        if let Some(info) = &info_before_read {
+            storage.record_replay_identity(info, content.len() as u64);
+        }
         Ok(storage)
     }
 
@@ -1028,6 +1309,7 @@ impl JsonlSessionStorage {
             let mut storage = self;
             storage.ensure_writer_lease().await?;
             if storage.progress.required {
+                storage.publish_preview().await;
                 return Ok(storage);
             }
             if storage.metadata.source_format != super::types::JsonlSourceFormat::V4 {
@@ -1053,7 +1335,7 @@ impl JsonlSessionStorage {
                 storage.fs.read_text_file(&path, None).await,
                 "read history for progress upgrade",
             )?;
-            if <[u8; 32]>::from(Sha256::digest(content.as_bytes())) != expected {
+            if Sha256::digest(content.as_bytes()) != expected {
                 return Err(SessionError::invalid_entry(
                     "session history changed before progress upgrade; reopen session",
                 ));
@@ -1100,7 +1382,7 @@ impl JsonlSessionStorage {
                         fs.read_text_file(&history_path, None).await,
                         "recheck history for progress upgrade",
                     )?;
-                    if <[u8; 32]>::from(Sha256::digest(current.as_bytes())) != expected {
+                    if Sha256::digest(current.as_bytes()) != expected {
                         return Err(SessionError::invalid_entry(
                             "session history changed during progress upgrade; reopen session",
                         ));
@@ -1205,7 +1487,7 @@ impl JsonlSessionStorage {
         // The target lease must precede creation of the progress companion and
         // the staged replacement, otherwise a competing fork can leave a
         // partially initialized target behind a failed ownership check.
-        let _target_lease = file_result(
+        let target_lease = file_result(
             self.fs.try_acquire_writer_lease(path).await,
             &format!("Failed to acquire writer lease for fork {path}"),
         )?;
@@ -1340,7 +1622,13 @@ impl JsonlSessionStorage {
             })
         })
         .await?;
-        JsonlSessionStorage::load(self.fs.clone(), path, clock, ids).await
+        let storage = Self::load(self.fs.clone(), path, clock, ids).await?;
+        // Publish the destination's index under the creation lease, then
+        // return the handle with the same ownership semantics as a plain load.
+        *storage.writer_lease.lock().unwrap() = target_lease;
+        storage.publish_preview().await;
+        storage.writer_lease.lock().unwrap().take();
+        Ok(storage)
     }
 
     /// Wait for all in-flight appends to settle. Mirrors TS `drain`.
@@ -1354,6 +1642,56 @@ impl JsonlSessionStorage {
     /// The rich JSONL metadata (the trait exposes only the base subset).
     pub fn jsonl_metadata(&self) -> JsonlSessionMetadata {
         self.metadata.clone()
+    }
+
+    /// Verify the source that is about to be replaced while the writer tail
+    /// is held. A checkpoint seeds the revision; subsequent lines advance it
+    /// just as they do during replay. Unreadable mutations block publication.
+    async fn verified_replacement_header(
+        &self,
+        expected: HistoryIdentity,
+    ) -> SessionResult<(JsonlV4Header, Option<HistoryCheckpoint>)> {
+        let content = file_result(
+            self.fs.read_text_file(&self.metadata.path, None).await,
+            "read JSONL history for replacement",
+        )?;
+        let mut lines = content.lines();
+        let header = parse_header(lines.next().unwrap_or_default()).map_err(|e| {
+            SessionError::invalid_entry(format!("parse JSONL replacement header: {e}"))
+        })?;
+        if header.id != self.metadata.id || header.history_generation() != expected.generation {
+            return Err(SessionError::storage(
+                "history replacement header identity conflict",
+            ));
+        }
+        let checkpoint = history_checkpoint(&header)
+            .map_err(|e| SessionError::invalid_entry(format!("parse JSONL checkpoint: {e}")))?;
+        let initial_revision = checkpoint
+            .as_ref()
+            .map_or(0, |image| image.history_identity.revision);
+        let revision = lines.filter(|line| !line.trim().is_empty()).try_fold(
+            initial_revision,
+            |latest, line| {
+                let mutation = parse_mutation(line).map_err(|error| {
+                    SessionError::invalid_entry(format!(
+                        "parse JSONL replacement mutation: {error}"
+                    ))
+                })?;
+                let seq = mutation.seq();
+                if seq <= latest {
+                    return Err(SessionError::invalid_entry(format!(
+                        "out-of-order JSONL replacement mutation at sequence {seq}"
+                    )));
+                }
+                Ok(seq)
+            },
+        )?;
+        if revision != expected.revision {
+            return Err(SessionError::storage(
+                "history replacement revision conflict during publication",
+            ));
+        }
+        Ok((header, checkpoint))
     }
 
     async fn replace_history_owned(
@@ -1389,46 +1727,13 @@ impl JsonlSessionStorage {
         let next_generation = expected_generation
             .checked_add(1)
             .ok_or_else(|| SessionError::storage("history replacement generation exhausted"))?;
-        let content = file_result(
-            self.fs.read_text_file(&self.metadata.path, None).await,
-            "read JSONL history for replacement",
-        )?;
-        let header_line = content
-            .split_once('\n')
-            .map(|(line, _)| line)
-            .unwrap_or(content.as_str())
-            .trim_end_matches('\r');
-        let physical_revision = content
-            .split_terminator('\n')
-            .skip(1)
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                parse_mutation(line.trim_end_matches('\r'))
-                    .map(|mutation| mutation.seq())
-                    .map_err(|error| {
-                        SessionError::invalid_entry(format!(
-                            "parse JSONL replacement mutation: {error}"
-                        ))
-                    })
+        let (mut header, checkpoint) = self
+            .verified_replacement_header(HistoryIdentity {
+                revision: expected_revision,
+                generation: expected_generation,
             })
-            .try_fold(0u64, |maximum, seq| seq.map(|seq| maximum.max(seq)))?;
-        if physical_revision != expected_revision {
-            return Err(SessionError::storage(
-                "history replacement revision conflict during publication",
-            ));
-        }
-        let mut header = parse_header(header_line).map_err(|e| {
-            SessionError::invalid_entry(format!("parse JSONL replacement header: {e}"))
-        })?;
-        if header.id != self.metadata.id || header.history_generation() != expected_generation {
-            return Err(SessionError::storage(
-                "history replacement header identity conflict",
-            ));
-        }
-        if history_checkpoint(&header)
-            .map_err(|e| SessionError::invalid_entry(format!("parse JSONL checkpoint: {e}")))?
-            .is_some()
-        {
+            .await?;
+        if checkpoint.is_some() {
             return Err(SessionError::storage(
                 "checkpoint history requires checkpoint replacement",
             ));
@@ -1443,18 +1748,7 @@ impl JsonlSessionStorage {
         for mutation in &canonical_mutations {
             output.push_str(&encode_mutation(mutation));
         }
-        let fs = self.fs.clone();
-        let path = self.metadata.path.clone();
-        publish_file_atomically(&fs, &path, move |fs, temp_path| {
-            Box::pin(async move {
-                file_result(
-                    fs.write_file(temp_path, FileContent::Text(output), None)
-                        .await,
-                    "stage JSONL history replacement",
-                )
-            })
-        })
-        .await?;
+        self.publish_history_replacement(output).await?;
         *self.state.lock().await = candidate;
         self.generation.store(next_generation, Ordering::Release);
         Ok(HistoryIdentity {
@@ -1491,41 +1785,9 @@ impl JsonlSessionStorage {
             .checked_add(1)
             .ok_or_else(|| SessionError::storage("history replacement generation exhausted"))?;
         let candidate = ResidentState::from_checkpoint(checkpoint.state.clone())?;
-        let content = file_result(
-            self.fs.read_text_file(&self.metadata.path, None).await,
-            "read JSONL history for checkpoint replacement",
-        )?;
-        let header_line = content
-            .split_once('\n')
-            .map(|(line, _)| line)
-            .unwrap_or(content.as_str())
-            .trim_end_matches('\r');
-        let mut header = parse_header(header_line).map_err(|e| {
-            SessionError::invalid_entry(format!("parse JSONL checkpoint header: {e}"))
-        })?;
-        if header.id != self.metadata.id || header.history_generation() != expected_generation {
-            return Err(SessionError::storage(
-                "history checkpoint header identity conflict",
-            ));
-        }
-        let header_revision = history_checkpoint(&header)
-            .map_err(|e| SessionError::invalid_entry(format!("parse JSONL checkpoint: {e}")))?
-            .map(|image| image.history_identity.revision);
-        if header_revision.unwrap_or_else(|| {
-            content
-                .split_terminator('\n')
-                .skip(1)
-                .filter(|line| !line.trim().is_empty())
-                .filter_map(|line| parse_mutation(line.trim_end_matches('\r')).ok())
-                .map(|mutation| mutation.seq())
-                .max()
-                .unwrap_or(0)
-        }) != expected_revision
-        {
-            return Err(SessionError::storage(
-                "history checkpoint revision conflict during publication",
-            ));
-        }
+        let (mut header, _) = self
+            .verified_replacement_header(checkpoint.history_identity)
+            .await?;
         let archive = checkpoint.receipt_archive;
         let mut published = HistoryCheckpoint::new(
             HistoryIdentity {
@@ -1549,21 +1811,8 @@ impl JsonlSessionStorage {
         );
         header.metadata = Some(metadata);
         let output = encode_header(&header);
-        let legacy_digest =
-            (!self.progress.required).then(|| Sha256::digest(output.as_bytes()).into());
-        let fs = self.fs.clone();
-        let path = self.metadata.path.clone();
-        let staged = output.clone();
-        publish_file_atomically(&fs, &path, move |fs, temp_path| {
-            Box::pin(async move {
-                file_result(
-                    fs.write_file(temp_path, FileContent::Text(staged), None)
-                        .await,
-                    "stage JSONL checkpoint replacement",
-                )
-            })
-        })
-        .await?;
+        let legacy_digest = (!self.progress.required).then(|| Sha256::digest(output.as_bytes()));
+        self.publish_history_replacement(output).await?;
         *self.state.lock().await = candidate;
         self.generation.store(next_generation, Ordering::Release);
         if let Some(digest) = legacy_digest {
@@ -1575,13 +1824,34 @@ impl JsonlSessionStorage {
         })
     }
 
-    async fn reconcile_if_needed(&self) -> SessionResult<()> {
-        if self.uncertain.load(Ordering::Acquire) {
-            return Err(SessionError::storage(format!(
-                "Session {} has an unsettled append; reopen it before writing",
-                self.metadata.path
-            )));
+    async fn publish_history_replacement(&self, output: String) -> SessionResult<()> {
+        // The next append must open the published inode, never the retired one.
+        *self.append.lock().await = None;
+        let result =
+            publish_file_atomically(&self.fs, &self.metadata.path, move |fs, temp_path| {
+                Box::pin(async move {
+                    file_result(
+                        fs.write_file(temp_path, FileContent::Text(output), None)
+                            .await,
+                        "stage JSONL history replacement",
+                    )
+                })
+            })
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error.stage == PublicationStage::Publishing {
+                    // The file may already contain the new generation while the
+                    // live reducer still reflects the old one.
+                    self.uncertain.store(true, Ordering::Release);
+                }
+                Err(error.into())
+            }
         }
+    }
+
+    async fn reconcile_if_needed(&self) -> SessionResult<()> {
         if !self.needs_reconcile.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -1594,6 +1864,7 @@ impl JsonlSessionStorage {
         .await?;
         let recovered_state = recovered.state.lock().await.clone();
         *self.state.lock().await = recovered_state;
+        *self.preview_source.lock().unwrap() = recovered.preview_source.lock().unwrap().clone();
         self.needs_reconcile.store(false, Ordering::Release);
         Ok(())
     }
@@ -1603,6 +1874,7 @@ impl JsonlSessionStorage {
         if lines.is_empty() {
             return Ok(());
         }
+        let preview_before = self.preview_source.lock().unwrap().clone();
         let mut append = self.append.lock().await;
         if append.is_none() {
             *append = file_result(
@@ -1611,7 +1883,14 @@ impl JsonlSessionStorage {
             )?;
         }
         let result = if let Some(writer) = append.as_mut() {
-            let result = writer.append_with_receipt(&lines).await;
+            let result = if preview_before.is_some() {
+                writer.append_with_native_metadata(&lines).await
+            } else {
+                writer
+                    .append_with_receipt(&lines)
+                    .await
+                    .map(|receipt| (receipt, None))
+            };
             if result.is_err() {
                 *append = None;
             }
@@ -1620,7 +1899,7 @@ impl JsonlSessionStorage {
             self.fs
                 .append_file(&self.metadata.path, FileContent::Bytes(lines.clone()), None)
                 .await
-                .map(|_| None)
+                .map(|_| (None, None))
         };
         // Treat a sync failure like any post-write uncertainty: the bytes may
         // already be visible, so the existing conservative tail recovery must
@@ -1635,8 +1914,8 @@ impl JsonlSessionStorage {
             },
             Err(error) => Err(error),
         };
-        let receipt = match result {
-            Ok(receipt) => receipt,
+        let (receipt, metadata) = match result {
+            Ok(result) => result,
             Err(error) => {
                 // The reducer has not seen this batch. Remove the whole batch,
                 // including any complete lines before a torn final line.
@@ -1654,7 +1933,15 @@ impl JsonlSessionStorage {
         drop(append);
         // A missing (or malformed custom) receipt is a compatibility fallback,
         // never an error after bytes have already been acknowledged.
-        if let Some(receipt) = receipt.filter(|receipt| receipt.length == lines.len()) {
+        let receipt = receipt.filter(|receipt| receipt.length == lines.len());
+        if let Some(before) = preview_before {
+            let next = receipt
+                .as_ref()
+                .zip(metadata.as_ref())
+                .and_then(|(receipt, metadata)| before.appended(receipt, metadata));
+            *self.preview_source.lock().unwrap() = next;
+        }
+        if let Some(receipt) = receipt {
             self.state.lock().await.bind_append(receipt, &lines);
         }
         Ok(())
@@ -2225,6 +2512,28 @@ impl SessionStorage for JsonlSessionStorage {
         ))
     }
 
+    async fn tool_result_identity(&self, id: &str) -> SessionResult<Option<(String, String)>> {
+        let selected = self.state.lock().await.entry_ref(id);
+        match selected {
+            Some(payload) => payload.tool_result_identity().await,
+            None => Ok(None),
+        }
+    }
+
+    async fn recovery_entries_settled(
+        &self,
+        checks: &[RecoveryEntryCheck<'_>],
+    ) -> SessionResult<Vec<bool>> {
+        let selected: Vec<_> = {
+            let state = self.state.lock().await;
+            checks
+                .iter()
+                .map(|check| check.id().and_then(|id| state.entry_ref(id)))
+                .collect()
+        };
+        recovery_batch::read(checks, &selected).await
+    }
+
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
         let selected = self.state.lock().await.entry_ref(id);
         match selected {
@@ -2321,6 +2630,36 @@ impl SessionStorage for JsonlSessionStorage {
     async fn get_stats(&self) -> SessionResult<SessionStats> {
         let state = self.state.lock().await;
         Ok(state.get_stats().clone())
+    }
+
+    /// An explicit, writer-ordered physical history barrier. `run_owned` keeps
+    /// the tail reservation through sync and identity sampling even if the
+    /// caller drops its wait; later writes/replacements cannot overtake it.
+    async fn sync_history(&self) -> SessionResult<HistoryIdentity> {
+        self.run_owned(|s| async move {
+            if !s.writer_lease_held() {
+                return Err(SessionError::storage(
+                    "physical history synchronization requires a writer lease",
+                ));
+            }
+            file_result(
+                s.fs.sync_file_and_parent(&s.metadata.path, None).await,
+                "Failed to synchronize session history",
+            )?;
+            // A concurrent explicit retirement or a replaced lease fence must
+            // never return an apparently valid durability observation.
+            s.ensure_writer_lease().await?;
+            if !s.writer_lease_held() {
+                return Err(SessionError::storage(
+                    "session writer lease was lost during history synchronization",
+                ));
+            }
+            Ok(HistoryIdentity {
+                revision: s.state.lock().await.sequence(),
+                generation: s.generation.load(Ordering::Acquire),
+            })
+        })
+        .await
     }
 
     /// Wait for the append that is in flight, if any, to settle.
@@ -2603,6 +2942,24 @@ fn is_assistant_frame_append(line: &str) -> bool {
         && value.get("op").and_then(serde_json::Value::as_str) == Some("append")
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PublicationStage {
+    Populating,
+    SyncingStagedFile,
+    Publishing,
+}
+
+pub(super) struct FilePublicationError {
+    pub(super) stage: PublicationStage,
+    error: SessionError,
+}
+
+impl From<FilePublicationError> for SessionError {
+    fn from(error: FilePublicationError) -> Self {
+        error.error
+    }
+}
+
 /// Build a complete sibling temporary file, then atomically rename it over the
 /// destination. Mirrors TS `publishFileAtomically`.
 ///
@@ -2615,7 +2972,7 @@ pub(super) async fn publish_file_atomically<F>(
     fs: &Arc<dyn FileSystem>,
     destination_path: &str,
     populate: F,
-) -> SessionResult<()>
+) -> Result<(), FilePublicationError>
 where
     F: for<'a> FnOnce(
         &'a Arc<dyn FileSystem>,
@@ -2629,15 +2986,18 @@ where
     // the staged `.tmp` is best-effort removed on ANY failure (staging or
     // rename), so a crash/failure never leaves a partial `.tmp` behind. The
     // original destination is untouched until the rename commits.
+    let mut stage = PublicationStage::Populating;
     let result: SessionResult<()> = (async {
         populate(fs, &temp_path).await?;
         // A successful write/flush only establishes visibility. Backends with
         // physical durability support sync the complete staged file before
         // publication, then sync the containing directory after rename.
+        stage = PublicationStage::SyncingStagedFile;
         file_result(
             fs.sync_file(&temp_path, false, None).await,
             &format!("Failed to sync staged file {destination_path}"),
         )?;
+        stage = PublicationStage::Publishing;
         file_result(
             fs.rename_file(&temp_path, destination_path, None).await,
             &format!("Failed to publish staged file {destination_path}"),
@@ -2659,7 +3019,7 @@ where
         // Best-effort cleanup; preserve the original error.
         let _ = fs.remove(&temp_path, false, true, None).await;
     }
-    result
+    result.map_err(|error| FilePublicationError { stage, error })
 }
 
 /// Result of scanning a JSONL history for frames a `clear_run` already retired.
@@ -3336,6 +3696,82 @@ mod tests {
             Some(content.len() as u64),
             "reopened JSONL must observe the same published physical image"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_replacement_accounts_for_appended_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, storage, clock, ids) = session_on_disk(&temp).await;
+        let initial = storage.history_identity().await.unwrap();
+        let checkpoint = SessionState::new().history_checkpoint(initial).unwrap();
+        let first = storage
+            .replace_history_with_checkpoint_if_revision_and_generation(
+                initial.revision,
+                initial.generation,
+                checkpoint,
+            )
+            .await
+            .unwrap();
+        let stale =
+            JsonlSessionStorage::load(fs.clone(), "session.jsonl", clock.clone(), ids.clone())
+                .await
+                .unwrap();
+        storage
+            .append_entry(provisioned_message("after-checkpoint"), "main")
+            .await
+            .unwrap();
+        let before = fs.read_text_file("session.jsonl", None).await.unwrap();
+        storage.release_writer_lease();
+        let stale_image = SessionState::new().history_checkpoint(first).unwrap();
+        let error = stale
+            .replace_history_with_checkpoint_if_revision_and_generation(
+                first.revision,
+                first.generation,
+                stale_image,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("revision conflict"));
+        assert_eq!(
+            fs.read_text_file("session.jsonl", None).await.unwrap(),
+            before
+        );
+        stale.release_writer_lease();
+
+        let current =
+            JsonlSessionStorage::load(fs.clone(), "session.jsonl", clock.clone(), ids.clone())
+                .await
+                .unwrap();
+        let identity = current.history_identity().await.unwrap();
+        let state = current
+            .state
+            .lock()
+            .await
+            .clone()
+            .into_detached()
+            .await
+            .unwrap();
+        let published = current
+            .replace_history_with_checkpoint_if_revision_and_generation(
+                identity.revision,
+                identity.generation,
+                state.history_checkpoint(identity).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(published.revision, identity.revision);
+        assert_eq!(published.generation, first.generation + 1);
+        current.release_writer_lease();
+
+        let reopened = JsonlSessionStorage::load(fs, "session.jsonl", clock, ids)
+            .await
+            .unwrap();
+        assert_eq!(reopened.history_identity().await.unwrap(), published);
+        assert!(reopened
+            .get_entry("after-checkpoint")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

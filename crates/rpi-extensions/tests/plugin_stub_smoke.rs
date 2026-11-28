@@ -60,6 +60,17 @@ use tokio_util::sync::CancellationToken;
 /// own location (`<target>/<profile>/deps/`). Returns the cdylib path and the
 /// dir it sits in (the dir is what `load_session` scans).
 fn locate_stub() -> Option<(PathBuf, PathBuf)> {
+    // Explicit artifact selection also works with a remapped Cargo test binary
+    // layout. An invalid explicitly supplied fixture must fail, never skip.
+    if let Some(path) = std::env::var_os("RPI_PLUGIN_STUB_PATH") {
+        let path = std::fs::canonicalize(path).expect("explicit plugin-stub artifact must exist");
+        assert!(
+            path.is_file(),
+            "explicit plugin-stub artifact must be a file"
+        );
+        let dir = path.parent().expect("artifact parent").to_path_buf();
+        return Some((path, dir));
+    }
     let exe = std::env::current_exe().ok()?;
     // exe ≈ <target>/debug/deps/rpi_extensions-<hash>.exe
     let deps = exe.parent()?; // .../deps
@@ -872,4 +883,134 @@ fn stub_message_end_hits(stub_path: &std::path::Path) -> usize {
     drop(sym);
     drop(lib);
     hits
+}
+
+/// Required-artifact concurrency proof: no `return`/skip on a missing fixture.
+/// Build plugin-stub first, select it with RPI_PLUGIN_STUB_PATH, and run this
+/// explicitly (`--include-ignored` on this integration-test binary).
+#[test]
+#[ignore = "requires freshly built plugin-stub selected by RPI_PLUGIN_STUB_PATH"]
+fn shared_real_cdylib_keeps_concurrent_agent_and_sessionless_contexts_separate() {
+    use rpi_ai::{Context, ProviderHooks};
+    use rpi_extensions::{ExtensionProviderContext, ExtensionProviderHooks};
+    let (source, _) = locate_stub().expect("required real plugin-stub artifact is missing");
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join(cdylib_filename());
+    std::fs::copy(source, &path).unwrap();
+    let diag = Arc::new(RecordingDiag::default());
+    let session = load_session(&[scratch.path().to_path_buf()], diag.clone(), None);
+    assert!(
+        diag.warnings.lock().unwrap().is_empty(),
+        "real plugin load cannot be skipped"
+    );
+    let before = stub_prompt_transform_hits(&path);
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    std::thread::scope(|scope| {
+        for index in 0..8 {
+            // All hooks use precisely this loaded DLL and its registry, not
+            // separately loaded plugins or synthetic in-process callbacks.
+            let session_id = (index % 2 == 0).then(|| format!("real-session-{index}"));
+            let identity = ExtensionProviderContext {
+                agent_id: Some(format!("real-agent-{index}")),
+                session_id,
+            };
+            let hooks = ExtensionProviderHooks::from_session(&session)
+                .unwrap()
+                .with_context(identity.clone());
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                let model = rpi_ai::Model::new(
+                    "fixture",
+                    "fixture",
+                    rpi_ai::Api::AnthropicMessages,
+                    "fixture",
+                    "https://example.invalid",
+                );
+                let ctx = Context {
+                    system_prompt: Some("BASE".into()),
+                    ..Context::new(vec![rpi_ai::Message::User(rpi_ai::UserMessage::new(
+                        "same timestamp for every Agent",
+                        42,
+                    ))])
+                };
+                barrier.wait();
+                let patch = hooks.transform_context(&model, &ctx).unwrap();
+                let applied = patch.system_prompt.as_ref().unwrap();
+                let marker = applied
+                    .strip_prefix("[plugin-stub says: BASE")
+                    .expect("fresh DLL must echo explicit identity");
+                let actual: serde_json::Value =
+                    serde_json::from_str(marker).expect("DLL returned structured scoped identity");
+                assert_eq!(
+                    actual,
+                    serde_json::json!({"agentId":identity.agent_id,"sessionId":identity.session_id})
+                );
+                assert_eq!(
+                    hooks.transform_context(&model, &ctx).unwrap().system_prompt,
+                    patch.system_prompt
+                );
+            });
+        }
+    });
+    assert_eq!(
+        stub_prompt_transform_hits(&path),
+        before + 8,
+        "exactly one real DLL transform per Agent despite identical prompt timestamps"
+    );
+}
+
+/// A real DLL/registry and concurrent tool adapters, but NOT a Host binary
+/// extension binding or the management-DLL + HTTP end-to-end acceptance.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires freshly built plugin-stub selected by RPI_PLUGIN_STUB_PATH"]
+async fn shared_real_cdylib_tools_keep_frozen_agent_and_sessionless_contexts_separate() {
+    use rpi_extensions::ToolCallContext;
+    let (source, _) = locate_stub().expect("required real plugin-stub artifact is missing");
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join(cdylib_filename());
+    std::fs::copy(source, &path).unwrap();
+    let diag = Arc::new(RecordingDiag::default());
+    let session = load_session(&[scratch.path().to_path_buf()], diag.clone(), None);
+    assert!(
+        diag.warnings.lock().unwrap().is_empty(),
+        "real plugin load cannot be skipped"
+    );
+    assert_eq!(session.loaded_paths(), [path]);
+    let snapshot = session.snapshot().expect("real registry");
+    let tool = snapshot
+        .tools()
+        .iter()
+        .find(|tool| tool.tool.name == "echo")
+        .unwrap();
+    let original = serde_json::json!({"text":"identity","probeContext":true,
+        "__rpi":{"cwd":"/forged","agentId":"forged","sessionId":"forged","runtimeKey":"forged"}});
+    let mut tasks = Vec::new();
+    for index in 0..8 {
+        let id = format!("real-tool-agent-{index}");
+        let cwd = format!("/real-tool-agent-{index}");
+        let session_id = (index % 2 == 0).then(|| format!("real-tool-session-{index}"));
+        let context = ToolCallContext::for_agent(cwd.clone(), id.clone(), session_id.clone());
+        context.clone().set_session_id("wrong-late-cli-identity");
+        let adapter = PluginToolAdapter::new(tool.tool.clone(), tool.handle(), session.keepalive())
+            .with_context(context);
+        let params = original.clone();
+        tasks.push(tokio::spawn(async move {
+            let result = adapter
+                .execute(&id, params, CancellationToken::new(), Arc::new(|_| {}))
+                .await
+                .unwrap();
+            assert_eq!(
+                result.details["context"],
+                serde_json::json!({"cwd":cwd,"agentId":id,"sessionId":session_id})
+            );
+        }));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for task in tasks {
+            task.await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(original["__rpi"]["sessionId"], "forged");
 }

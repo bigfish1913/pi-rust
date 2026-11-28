@@ -79,8 +79,10 @@ async fn tui_fork_locks_the_copy_and_keeps_the_selected_root_for_switch_and_pick
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     assert!(
         switch_to_session(
-            &harness,
-            &lane,
+            SessionLane {
+                harness: &harness,
+                lane: &lane,
+            },
             &initial_id,
             &cwd,
             &state.chat_container,
@@ -155,8 +157,10 @@ async fn tui_import_preserves_identity_history_and_source_across_cwds() {
     let state = state_with_root(&root);
     let context = rpi_extensions::ToolCallContext::new(cwd.to_string_lossy());
     import_session(
-        &harness,
-        &lane,
+        SessionLane {
+            harness: &harness,
+            lane: &lane,
+        },
         &source_path.to_string_lossy(),
         &cwd,
         &state.chat_container,
@@ -223,8 +227,10 @@ async fn invalid_import_leaves_the_active_session_and_repository_untouched() {
     let state = state_with_root(&root);
     let context = rpi_extensions::ToolCallContext::new(cwd.to_string_lossy());
     import_session(
-        &harness,
-        &lane,
+        SessionLane {
+            harness: &harness,
+            lane: &lane,
+        },
         &invalid.to_string_lossy(),
         cwd,
         &state.chat_container,
@@ -305,8 +311,10 @@ async fn session_switch_banner_reports_real_capabilities() {
 
     assert!(
         switch_to_session(
-            &harness,
-            &lane,
+            SessionLane {
+                harness: &harness,
+                lane: &lane,
+            },
             &first_id,
             cwd,
             &state.chat_container,
@@ -651,8 +659,10 @@ async fn switching_back_to_a_session_restores_its_model() {
 
     assert!(
         switch_to_session(
-            &harness,
-            &lane,
+            SessionLane {
+                harness: &harness,
+                lane: &lane,
+            },
             &first_id,
             cwd,
             &state.chat_container,
@@ -740,8 +750,10 @@ async fn switching_back_to_a_session_restores_its_footer_usage() {
 
     assert!(
         switch_to_session(
-            &harness,
-            &lane,
+            SessionLane {
+                harness: &harness,
+                lane: &lane,
+            },
             &first_id,
             cwd,
             &state.chat_container,
@@ -816,8 +828,10 @@ async fn unknown_session_model_leaves_the_current_model_in_place() {
 
     assert!(
         switch_to_session(
-            &harness,
-            &lane,
+            SessionLane {
+                harness: &harness,
+                lane: &lane,
+            },
             &first_id,
             cwd,
             &state.chat_container,
@@ -897,7 +911,6 @@ async fn review_pr104_replay_preserves_the_live_cache_hit_rate() {
             },
             &tui,
             &state,
-            &state.chat_container,
             &lane,
         )
         .await;
@@ -906,8 +919,10 @@ async fn review_pr104_replay_preserves_the_live_cache_hit_rate() {
     assert!(before.contains("CH10.0%"), "live hit rate: {before}");
     assert!(
         switch_to_session(
-            &harness,
-            &lane,
+            SessionLane {
+                harness: &harness,
+                lane: &lane,
+            },
             &source_id,
             cwd,
             &state.chat_container,
@@ -968,8 +983,10 @@ async fn review_pr104_restore_model_must_follow_the_selected_branch() {
     ]));
     assert!(
         switch_to_session(
-            &harness,
-            &lane,
+            SessionLane {
+                harness: &harness,
+                lane: &lane,
+            },
             &source_id,
             cwd,
             &state.chat_container,
@@ -1037,8 +1054,10 @@ async fn review_pr104_restore_model_must_ignore_a_child_lane() {
     ]));
     assert!(
         switch_to_session(
-            &harness,
-            &lane,
+            SessionLane {
+                harness: &harness,
+                lane: &lane,
+            },
             &source_id,
             cwd,
             &state.chat_container,
@@ -1144,8 +1163,10 @@ async fn rereview_pr104_context_must_not_come_from_a_child_lane() {
     let catalog = Arc::new(std::sync::RwLock::new(vec![parent_model]));
     assert!(
         switch_to_session(
-            &harness,
-            &lane,
+            SessionLane {
+                harness: &harness,
+                lane: &lane,
+            },
             &source_id,
             cwd,
             &state.chat_container,
@@ -1209,8 +1230,10 @@ async fn rereview_pr104_compaction_must_invalidate_pre_compaction_context() {
     let catalog = Arc::new(std::sync::RwLock::new(vec![model]));
     assert!(
         switch_to_session(
-            &harness,
-            &lane,
+            SessionLane {
+                harness: &harness,
+                lane: &lane,
+            },
             &source_id,
             cwd,
             &state.chat_container,
@@ -1440,7 +1463,6 @@ async fn review_distinct_turn_with_same_timestamp_and_usage_is_not_dropped() {
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;
@@ -1481,7 +1503,6 @@ async fn review_reconcile_at_agent_end_is_not_recounted_by_a_later_identical_eve
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;
@@ -1506,7 +1527,6 @@ async fn review_reconcile_at_agent_end_is_not_recounted_by_a_later_identical_eve
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;
@@ -1545,7 +1565,6 @@ async fn review_pending_message_end_after_reconcile_does_not_double_usage() {
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;
@@ -1604,7 +1623,6 @@ async fn review_unpersisted_message_after_reconcile_still_counts_once() {
         },
         &tui,
         &state,
-        &state.chat_container,
         &lane,
     )
     .await;

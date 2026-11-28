@@ -20,6 +20,7 @@ pub mod component;
 pub mod container;
 pub mod countdown_timer;
 pub mod diff;
+pub mod display_context;
 pub mod dynamic_border;
 pub mod editor;
 pub mod footer;

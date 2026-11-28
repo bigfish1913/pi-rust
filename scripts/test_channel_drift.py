@@ -116,6 +116,20 @@ class CollectTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             drift.collect(FakeRegistry(bodies))
 
+    def test_rate_limited_lookup_names_the_missing_token(self):
+        bodies = self.bodies()
+        bodies["https://api.github.com/repos/bigfish1913/pi-rust/releases"] = (
+            403, '{"message":"API rate limit exceeded"}')
+        with self.assertRaises(RuntimeError) as unauthenticated:
+            drift.collect(FakeRegistry(bodies))
+        message = str(unauthenticated.exception)
+        self.assertIn("HTTP 403", message)
+        self.assertIn("GITHUB_TOKEN", message)
+        # With a token the failure is a real API answer, not a missing header.
+        with self.assertRaises(RuntimeError) as authenticated:
+            drift.collect(FakeRegistry(bodies), token="secret-token")
+        self.assertNotIn("GITHUB_TOKEN", str(authenticated.exception))
+
     def test_registry_outage_is_unknown_not_silently_ok(self):
         bodies = self.bodies()
         bodies["https://registry.npmjs.org/@bigfishnpm%2Frpi"] = (503, "")
